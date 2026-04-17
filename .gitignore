@@ -98,6 +98,10 @@ dist
 # Sveltekit cache directory
 .svelte-kit/
 
+target/
+Cargo.lock
+src/parser/
+
 # vitepress build output
 **/.vitepress/dist
 
