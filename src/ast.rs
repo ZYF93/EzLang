@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Type {
     I8, I32, I64, U8, U32, U64, F32, F64,
     Str, Bool, Void, Blob,
@@ -13,20 +13,20 @@ pub enum Type {
     Alias(String, Box<Type>), // type Alias = Shape
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Field {
     pub name: String,
     pub ty: Type,
     pub default: Option<Box<Expr>>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Param {
     pub name: String,
     pub ty: Type,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
     Literal(Literal),
     Ident(String),
@@ -48,7 +48,7 @@ pub enum Expr {
     Tag(String, HashMap<String, Expr>, Vec<Expr>), // <tag attrs> children </tag>
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Literal {
     Int(i64),
     Uint(u64),
@@ -57,25 +57,25 @@ pub enum Literal {
     Bool(bool),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum BinOp {
     Add, Sub, Mul, Div, Mod,
     Eq, Ne, Lt, Le, Gt, Ge,
     And, Or,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum UnOp {
     Neg, Not,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Arg {
     pub name: Option<String>,
     pub expr: Expr,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Stmt {
     Let(bool, String, Option<Type>, Expr), // let/const name: Type = expr
     Static(String, Type, Expr),
@@ -91,21 +91,21 @@ pub enum Stmt {
     TypeAlias(String, Type),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum LoopKind {
     Infinite,
     Range(Expr, Expr), // 0...10
     Iter(Expr), // item in list
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Method {
     pub name: String,
     pub params: Vec<Param>,
     pub body: Expr,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Decorator {
     pub name: String,
     pub args: Vec<Expr>,
