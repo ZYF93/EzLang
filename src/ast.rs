@@ -34,7 +34,7 @@ pub enum Expr {
     UnaryOp(UnOp, Box<Expr>),
     Call(Box<Expr>, Vec<Arg>),
     StructInit(String, Vec<(String, Expr)>), // Name(field=val)
-    Array(Vec<Expr>),
+    Array(Vec<Option<Expr>>),
     If(Box<Expr>, Box<Expr>, Box<Expr>), // cond ? then : else
     Match(Vec<(Expr, Expr)>), // match { cond ? expr, ... }
     Block(Vec<Stmt>),

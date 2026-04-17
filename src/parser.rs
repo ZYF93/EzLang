@@ -5,7 +5,7 @@ use nom::{
     character::complete::{char, digit1, multispace1},
     combinator::{all_consuming, map, opt, recognize, value},
     multi::{many0, separated_list0},
-    sequence::{delimited, preceded, tuple},
+    sequence::{delimited, preceded, terminated, tuple},
 };
 use crate::ast::*;
 
@@ -39,7 +39,7 @@ fn parse_block_comment(input: &str) -> IResult<&str, &str> {
 }
 
 pub fn parse(input: &str) -> IResult<&str, Vec<Stmt>> {
-    all_consuming(many0(ws(parse_stmt)))(input)
+    all_consuming(terminated(many0(ws(parse_stmt)), skip_ws))(input)
 }
 
 fn parse_stmt(input: &str) -> IResult<&str, Stmt> {
@@ -47,6 +47,9 @@ fn parse_stmt(input: &str) -> IResult<&str, Stmt> {
         parse_let_stmt,
         parse_const_stmt,
         parse_static_stmt,
+        parse_loop_stmt,
+        parse_break_stmt,
+        parse_continue_stmt,
         parse_expr_stmt,
         // add more
     ))(input)
@@ -83,11 +86,93 @@ fn parse_ident(input: &str) -> IResult<&str, String> {
 }
 
 fn parse_type(input: &str) -> IResult<&str, Type> {
+    let (mut input, first) = parse_single_type(input)?;
+    let mut members = vec![first];
+
+    loop {
+        let parsed_union = preceded(ws(char('|')), parse_single_type)(input);
+        match parsed_union {
+            Ok((next_input, ty)) => {
+                members.push(ty);
+                input = next_input;
+            }
+            Err(_) => break,
+        }
+    }
+
+    if members.len() == 1 {
+        Ok((input, members.remove(0)))
+    } else {
+        Ok((input, Type::Union(members)))
+    }
+}
+
+fn parse_single_type(input: &str) -> IResult<&str, Type> {
+    let (mut input, mut ty) = ws(parse_base_type)(input)?;
+    loop {
+        let parsed = alt((
+            value(None, ws(tag("[]"))),
+            map(delimited(ws(char('[')), ws(digit1), ws(char(']'))), |s: &str| {
+                Some(s.parse::<usize>().unwrap())
+            }),
+        ))(input);
+
+        match parsed {
+            Ok((next_input, len)) => {
+                ty = Type::Array(Box::new(ty), len);
+                input = next_input;
+            }
+            Err(_) => break,
+        }
+    }
+
+    loop {
+        match ws(char('?'))(input) {
+            Ok((next_input, _)) => {
+                ty = Type::Optional(Box::new(ty));
+                input = next_input;
+            }
+            Err(_) => break,
+        }
+    }
+
+    Ok((input, ty))
+}
+
+fn parse_base_type(input: &str) -> IResult<&str, Type> {
     alt((
+        parse_fn_type,
+        map(tag("I64"), |_| Type::I64),
         map(tag("I32"), |_| Type::I32),
+        map(tag("I8"), |_| Type::I8),
+        map(tag("U64"), |_| Type::U64),
+        map(tag("U32"), |_| Type::U32),
+        map(tag("U8"), |_| Type::U8),
+        map(tag("F32"), |_| Type::F32),
+        map(tag("F64"), |_| Type::F64),
         map(tag("Str"), |_| Type::Str),
-        // add more
+        map(tag("Bool"), |_| Type::Bool),
+        map(tag("Void"), |_| Type::Void),
+        map(tag("Blob"), |_| Type::Blob),
     ))(input)
+}
+
+fn parse_fn_type(input: &str) -> IResult<&str, Type> {
+    let (input, params) = delimited(
+        ws(char('(')),
+        separated_list0(ws(char(',')), parse_type_param),
+        ws(char(')')),
+    )(input)?;
+    let (input, _) = ws(tag("=>"))(input)?;
+    let (input, ret_ty) = parse_single_type(input)?;
+    Ok((input, Type::Fn(params, Box::new(ret_ty))))
+}
+
+fn parse_type_param(input: &str) -> IResult<&str, Param> {
+    let (input, name) = ws(parse_ident)(input)?;
+    let (input, _) = ws(char(':'))(input)?;
+    let (input, ty) = parse_type(input)?;
+    Ok((input, Param { name, ty }))
 }
 
 fn parse_expr(input: &str) -> IResult<&str, Expr> {
@@ -148,12 +233,76 @@ fn precedence(op: &BinOp) -> u8 {
 
 fn parse_primary(input: &str) -> IResult<&str, Expr> {
     alt((
+        parse_fn_literal,
         parse_literal,
+        parse_array_literal,
         parse_match,
         parse_ident_expr,
         parse_block,
         delimited(ws(char('(')), parse_expr, ws(char(')'))),
     ))(input)
+}
+
+fn parse_fn_literal(input: &str) -> IResult<&str, Expr> {
+    let (input, params) = delimited(
+        ws(char('(')),
+        separated_list0(ws(char(',')), parse_fn_literal_param),
+        ws(char(')')),
+    )(input)?;
+    let (input, _) = ws(tag("=>"))(input)?;
+    let (input, body) = parse_expr(input)?;
+    Ok((input, Expr::FnDef(params, Box::new(body))))
+}
+
+fn parse_fn_literal_param(input: &str) -> IResult<&str, Param> {
+    let (input, name) = ws(parse_ident)(input)?;
+    let (input, ty) = opt(preceded(ws(char(':')), parse_type))(input)?;
+    Ok((input, Param {
+        name,
+        ty: ty.unwrap_or(Type::Void),
+    }))
+}
+
+fn parse_array_literal(input: &str) -> IResult<&str, Expr> {
+    let (mut input, _) = ws(char('['))(input)?;
+    let mut items: Vec<Option<Expr>> = Vec::new();
+    let mut last_was_comma = false;
+
+    loop {
+        let (next, _) = skip_ws(input)?;
+        input = next;
+
+        if let Ok((next, _)) = char::<&str, nom::error::Error<&str>>(']')(input) {
+            if last_was_comma {
+                items.push(None);
+            }
+            input = next;
+            break;
+        }
+
+        if let Ok((next, expr)) = parse_expr(input) {
+            items.push(Some(expr));
+            input = next;
+        } else if let Ok((next, _)) = char::<&str, nom::error::Error<&str>>(',')(input) {
+            items.push(None);
+            input = next;
+            last_was_comma = true;
+            continue;
+        } else {
+            return Err(nom::Err::Error(nom::error::Error::new(input, nom::error::ErrorKind::Char)));
+        }
+
+        let (next, _) = skip_ws(input)?;
+        input = next;
+        if let Ok((next, _)) = char::<&str, nom::error::Error<&str>>(',')(input) {
+            input = next;
+            last_was_comma = true;
+        } else {
+            last_was_comma = false;
+        }
+    }
+
+    Ok((input, Expr::Array(items)))
 }
 
 fn parse_match(input: &str) -> IResult<&str, Expr> {
@@ -238,6 +387,43 @@ fn parse_expr_stmt(input: &str) -> IResult<&str, Stmt> {
     let (input, expr) = parse_expr(input)?;
     let (input, _) = ws(char(';'))(input)?;
     Ok((input, Stmt::Expr(expr)))
+}
+
+fn parse_break_stmt(input: &str) -> IResult<&str, Stmt> {
+    let (input, _) = ws(tag("break"))(input)?;
+    let (input, _) = ws(char(';'))(input)?;
+    Ok((input, Stmt::Break))
+}
+
+fn parse_continue_stmt(input: &str) -> IResult<&str, Stmt> {
+    let (input, _) = ws(tag("continue"))(input)?;
+    let (input, _) = ws(char(';'))(input)?;
+    Ok((input, Stmt::Continue))
+}
+
+fn parse_loop_stmt(input: &str) -> IResult<&str, Stmt> {
+    let (input, _) = ws(tag("loop"))(input)?;
+    let (input, kind) = parse_loop_kind(input)?;
+    let (input, body) = delimited(ws(char('{')), many0(ws(parse_stmt)), ws(char('}')))(input)?;
+    let (input, _) = ws(char(';'))(input)?;
+    Ok((input, Stmt::Loop(kind, body)))
+}
+
+fn parse_loop_kind(input: &str) -> IResult<&str, LoopKind> {
+    if let Ok((_, _)) = ws(char('{'))(input) {
+        return Ok((input, LoopKind::Infinite));
+    }
+
+    let (input, _) = ws(parse_ident)(input)?;
+    let (input, _) = ws(tag("in"))(input)?;
+    let (input, start_or_iter) = parse_binary_expr_prec(input, 1)?;
+    let (input, range_end) = opt(preceded(ws(tag("...")), |i| parse_binary_expr_prec(i, 1)))(input)?;
+
+    if let Some(end) = range_end {
+        Ok((input, LoopKind::Range(start_or_iter, end)))
+    } else {
+        Ok((input, LoopKind::Iter(start_or_iter)))
+    }
 }
 
 fn parse_static_stmt(input: &str) -> IResult<&str, Stmt> {
