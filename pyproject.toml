@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ezlang"
+version = "0.1.0"
+description = "EzLang Compiler"
+authors = [
+    {name = "张一凡", email = "344275632@qq.com"},
+]
+dependencies = [
+    "antlr4-python3-runtime",
+    "llvmlite",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-dir]
+"" = "src"
