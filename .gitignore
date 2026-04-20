@@ -141,3 +141,13 @@ src/parser/
 # Vite logs files
 vite.config.js.timestamp-*
 vite.config.ts.timestamp-*
+
+# Python cache
+**/__pycache__
+*.py[cod]
+
+# WASI runtime cache
+.wasi/
+
+# WASM files
+*.wasm
