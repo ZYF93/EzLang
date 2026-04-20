@@ -81,6 +81,19 @@ class SemanticAnalyzer(EzLangVisitor):
         if self.symbol_table.parent:
             self.symbol_table = self.symbol_table.parent
 
+    def visitTypeDeclaration(self, ctx: EzLangParser.TypeDeclarationContext):
+        type_name = ctx.ID().getText()
+        # 解析等号右边的类型
+        aliased_type = None
+        if ctx.type_():
+            aliased_type = self.visit(ctx.type_())
+        
+        if aliased_type:
+            self.symbol_table.define_type(type_name, aliased_type)
+        else:
+            self.symbol_table.define_type(type_name, Type(type_name))
+        return self.visitChildren(ctx)
+
     def visitStructDeclaration(self, ctx: EzLangParser.StructDeclarationContext):
         struct_name = ctx.ID().getText()
         struct_type = StructType(struct_name)

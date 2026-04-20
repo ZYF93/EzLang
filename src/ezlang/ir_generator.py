@@ -17,6 +17,7 @@ class IRGenerator(EzLangVisitor):
         # 定义内置类型
         self.i32 = ir.IntType(32)
         self.i64 = ir.IntType(64)
+        self.i1 = ir.IntType(1)
         self.i8 = ir.IntType(8)
         self.void = ir.VoidType()
         
@@ -70,16 +71,108 @@ class IRGenerator(EzLangVisitor):
                 self.locals[-1][var_name] = val
         return None
 
-    def visitPostfixExpression(self, ctx: EzLangParser.PostfixExpressionContext):
-        # 如果有 postfix (LPAREN ... RPAREN)，说明是调用或实例化
-        base = self.visit(ctx.primaryExpression())
+    def visitAdditiveExpression(self, ctx: EzLangParser.AdditiveExpressionContext):
+        results = [self.visit(m) for m in ctx.multiplicativeExpression()]
+        res = results[0]
+        for i in range(1, len(results)):
+            op = ctx.getChild(i*2-1).getText()
+            if op == '+': res = self.builder.add(res, results[i])
+            else: res = self.builder.sub(res, results[i])
+        return res
+
+    def visitMultiplicativeExpression(self, ctx: EzLangParser.MultiplicativeExpressionContext):
+        results = [self.visit(u) for u in ctx.unaryExpression()]
+        res = results[0]
+        for i in range(1, len(results)):
+            op = ctx.getChild(i*2-1).getText()
+            if op == '*': res = self.builder.mul(res, results[i])
+            elif op == '/': res = self.builder.sdiv(res, results[i])
+            else: res = self.builder.srem(res, results[i])
+        return res
+
+    def visitRelationalExpression(self, ctx: EzLangParser.RelationalExpressionContext):
+        results = [self.visit(s) for s in ctx.shiftExpression()]
+        if len(results) == 1: return results[0]
+        res = results[0]
+        for i in range(1, len(results)):
+            op = ctx.getChild(i*2-1).getText()
+            pred = {'>': '>', '<': '<', '>=': '>=', '<=': '<='}[op]
+            res = self.builder.icmp_signed(pred, res, results[i])
+        return res
+
+    def visitLogicalAndExpression(self, ctx: EzLangParser.LogicalAndExpressionContext):
+        # 短路与：if left is false, result is false; else evaluate right.
+        sub_exprs = ctx.equalityExpression()
+        if len(sub_exprs) == 1: return self.visit(sub_exprs[0])
         
+        left_val = self.visit(sub_exprs[0])
+        
+        for i in range(1, len(sub_exprs)):
+            current_block = self.builder.block
+            right_block = self.builder.function.append_basic_block(name="and.rhs")
+            exit_block = self.builder.function.append_basic_block(name="and.exit")
+            
+            self.builder.cbranch(left_val, right_block, exit_block)
+            
+            # Right side
+            self.builder.position_at_end(right_block)
+            right_val = self.visit(sub_exprs[i])
+            self.builder.branch(exit_block)
+            last_right_block = self.builder.block
+            
+            # Exit
+            self.builder.position_at_end(exit_block)
+            phi = self.builder.phi(self.i1, name="and.phi")
+            phi.add_incoming(ir.Constant(self.i1, 0), current_block)
+            phi.add_incoming(right_val, last_right_block)
+            left_val = phi
+            
+        return left_val
+
+    def visitLogicalOrExpression(self, ctx: EzLangParser.LogicalOrExpressionContext):
+        # 短路或：if left is true, result is true; else evaluate right.
+        sub_exprs = ctx.logicalAndExpression()
+        if len(sub_exprs) == 1: return self.visit(sub_exprs[0])
+        
+        left_val = self.visit(sub_exprs[0])
+        for i in range(1, len(sub_exprs)):
+            current_block = self.builder.block
+            right_block = self.builder.function.append_basic_block(name="or.rhs")
+            exit_block = self.builder.function.append_basic_block(name="or.exit")
+            
+            self.builder.cbranch(left_val, exit_block, right_block)
+            
+            # Right side
+            self.builder.position_at_end(right_block)
+            right_val = self.visit(sub_exprs[i])
+            self.builder.branch(exit_block)
+            last_right_block = self.builder.block
+            
+            # Exit
+            self.builder.position_at_end(exit_block)
+            phi = self.builder.phi(self.i1, name="or.phi")
+            phi.add_incoming(ir.Constant(self.i1, 1), current_block)
+            phi.add_incoming(right_val, last_right_block)
+            left_val = phi
+            
+        return left_val
+
+    def visitEqualityExpression(self, ctx: EzLangParser.EqualityExpressionContext):
+        results = [self.visit(r) for r in ctx.relationalExpression()]
+        if len(results) == 1: return results[0]
+        res = results[0]
+        for i in range(1, len(results)):
+            op = ctx.getChild(i*2-1).getText()
+            pred = '==' if op == '==' else '!='
+            res = self.builder.icmp_signed(pred, res, results[i])
+        return res
+
+    def visitPostfixExpression(self, ctx: EzLangParser.PostfixExpressionContext):
+        base = self.visit(ctx.primaryExpression())
         for i in range(ctx.getChildCount()):
             child = ctx.getChild(i)
             if isinstance(child, EzLangParser.PostfixContext):
                 if child.LPAREN():
-                    # 简化逻辑：如果是首字母大写的 ID 后跟 ()，认为是结构体实例化
-                    # 这里先直接为测试生成 arena_alloc 调用
                     size = ir.Constant(self.i32, 64)
                     base = self.builder.call(self.alloc_func, [size])
         return base
@@ -88,28 +181,22 @@ class IRGenerator(EzLangVisitor):
         if ctx.ID():
             name = ctx.ID().getText()
             for scope in reversed(self.locals):
-                if name in scope:
-                    return scope[name]
-            return name # 返回名称用于识别（简化处理）
+                if name in scope: return scope[name]
+            return name
         return self.visitChildren(ctx)
 
     def visitLiteral(self, ctx: EzLangParser.LiteralContext):
         if ctx.INT():
             val = int(ctx.INT().getText(), 0)
             return ir.Constant(self.i32, val)
+        if ctx.TRUE(): return ir.Constant(self.i1, 1)
+        if ctx.FALSE(): return ir.Constant(self.i1, 0)
         return None
 
-    # 默认遍历
     def visitStatement(self, ctx): return self.visitChildren(ctx)
     def visitExpression(self, ctx): return self.visitChildren(ctx)
     def visitAssignmentExpression(self, ctx): return self.visitChildren(ctx)
     def visitPipelineExpression(self, ctx): return self.visitChildren(ctx)
     def visitConditionalExpression(self, ctx): return self.visitChildren(ctx)
-    def visitLogicalOrExpression(self, ctx): return self.visitChildren(ctx)
-    def visitLogicalAndExpression(self, ctx): return self.visitChildren(ctx)
-    def visitEqualityExpression(self, ctx): return self.visitChildren(ctx)
-    def visitRelationalExpression(self, ctx): return self.visitChildren(ctx)
-    def visitShiftExpression(self, ctx): return self.visitChildren(ctx)
-    def visitAdditiveExpression(self, ctx): return self.visitChildren(ctx)
-    def visitMultiplicativeExpression(self, ctx): return self.visitChildren(ctx)
+    def visitShiftExpression(self, ctx): return self.visit(ctx.additiveExpression(0))
     def visitUnaryExpression(self, ctx): return self.visitChildren(ctx)
