@@ -35,6 +35,15 @@ class EzLangListener(ParseTreeListener):
         pass
 
 
+    # Enter a parse tree produced by EzLangParser#anonymousStruct.
+    def enterAnonymousStruct(self, ctx:EzLangParser.AnonymousStructContext):
+        pass
+
+    # Exit a parse tree produced by EzLangParser#anonymousStruct.
+    def exitAnonymousStruct(self, ctx:EzLangParser.AnonymousStructContext):
+        pass
+
+
     # Enter a parse tree produced by EzLangParser#variableDeclaration.
     def enterVariableDeclaration(self, ctx:EzLangParser.VariableDeclarationContext):
         pass
@@ -125,15 +134,6 @@ class EzLangListener(ParseTreeListener):
         pass
 
 
-    # Enter a parse tree produced by EzLangParser#blockOrExpression.
-    def enterBlockOrExpression(self, ctx:EzLangParser.BlockOrExpressionContext):
-        pass
-
-    # Exit a parse tree produced by EzLangParser#blockOrExpression.
-    def exitBlockOrExpression(self, ctx:EzLangParser.BlockOrExpressionContext):
-        pass
-
-
     # Enter a parse tree produced by EzLangParser#block.
     def enterBlock(self, ctx:EzLangParser.BlockContext):
         pass
@@ -149,6 +149,24 @@ class EzLangListener(ParseTreeListener):
 
     # Exit a parse tree produced by EzLangParser#blockStatement.
     def exitBlockStatement(self, ctx:EzLangParser.BlockStatementContext):
+        pass
+
+
+    # Enter a parse tree produced by EzLangParser#breakStatement.
+    def enterBreakStatement(self, ctx:EzLangParser.BreakStatementContext):
+        pass
+
+    # Exit a parse tree produced by EzLangParser#breakStatement.
+    def exitBreakStatement(self, ctx:EzLangParser.BreakStatementContext):
+        pass
+
+
+    # Enter a parse tree produced by EzLangParser#continueStatement.
+    def enterContinueStatement(self, ctx:EzLangParser.ContinueStatementContext):
+        pass
+
+    # Exit a parse tree produced by EzLangParser#continueStatement.
+    def exitContinueStatement(self, ctx:EzLangParser.ContinueStatementContext):
         pass
 
 
@@ -206,15 +224,6 @@ class EzLangListener(ParseTreeListener):
         pass
 
 
-    # Enter a parse tree produced by EzLangParser#pipelineExpression.
-    def enterPipelineExpression(self, ctx:EzLangParser.PipelineExpressionContext):
-        pass
-
-    # Exit a parse tree produced by EzLangParser#pipelineExpression.
-    def exitPipelineExpression(self, ctx:EzLangParser.PipelineExpressionContext):
-        pass
-
-
     # Enter a parse tree produced by EzLangParser#assignmentExpression.
     def enterAssignmentExpression(self, ctx:EzLangParser.AssignmentExpressionContext):
         pass
@@ -233,12 +242,30 @@ class EzLangListener(ParseTreeListener):
         pass
 
 
+    # Enter a parse tree produced by EzLangParser#pipelineExpression.
+    def enterPipelineExpression(self, ctx:EzLangParser.PipelineExpressionContext):
+        pass
+
+    # Exit a parse tree produced by EzLangParser#pipelineExpression.
+    def exitPipelineExpression(self, ctx:EzLangParser.PipelineExpressionContext):
+        pass
+
+
     # Enter a parse tree produced by EzLangParser#conditionalExpression.
     def enterConditionalExpression(self, ctx:EzLangParser.ConditionalExpressionContext):
         pass
 
     # Exit a parse tree produced by EzLangParser#conditionalExpression.
     def exitConditionalExpression(self, ctx:EzLangParser.ConditionalExpressionContext):
+        pass
+
+
+    # Enter a parse tree produced by EzLangParser#controlFlowOnly.
+    def enterControlFlowOnly(self, ctx:EzLangParser.ControlFlowOnlyContext):
+        pass
+
+    # Exit a parse tree produced by EzLangParser#controlFlowOnly.
+    def exitControlFlowOnly(self, ctx:EzLangParser.ControlFlowOnlyContext):
         pass
 
 
@@ -404,6 +431,33 @@ class EzLangListener(ParseTreeListener):
         pass
 
 
+    # Enter a parse tree produced by EzLangParser#catchExpression.
+    def enterCatchExpression(self, ctx:EzLangParser.CatchExpressionContext):
+        pass
+
+    # Exit a parse tree produced by EzLangParser#catchExpression.
+    def exitCatchExpression(self, ctx:EzLangParser.CatchExpressionContext):
+        pass
+
+
+    # Enter a parse tree produced by EzLangParser#throwExpression.
+    def enterThrowExpression(self, ctx:EzLangParser.ThrowExpressionContext):
+        pass
+
+    # Exit a parse tree produced by EzLangParser#throwExpression.
+    def exitThrowExpression(self, ctx:EzLangParser.ThrowExpressionContext):
+        pass
+
+
+    # Enter a parse tree produced by EzLangParser#awaitExpression.
+    def enterAwaitExpression(self, ctx:EzLangParser.AwaitExpressionContext):
+        pass
+
+    # Exit a parse tree produced by EzLangParser#awaitExpression.
+    def exitAwaitExpression(self, ctx:EzLangParser.AwaitExpressionContext):
+        pass
+
+
     # Enter a parse tree produced by EzLangParser#literal.
     def enterLiteral(self, ctx:EzLangParser.LiteralContext):
         pass
@@ -485,15 +539,6 @@ class EzLangListener(ParseTreeListener):
         pass
 
 
-    # Enter a parse tree produced by EzLangParser#interpolatedString.
-    def enterInterpolatedString(self, ctx:EzLangParser.InterpolatedStringContext):
-        pass
-
-    # Exit a parse tree produced by EzLangParser#interpolatedString.
-    def exitInterpolatedString(self, ctx:EzLangParser.InterpolatedStringContext):
-        pass
-
-
     # Enter a parse tree produced by EzLangParser#expressionStatement.
     def enterExpressionStatement(self, ctx:EzLangParser.ExpressionStatementContext):
         pass
@@ -539,39 +584,12 @@ class EzLangListener(ParseTreeListener):
         pass
 
 
-    # Enter a parse tree produced by EzLangParser#optionalType.
-    def enterOptionalType(self, ctx:EzLangParser.OptionalTypeContext):
-        pass
-
-    # Exit a parse tree produced by EzLangParser#optionalType.
-    def exitOptionalType(self, ctx:EzLangParser.OptionalTypeContext):
-        pass
-
-
-    # Enter a parse tree produced by EzLangParser#unionType.
-    def enterUnionType(self, ctx:EzLangParser.UnionTypeContext):
-        pass
-
-    # Exit a parse tree produced by EzLangParser#unionType.
-    def exitUnionType(self, ctx:EzLangParser.UnionTypeContext):
-        pass
-
-
     # Enter a parse tree produced by EzLangParser#functionType.
     def enterFunctionType(self, ctx:EzLangParser.FunctionTypeContext):
         pass
 
     # Exit a parse tree produced by EzLangParser#functionType.
     def exitFunctionType(self, ctx:EzLangParser.FunctionTypeContext):
-        pass
-
-
-    # Enter a parse tree produced by EzLangParser#genericType.
-    def enterGenericType(self, ctx:EzLangParser.GenericTypeContext):
-        pass
-
-    # Exit a parse tree produced by EzLangParser#genericType.
-    def exitGenericType(self, ctx:EzLangParser.GenericTypeContext):
         pass
 
 

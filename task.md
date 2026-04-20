@@ -18,7 +18,7 @@
 - [x] 词法分析（lexer）
   - 验收：针对基础语法和关键字的 `.ez` 示例，lexer 能正确生成 token 序列。
   - 例：`types.ez`、`vars.ez` 中的关键语法构件必须被正确识别。
-- [ ] 语法分析（parser）
+- [x] 语法分析（parser）
   - 验收：parser 能生成正确 AST，且语法错误能被准确定位。
   - 例：`structs.ez`、`control.ez` 中的结构体、循环、条件语句应生成有效 AST。
 - [ ] 语义分析（semantic analyzer）

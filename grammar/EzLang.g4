@@ -98,11 +98,11 @@ QUOTE : '"';
 
 // Literals
 ID : [a-zA-Z_][a-zA-Z0-9_]*;
-INT : [0-9]+ | '0x' [0-9a-fA-F]+ | '0b' [01]+;
-FLOAT : [0-9]+ '.' [0-9]* | '.' [0-9]+;
+INT : '0x' [0-9a-fA-F]+ | '0b' [01]+ | [0-9]+;
+FLOAT : [0-9]+ '.' [0-9]+;
 
-// String with interpolation support
-STRING : QUOTE (STRING_CONTENT | LBRACE_INTERP (options {greedy=false;} : .)* RBRACE_INTERP)* QUOTE;
+// String
+STRING : QUOTE (STRING_CONTENT | LBRACE_INTERP .*? RBRACE_INTERP)* QUOTE;
 fragment STRING_CONTENT : ~["\\{] | '\\' . | '{' ~['{'];
 
 // Comments
@@ -115,7 +115,7 @@ WS : [ \t\r\n]+ -> skip;
 
 // --- Parser Rules ---
 
-program : statement* EOF;
+program : (statement | SEMI)* EOF;
 
 statement : typeDeclaration
           | variableDeclaration
@@ -124,15 +124,20 @@ statement : typeDeclaration
           | importStatement
           | exportStatement
           | declareStatement
+          | controlStatement
           | expressionStatement
           | blockStatement
+          | breakStatement
+          | continueStatement
           ;
 
-typeDeclaration : TYPE ID genericParams? ASSIGN type SEMI;
+typeDeclaration : TYPE ID genericParams? ASSIGN (type | anonymousStruct) SEMI;
 
-variableDeclaration : decorator? (LET | CONST | STATIC) ID genericParams? (COLON type)? ASSIGN expression SEMI;
+anonymousStruct : LBRACE field* RBRACE;
 
-structDeclaration : STRUCT ID genericParams? LBRACE structBody RBRACE SEMI;
+variableDeclaration : decorator? (LET | CONST | STATIC) ID genericParams? (COLON type)? (ASSIGN expression)? SEMI;
+
+structDeclaration : STRUCT ID genericParams? LBRACE structBody RBRACE SEMI?;
 
 structBody : (baseStruct | field | method)*;
 
@@ -140,21 +145,22 @@ baseStruct : ELLIPSIS ID SEMI;
 
 field : ID COLON type (ASSIGN expression)? SEMI;
 
-method : ID ASSIGN functionExpression SEMI;
+method : ID ASSIGN functionExpression SEMI?;
 
-functionDeclaration : (ASYNC)? CONST ID ASSIGN functionExpression SEMI;
+functionDeclaration : (ASYNC)? CONST ID ASSIGN functionExpression SEMI?;
 
-functionExpression : LPAREN parameters? RPAREN (ARROW type)? blockOrExpression;
+functionExpression : LPAREN parameters? RPAREN (ARROW type)? (block | ARROW (expression | controlFlowOnly));
 
 parameters : parameter (COMMA parameter)*;
 
-parameter : ID (QMARK)? COLON type (ASSIGN expression)?;
-
-blockOrExpression : block | ARROW expression;
+parameter : (THIS | ID) (QMARK)? COLON type (ASSIGN expression)?;
 
 block : LBRACE statement* RBRACE;
 
 blockStatement : block;
+
+breakStatement : BREAK SEMI?;
+continueStatement : CONTINUE SEMI?;
 
 importStatement : FROM STRING IMPORT LBRACE importItems RBRACE SEMI;
 
@@ -166,15 +172,19 @@ exportStatement : EXPORT (variableDeclaration | structDeclaration | functionDecl
 
 declareStatement : DECLARE (CONST | LET | STATIC)? ID COLON type SEMI;
 
-expression : pipelineExpression;
+expression : assignmentExpression;
 
-pipelineExpression : conditionalExpression (PIPE ID LPAREN argumentList? RPAREN)*;
-
-assignmentExpression : conditionalExpression (assignmentOp conditionalExpression)*;
+assignmentExpression : pipelineExpression (assignmentOp assignmentExpression)?;
 
 assignmentOp : ASSIGN | ADD_ASSIGN | SUB_ASSIGN | MUL_ASSIGN | DIV_ASSIGN | MOD_ASSIGN | AND_ASSIGN | OR_ASSIGN | XOR_ASSIGN | LSHIFT_ASSIGN | RSHIFT_ASSIGN;
 
-conditionalExpression : logicalOrExpression (QMARK expression COLON expression)?;
+pipelineExpression : conditionalExpression (PIPE ID LPAREN argumentList? RPAREN)*;
+
+// 修改 conditionalExpression 以支持 break/continue/throw
+conditionalExpression : logicalOrExpression (QMARK (expression | block | controlFlowOnly) (COLON (expression | block | controlFlowOnly))?)?;
+
+// 仅能在控制流中使用的特殊表达式（模拟语句行为）
+controlFlowOnly : BREAK | CONTINUE | throwExpression;
 
 logicalOrExpression : logicalAndExpression (LOR logicalAndExpression)*;
 
@@ -216,15 +226,21 @@ namedArgument : ID ASSIGN expression | expression;
 
 primaryExpression : literal
                   | ID
+                  | THIS
                   | LPAREN expression RPAREN
                   | vectorLiteral
                   | structLiteral
                   | markupLiteral
                   | TYPEOF LPAREN expression RPAREN
-                  | CATCH block
-                  | THROW expression
-                  | AWAIT expression
+                  | catchExpression
+                  | throwExpression
+                  | awaitExpression
+                  | block
                   ;
+
+catchExpression : CATCH block;
+throwExpression : THROW expression;
+awaitExpression : AWAIT expression;
 
 literal : INT | FLOAT | STRING | TRUE | FALSE;
 
@@ -244,9 +260,7 @@ markupAttr : ID ASSIGN STRING | ID ASSIGN expression;
 
 markupContent : (STRING | LBRACE expression RBRACE | markupLiteral)*;
 
-interpolatedString : QUOTE (STRING_CONTENT | LBRACE_INTERP expression RBRACE_INTERP)* QUOTE;
-
-expressionStatement : expression SEMI;
+expressionStatement : (expression | controlFlowOnly) SEMI;
 
 // Types
 type : (functionType | simpleType) (OR (functionType | simpleType))*;
@@ -255,15 +269,10 @@ simpleType : baseType typeSuffix*;
 
 typeSuffix : LBRACK INT? RBRACK | QMARK | LT simpleType (COMMA simpleType)* GT | LPAREN parameters? RPAREN ARROW simpleType | VEC_LIT LT simpleType GT LBRACK INT RBRACK;
 
-baseType : I8 | I32 | I64 | U8 | U32 | U64 | F32 | F64 | STR_TYPE | BOOL_TYPE | VOID_TYPE_CAP | ID;
-
-optionalType : type QMARK;
-
-unionType : type OR type;
+// 关键修复：将 VEC_LIT 加入 baseType
+baseType : I8 | I32 | I64 | U8 | U32 | U64 | F32 | F64 | STR_TYPE | BOOL_TYPE | VOID_TYPE_CAP | VEC_LIT | ID;
 
 functionType : LPAREN parameters? RPAREN ARROW type;
-
-genericType : ID genericArgs;
 
 genericArgs : LT simpleType (COMMA simpleType)* GT;
 
@@ -272,7 +281,7 @@ genericParams : LT ID (COMMA ID)* GT;
 // Decorators
 decorator : AT ID;
 
-// Control flow
+// Control flow statements
 controlStatement : loopStatement | matchStatement | conditionalStatement;
 
 loopStatement : LOOP (rangeLoop | infiniteLoop);
@@ -281,8 +290,8 @@ infiniteLoop : block;
 
 rangeLoop : ID IN expression ELLIPSIS expression block;
 
-conditionalStatement : expression QMARK (expression | block) (COLON (expression | block))?;
+conditionalStatement : expression QMARK (expression | block | controlFlowOnly) (COLON (expression | block | controlFlowOnly))?;
 
 matchStatement : MATCH LBRACE matchCase (COMMA matchCase)* RBRACE;
 
-matchCase : LPAREN expression RPAREN QMARK (expression | block);
+matchCase : LPAREN expression RPAREN QMARK (expression | block | controlFlowOnly);

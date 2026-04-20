@@ -1,0 +1,47 @@
+// control.ez — 控制流与表达式验收文件
+
+// 1. 条件表达式与语句
+let x = 10;
+(x > 0) ? print(msg = "positive");
+
+let y = (x > 5) ? 100 : 200;
+
+// 2. 块条件
+(x == 10) ? {
+    print(msg = "is ten");
+} : {
+    print(msg = "is not ten");
+};
+
+// 3. 无限循环
+let i = 0;
+loop {
+    (i >= 10) ? break;
+    i = i + 1;
+};
+
+// 4. 范围循环
+loop j in 0...5 {
+    print(msg = "looping...");
+};
+
+// 5. 模式匹配 (match)
+let score = 85;
+match {
+    (score >= 90) ? print(msg = "A"),
+    (score >= 80) ? print(msg = "B"),
+    (true) ? print(msg = "C")
+};
+
+// 6. 异常捕获 (catch/throw)
+let result = catch {
+    (x < 0) ? throw Error(msg = "negative");
+    x * 2;
+};
+
+// 7. 复杂 match (包含 continue)
+let k = 0;
+match {
+    (k == 0) ? { k = 1; continue; },
+    (k == 1) ? { print(msg = "k is one"); break; }
+};
