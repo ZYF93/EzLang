@@ -240,7 +240,7 @@ ELLIPSIS : '...';
 
 // Literals
 ID : [a-zA-Z_][a-zA-Z0-9_]*;
-INT : [0-9]+;
+INT : [0-9]+ | '0x' [0-9a-fA-F]+ | '0b' [01]+;
 FLOAT : [0-9]+ '.' [0-9]* | '.' [0-9]+;
 STRING : '"' (STRING_CONTENT | '{{' .*? '}}')* '"';
 fragment STRING_CONTENT : ~["\\] | '\\' .;

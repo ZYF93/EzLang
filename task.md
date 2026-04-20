@@ -1,10 +1,11 @@
-﻿# EzLang TDD 开发任务
+# EzLang TDD 开发任务
 
 ## 开发方式
 - 采用 TDD（测试驱动开发）模式。
 - 每个功能先写测试用例，再编写 `.ez` 验收示例文件，最后实现编译器使测试和验收示例全部通过。
 - 测试用例应直接引用或加载对应 `.ez` 文件，以保证实现与示例文件一致。
 - 任务拆解为可验证的最小单元，适合 AI 按步骤完成。
+- **ANTLR 依赖**：Lexer 和 Parser 基于 ANTLR4 生成。每次修改语法规则时，必须先修改 `grammar/EzLang.g4`，然后执行 `antlr4 -Dlanguage=Python3 -o src/ezlang/antlr_generated grammar/EzLang.g4` 重新生成代码。禁止手动修改 `src/ezlang/antlr_generated/` 下的生成文件。
 
 ## 验收标准
 - 每个任务项都有至少一个测试用例，并引入对应的 `.ez` 验收文件。
