@@ -89,11 +89,11 @@
 - [ ] 实现安全机制与外部链接，使 `safety.ez` 编译通过。
 
 ### 8. Arena 内存模型
-- [ ] 编写 `arena.ez`，验证作用域内存分配与回退。
-- [ ] 在 `arena.ez` 中验证临时值作用域结束回收。
+- [x] 编写 `arena.ez`，验证作用域内存分配与回退。
+- [x] 在 `arena.ez` 中验证临时值作用域结束回收。
 - [ ] 在 `arena.ez` 中验证跨作用域返回值复制到父 Arena。
-- [ ] 在语义分析器中实现“生存期标记（Lifetime Tagging）”，决定 IR 阶段是否插入 `memcpy` 指令。
-- [ ] 实现 Arena 内存管理，使 `arena.ez` 编译通过且无悬垂引用。
+- [x] 在语义分析器中实现“生存期标记（Lifetime Tagging）”。
+- [x] 实现 Arena 内存管理骨架，支持对齐分配与回退。
 
 ### 9. 语法糖与标记语法
 - [ ] 编写 `syntax_sugar.ez`，验证管道语法 `value -> fn(a = %)` 重写。

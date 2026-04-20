@@ -1,0 +1,27 @@
+// arena.ez — 内存模型验收文件
+
+struct BigData {
+    id: I32;
+    buffer: I32[1024];
+};
+
+// 1. 块作用域分配
+{
+    let data = BigData(id = 1);
+    // data 在此块结束时应被回收（Arena 指针回退）
+};
+
+// 2. 临时值回收
+let count = 0;
+loop i in 0...10 {
+    // 循环内的临时对象应在每次迭代结束时清理
+    let temp = BigData(id = i);
+    count = count + temp.id;
+};
+
+// 3. 返回值提升 (Return Promotion)
+// 这需要编译器能自动识别返回值，并将其分配在调用者的 Arena 中，或者执行拷贝
+const get_data = (id: I32) => BigData(id = id);
+
+let my_data = get_data(id = 100);
+print(msg = "Arena testing completed");
