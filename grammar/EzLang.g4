@@ -235,6 +235,7 @@ primaryExpression : literal
                   | catchExpression
                   | throwExpression
                   | awaitExpression
+                  | functionExpression
                   | block
                   ;
 
@@ -260,7 +261,7 @@ markupAttr : ID ASSIGN STRING | ID ASSIGN expression;
 
 markupContent : (STRING | LBRACE expression RBRACE | markupLiteral)*;
 
-expressionStatement : (expression | controlFlowOnly) SEMI;
+expressionStatement : (expression | controlFlowOnly) SEMI?;
 
 // Types
 type : (functionType | simpleType) (OR (functionType | simpleType))*;
