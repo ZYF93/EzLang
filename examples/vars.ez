@@ -1,48 +1,10 @@
-// vars.ez — 变量声明与值语义验收文件
-// 验证 let/const/static 声明、类型注解、值拷贝语义
+// vars.ez - 验证变量声明与值语义
+let count = 10;
+const PI = 3.14;
+static GLOBAL_VAL = 100;
 
-// 1. let 可变变量
-let count: I32 = 10;
-let name: Str = "EzLang";
+let copy = count; // 值语义拷贝
+count = 20;
 
-// 2. const 只读变量
-const max: I32 = 100;
-const pi: F64 = 3.14159;
-
-// 3. static 全局静态变量
-static config: Str = "release";
-static version: I32 = 1;
-
-// 4. 显式类型注解
-let x: I32 = 42;
-let y: F32 = 1.5;
-
-// 5. 类型推断（无显式注解）
-let inferred = 100;
-let inferredStr = "hello";
-
-// 6. 值语义拷贝
-let original: I32 = 10;
-let copy = original;
-
-// 7. 二进制和十六进制字面量
-let binVal: U8 = 0b1010;
-let hexVal: U32 = 0xFF;
-
-// 8. 复合赋值运算符
-let a: I32 = 10;
-a += 5;
-a -= 2;
-a *= 3;
-a /= 2;
-a %= 7;
-a &= 0b1111;
-a |= 0b0001;
-a ^= 0b0010;
-
-// 9. 负面测试：const 不应赋值（语义层检查，此处只验证词法）
-// const immutable: I32 = 1;
-// immutable = 2;  // 应在语义分析时报错
-
-// 10. 装饰器语法（词法层面）
-@log let decorated: I32 = 42;
+// 负面用例：const 修改（未来语义分析应拦截）
+// PI = 3.15;

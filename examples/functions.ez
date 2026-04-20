@@ -1,0 +1,13 @@
+// functions.ez - 验证函数调用
+const add = (a: I32, b: I32) => {
+    a + b;
+};
+
+const fib = (n: I32) => {
+    (n <= 1) ? n : fib(n - 1) + fib(n - 2);
+};
+
+const main = () => {
+    add(1, 2);
+    fib(5);
+};

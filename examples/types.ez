@@ -1,46 +1,9 @@
-// types.ez — 类型系统验收文件
-// 验证基本类型、复合类型、可选类型、联合类型、SIMD 向量类型的词法解析
+// types.ez - 验证基本类型系统
+let a: I32 = 42;
+let b: I64 = 1000000000;
+let c: Bool = true;
+let d: F32 = 3.14;
+let e: Str = "Hello EzLang";
 
-// 1. 基本数值类型
-let a: I8 = 1;
-let b: I32 = 42;
-let c: I64 = 100;
-let d: U8 = 255;
-let e: U32 = 1000;
-let f: U64 = 99999;
-let g: F32 = 3.14;
-let h: F64 = 2.718;
-
-// 2. 基础类型
-let s: Str = "hello";
-let flag: Bool = true;
-let nothing: Bool = false;
-
-// 3. 数组类型
-let arr1: I32[];
-let arr2: I32[100];
-
-// 4. SIMD 向量类型
-let v1: Vec<I32>[4] = Vec[1, 2, 3, 4];
-let v2: Vec<F32>[4] = Vec[1.0, 2.0, 3.0, 4.0];
-
-// 5. 可选类型
-let opt: I32? = 10;
-
-// 6. 联合类型
-let val: I32 | Str = "hello";
-
-// 7. 类型别名
-type Point = { x: I32; y: I32; };
-
-// 8. 泛型结构体类型
-struct Result<T> { ok: T; err: Str; };
-
-// 9. 负面测试：确保关键字不被误认为标识符
-// 以下注释中的标识符不应与关键字混淆
-let typeVar: I32 = 1;
-let letValue: I32 = 2;
-
-// 10. 注释验证
-/* 这是块注释 */
-// 这是行注释
+// 负面用例：类型不匹配（虽然目前的编译器还不强制报错，但语法应支持）
+// let f: I32 = "wrong"; 

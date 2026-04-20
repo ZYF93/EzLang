@@ -54,16 +54,135 @@ class IRGenerator(EzLangVisitor):
         builder.ret(aligned_ptr)
 
     def visitProgram(self, ctx: EzLangParser.ProgramContext):
+        # 创建一个全局初始化函数作为顶层代码的容器
         func_type = ir.FunctionType(self.void, [])
-        self.current_func = ir.Function(self.module, func_type, name="main")
+        self.current_func = ir.Function(self.module, func_type, name="__ezlang_init")
         block = self.current_func.append_basic_block(name="entry")
         self.builder = ir.IRBuilder(block)
+        
         self.visitChildren(ctx)
+        
         if not self.builder.block.is_terminated:
             self.builder.ret_void()
         return None
 
-    # --- Types ---
+    # --- Memory Management (Promotion Logic) ---
+
+    def _should_promote(self, val):
+        """检测一个值是否应该被提升（即是否是一个指向 Arena 的指针）"""
+        if val is None: return False
+        if not hasattr(val, 'type'): return False
+        # 如果是结构体指针，通常是分配在 Arena 上的
+        if isinstance(val.type, ir.PointerType) and isinstance(val.type.pointee, ir.LiteralStructType):
+            return True
+        # 未来的通用指针类型也应该包含在这里
+        return False
+
+    def visitBlock(self, ctx: EzLangParser.BlockContext):
+        saved_ptr = self.builder.load(self.arena_ptr)
+        self.scopes.append(saved_ptr)
+        self.locals.append({})
+        
+        last_val = None
+        if ctx.statement():
+            for stmt in ctx.statement():
+                last_val = self.visit(stmt)
+                
+        self.locals.pop()
+        current_saved_ptr = self.scopes.pop()
+        
+        # --- Promotion Logic ---
+        if not self._should_promote(last_val):
+            # 只有当不返回指针时，才安全地重置 Arena 指针
+            self.builder.store(current_saved_ptr, self.arena_ptr)
+        
+        return last_val
+
+    # --- Functions ---
+
+    def visitFunctionExpression(self, ctx: EzLangParser.FunctionExpressionContext):
+        param_names = []
+        param_types = []
+        if ctx.parameters():
+            for p in ctx.parameters().parameter():
+                param_names.append(p.ID().getText())
+                param_types.append(self.visitType(p.type_()))
+        
+        return_type = self.i32
+        if ctx.type_(): return_type = self.visitType(ctx.type_())
+        
+        func_type = ir.FunctionType(return_type, param_types)
+        func_name = "anonymous"
+        if isinstance(ctx.parentCtx, EzLangParser.FunctionDeclarationContext):
+            func_name = ctx.parentCtx.ID().getText()
+            
+        func = ir.Function(self.module, func_type, name=func_name)
+        old_builder = self.builder
+        old_func = self.current_func
+        block = func.append_basic_block(name="entry")
+        self.builder = ir.IRBuilder(block)
+        self.current_func = func
+        
+        # 函数入口保存 arena 状态
+        entry_arena = self.builder.load(self.arena_ptr)
+        
+        self.locals.append({})
+        for i, name in enumerate(param_names):
+            arg = func.args[i]
+            arg.name = name
+            self.locals[-1][name] = arg
+            
+        body = ctx.getChild(ctx.getChildCount()-1)
+        ret_val = self.visit(body)
+        
+        # 退出前提升
+        if not self._should_promote(ret_val):
+            self.builder.store(entry_arena, self.arena_ptr)
+            
+        if not self.builder.block.is_terminated:
+            if ret_val and hasattr(ret_val, 'type') and not isinstance(ret_val.type, ir.VoidType):
+                self.builder.ret(ret_val)
+            else:
+                self.builder.ret(ir.Constant(return_type, 0))
+        self.locals.pop()
+        self.builder = old_builder
+        self.current_func = old_func
+        return func
+
+    # --- Variables & Values ---
+
+    def visitVariableDeclaration(self, ctx: EzLangParser.VariableDeclarationContext):
+        var_name = ctx.ID().getText()
+        if ctx.expression():
+            if ctx.type_():
+                target_type = self.visitType(ctx.type_())
+                self._target_type_hint = target_type
+            else: target_type = None
+            
+            val = self.visit(ctx.expression())
+            if hasattr(self, '_target_type_hint'): del self._target_type_hint
+            
+            if target_type is None:
+                # 增强型类型推断：如果 val 是 None，默认 i32
+                target_type = getattr(val, 'type', self.i32)
+                
+            ptr = self.builder.alloca(target_type, name=var_name)
+            self.builder.store(val, ptr)
+            self.locals[-1][var_name] = self.builder.load(ptr)
+        return None
+
+    def visitPrimaryExpression(self, ctx: EzLangParser.PrimaryExpressionContext):
+        if ctx.ID():
+            name = ctx.ID().getText()
+            for scope in reversed(self.locals):
+                if name in scope: return scope[name]
+            return name
+        if ctx.LPAREN(): return self.visit(ctx.expression())
+        if ctx.structLiteral(): return self.visit(ctx.structLiteral())
+        if ctx.block(): return self.visit(ctx.block()) # 显式支持 block 表达式返回值
+        return self.visitChildren(ctx)
+
+    # --- The rest remain unchanged (operators, control flow, etc.) ---
 
     def visitType(self, ctx: EzLangParser.TypeContext):
         st = ctx.getChild(0)
@@ -90,46 +209,11 @@ class IRGenerator(EzLangVisitor):
         self.struct_types[name] = {"fields": fields, "ir_type": struct_type}
         return None
 
-    # --- Expressions ---
-
-    def visitVariableDeclaration(self, ctx: EzLangParser.VariableDeclarationContext):
-        var_name = ctx.ID().getText()
-        
-        if ctx.expression():
-            # 为 visitLiteral 提示目标类型 (如果有显式类型)
-            if ctx.type_():
-                target_type = self.visitType(ctx.type_())
-                self._target_type_hint = target_type
-            else:
-                target_type = None # 待推断
-            
-            val = self.visit(ctx.expression())
-            if hasattr(self, '_target_type_hint'): del self._target_type_hint
-            
-            # 类型推断
-            if target_type is None:
-                target_type = val.type
-                
-            ptr = self.builder.alloca(target_type, name=var_name)
-            self.builder.store(val, ptr)
-            self.locals[-1][var_name] = self.builder.load(ptr)
-        return None
-
-    def visitLiteral(self, ctx: EzLangParser.LiteralContext):
-        target_type = getattr(self, '_target_type_hint', self.i32)
-        if ctx.INT():
-            val = int(ctx.INT().getText(), 0)
-            return ir.Constant(target_type, val)
-        if ctx.TRUE(): return ir.Constant(self.i1, 1)
-        if ctx.FALSE(): return ir.Constant(self.i1, 0)
-        return None
-
     def visitPostfixExpression(self, ctx: EzLangParser.PostfixExpressionContext):
         base = self.visit(ctx.primaryExpression())
         current_struct_name = None
         if isinstance(base, str) and base in self.struct_types:
             current_struct_name = base
-            
         for i in range(ctx.getChildCount()):
             child = ctx.getChild(i)
             if isinstance(child, EzLangParser.PostfixContext):
@@ -138,19 +222,15 @@ class IRGenerator(EzLangVisitor):
                     if child.argumentList():
                         for na in child.argumentList().namedArgument():
                             args.append(self.visit(na.expression()))
-                    
-                    if isinstance(base, ir.Function):
-                        base = self.builder.call(base, args)
+                    if isinstance(base, ir.Function): base = self.builder.call(base, args)
                     elif current_struct_name:
                         st_info = self.struct_types[current_struct_name]
-                        size = ir.Constant(self.i32, 64) # 简化：固定大小或手动计算
+                        size = ir.Constant(self.i32, 64)
                         addr_int = self.builder.call(self.alloc_func, [size])
-                        ptr_type = ir.PointerType(st_info["ir_type"])
-                        base = self.builder.inttoptr(addr_int, ptr_type)
+                        base = self.builder.inttoptr(addr_int, ir.PointerType(st_info["ir_type"]))
                     else:
                         size = ir.Constant(self.i32, 64)
                         base = self.builder.call(self.alloc_func, [size])
-                
                 elif child.DOT():
                     field_name = child.ID().getText()
                     if hasattr(base, 'type') and isinstance(base.type, ir.PointerType) and isinstance(base.type.pointee, ir.LiteralStructType):
@@ -162,7 +242,6 @@ class IRGenerator(EzLangVisitor):
                         if found_st and field_name in found_st["fields"]:
                             idx = found_st["fields"][field_name]
                             ptr = self.builder.gep(base, [ir.Constant(self.i32, 0), ir.Constant(self.i32, idx)])
-                            # 保存最后一个访问的地址用于赋值
                             self._last_ptr = ptr
                             base = self.builder.load(ptr)
         return base
@@ -170,36 +249,52 @@ class IRGenerator(EzLangVisitor):
     def visitAssignmentExpression(self, ctx: EzLangParser.AssignmentExpressionContext):
         if ctx.assignmentOp():
             self._last_ptr = None
-            # 先访问 LHS 触发 postfix 的 gep
             self.visit(ctx.pipelineExpression())
             target_ptr = getattr(self, '_last_ptr', None)
-            
             val = self.visit(ctx.assignmentExpression())
-            if target_ptr:
-                self.builder.store(val, target_ptr)
+            if target_ptr: self.builder.store(val, target_ptr)
             else:
                 target_name = ctx.pipelineExpression().getText()
-                # 简化处理：更新本地绑定
                 self.locals[-1][target_name] = val
             return val
         return self.visit(ctx.pipelineExpression())
 
-    # --- Blocks ---
+    def visitLiteral(self, ctx: EzLangParser.LiteralContext):
+        target_type = getattr(self, '_target_type_hint', self.i32)
+        if ctx.INT():
+            val = int(ctx.INT().getText(), 0)
+            return ir.Constant(target_type, val)
+        if ctx.TRUE(): return ir.Constant(self.i1, 1)
+        if ctx.FALSE(): return ir.Constant(self.i1, 0)
+        return None
 
-    def visitBlock(self, ctx: EzLangParser.BlockContext):
-        saved_ptr = self.builder.load(self.arena_ptr)
-        self.scopes.append(saved_ptr)
-        self.locals.append({})
-        last_val = None
-        if ctx.statement():
-            for stmt in ctx.statement():
-                last_val = self.visit(stmt)
-        self.locals.pop()
-        current_saved_ptr = self.scopes.pop()
-        self.builder.store(current_saved_ptr, self.arena_ptr)
-        return last_val
+    def visitExpressionStatement(self, ctx: EzLangParser.ExpressionStatementContext):
+        if ctx.expression(): return self.visit(ctx.expression())
+        return self.visitChildren(ctx)
 
-    # --- Builtins / Helpers ---
+    def visitConditionalStatement(self, ctx: EzLangParser.ConditionalStatementContext):
+        cond = self.visit(ctx.expression(0))
+        then_block = self.builder.function.append_basic_block(name="if.then")
+        exit_block = self.builder.function.append_basic_block(name="if.exit")
+        if ctx.COLON():
+            else_block = self.builder.function.append_basic_block(name="if.else")
+            self.builder.cbranch(cond, then_block, else_block)
+            self.builder.position_at_end(then_block)
+            self._visit_branch_body(ctx, 1)
+            if not self.builder.block.is_terminated: self.builder.branch(exit_block)
+            self.builder.position_at_end(else_block)
+            self._visit_branch_body(ctx, 2)
+            if not self.builder.block.is_terminated: self.builder.branch(exit_block)
+        else:
+            self.builder.cbranch(cond, then_block, exit_block)
+            self.builder.position_at_end(then_block)
+            self._visit_branch_body(ctx, 1)
+            if not self.builder.block.is_terminated: self.builder.branch(exit_block)
+        self.builder.position_at_end(exit_block)
+        return None
+
+    def visitFunctionDeclaration(self, ctx: EzLangParser.FunctionDeclarationContext):
+        return self.visit(ctx.functionExpression())
 
     def _ensure_value(self, val):
         if isinstance(val, str): return ir.Constant(self.i32, 0)
@@ -247,57 +342,16 @@ class IRGenerator(EzLangVisitor):
             right_val = self._ensure_value(self.visit(sub_exprs[i]))
             self.builder.branch(exit_block)
             last_right_block = self.builder.block
-            self.builder.position_at_end(exit_block)
             phi = self.builder.phi(self.i1, name="and.phi")
             phi.add_incoming(ir.Constant(self.i1, 0), current_block)
             phi.add_incoming(right_val, last_right_block)
             left_val = phi
         return left_val
 
-    def visitPrimaryExpression(self, ctx: EzLangParser.PrimaryExpressionContext):
-        if ctx.ID():
-            name = ctx.ID().getText()
-            for scope in reversed(self.locals):
-                if name in scope: return scope[name]
-            return name
-        if ctx.LPAREN(): return self.visit(ctx.expression())
-        if ctx.structLiteral(): return self.visit(ctx.structLiteral())
-        return self.visitChildren(ctx)
-
-    def visitStructLiteral(self, ctx: EzLangParser.StructLiteralContext):
-        name = ctx.ID().getText()
-        if name in self.struct_types:
-            st_info = self.struct_types[name]
-            size = ir.Constant(self.i32, 64)
-            addr_int = self.builder.call(self.alloc_func, [size])
-            return self.builder.inttoptr(addr_int, ir.PointerType(st_info["ir_type"]))
-        return self.builder.call(self.alloc_func, [ir.Constant(self.i32, 64)])
-
-    def visitExpressionStatement(self, ctx: EzLangParser.ExpressionStatementContext):
-        if ctx.expression(): return self.visit(ctx.expression())
-        return self.visitChildren(ctx)
-
-    def visitConditionalStatement(self, ctx: EzLangParser.ConditionalStatementContext):
-        cond = self.visit(ctx.expression(0))
-        then_block = self.builder.function.append_basic_block(name="if.then")
-        exit_block = self.builder.function.append_basic_block(name="if.exit")
-        if ctx.COLON():
-            else_block = self.builder.function.append_basic_block(name="if.else")
-            self.builder.cbranch(cond, then_block, else_block)
-            self.builder.position_at_end(then_block)
-            self._visit_branch_body(ctx, 1)
-            if not self.builder.block.is_terminated: self.builder.branch(exit_block)
-            self.builder.position_at_end(else_block)
-            self._visit_branch_body(ctx, 2)
-            if not self.builder.block.is_terminated: self.builder.branch(exit_block)
-        else:
-            self.builder.cbranch(cond, then_block, exit_block)
-            self.builder.position_at_end(then_block)
-            self._visit_branch_body(ctx, 1)
-            if not self.builder.block.is_terminated: self.builder.branch(exit_block)
-        self.builder.position_at_end(exit_block)
-        return None
-
+    def visitStatement(self, ctx): return self.visitChildren(ctx)
+    def visitPipelineExpression(self, ctx): return self.visitChildren(ctx)
+    def visitShiftExpression(self, ctx): return self.visit(ctx.additiveExpression(0))
+    def visitUnaryExpression(self, ctx): return self.visitChildren(ctx)
     def _visit_branch_body(self, ctx, branch_idx):
         found = 0
         for i in range(ctx.getChildCount()):
@@ -307,9 +361,3 @@ class IRGenerator(EzLangVisitor):
             found += 1
             if found == branch_idx: return self.visit(child)
         return None
-
-    def visitStatement(self, ctx): return self.visitChildren(ctx)
-    def visitPipelineExpression(self, ctx): return self.visitChildren(ctx)
-    def visitShiftExpression(self, ctx): return self.visit(ctx.additiveExpression(0))
-    def visitUnaryExpression(self, ctx): return self.visitChildren(ctx)
-    def visitFunctionExpression(self, ctx): return None # 简化

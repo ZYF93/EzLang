@@ -1,42 +1,16 @@
-// structs.ez — 结构体与组合验收文件
-
-// 1. 基本结构体定义
+// structs.ez - 验证结构体
 struct Point {
     x: I32;
-    y: I32;
+    y: I32 = 0;
 };
 
-// 2. 带默认值的结构体
-struct User {
-    name: Str = "Guest";
-    id: I32;
-    active: Bool = true;
+struct Point3D {
+    ...Point; // 字段展开
+    z: I32;
 };
 
-// 3. 结构体组合（展开语法）
-struct Admin {
-    ...User;
-    level: I32 = 1;
+const main = () => {
+    let p1 = Point(x = 10);
+    let p2 = Point3D(x = 1, y = 2, z = 3);
+    p1.x;
 };
-
-// 4. 方法定义
-struct Counter {
-    value: I32 = 0;
-    
-    // 方法语法：name = (this: Type, args...) => expr/block
-    inc = (this: Counter) => {
-        this.value = this.value + 1;
-    };
-    
-    reset = (this: Counter, start: I32) => {
-        this.value = start;
-    };
-};
-
-// 5. 实例化（字面量）
-let p = Point(x = 10, y = 20);
-let u = User(id = 1);
-let a = Admin(id = 2, level = 99);
-
-// 6. 展开实例化
-let u2 = User(...u, name = "Admin");

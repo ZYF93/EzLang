@@ -1,0 +1,11 @@
+struct Point {
+    x: I32;
+    y: I32;
+};
+
+const main = () => {
+    let p = Point(x = 10, y = 20);
+    p.x + p.y;
+};
+
+main();

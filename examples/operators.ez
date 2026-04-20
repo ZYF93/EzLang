@@ -1,0 +1,7 @@
+// operators.ez - 验证运算符
+let a = 10 + 5 * 2;
+let b = (a > 10) && (a < 30);
+let c = 100 >> 2;
+let d = 0;
+d += 10;
+d *= 2;
