@@ -15,7 +15,7 @@
 - **增强验收**：每个 `.ez` 文件应包含正面和负面测试用例（如类型不匹配时应报错），以验证编译器错误处理。
 
 ## 编译器分层
-- [ ] 词法分析（lexer）
+- [x] 词法分析（lexer）
   - 验收：针对基础语法和关键字的 `.ez` 示例，lexer 能正确生成 token 序列。
   - 例：`types.ez`、`vars.ez` 中的关键语法构件必须被正确识别。
 - [ ] 语法分析（parser）
@@ -38,23 +38,23 @@
 - [ ] 为每个 `.ez` 验收文件编写测试用例，使测试直接引用或加载对应 `*.ez` 文件并验证编译器行为。
 
 ### 0. 环境与 WASI 适配层
-- [ ] 实现最小 WASI 运行时模拟（用于测试），支持 `print` 和内存分配（`memory.grow`）。
-- [ ] 编写 `wasi_test.ez`，验证 `print` 函数调用和基本内存操作。
-- [ ] 确保测试环境能跑通 `print` 和内存分配，否则后续任务无法验证结果。
+- [x] 实现最小 WASI 运行时模拟（用于测试），支持 `print` 和内存分配（`memory.grow`）。
+- [x] 编写 `wasi_test.ez`，验证 `print` 函数调用和基本内存操作。
+- [x] 确保测试环境能跑通 `print` 和内存分配，否则后续任务无法验证结果。
 
 ### 1. 类型系统与系统接口
-- [ ] 编写 `types.ez`，验证基本类型 `I8/I32/I64/U8/U32/U64/F32/F64` 解析与使用。
-- [ ] 在 `types.ez` 中验证 `Str/Bool/Void` 类型识别与类型注解。
-- [ ] 在 `types.ez` 中验证 `Type[]` 与 `Type[n]` 的数组语法。
-- [ ] 在 `types.ez` 中验证 `Vec<Type>[N]` SIMD 向量类型解析。
-- [ ] 在 `types.ez` 中验证 `Type?` 可选类型和 `Type1 | Type2` 联合类型。
+- [x] 编写 `types.ez`，验证基本类型 `I8/I32/I64/U8/U32/U64/F32/F64` 解析与使用。
+- [x] 在 `types.ez` 中验证 `Str/Bool/Void` 类型识别与类型注解。
+- [x] 在 `types.ez` 中验证 `Type[]` 与 `Type[n]` 的数组语法。
+- [x] 在 `types.ez` 中验证 `Vec<Type>[N]` SIMD 向量类型解析。
+- [x] 在 `types.ez` 中验证 `Type?` 可选类型和 `Type1 | Type2` 联合类型。
 - [ ] 验证 WASI 核心函数 `fd_write` 的内置声明。
 - [ ] 实现类型系统解析，使 `types.ez` 通过编译，并确保基础类型与 WASI I/O 兼容。
 
 ### 2. 变量声明与值语义
-- [ ] 编写 `vars.ez`，验证 `let/const/static` 声明语法。
-- [ ] 在 `vars.ez` 中验证显式类型注解 `: Type` 和默认初始化。
-- [ ] 在 `vars.ez` 中验证值语义拷贝 `let copy = count`。
+- [x] 编写 `vars.ez`，验证 `let/const/static` 声明语法。
+- [x] 在 `vars.ez` 中验证显式类型注解 `: Type` 和默认初始化。
+- [x] 在 `vars.ez` 中验证值语义拷贝 `let copy = count`。
 - [ ] 实现作用域与 Arena 回退机制，确保 `vars.ez` 编译通过且资源安全。
 
 ### 3. 结构体与组合语法
