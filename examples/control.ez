@@ -1,17 +1,18 @@
 // control.ez - 验证控制流
 let x = 10;
-if (x > 5) {
+(x > 5) ? {
     x = x + 1;
-} else {
+} : {
     x = x - 1;
-}
+};
 
 loop i in 0...10 {
-    if (i == 5) { break; }
+    (i == 5) ? break;
 }
 
-let result = match {
-    x == 10 => "ten";
-    x == 20 => "twenty";
-    true => "other";
-};
+let result = 0;
+match {
+    (x == 10) ? { result = 1; },
+    (x == 20) ? { result = 2; },
+    (true) ? { result = 3; }
+}

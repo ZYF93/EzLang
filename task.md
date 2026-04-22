@@ -36,16 +36,16 @@
 - [x] 实现类型系统解析，使 `types.ez` 通过编译。
 
 ### 2. 变量声明与值语义
-- [ ] 编写 `vars.ez`，验证 `let/const/static` 声明语法。
-- [ ] 实现作用域与 Arena 回退机制，确保 `vars.ez` 编译通过。
+- [x] 编写 `vars.ez`，验证 `let/const/static` 声明语法。
+- [x] 实现作用域与 Arena 回退机制，确保 `vars.ez` 编译通过。
 
 ### 3. 结构体与组合语法
-- [ ] 编写 `structs.ez`，验证结构体定义、方法与 `this`。
-- [ ] 实现结构体语义，使 `structs.ez` 编译通过。
+- [x] 编写 `structs.ez`，验证结构体定义、方法与 `this`。
+- [x] 实现结构体语义，使 `structs.ez` 编译通过。
 
 ### 4. 控制流与表达式
-- [ ] 编写 `control.ez`，验证 `loop`, `if-else`, `match`。
-- [ ] 实现控制流逻辑，让 `control.ez` 编译通过。
+- [x] 编写 `control.ez`，验证 `loop`, `if-else`, `match`。
+- [x] 实现控制流逻辑，让 `control.ez` 编译通过。
 
 ### 5. 函数与上下文绑定
 - [ ] 编写 `functions.ez`，验证命名参数、默认参数。

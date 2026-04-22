@@ -93,21 +93,30 @@ class SemanticAnalyzer(EzLangVisitor):
         struct_type = StructType(struct_name)
         self.symbol_table.define_type(struct_name, struct_type)
         
+        self.enter_scope()
+        if ctx.genericParams():
+            for param_id in ctx.genericParams().ID():
+                self.symbol_table.define_type(param_id.getText(), GenericPlaceholderType(param_id.getText()))
+                
         # 收集字段
         body = ctx.structBody()
         if body:
             for i in range(body.getChildCount()):
                 child = body.getChild(i)
-                if isinstance(child, EzLangParser.FieldContext):
+                if isinstance(child, EzLangParser.BaseStructContext):
+                    base_name = child.ID().getText()
+                    base_type = self.symbol_table.lookup_type(base_name)
+                    if base_type and isinstance(base_type, StructType):
+                        for f_name, f_info in base_type.fields.items():
+                            struct_type.fields[f_name] = f_info
+                    else:
+                        self.errors.append(f"Undefined base struct: {base_name}")
+                elif isinstance(child, EzLangParser.FieldContext):
                     f_name = child.ID().getText()
                     f_type = self.visit(child.type_())
                     is_required = child.ASSIGN() is None
                     struct_type.fields[f_name] = {"type": f_type, "required": is_required}
         
-        self.enter_scope()
-        if ctx.genericParams():
-            for param_id in ctx.genericParams().ID():
-                self.symbol_table.define_type(param_id.getText(), GenericPlaceholderType(param_id.getText()))
         res = self.visitChildren(ctx)
         self.exit_scope()
         return res
