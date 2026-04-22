@@ -9,8 +9,8 @@ struct Point3D {
     z: I32;
 };
 
-const main = () => {
+const run = () => {
     let p1 = Point(x = 10);
     let p2 = Point3D(x = 1, y = 2, z = 3);
-    p1.x;
+    return p1.x;
 };

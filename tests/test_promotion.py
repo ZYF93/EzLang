@@ -12,7 +12,7 @@ def test_ir_block_return_promotion():
     source = """
     struct Point { x: I32; };
     let p = {
-        let internal_p = Point();
+        let internal_p = Point(x = 1);
         internal_p;
     };
     """
@@ -28,7 +28,7 @@ def test_ir_function_return_promotion():
     source = """
     struct Data { val: I32; };
     const create = () => {
-        let d = Data();
+        let d = Data(val = 1);
         d;
     };
     """

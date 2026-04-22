@@ -170,6 +170,15 @@ class EzLangListener(ParseTreeListener):
         pass
 
 
+    # Enter a parse tree produced by EzLangParser#returnStatement.
+    def enterReturnStatement(self, ctx:EzLangParser.ReturnStatementContext):
+        pass
+
+    # Exit a parse tree produced by EzLangParser#returnStatement.
+    def exitReturnStatement(self, ctx:EzLangParser.ReturnStatementContext):
+        pass
+
+
     # Enter a parse tree produced by EzLangParser#importStatement.
     def enterImportStatement(self, ctx:EzLangParser.ImportStatementContext):
         pass

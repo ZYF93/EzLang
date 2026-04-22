@@ -3,14 +3,14 @@ struct Data { val: I32; };
 
 const create = () => {
     let d = Data(val = 42);
-    d; // 提升到父作用域
+    return d; // 提升到父作用域
 };
 
-const main = () => {
+const run = () => {
     let result = {
         let x = 10;
         let p = Data(val = x);
-        p; // 提升到 main 作用域
+        p; // 提升到 run 作用域
     };
-    create();
+    return create();
 };

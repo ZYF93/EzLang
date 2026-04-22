@@ -99,6 +99,11 @@ class EzLangVisitor(ParseTreeVisitor):
         return self.visitChildren(ctx)
 
 
+    # Visit a parse tree produced by EzLangParser#returnStatement.
+    def visitReturnStatement(self, ctx:EzLangParser.ReturnStatementContext):
+        return self.visitChildren(ctx)
+
+
     # Visit a parse tree produced by EzLangParser#importStatement.
     def visitImportStatement(self, ctx:EzLangParser.ImportStatementContext):
         return self.visitChildren(ctx)

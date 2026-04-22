@@ -21,6 +21,7 @@ MATCH : 'match';
 CATCH : 'catch';
 THROW : 'throw';
 TYPEOF : 'typeof';
+RETURN : 'return';
 FN : 'fn';
 THIS : 'this';
 TRUE : 'true';
@@ -118,9 +119,9 @@ WS : [ \t\r\n]+ -> skip;
 program : (statement | SEMI)* EOF;
 
 statement : typeDeclaration
+          | functionDeclaration
           | variableDeclaration
           | structDeclaration
-          | functionDeclaration
           | importStatement
           | exportStatement
           | declareStatement
@@ -129,6 +130,7 @@ statement : typeDeclaration
           | blockStatement
           | breakStatement
           | continueStatement
+          | returnStatement
           ;
 
 typeDeclaration : TYPE ID genericParams? ASSIGN (type | anonymousStruct) SEMI;
@@ -161,6 +163,7 @@ blockStatement : block;
 
 breakStatement : BREAK SEMI?;
 continueStatement : CONTINUE SEMI?;
+returnStatement : RETURN expression? SEMI?;
 
 importStatement : FROM STRING IMPORT LBRACE importItems RBRACE SEMI;
 

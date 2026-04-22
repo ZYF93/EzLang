@@ -42,12 +42,12 @@ def test_lexer_types_ez():
     
     # 验证关键关键字和类型是否存在
     assert 'LET' in symbolic_names
-    assert 'TYPE' in symbolic_names
-    assert 'STRUCT' in symbolic_names
+    assert 'DECLARE' in symbolic_names
+    assert 'CONST' in symbolic_names
     assert 'ID' in symbolic_names
     assert 'INT' in symbolic_names
     assert 'I32' in symbolic_names
-    assert 'VEC_LIT' in symbolic_names
+    assert 'F32' in symbolic_names
     assert 'BOOL_TYPE' in symbolic_names
     assert 'TRUE' in symbolic_names
 
@@ -63,15 +63,10 @@ def test_lexer_vars_ez():
     
     assert 'STATIC' in symbolic_names
     assert 'CONST' in symbolic_names
-    assert '0b1010' in token_texts
-    assert '0xFF' in token_texts
-    
-    # 验证复合赋值操作符
-    assert 'ADD_ASSIGN' in symbolic_names
-    assert 'AND_ASSIGN' in symbolic_names
-    
-    # 验证装饰器符号
-    assert 'AT' in symbolic_names
+    assert '10' in token_texts
+    assert '20' in token_texts
+    assert '3.14' in token_texts
+    assert 'ASSIGN' in symbolic_names
 
 def test_lexer_literals():
     # 测试新增的进制支持

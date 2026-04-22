@@ -30,6 +30,10 @@ def test_parser_control_ez():
     parser = parse_file('examples/control.ez')
     assert not parser.has_errors(), f"Control parsing errors: {parser.get_errors()}"
 
+def test_parser_functions_ez():
+    parser = parse_file('examples/functions.ez')
+    assert not parser.has_errors(), f"Functions parsing errors: {parser.get_errors()}"
+
 def test_parser_wasi_test_ez():
     parser = parse_file('examples/wasi_test.ez')
     assert not parser.has_errors(), f"WASI test parsing errors: {parser.get_errors()}"

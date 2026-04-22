@@ -16,6 +16,7 @@ class IRGenerator(EzLangVisitor):
         self.locals = [{}]
         self.struct_types = {}
         self.loop_stack = []
+        self.functions = {}
         
         # 定义内置类型
         self.i32 = ir.IntType(32)
@@ -67,8 +68,16 @@ class IRGenerator(EzLangVisitor):
         self.current_func = ir.Function(self.module, func_type, name="__ezlang_init")
         block = self.current_func.append_basic_block(name="entry")
         self.builder = ir.IRBuilder(block)
-        
-        self.visitChildren(ctx)
+
+        for stmt in ctx.statement():
+            first_child = stmt.getChild(0)
+            if isinstance(first_child, EzLangParser.FunctionDeclarationContext):
+                self._declare_function(first_child)
+            elif isinstance(first_child, EzLangParser.DeclareStatementContext):
+                self.visitDeclareStatement(first_child)
+
+        for stmt in ctx.statement():
+            self.visit(stmt)
         
         if not self.builder.block.is_terminated:
             self.builder.ret_void()
@@ -108,26 +117,118 @@ class IRGenerator(EzLangVisitor):
 
     # --- Functions ---
 
-    def visitFunctionExpression(self, ctx: EzLangParser.FunctionExpressionContext):
+    def _extract_function_type_ctx(self, type_ctx):
+        if type_ctx is None:
+            return None
+
+        for i in range(type_ctx.getChildCount()):
+            child = type_ctx.getChild(i)
+            if isinstance(child, EzLangParser.FunctionTypeContext):
+                return child
+        return None
+
+    def _function_uses_block_body(self, function_ctx):
+        body_text = function_ctx.getText()
+        arrow_index = body_text.rfind("=>")
+        if arrow_index == -1:
+            return False
+        return body_text[arrow_index + 2 :].strip().startswith("{")
+
+    def _create_function_metadata(self, name, function_ctx):
         param_names = []
         param_types = []
-        if ctx.parameters():
-            for p in ctx.parameters().parameter():
-                if p.THIS():
-                    param_names.append("this")
-                else:
-                    param_names.append(p.ID().getText())
-                param_types.append(self.visitType(p.type_()))
-        
-        return_type = self.i32
-        if ctx.type_(): return_type = self.visitType(ctx.type_())
-        
+        default_exprs = []
+
+        if function_ctx.parameters():
+            for param in function_ctx.parameters().parameter():
+                param_names.append("this" if param.THIS() else param.ID().getText())
+                param_types.append(self.visitType(param.type_()))
+                default_exprs.append(param.expression())
+
+        return_type = self.visitType(function_ctx.type_()) if function_ctx.type_() else self.i32
         func_type = ir.FunctionType(return_type, param_types)
+        func = ir.Function(self.module, func_type, name=name)
+        metadata = {
+            "ir": func,
+            "params": [
+                {"name": param_names[i], "type": param_types[i], "default_ctx": default_exprs[i]}
+                for i in range(len(param_names))
+            ],
+            "return_type": return_type,
+            "generated": False,
+        }
+        self.functions[name] = metadata
+        return metadata
+
+    def _declare_function(self, ctx: EzLangParser.FunctionDeclarationContext):
+        func_name = ctx.ID().getText()
+        if func_name in self.functions:
+            return self.functions[func_name]
+        return self._create_function_metadata(func_name, ctx.functionExpression())
+
+    def _build_call_arguments(self, metadata, argument_list_ctx):
+        named_args = {}
+
+        if argument_list_ctx:
+            for arg in argument_list_ctx.namedArgument():
+                if arg.ID() and arg.ASSIGN():
+                    named_args[arg.ID().getText()] = arg.expression()
+                else:
+                    raise Exception(f"Positional arguments are not allowed for function '{metadata['ir'].name}'")
+
+        final_args = []
+        for param in metadata["params"]:
+            if param["name"] in named_args:
+                expr_ctx = named_args.pop(param["name"])
+            elif param["default_ctx"] is not None:
+                expr_ctx = param["default_ctx"]
+            else:
+                raise Exception(f"Missing required argument '{param['name']}' for function '{metadata['ir'].name}'")
+
+            final_args.append(self.visit(expr_ctx))
+
+        if named_args:
+            unknown_name = next(iter(named_args))
+            raise Exception(f"Unknown argument '{unknown_name}' for function '{metadata['ir'].name}'")
+
+        return final_args
+
+    def _declare_external_function(self, name, function_type_ctx):
+        if name in self.functions:
+            return self.functions[name]
+
+        param_names = []
+        param_types = []
+        if function_type_ctx.parameters():
+            for param in function_type_ctx.parameters().parameter():
+                param_names.append("this" if param.THIS() else param.ID().getText())
+                param_types.append(self.visitType(param.type_()))
+
+        return_type = self.visitType(function_type_ctx.type_()) if function_type_ctx.type_() else self.void
+        func_type = ir.FunctionType(return_type, param_types)
+        func = ir.Function(self.module, func_type, name=name)
+        metadata = {
+            "ir": func,
+            "params": [{"name": param_names[i], "type": param_types[i], "default_ctx": None} for i in range(len(param_names))],
+            "return_type": return_type,
+            "generated": True,
+        }
+        self.functions[name] = metadata
+        return metadata
+
+    def visitFunctionExpression(self, ctx: EzLangParser.FunctionExpressionContext):
         func_name = "anonymous"
         if isinstance(ctx.parentCtx, EzLangParser.FunctionDeclarationContext):
-            func_name = ctx.parentCtx.ID().getText()
-            
-        func = ir.Function(self.module, func_type, name=func_name)
+            metadata = self._declare_function(ctx.parentCtx)
+        else:
+            metadata = self._create_function_metadata(func_name, ctx)
+
+        if metadata["generated"]:
+            return metadata["ir"]
+
+        metadata["generated"] = True
+        func = metadata["ir"]
+        return_type = metadata["return_type"]
         old_builder = self.builder
         old_func = self.current_func
         block = func.append_basic_block(name="entry")
@@ -138,10 +239,10 @@ class IRGenerator(EzLangVisitor):
         entry_arena = self.builder.load(self.arena_ptr)
         
         self.locals.append({})
-        for i, name in enumerate(param_names):
+        for i, param in enumerate(metadata["params"]):
             arg = func.args[i]
-            arg.name = name
-            self.locals[-1][name] = arg
+            arg.name = param["name"]
+            self.locals[-1][param["name"]] = arg
             
         body = ctx.getChild(ctx.getChildCount()-1)
         ret_val = self.visit(body)
@@ -151,14 +252,31 @@ class IRGenerator(EzLangVisitor):
             self.builder.store(entry_arena, self.arena_ptr)
             
         if not self.builder.block.is_terminated:
-            if ret_val and hasattr(ret_val, 'type') and not isinstance(ret_val.type, ir.VoidType):
+            if self._function_uses_block_body(ctx):
+                if isinstance(return_type, ir.VoidType):
+                    self.builder.ret_void()
+                else:
+                    self.builder.ret(ir.Constant(return_type, 0))
+            elif ret_val and hasattr(ret_val, 'type') and not isinstance(ret_val.type, ir.VoidType):
                 self.builder.ret(ret_val)
             else:
-                self.builder.ret(ir.Constant(return_type, 0))
+                if isinstance(return_type, ir.VoidType):
+                    self.builder.ret_void()
+                else:
+                    self.builder.ret(ir.Constant(return_type, 0))
         self.locals.pop()
         self.builder = old_builder
         self.current_func = old_func
         return func
+
+    def visitFunctionDeclaration(self, ctx: EzLangParser.FunctionDeclarationContext):
+        return self.visit(ctx.functionExpression())
+
+    def visitDeclareStatement(self, ctx: EzLangParser.DeclareStatementContext):
+        function_type_ctx = self._extract_function_type_ctx(ctx.type_())
+        if function_type_ctx:
+            self._declare_external_function(ctx.ID().getText(), function_type_ctx)
+        return None
 
     # --- Variables & Values ---
 
@@ -192,8 +310,8 @@ class IRGenerator(EzLangVisitor):
         return None
 
     def visitPrimaryExpression(self, ctx: EzLangParser.PrimaryExpressionContext):
-        if ctx.ID():
-            name = ctx.ID().getText()
+        if ctx.ID() or ctx.THIS():
+            name = "this" if ctx.THIS() else ctx.ID().getText()
             for scope in reversed(self.locals):
                 if name in scope:
                     var_info = scope[name]
@@ -205,6 +323,9 @@ class IRGenerator(EzLangVisitor):
                     # For function args which might just be values
                     self._last_ptr = None
                     return var_info
+            if name in self.functions:
+                self._last_ptr = None
+                return self.functions[name]["ir"]
             # Not found in locals, might be global or unresolved
             self._last_ptr = None
             return name
@@ -263,19 +384,17 @@ class IRGenerator(EzLangVisitor):
             child = ctx.getChild(i)
             if isinstance(child, EzLangParser.PostfixContext):
                 if child.LPAREN():
-                    args = []
-                    if child.argumentList():
-                        for na in child.argumentList().namedArgument():
-                            args.append(self.visit(na.expression()))
-                    if isinstance(base, ir.Function): base = self.builder.call(base, args)
+                    if isinstance(base, ir.Function):
+                        metadata = self.functions.get(base.name, {"params": [], "return_type": base.function_type.return_type})
+                        args = self._build_call_arguments(metadata, child.argumentList())
+                        base = self.builder.call(base, args)
                     elif current_struct_name:
                         st_info = self.struct_types[current_struct_name]
                         size = ir.Constant(self.i32, 64)
                         addr_int = self.builder.call(self.alloc_func, [size])
                         base = self.builder.inttoptr(addr_int, ir.PointerType(st_info["ir_type"]))
                     else:
-                        size = ir.Constant(self.i32, 64)
-                        base = self.builder.call(self.alloc_func, [size])
+                        raise Exception(f"Unsupported call target: {base}")
                 elif child.DOT():
                     field_name = child.ID().getText()
                     if hasattr(base, 'type') and isinstance(base.type, ir.PointerType) and isinstance(base.type.pointee, ir.LiteralStructType):
@@ -331,6 +450,14 @@ class IRGenerator(EzLangVisitor):
         if ctx.expression(): return self.visit(ctx.expression())
         return self.visitChildren(ctx)
 
+    def visitReturnStatement(self, ctx: EzLangParser.ReturnStatementContext):
+        if ctx.expression():
+            ret_val = self._ensure_value(self.visit(ctx.expression()))
+            self.builder.ret(ret_val)
+        else:
+            self.builder.ret_void()
+        return None
+
     def visitConditionalStatement(self, ctx: EzLangParser.ConditionalStatementContext):
         return self._handle_conditional(ctx)
         
@@ -380,9 +507,6 @@ class IRGenerator(EzLangVisitor):
             self.builder.position_at_end(exit_block)
             
         return None
-
-    def visitFunctionDeclaration(self, ctx: EzLangParser.FunctionDeclarationContext):
-        return self.visit(ctx.functionExpression())
 
     def _ensure_value(self, val):
         if val is None or isinstance(val, str): return ir.Constant(self.i32, 0)
