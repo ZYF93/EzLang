@@ -19,11 +19,11 @@ class EzLangCompiler:
             with open(path, 'r') as f:
                 return json.load(f)
         return {
-            "target": "wasi",
-            "optimization": "O2"
+            "project": {"entry": "src/main.ez", "name": "unknown"},
+            "targets": [{"name": "default", "arch": "wasm32", "os": "wasi", "optimization_level": "O2", "output": "dist/output.wasm"}]
         }
 
-    def compile(self, source_code: str) -> str:
+    def compile(self, source_code: str, target_config=None) -> str:
         # Lexical Analysis
         lexer = EzLangLexerWrapper(source_code)
         tokens = lexer.get_tokens()
@@ -41,28 +41,43 @@ class EzLangCompiler:
         ir_code = ir_gen.generate_ir()
 
         # LLVM Backend (根据 config 调整目标)
-        target = self.config.get("target", "wasi")
-        backend = LLVMBackend(ir_code, target=target)
+        target_os = "wasi"
+        if target_config:
+            target_os = target_config.get("os", "wasi")
+        backend = LLVMBackend(ir_code, target=target_os)
         
         llvm_ir = backend.generate_llvm_ir()
 
         return llvm_ir
 
-    def build_project(self):
+    def build_project(self, target_name=None):
         """根据 config.json 编译整个项目"""
-        entry_path = self.config.get("entry", "src/main.ez")
+        project = self.config.get("project", {})
+        entry_path = project.get("entry", "src/main.ez")
+        
         if not os.path.exists(entry_path):
             raise Exception(f"Entry file not found: {entry_path}")
             
         with open(entry_path, 'r') as f:
             source = f.read()
             
-        llvm_ir = self.compile(source)
+        targets = self.config.get("targets", [])
+        if not targets:
+            raise Exception("No targets defined in config.")
+            
+        target_to_build = targets[0]
+        if target_name:
+            for t in targets:
+                if t.get("name") == target_name:
+                    target_to_build = t
+                    break
+                    
+        llvm_ir = self.compile(source, target_config=target_to_build)
         
-        output_path = self.config.get("output", "dist/output.ll")
+        output_path = target_to_build.get("output", "dist/output.ll")
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
         
         with open(output_path, 'w') as f:
             f.write(llvm_ir)
             
-        print(f"Successfully compiled {self.config['name']} to {output_path} (Target: {self.config['target']})")
+        print(f"Successfully compiled {project.get('name', 'unknown')} to {output_path} (Target: {target_to_build.get('name')})")

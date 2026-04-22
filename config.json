@@ -1,15 +1,19 @@
 {
+  "project": {
     "name": "ezlang-demo",
     "version": "0.1.0",
-    "target": "wasi",
-    "entry": "src/main.ez",
-    "output": "dist/output.wasm",
-    "optimization": "O2",
-    "deps": {
-        "std": "0.1.0"
-    },
-    "devDeps": {
-        "test-runner": "1.0.0"
-    },
-    "peerDeps": {}
+    "entry": "src/main.ez"
+  },
+  "targets": [
+    {
+      "name": "wasi",
+      "arch": "wasm32",
+      "os": "wasi",
+      "optimization_level": "O2",
+      "output": "dist/output.wasm"
+    }
+  ],
+  "dependencies": {
+    "std": "0.1.0"
+  }
 }

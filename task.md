@@ -30,10 +30,10 @@
 - [ ] 确保测试环境能跑通 `print` 和内存分配，否则后续任务无法验证结果。
 
 ### 1. 类型系统与系统接口
-- [ ] 编写 `types.ez`，验证基本类型 `I8/I32/I64/U8/U32/U64/F32/F64` 解析与使用。
-- [ ] 在 `types.ez` 中验证 `Str/Bool/Void` 类型识别与类型注解。
-- [ ] 验证 WASI 核心函数 `fd_write` 的内置声明。
-- [ ] 实现类型系统解析，使 `types.ez` 通过编译。
+- [x] 编写 `types.ez`，验证基本类型 `I8/I32/I64/U8/U32/U64/F32/F64` 解析与使用。
+- [x] 在 `types.ez` 中验证 `Str/Bool/Void` 类型识别与类型注解。
+- [x] 验证 WASI 核心函数 `fd_write` 的内置声明。
+- [x] 实现类型系统解析，使 `types.ez` 通过编译。
 
 ### 2. 变量声明与值语义
 - [ ] 编写 `vars.ez`，验证 `let/const/static` 声明语法。
@@ -58,9 +58,16 @@
 
 ### 10. 工程化工具链与多目标编译
 - [x] 定义 `config.json` 规范。
-- [x] 实现编译器读取 `config.json` 自动化构建。
-- [x] 实现 `LLVMBackend` 对多目标三元组的支持。
+  - `project.entry`: 入口文件。
+  - `targets`: 支持 `arch` (如 wasm32/x86_64), `os` (如 wasi/linux/windows), `optimization_level` (如 O0-O3), `output`。
+  - `dependencies`: 依赖模块路径映射。
+- [ ] 实现编译器读取 `config.json` 自动化构建。
+- [ ] 实现 `LLVMBackend` 对多目标三元组的支持。
 - [ ] 实现依赖路径检索初步逻辑。
+- [ ] 实现 `ezlang` 命令行工具：
+  - `ezlang build [--target <name>]`: 基于 config.json 构建。
+  - `ezlang run <file>`: 快速运行脚本。
+  - `ezlang test / fmt / lint`: 辅助工具链雏形。
 
 ### 11. 运算符与表达式
 - [ ] 编写 `operators.ez`，验证算术、逻辑、位运算。

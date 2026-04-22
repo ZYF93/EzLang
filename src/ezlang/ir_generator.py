@@ -24,8 +24,15 @@ class IRGenerator(EzLangVisitor):
         self.void = ir.VoidType()
         
         self.type_map = {
+            "I8": self.i8,
             "I32": self.i32,
             "I64": self.i64,
+            "U8": self.i8,
+            "U32": self.i32,
+            "U64": self.i64,
+            "F32": ir.FloatType(),
+            "F64": ir.DoubleType(),
+            "Str": ir.PointerType(self.i8),
             "Bool": self.i1,
             "Void": self.void
         }
@@ -264,9 +271,20 @@ class IRGenerator(EzLangVisitor):
         if ctx.INT():
             val = int(ctx.INT().getText(), 0)
             return ir.Constant(target_type, val)
+        if ctx.FLOAT():
+            val = float(ctx.FLOAT().getText())
+            return ir.Constant(target_type, val)
+        if ctx.STRING():
+            # For strings we just create a global constant for now
+            string_val = ctx.STRING().getText().strip('"')
+            str_const = ir.Constant(ir.ArrayType(self.i8, len(string_val) + 1), bytearray(string_val + '\0', 'utf8'))
+            global_str = ir.GlobalVariable(self.module, str_const.type, name=f"str_{id(ctx)}")
+            global_str.linkage = 'internal'
+            global_str.initializer = str_const
+            return self.builder.bitcast(global_str, ir.PointerType(self.i8))
         if ctx.TRUE(): return ir.Constant(self.i1, 1)
         if ctx.FALSE(): return ir.Constant(self.i1, 0)
-        return None
+        return ir.Constant(target_type, 0)
 
     def visitExpressionStatement(self, ctx: EzLangParser.ExpressionStatementContext):
         if ctx.expression(): return self.visit(ctx.expression())

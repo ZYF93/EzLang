@@ -10,7 +10,7 @@ def test_ir_struct_member_access():
     compiler = EzLangCompiler()
     source = """
     struct Point { x: I32; y: I32; };
-    let p = Point();
+    let p = Point(x = 0, y = 0);
     p.x = 10;
     let val = p.y;
     """
