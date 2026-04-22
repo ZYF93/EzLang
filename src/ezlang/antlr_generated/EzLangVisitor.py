@@ -189,6 +189,21 @@ class EzLangVisitor(ParseTreeVisitor):
         return self.visitChildren(ctx)
 
 
+    # Visit a parse tree produced by EzLangParser#bitwiseOrExpression.
+    def visitBitwiseOrExpression(self, ctx:EzLangParser.BitwiseOrExpressionContext):
+        return self.visitChildren(ctx)
+
+
+    # Visit a parse tree produced by EzLangParser#bitwiseXorExpression.
+    def visitBitwiseXorExpression(self, ctx:EzLangParser.BitwiseXorExpressionContext):
+        return self.visitChildren(ctx)
+
+
+    # Visit a parse tree produced by EzLangParser#bitwiseAndExpression.
+    def visitBitwiseAndExpression(self, ctx:EzLangParser.BitwiseAndExpressionContext):
+        return self.visitChildren(ctx)
+
+
     # Visit a parse tree produced by EzLangParser#shiftExpression.
     def visitShiftExpression(self, ctx:EzLangParser.ShiftExpressionContext):
         return self.visitChildren(ctx)

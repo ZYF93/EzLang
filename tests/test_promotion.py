@@ -29,7 +29,7 @@ def test_ir_function_return_promotion():
     struct Data { val: I32; };
     const create = () => {
         let d = Data(val = 1);
-        d;
+        return d;
     };
     """
     ir_code = compiler.compile(source)

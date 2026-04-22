@@ -413,9 +413,11 @@ class IRGenerator(EzLangVisitor):
     def visitAssignmentExpression(self, ctx: EzLangParser.AssignmentExpressionContext):
         if ctx.assignmentOp():
             self._last_ptr = None
-            self.visit(ctx.pipelineExpression())
+            left_val = self.visit(ctx.pipelineExpression())
             target_ptr = getattr(self, '_last_ptr', None)
-            val = self.visit(ctx.assignmentExpression())
+            rhs_val = self.visit(ctx.assignmentExpression())
+            op = ctx.assignmentOp().getText()
+            val = rhs_val if op == '=' else self._apply_binary_operator(op[:-1], self._ensure_value(left_val), self._ensure_value(rhs_val))
             if target_ptr: self.builder.store(val, target_ptr)
             else:
                 target_name = ctx.pipelineExpression().getText()
@@ -511,6 +513,19 @@ class IRGenerator(EzLangVisitor):
     def _ensure_value(self, val):
         if val is None or isinstance(val, str): return ir.Constant(self.i32, 0)
         return val
+
+    def _apply_binary_operator(self, op, left, right):
+        if op == '+': return self.builder.add(left, right)
+        if op == '-': return self.builder.sub(left, right)
+        if op == '*': return self.builder.mul(left, right)
+        if op == '/': return self.builder.sdiv(left, right)
+        if op == '%': return self.builder.srem(left, right)
+        if op == '<<': return self.builder.shl(left, right)
+        if op == '>>': return self.builder.ashr(left, right)
+        if op == '&': return self.builder.and_(left, right)
+        if op == '|': return self.builder.or_(left, right)
+        if op == '^': return self.builder.xor(left, right)
+        raise Exception(f"Unsupported operator: {op}")
 
     def visitLoopStatement(self, ctx: EzLangParser.LoopStatementContext):
         loop_cond = self.builder.function.append_basic_block(name="loop.cond")
@@ -611,8 +626,7 @@ class IRGenerator(EzLangVisitor):
         res = results[0]
         for i in range(1, len(results)):
             op = ctx.getChild(i*2-1).getText()
-            if op == '+': res = self.builder.add(res, results[i])
-            else: res = self.builder.sub(res, results[i])
+            res = self._apply_binary_operator(op, res, results[i])
         return res
 
     def visitMultiplicativeExpression(self, ctx: EzLangParser.MultiplicativeExpressionContext):
@@ -620,13 +634,11 @@ class IRGenerator(EzLangVisitor):
         res = results[0]
         for i in range(1, len(results)):
             op = ctx.getChild(i*2-1).getText()
-            if op == '*': res = self.builder.mul(res, results[i])
-            elif op == '/': res = self.builder.sdiv(res, results[i])
-            else: res = self.builder.srem(res, results[i])
+            res = self._apply_binary_operator(op, res, results[i])
         return res
 
     def visitRelationalExpression(self, ctx: EzLangParser.RelationalExpressionContext):
-        results = [self._ensure_value(self.visit(s)) for s in ctx.shiftExpression()]
+        results = [self._ensure_value(self.visit(s)) for s in ctx.bitwiseOrExpression()]
         if len(results) == 1: return results[0]
         res = results[0]
         for i in range(1, len(results)):
@@ -658,16 +670,80 @@ class IRGenerator(EzLangVisitor):
             right_val = self._ensure_value(self.visit(sub_exprs[i]))
             self.builder.branch(exit_block)
             last_right_block = self.builder.block
+            self.builder.position_at_end(exit_block)
             phi = self.builder.phi(self.i1, name="and.phi")
             phi.add_incoming(ir.Constant(self.i1, 0), current_block)
             phi.add_incoming(right_val, last_right_block)
             left_val = phi
         return left_val
 
+    def visitLogicalOrExpression(self, ctx: EzLangParser.LogicalOrExpressionContext):
+        sub_exprs = ctx.logicalAndExpression()
+        if len(sub_exprs) == 1:
+            return self.visit(sub_exprs[0])
+        left_val = self._ensure_value(self.visit(sub_exprs[0]))
+        for i in range(1, len(sub_exprs)):
+            current_block = self.builder.block
+            right_block = self.builder.function.append_basic_block(name="or.rhs")
+            exit_block = self.builder.function.append_basic_block(name="or.exit")
+            self.builder.cbranch(left_val, exit_block, right_block)
+            short_circuit_block = self.builder.block
+            self.builder.position_at_end(right_block)
+            right_val = self._ensure_value(self.visit(sub_exprs[i]))
+            self.builder.branch(exit_block)
+            last_right_block = self.builder.block
+            self.builder.position_at_end(exit_block)
+            phi = self.builder.phi(self.i1, name="or.phi")
+            phi.add_incoming(ir.Constant(self.i1, 1), short_circuit_block)
+            phi.add_incoming(right_val, last_right_block)
+            left_val = phi
+        return left_val
+
+    def visitBitwiseAndExpression(self, ctx):
+        results = [self._ensure_value(self.visit(s)) for s in ctx.shiftExpression()]
+        res = results[0]
+        for i in range(1, len(results)):
+            res = self.builder.and_(res, results[i])
+        return res
+
+    def visitBitwiseXorExpression(self, ctx):
+        results = [self._ensure_value(self.visit(s)) for s in ctx.bitwiseAndExpression()]
+        res = results[0]
+        for i in range(1, len(results)):
+            res = self.builder.xor(res, results[i])
+        return res
+
+    def visitBitwiseOrExpression(self, ctx):
+        results = [self._ensure_value(self.visit(s)) for s in ctx.bitwiseXorExpression()]
+        res = results[0]
+        for i in range(1, len(results)):
+            res = self.builder.or_(res, results[i])
+        return res
+
     def visitStatement(self, ctx): return self.visitChildren(ctx)
     def visitPipelineExpression(self, ctx): return self.visitChildren(ctx)
-    def visitShiftExpression(self, ctx): return self.visit(ctx.additiveExpression(0))
-    def visitUnaryExpression(self, ctx): return self.visitChildren(ctx)
+    def visitShiftExpression(self, ctx):
+        results = [self._ensure_value(self.visit(a)) for a in ctx.additiveExpression()]
+        res = results[0]
+        for i in range(1, len(results)):
+            op = ctx.getChild(i * 2 - 1).getText()
+            res = self._apply_binary_operator(op, res, results[i])
+        return res
+    def visitUnaryExpression(self, ctx):
+        if ctx.getChildCount() == 2:
+            op = ctx.getChild(0).getText()
+            val = self._ensure_value(self.visit(ctx.unaryExpression()))
+            if op == '+':
+                return val
+            if op == '-':
+                return self.builder.sub(ir.Constant(val.type, 0), val)
+            if op == '!':
+                if val.type == self.i1:
+                    return self.builder.xor(val, ir.Constant(self.i1, 1))
+                return self.builder.icmp_signed('==', val, ir.Constant(val.type, 0))
+            if op == '~':
+                return self.builder.xor(val, ir.Constant(val.type, -1))
+        return self.visitChildren(ctx)
     def _visit_branch_body(self, ctx, branch_idx):
         found = 0
         for i in range(ctx.getChildCount()):

@@ -197,9 +197,15 @@ equalityExpression : relationalExpression (equalityOp relationalExpression)*;
 
 equalityOp : EQ | NE;
 
-relationalExpression : shiftExpression (relationalOp shiftExpression)*;
+relationalExpression : bitwiseOrExpression (relationalOp bitwiseOrExpression)*;
 
 relationalOp : LT | GT | LE | GE;
+
+bitwiseOrExpression : bitwiseXorExpression (OR bitwiseXorExpression)*;
+
+bitwiseXorExpression : bitwiseAndExpression (XOR bitwiseAndExpression)*;
+
+bitwiseAndExpression : shiftExpression (AND shiftExpression)*;
 
 shiftExpression : additiveExpression (shiftOp additiveExpression)*;
 

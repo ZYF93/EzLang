@@ -332,6 +332,33 @@ class EzLangListener(ParseTreeListener):
         pass
 
 
+    # Enter a parse tree produced by EzLangParser#bitwiseOrExpression.
+    def enterBitwiseOrExpression(self, ctx:EzLangParser.BitwiseOrExpressionContext):
+        pass
+
+    # Exit a parse tree produced by EzLangParser#bitwiseOrExpression.
+    def exitBitwiseOrExpression(self, ctx:EzLangParser.BitwiseOrExpressionContext):
+        pass
+
+
+    # Enter a parse tree produced by EzLangParser#bitwiseXorExpression.
+    def enterBitwiseXorExpression(self, ctx:EzLangParser.BitwiseXorExpressionContext):
+        pass
+
+    # Exit a parse tree produced by EzLangParser#bitwiseXorExpression.
+    def exitBitwiseXorExpression(self, ctx:EzLangParser.BitwiseXorExpressionContext):
+        pass
+
+
+    # Enter a parse tree produced by EzLangParser#bitwiseAndExpression.
+    def enterBitwiseAndExpression(self, ctx:EzLangParser.BitwiseAndExpressionContext):
+        pass
+
+    # Exit a parse tree produced by EzLangParser#bitwiseAndExpression.
+    def exitBitwiseAndExpression(self, ctx:EzLangParser.BitwiseAndExpressionContext):
+        pass
+
+
     # Enter a parse tree produced by EzLangParser#shiftExpression.
     def enterShiftExpression(self, ctx:EzLangParser.ShiftExpressionContext):
         pass

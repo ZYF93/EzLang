@@ -52,9 +52,9 @@
 - [x] 实现函数调用语义，使 `functions.ez` 编译通过。
 
 ### 8. Arena 内存模型
-- [ ] 编写 `arena.ez`，验证作用域内存分配与回退。
-- [ ] 在 `arena.ez` 中验证跨作用域返回值复制到父 Arena。
-- [ ] 实现 Arena 内存管理骨架。
+- [x] 编写 `arena.ez`，验证作用域内存分配与回退。
+- [x] 在 `arena.ez` 中验证跨作用域返回值复制到父 Arena。
+- [x] 实现 Arena 内存管理骨架。
 
 ### 10. 工程化工具链与多目标编译
 - [x] 定义 `config.json` 规范。
@@ -70,8 +70,8 @@
   - `ezlang test / fmt / lint`: 辅助工具链雏形。
 
 ### 11. 运算符与表达式
-- [ ] 编写 `operators.ez`，验证算术、逻辑、位运算。
-- [ ] 实现运算符语义，使 `operators.ez` 编译通过。
+- [x] 编写 `operators.ez`，验证算术、逻辑、位运算。
+- [x] 实现运算符语义，使 `operators.ez` 编译通过。
 
 ## 交付说明
 - 每个任务完成后，在 `task.md` 中打勾对应项。
