@@ -61,17 +61,23 @@
   - `project.entry`: 入口文件。
   - `targets`: 支持 `arch` (如 wasm32/x86_64), `os` (如 wasi/linux/windows), `optimization_level` (如 O0-O3), `output`。
   - `dependencies`: 依赖模块路径映射。
-- [ ] 实现编译器读取 `config.json` 自动化构建。
-- [ ] 实现 `LLVMBackend` 对多目标三元组的支持。
-- [ ] 实现依赖路径检索初步逻辑。
-- [ ] 实现 `ezlang` 命令行工具：
+- [x] 实现编译器读取 `config.json` 自动化构建。
+- [x] 实现 `LLVMBackend` 对多目标三元组的支持。
+- [x] 实现依赖路径检索初步逻辑。
+- [x] 实现 `ezlang` 命令行工具：
   - `ezlang build [--target <name>]`: 基于 config.json 构建。
   - `ezlang run <file>`: 快速运行脚本。
   - `ezlang test / fmt / lint`: 辅助工具链雏形。
 
+
 ### 11. 运算符与表达式
 - [x] 编写 `operators.ez`，验证算术、逻辑、位运算。
 - [x] 实现运算符语义，使 `operators.ez` 编译通过。
+
+### 12. Dict与交叉类型
+- [ ] 编写 `dict_and_intersection.ez`，验证 Dict 类型（如 `type Shape = { name: Str; [dynamic: Str]: Str }` 和 `let s: Shape = { name: "Square"; side: "10" }`）的鸭子类型验证。
+- [ ] 在示例中验证交叉类型 `ShapeA & ShapeB` 的合并与类型推断。
+- [ ] 实现 Dict 与交叉类型的解析与语义检查，使测试用例编译通过。
 
 ## 交付说明
 - 每个任务完成后，在 `task.md` 中打勾对应项。

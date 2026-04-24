@@ -14,6 +14,9 @@ dependencies = [
     "llvmlite",
 ]
 
+[project.scripts]
+ezlang = "ezlang.main:main"
+
 [tool.setuptools.packages.find]
 where = ["src"]
 

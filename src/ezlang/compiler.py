@@ -50,6 +50,15 @@ class EzLangCompiler:
 
         return llvm_ir
 
+    def resolve_dependency(self, dep_name: str) -> str:
+        """初步的依赖模块路径检索逻辑"""
+        dependencies = self.config.get("dependencies", {})
+        if dep_name in dependencies:
+            # 假定依赖的存放路径或缓存路径，例如 ez_modules
+            dep_path = os.path.join(os.getcwd(), "ez_modules", dep_name)
+            return dep_path
+        raise Exception(f"Dependency not found in config: {dep_name}")
+
     def build_project(self, target_name=None):
         """根据 config.json 编译整个项目"""
         project = self.config.get("project", {})
