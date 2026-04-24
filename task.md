@@ -75,9 +75,13 @@
 - [x] 实现运算符语义，使 `operators.ez` 编译通过。
 
 ### 12. Dict与交叉类型
-- [ ] 编写 `dict_and_intersection.ez`，验证 Dict 类型（如 `type Shape = { name: Str; [dynamic: Str]: Str }` 和 `let s: Shape = { name: "Square"; side: "10" }`）的鸭子类型验证。
-- [ ] 在示例中验证交叉类型 `ShapeA & ShapeB` 的合并与类型推断。
-- [ ] 实现 Dict 与交叉类型的解析与语义检查，使测试用例编译通过。
+- [ ] 编写 `dict_and_intersection.ez`，验证以下特性：
+  - Dict 类型声明（包括固定字段和 `[dynamic: Str]: Str` 动态键）。
+  - 字面量语法 `{ prop = value }` 的自动形状推断。
+  - 字面量语法 `{ prop: Type = value }` 的显式类型指定。
+  - `type` 声明的形状对 `Struct` 和 `Dict` 的鸭子类型验证。
+- [ ] 在示例中验证交叉类型 `ShapeA & ShapeB` 的合并、类型推断与鸭子类型检查。
+- [ ] 实现相关语义检查逻辑，确保所有鸭子类型匹配场景正确通过。
 
 ## 交付说明
 - 每个任务完成后，在 `task.md` 中打勾对应项。
