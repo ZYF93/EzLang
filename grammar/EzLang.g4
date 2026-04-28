@@ -1,307 +1,445 @@
 grammar EzLang;
 
-// --- Lexer Rules ---
+// ======================== Parser Rules ========================
+
+program
+    : topLevelStatement* EOF
+    ;
+
+topLevelStatement
+    : statement
+    ;
+
+statement
+    : letDecl
+    | constDecl
+    | staticDecl
+    | structDef
+    | typeDef
+    | declareStmt
+    | importStmt
+    | exportStmt
+    | returnStmt
+    | throwStmt
+    | breakStmt
+    | continueStmt
+    | loopStmt
+    | matchStmt
+    | condBlockStmt
+    | exprStmt
+    ;
+
+// ---- Declarations ----
+
+letDecl
+    : decorator? LET IDENT (COLON typeExpr)? ASSIGN expression SEMI
+    ;
+
+constDecl
+    : decorator? ASYNC? CONST IDENT (COLON typeExpr)? ASSIGN expression SEMI
+    ;
+
+staticDecl
+    : STATIC IDENT (COLON typeExpr)? ASSIGN expression SEMI
+    ;
+
+// ---- Struct ----
+
+structDef
+    : STRUCT IDENT typeParams? LBRACE structMember* RBRACE SEMI?
+    ;
+
+structMember
+    : DOTDOTDOT IDENT SEMI                              // ...Base;
+    | IDENT COLON typeExpr (ASSIGN expression)? SEMI  // field: Type = default;
+    | IDENT ASSIGN expression SEMI                    // method = expr;
+    ;
+
+// ---- Type Alias ----
+
+typeDef
+    : TYPE IDENT typeParams? ASSIGN shapeType SEMI?
+    | TYPE IDENT typeParams? ASSIGN typeExpr SEMI?
+    ;
+
+shapeType
+    : LBRACE shapeMember* RBRACE
+    ;
+
+shapeMember
+    : DOTDOTDOT IDENT SEMI                                              // ...Base;
+    | LBRACKET IDENT COLON typeExpr RBRACKET COLON typeExpr SEMI?    // [key: KType]: VType
+    | IDENT COLON typeExpr SEMI                                      // field: Type;
+    ;
+
+// ---- Declare / Import / Export ----
+
+declareStmt
+    : DECLARE CONST IDENT COLON typeExpr SEMI
+    ;
+
+importStmt
+    : FROM STRING IMPORT LBRACE importItem (COMMA importItem)* RBRACE SEMI?
+    ;
+
+importItem
+    : IDENT (AS IDENT)?
+    ;
+
+exportStmt
+    : EXPORT letDecl
+    | EXPORT constDecl
+    | EXPORT staticDecl
+    ;
+
+// ---- Control Statements ----
+
+returnStmt
+    : RETURN expression? SEMI
+    ;
+
+throwStmt
+    : THROW expression SEMI
+    ;
+
+breakStmt
+    : BREAK SEMI?
+    ;
+
+continueStmt
+    : CONTINUE SEMI?
+    ;
+
+exprStmt
+    : expression SEMI
+    ;
+
+decorator
+    : AT IDENT
+    ;
+
+// ======================== Expressions ========================
+
+expression
+    : assignExpr
+    ;
+
+assignExpr
+    : conditionalExpr assignOp assignExpr     // right-associative
+    | conditionalExpr
+    ;
+
+assignOp
+    : ASSIGN | PLUS_ASSIGN | MINUS_ASSIGN | STAR_ASSIGN | SLASH_ASSIGN
+    | PERCENT_ASSIGN | AMP_ASSIGN | PIPE_ASSIGN | CARET_ASSIGN
+    | SHL_ASSIGN | SHR_ASSIGN
+    ;
+
+conditionalExpr
+    : pipeExpr QUESTION block COLON conditionalExpr   // chained: (c)?{} : (c2)?{}
+    | pipeExpr QUESTION block COLON block             // (c)?{} : {}
+    | pipeExpr QUESTION block                         // (c)?{}
+    | pipeExpr QUESTION BREAK                         // (c) ? break
+    | pipeExpr QUESTION CONTINUE                      // (c) ? continue
+    | pipeExpr QUESTION expression COLON expression   // ternary value
+    | pipeExpr QUESTION expression                    // conditional expr
+    | pipeExpr
+    ;
+
+pipeExpr
+    : orExpr (PIPE_ARROW IDENT LPAREN namedArgList? RPAREN)*
+    ;
+
+orExpr
+    : andExpr (OR andExpr)*
+    ;
+
+andExpr
+    : bitOrExpr (AND bitOrExpr)*
+    ;
+
+bitOrExpr
+    : bitXorExpr (BIT_OR bitXorExpr)*
+    ;
+
+bitXorExpr
+    : bitAndExpr (CARET bitAndExpr)*
+    ;
+
+bitAndExpr
+    : eqExpr (AMP eqExpr)*
+    ;
+
+eqExpr
+    : compExpr ((EQUAL | NOT_EQUAL) compExpr)*
+    ;
+
+compExpr
+    : shiftExpr ((LT | GT | LTE | GTE) shiftExpr)*
+    ;
+
+shiftExpr
+    : addExpr ((SHL | SHR) addExpr)*
+    ;
+
+addExpr
+    : mulExpr ((PLUS | MINUS) mulExpr)*
+    ;
+
+mulExpr
+    : unaryExpr ((STAR | SLASH | PERCENT) unaryExpr)*
+    ;
+
+unaryExpr
+    : BANG unaryExpr
+    | MINUS unaryExpr
+    | postfixExpr
+    ;
+
+postfixExpr
+    : primaryExpr postfix*
+    ;
+
+postfix
+    : DOT IDENT                           // member access
+    | LPAREN namedArgList? RPAREN         // function/struct call
+    | LBRACKET expression RBRACKET        // index
+    ;
+
+primaryExpr
+    : INT_LIT
+    | FLOAT_LIT
+    | STRING
+    | BOOL_LIT
+    | IDENT typeArgs?
+    | LPAREN expression RPAREN
+    | block
+    | lambdaExpr
+    | matchExpr
+    | loopExpr
+    | catchExpr
+    | arrayLiteral
+    | vecLiteral
+    | dictLiteral
+    | typeofExpr
+    | AWAIT expression
+    ;
+
+// ---- Lambda ----
+
+lambdaExpr
+    : typeParams? LPAREN paramList? RPAREN (COLON typeExpr)? FAT_ARROW expression
+    | typeParams? LPAREN paramList? RPAREN (COLON typeExpr)? FAT_ARROW block
+    ;
+
+paramList
+    : param (COMMA param)*
+    ;
+
+param
+    : IDENT COLON typeExpr (ASSIGN expression)?
+    ;
+
+// ---- Named arguments ----
+
+namedArgList
+    : namedArg (COMMA namedArg)*
+    ;
+
+namedArg
+    : IDENT ASSIGN expression             // name = value
+    | IDENT ASSIGN QUESTION               // currying placeholder
+    | DOTDOTDOT expression                   // ...obj
+    ;
+
+// ---- Block ----
+
+block
+    : LBRACE statement* RBRACE
+    ;
+
+// ---- Match ----
+
+matchExpr
+    : MATCH LBRACE matchArm (COMMA matchArm)* COMMA? RBRACE
+    ;
+
+matchArm
+    : LPAREN expression RPAREN QUESTION block
+    | LPAREN expression RPAREN QUESTION expression
+    ;
+
+// ---- Loop ----
+
+loopExpr
+    : LOOP IDENT IN expression DOTDOTDOT expression block
+    | LOOP block
+    ;
+
+// ---- Catch ----
+
+catchExpr
+    : CATCH block
+    ;
+
+// ---- Literals ----
+
+arrayLiteral
+    : LBRACKET (expression (COMMA expression)*)? RBRACKET
+    ;
+
+vecLiteral
+    : VEC LBRACKET expression (COMMA expression)* RBRACKET
+    ;
+
+dictLiteral
+    : LBRACE dictEntry (COMMA dictEntry)* COMMA? RBRACE
+    ;
+
+dictEntry
+    : IDENT COLON typeExpr ASSIGN expression    // prop: Type = value
+    | IDENT ASSIGN expression                   // prop = value (inferred)
+    ;
+
+typeofExpr
+    : TYPEOF expression
+    ;
+
+// ======================== Type Expressions ========================
+
+typeExpr
+    : unionType
+    ;
+
+unionType
+    : optionalType (BIT_OR optionalType)*
+    ;
+
+optionalType
+    : arrayType QUESTION        // Type?
+    | arrayType
+    ;
+
+arrayType
+    : atomicType LBRACKET RBRACKET   // Type[]
+    | atomicType
+    ;
+
+atomicType
+    : IDENT typeArgs?                                       // Named type
+    | VEC LT typeExpr GT LBRACKET INT_LIT RBRACKET          // Vec<T>[N]
+    | LPAREN paramTypeList? RPAREN FAT_ARROW typeExpr       // Function type
+    | STAR IDENT                                            // Pointer *I8
+    | shapeType                                             // Inline shape
+    ;
+
+paramTypeList
+    : paramType (COMMA paramType)*
+    ;
+
+paramType
+    : IDENT COLON typeExpr
+    ;
+
+typeParams
+    : LT IDENT (COMMA IDENT)* GT
+    ;
+
+typeArgs
+    : LT typeExpr (COMMA typeExpr)* GT
+    ;
+
+// ======================== Lexer Rules ========================
 
 // Keywords
-LET : 'let';
-CONST : 'const';
-STATIC : 'static';
-STRUCT : 'struct';
-TYPE : 'type';
-DECLARE : 'declare';
-LOOP : 'loop';
-AWAIT : 'await';
-ASYNC : 'async';
-BREAK : 'break';
-CONTINUE : 'continue';
-IMPORT : 'import';
-EXPORT : 'export';
-FROM : 'from';
-MATCH : 'match';
-CATCH : 'catch';
-THROW : 'throw';
-TYPEOF : 'typeof';
-RETURN : 'return';
-FN : 'fn';
-THIS : 'this';
-TRUE : 'true';
-FALSE : 'false';
-VOID_TYPE : 'void';
-AS : 'as';
-IN : 'in';
+LET         : 'let';
+CONST       : 'const';
+STATIC      : 'static';
+STRUCT      : 'struct';
+TYPE        : 'type';
+DECLARE     : 'declare';
+LOOP        : 'loop';
+AWAIT       : 'await';
+ASYNC       : 'async';
+BREAK       : 'break';
+CONTINUE    : 'continue';
+IMPORT      : 'import';
+EXPORT      : 'export';
+FROM        : 'from';
+MATCH       : 'match';
+CATCH       : 'catch';
+THROW       : 'throw';
+TYPEOF      : 'typeof';
+RETURN      : 'return';
+IN          : 'in';
+AS          : 'as';
+VEC         : 'Vec';
 
-// Type Names
-I8 : 'I8';
-I32 : 'I32';
-I64 : 'I64';
-U8 : 'U8';
-U32 : 'U32';
-U64 : 'U64';
-F32 : 'F32';
-F64 : 'F64';
-STR_TYPE : 'Str';
-BOOL_TYPE : 'Bool';
-VOID_TYPE_CAP : 'Void';
-VEC_LIT : 'Vec';
+// Boolean literals
+BOOL_LIT    : 'true' | 'false';
 
 // Operators & Punctuation
-ADD_ASSIGN : '+=';
-SUB_ASSIGN : '-=';
-MUL_ASSIGN : '*=';
-DIV_ASSIGN : '/=';
-MOD_ASSIGN : '%=';
-AND_ASSIGN : '&=';
-OR_ASSIGN : '|=';
-XOR_ASSIGN : '^=';
-LSHIFT_ASSIGN : '<<=';
-RSHIFT_ASSIGN : '>>=';
-
-PLUS : '+';
-MINUS : '-';
-MUL : '*';
-DIV : '/';
-MOD : '%';
-AND : '&';
-OR : '|';
-XOR : '^';
-BIT_NOT : '~';
-LSHIFT : '<<';
-RSHIFT : '>>';
-LAND : '&&';
-LOR : '||';
-NOT : '!';
-EQ : '==';
-NE : '!=';
-LT : '<';
-GT : '>';
-LE : '<=';
-GE : '>=';
-ASSIGN : '=';
-QMARK : '?';
-COLON : ':';
-SEMI : ';';
-COMMA : ',';
-DOT : '.';
-LPAREN : '(';
-RPAREN : ')';
-LBRACK : '[';
-RBRACK : ']';
-LBRACE : '{';
-RBRACE : '}';
-AT : '@';
-ARROW : '=>';
-PIPE : '->';
-ELLIPSIS : '...';
-
-LBRACE_INTERP : '{{';
-RBRACE_INTERP : '}}';
-QUOTE : '"';
-
-// Literals
-ID : [a-zA-Z_][a-zA-Z0-9_]*;
-INT : '0x' [0-9a-fA-F]+ | '0b' [01]+ | [0-9]+;
-FLOAT : [0-9]+ '.' [0-9]+;
-
-// String
-STRING : QUOTE (STRING_CONTENT | LBRACE_INTERP .*? RBRACE_INTERP)* QUOTE;
-fragment STRING_CONTENT : ~["\\{] | '\\' . | '{' ~['{'];
-
-// Comments
-LINE_COMMENT : '//' ~[\r\n]* -> skip;
-BLOCK_COMMENT : '/*' .*? '*/' -> skip;
-
-// Whitespace
-WS : [ \t\r\n]+ -> skip;
-
-
-// --- Parser Rules ---
-
-program : (statement | SEMI)* EOF;
-
-statement : typeDeclaration
-          | functionDeclaration
-          | variableDeclaration
-          | structDeclaration
-          | importStatement
-          | exportStatement
-          | declareStatement
-          | controlStatement
-          | expressionStatement
-          | blockStatement
-          | breakStatement
-          | continueStatement
-          | returnStatement
-          ;
-
-typeDeclaration : TYPE ID genericParams? ASSIGN (type | anonymousStruct) SEMI;
-
-anonymousStruct : LBRACE field* RBRACE;
-
-variableDeclaration : decorator? (LET | CONST | STATIC) ID genericParams? (COLON type)? (ASSIGN expression)? SEMI;
-
-structDeclaration : STRUCT ID genericParams? LBRACE structBody RBRACE SEMI?;
-
-structBody : (baseStruct | field | method)*;
-
-baseStruct : ELLIPSIS ID SEMI;
-
-field : ID COLON type (ASSIGN expression)? SEMI;
-
-method : ID ASSIGN functionExpression SEMI?;
-
-functionDeclaration : (ASYNC)? CONST ID ASSIGN functionExpression SEMI?;
-
-functionExpression : LPAREN parameters? RPAREN (ARROW type)? (block | ARROW (expression | controlFlowOnly));
-
-parameters : parameter (COMMA parameter)*;
-
-parameter : (THIS | ID) (QMARK)? COLON type (ASSIGN expression)?;
-
-block : LBRACE statement* RBRACE;
-
-blockStatement : block;
-
-breakStatement : BREAK SEMI?;
-continueStatement : CONTINUE SEMI?;
-returnStatement : RETURN expression? SEMI?;
-
-importStatement : FROM STRING IMPORT LBRACE importItems RBRACE SEMI;
-
-importItems : importItem (COMMA importItem)*;
-
-importItem : ID (AS ID)?;
-
-exportStatement : EXPORT (variableDeclaration | structDeclaration | functionDeclaration | typeDeclaration);
-
-declareStatement : DECLARE (CONST | LET | STATIC)? ID COLON type SEMI;
-
-expression : assignmentExpression;
-
-assignmentExpression : pipelineExpression (assignmentOp assignmentExpression)?;
-
-assignmentOp : ASSIGN | ADD_ASSIGN | SUB_ASSIGN | MUL_ASSIGN | DIV_ASSIGN | MOD_ASSIGN | AND_ASSIGN | OR_ASSIGN | XOR_ASSIGN | LSHIFT_ASSIGN | RSHIFT_ASSIGN;
-
-pipelineExpression : conditionalExpression (PIPE ID LPAREN argumentList? RPAREN)*;
-
-// 修改 conditionalExpression 以支持 break/continue/throw
-conditionalExpression : logicalOrExpression (QMARK (expression | block | controlFlowOnly) (COLON (expression | block | controlFlowOnly))?)?;
-
-// 仅能在控制流中使用的特殊表达式（模拟语句行为）
-controlFlowOnly : BREAK | CONTINUE | throwExpression;
-
-logicalOrExpression : logicalAndExpression (LOR logicalAndExpression)*;
-
-logicalAndExpression : equalityExpression (LAND equalityExpression)*;
-
-equalityExpression : relationalExpression (equalityOp relationalExpression)*;
-
-equalityOp : EQ | NE;
-
-relationalExpression : bitwiseOrExpression (relationalOp bitwiseOrExpression)*;
-
-relationalOp : LT | GT | LE | GE;
-
-bitwiseOrExpression : bitwiseXorExpression (OR bitwiseXorExpression)*;
-
-bitwiseXorExpression : bitwiseAndExpression (XOR bitwiseAndExpression)*;
-
-bitwiseAndExpression : shiftExpression (AND shiftExpression)*;
-
-shiftExpression : additiveExpression (shiftOp additiveExpression)*;
-
-shiftOp : LSHIFT | RSHIFT;
-
-additiveExpression : multiplicativeExpression (addOp multiplicativeExpression)*;
-
-addOp : PLUS | MINUS;
-
-multiplicativeExpression : unaryExpression (mulOp unaryExpression)*;
-
-mulOp : MUL | DIV | MOD;
-
-unaryExpression : (PLUS | MINUS | NOT | BIT_NOT) unaryExpression | postfixExpression;
-
-postfixExpression : primaryExpression (postfix)*;
-
-postfix : DOT ID
-        | LPAREN argumentList? RPAREN
-        | LBRACK expression RBRACK
-        | NOT
-        ;
-
-argumentList : namedArgument (COMMA namedArgument)*;
-
-namedArgument : ID ASSIGN expression | expression;
-
-primaryExpression : literal
-                  | ID
-                  | THIS
-                  | LPAREN expression RPAREN
-                  | vectorLiteral
-                  | structLiteral
-                  | markupLiteral
-                  | TYPEOF LPAREN expression RPAREN
-                  | catchExpression
-                  | throwExpression
-                  | awaitExpression
-                  | functionExpression
-                  | block
-                  ;
-
-catchExpression : CATCH block;
-throwExpression : THROW expression;
-awaitExpression : AWAIT expression;
-
-literal : INT | FLOAT | STRING | TRUE | FALSE;
-
-vectorLiteral : VEC_LIT (LT simpleType GT)? LBRACK expression (COMMA expression)* RBRACK | VEC_LIT LBRACK expression (COMMA expression)* RBRACK;
-
-structLiteral : ID genericArgs? LPAREN structFields? RPAREN;
-
-structFields : structField (COMMA structField)*;
-
-structField : ID ASSIGN expression | ELLIPSIS expression;
-
-markupLiteral : LT ID markupAttrs? GT (markupContent | DIV) LT DIV ID GT | LT ID markupAttrs? DIV GT;
-
-markupAttrs : markupAttr+;
-
-markupAttr : ID ASSIGN STRING | ID ASSIGN expression;
-
-markupContent : (STRING | LBRACE expression RBRACE | markupLiteral)*;
-
-expressionStatement : (expression | controlFlowOnly) SEMI?;
-
-// Types
-type : (functionType | simpleType) (OR (functionType | simpleType))*;
-
-simpleType : baseType typeSuffix*;
-
-typeSuffix : LBRACK INT? RBRACK | QMARK | LT simpleType (COMMA simpleType)* GT | LPAREN parameters? RPAREN ARROW simpleType | VEC_LIT LT simpleType GT LBRACK INT RBRACK;
-
-// 关键修复：将 VEC_LIT 加入 baseType
-baseType : I8 | I32 | I64 | U8 | U32 | U64 | F32 | F64 | STR_TYPE | BOOL_TYPE | VOID_TYPE_CAP | VEC_LIT | ID;
-
-functionType : LPAREN parameters? RPAREN ARROW type;
-
-genericArgs : LT simpleType (COMMA simpleType)* GT;
-
-genericParams : LT ID (COMMA ID)* GT;
-
-// Decorators
-decorator : AT ID;
-
-// Control flow statements
-controlStatement : loopStatement | matchStatement | conditionalStatement;
-
-loopStatement : LOOP (rangeLoop | infiniteLoop);
-
-infiniteLoop : block;
-
-rangeLoop : ID IN expression ELLIPSIS expression block;
-
-conditionalStatement : expression QMARK (expression | block | controlFlowOnly) (COLON (expression | block | controlFlowOnly))?;
-
-matchStatement : MATCH LBRACE matchCase (COMMA matchCase)* RBRACE;
-
-matchCase : LPAREN expression RPAREN QMARK (expression | block | controlFlowOnly);
+FAT_ARROW   : '=>';
+PIPE_ARROW  : '->';
+DOTDOTDOT   : '...';
+SHL_ASSIGN  : '<<=';
+SHR_ASSIGN  : '>>=';
+PLUS_ASSIGN : '+=';
+MINUS_ASSIGN: '-=';
+STAR_ASSIGN : '*=';
+SLASH_ASSIGN: '/=';
+PERCENT_ASSIGN: '%=';
+AMP_ASSIGN  : '&=';
+PIPE_ASSIGN : '|=';
+CARET_ASSIGN: '^=';
+SHL         : '<<';
+SHR         : '>>';
+EQUAL       : '==';
+NOT_EQUAL   : '!=';
+LTE         : '<=';
+GTE         : '>=';
+AND         : '&&';
+OR          : '||';
+LT          : '<';
+GT          : '>';
+ASSIGN      : '=';
+PLUS        : '+';
+MINUS       : '-';
+STAR        : '*';
+SLASH       : '/';
+PERCENT     : '%';
+AMP         : '&';
+BIT_OR      : '|';
+CARET       : '^';
+BANG        : '!';
+QUESTION    : '?';
+COLON       : ':';
+SEMI        : ';';
+COMMA       : ',';
+DOT         : '.';
+AT          : '@';
+LPAREN      : '(';
+RPAREN      : ')';
+LBRACE      : '{';
+RBRACE      : '}';
+LBRACKET    : '[';
+RBRACKET    : ']';
+
+// Identifiers
+IDENT       : [a-zA-Z_][a-zA-Z0-9_]*;
+
+// Numeric literals
+INT_LIT     : '0x' [0-9a-fA-F]+
+            | '0b' [01]+
+            | [0-9]+
+            ;
+
+FLOAT_LIT   : [0-9]+ '.' [0-9]+;
+
+// String literal
+STRING      : '"' (~["\\\r\n] | '\\' .)* '"';
+
+// Whitespace & Comments
+WS          : [ \t\r\n]+ -> skip;
+LINE_COMMENT: '//' ~[\r\n]* -> skip;
+BLOCK_COMMENT: '/*' .*? '*/' -> skip;

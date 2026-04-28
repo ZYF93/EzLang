@@ -90,11 +90,11 @@ let inferred = identity(42)  // 推断为 I32
   * 函数类型：`(name: Type, ...) => ReturnType`。
   * 可选类型：`Type?`。底层为 `Option<T>`，访问时使用 `expr?` 或强制拆包 `Type! expr`。
   * 联合类型：`Type1 | Type2`。必须通过模式匹配或类型检查区分具体分支。
-* **Dict 类型与鸭子类型**：
-  * 字典可通过字面量 `{ prop: Type; ... }` 创建。支持固定字段和动态键。
+* **类型别名与鸭子类型**：
+  * 使用 `type Alias = { ... }` 定义的形状采用鸭子类型（Duck Typing）进行验证。任何结构（包括 `Struct` 或 `Dict`）只要包含形状要求的字段，即可视为匹配该类型。
+  * `Dict` 类型（字典）可通过字面量 `{ prop: Type; ... }` 创建，支持固定字段和动态键。
   * 支持 `{ prop = value }` 的推断初始化或 `{ prop: Type = value }`。
   * 可以使用 `typeof { prop: Type = value }` 语法来获取对应的 `Dict` 类型。
-  * `type Alias = Shape` 定义的形状采用鸭子类型（Duck Typing）进行验证。任何结构（包括 Struct 或 Dict）只要包含形状要求的字段，即可视为匹配该类型。声明的 Dict 形状本质上是用于验证类型的鸭子类型模板。
 * **类型扩展**：`...BaseType` 将基础形状的字段展开并平铺到当前定义中。
 * **泛型系统**：
   * 允许类型参数化实现代码复用，支持多类型参数 `<T, K>`。

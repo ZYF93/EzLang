@@ -2,6 +2,9 @@
 name = "ezlang"
 version = "0.1.0"
 description = "A simple and efficient programming language"
+public = true
+registry = "https://www.xxx.com"
+main = "./src/index.ez"
 
 [workspace]
 members = ["./packages/**", "./apps/**"]
@@ -25,4 +28,5 @@ name = "frontend"
 
 [deps]
 std = "./lib/std.ez"
-xxx = "0.1.0"
+utils = "0.1.0"
+packageA = "@workspace"
