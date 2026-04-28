@@ -29,6 +29,7 @@ EzLang/
 ├── extensions/         # 开发辅助：包含 LSP (语言服务器) 与 VSCode 插件
 ├── docs/               # 文档中心：语言规格说明、标准库设计及工具链指南
 ├── grammar/            # ANTLR4 文法定义
+├── test/               # 测试
 └── examples/           # 示例代码：展示 EzLang 的语法特性与应用场景
 ```
 
