@@ -30,6 +30,7 @@ EzLang 提供了开箱即用的命令行工具链（CLI），并采用 `project.
 * `main` (字符串)：包的主入口文件路径（如 `"index.ez"`）。
 * `public` (布尔值)：是否将该包对外公开。为 `true` 时，配合 `ez release` 可发布到远端。
 * `registry` (字符串)：包管理远端服务的具体地址（如 `"https://www.xxx.com"`），指定本包发布的目标中心仓库或拉取依赖的源。
+* `optimize` (数字)：优化等级，0-3，默认值为 2。
 
 ### `[workspace]`
 用于单一代码库（Monorepo）下的多包管理。

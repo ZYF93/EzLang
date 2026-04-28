@@ -5,6 +5,7 @@ description = "A simple and efficient programming language"
 public = true
 registry = "https://www.xxx.com"
 main = "./src/index.ez"
+optimize = 2
 
 [workspace]
 members = ["./packages/**", "./apps/**"]

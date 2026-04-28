@@ -114,6 +114,18 @@ exprStmt
     : expression SEMI
     ;
 
+loopStmt
+    : loopExpr SEMI?
+    ;
+
+matchStmt
+    : matchExpr SEMI?
+    ;
+
+condBlockStmt
+    : pipeExpr QUESTION block (COLON (block | conditionalExpr))? SEMI?
+    ;
+
 decorator
     : AT IDENT
     ;

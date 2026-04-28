@@ -109,6 +109,21 @@ class EzLangVisitor(ParseTreeVisitor):
         return self.visitChildren(ctx)
 
 
+    # Visit a parse tree produced by EzLangParser#loopStmt.
+    def visitLoopStmt(self, ctx:EzLangParser.LoopStmtContext):
+        return self.visitChildren(ctx)
+
+
+    # Visit a parse tree produced by EzLangParser#matchStmt.
+    def visitMatchStmt(self, ctx:EzLangParser.MatchStmtContext):
+        return self.visitChildren(ctx)
+
+
+    # Visit a parse tree produced by EzLangParser#condBlockStmt.
+    def visitCondBlockStmt(self, ctx:EzLangParser.CondBlockStmtContext):
+        return self.visitChildren(ctx)
+
+
     # Visit a parse tree produced by EzLangParser#decorator.
     def visitDecorator(self, ctx:EzLangParser.DecoratorContext):
         return self.visitChildren(ctx)

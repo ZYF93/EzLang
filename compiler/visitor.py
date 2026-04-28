@@ -212,6 +212,30 @@ class ASTBuilder(EzLangVisitor):
     def visitExprStmt(self, ctx):
         return ExprStmt(expr=self.visit(ctx.expression()), span=self._make_span(ctx))
 
+    def visitLoopStmt(self, ctx):
+        # loopStmt just wraps loopExpr, which returns a LoopExpr (ExprNode)
+        return ExprStmt(expr=self.visit(ctx.loopExpr()), span=self._make_span(ctx))
+
+    def visitMatchStmt(self, ctx):
+        # matchStmt just wraps matchExpr, which returns a MatchExpr (ExprNode)
+        return ExprStmt(expr=self.visit(ctx.matchExpr()), span=self._make_span(ctx))
+
+    def visitCondBlockStmt(self, ctx):
+        # condBlockStmt is the statement form of a conditional block
+        condition = self.visit(ctx.pipeExpr())
+        blocks = ctx.block()
+        then_block = self.visit(blocks[0])
+        else_part = None
+        if ctx.conditionalExpr():
+            else_part = self.visit(ctx.conditionalExpr())
+        elif len(blocks) > 1:
+            else_part = self.visit(blocks[1])
+        
+        return ExprStmt(expr=ConditionalExpr(
+            condition=condition, then_expr=then_block,
+            else_expr=else_part, span=self._make_span(ctx)
+        ), span=self._make_span(ctx))
+
     # ======================== Expressions ========================
 
     def visitExpression(self, ctx):
@@ -241,8 +265,23 @@ class ASTBuilder(EzLangVisitor):
                     condition=condition, then_expr=then_block,
                     else_expr=else_part, span=self._make_span(ctx)
                 )
+            elif ctx.BREAK():
+                return ConditionalExpr(
+                    condition=condition,
+                    then_expr=BreakStmt(span=self._make_span(ctx)),
+                    span=self._make_span(ctx)
+                )
+            elif ctx.CONTINUE():
+                return ConditionalExpr(
+                    condition=condition,
+                    then_expr=ContinueStmt(span=self._make_span(ctx)),
+                    span=self._make_span(ctx)
+                )
             else:
                 exprs = ctx.expression()
+                if not exprs:
+                    # 这不应该发生，除非文法规则有误
+                    return self.visit(ctx.pipeExpr())
                 then_expr = self.visit(exprs[0])
                 else_expr = self.visit(exprs[1]) if len(exprs) > 1 else None
                 return ConditionalExpr(

@@ -129,10 +129,23 @@ def cmd_compile(args):
         output_dir=args.output or "./dist"
     )
     ctx = CompileContext(module_name=Path(filepath).stem, target=target)
-
-    # TODO: 阶段二实现 codegen
-    print(f"✅ 编译成功: {filepath}")
-    print(ctx.dump_ir())
+    
+    from compiler.codegen import CodeGenerator
+    codegen = CodeGenerator(ctx, collector)
+    
+    try:
+        ir_code = codegen.generate(ast)
+        if collector.has_errors:
+            collector.report()
+            sys.exit(1)
+            
+        print(f"✅ 编译成功: {filepath}")
+        print(ir_code)
+    except Exception as e:
+        print(f"❌ 编译出错: {e}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
 
 
 def cmd_check(args):

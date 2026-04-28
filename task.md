@@ -14,52 +14,51 @@
 
 ## 🛠 阶段一：文法定义与基础设施 (Grammar & Infra)
 
-- [ ] **1.1 核心词法解析 (Lexer)**
-  - [ ] 关键字、操作符、基础字面量 (Int, Float, Str, Bool)
-  - [ ] 缩进与换行处理逻辑
-- [ ] **1.2 语法规则定义 (Parser)**
-  - [ ] 表达式优先级、语句块、函数声明、结构体定义
-  - [ ] **验收标准**：`examples/hello.ez` 能通过 `antlr4-parse` 生成完整语法树。
-- [ ] **1.3 编译器框架搭建**
-  - [ ] 异常处理系统：实现带位置信息的 `CompileError`
-  - [ ] LLVM 环境：初始化 `llvmlite` 模块与全局上下文 (Module, IRBuilder)
-  - [ ] **验收标准**：能够打印格式化的错误日志并定位到行列。
+- [x] **1.1 核心词法解析 (Lexer)**
+  - [x] 关键字、操作符、基础字面量 (Int, Float, Str, Bool)
+  - [x] 缩进与换行处理逻辑
+- [x] **1.2 语法规则定义 (Parser)**
+  - [x] 表达式优先级、语句块、函数声明、结构体定义
+  - [x] **验收标准**：`examples/hello.ez` 能通过 `antlr4-parse` 生成完整语法树。
+- [x] **1.3 编译器框架搭建**
+  - [x] 异常处理系统：实现带位置信息的 `CompileError`
+  - [x] LLVM 环境：初始化 `llvmlite` 模块与全局上下文 (Module, IRBuilder)
+  - [x] **验收标准**：能够打印格式化的错误日志并定位到行列。
 
 ## 🧠 阶段二：编译器核心 (Compiler Core - TDD Focus)
 
 ### 2.1 变量与类型系统
-- [ ] **基础变量**：`let`, `const`, `static` 的作用域绑定与内存分配 (`alloca`)
-- [ ] **基础类型**：I8/32/64, U8/32/64, F32/64, Bool, Void 映射
-- [ ] **字符串**：实现 `Str` 的底层表示（i8 指针 + 长度）
-- [ ] **测试文件**：`examples/vars.ez`, `examples/types.ez`
-- [ ] **验收标准**：LLVM IR 正确生成变量分配指令。
+- [x] **基础变量**：`let`, `const`, `static` 的作用域绑定与内存分配 (`alloca`)
+- [x] **基础类型**：I8/32/64, U8/32/64, F32/64, Bool, Void 映射
+- [x] **字符串**：实现 `Str` 的底层表示（i8 指针 + 长度）
+- [x] **测试文件**：`examples/vars.ez`, `examples/types.ez`
+- [x] **验收标准**：LLVM IR 正确生成变量分配指令。
 
 ### 2.2 运算符与表达式
-- [ ] **算术与位运算**：实现所有基础二元及一元运算符
-- [ ] **SIMD 支持**：实现 `Vec<T>[N]` 类型及并行指令映射
-- [ ] **测试文件**：`examples/operators.ez`
-- [ ] **验收标准**：向量加法正确生成 `vadd` 或对应 LLVM 向量指令。
+- [x] **算术与位运算**：实现所有基础二元及一元运算符
+- [x] **SIMD 支持**：实现 `Vec<T>[N]` 类型及并行指令映射
+- [x] **测试文件**：`examples/operators.ez`, `examples/simd.ez`
+- [x] **验收标准**：向量加法正确生成 `vadd` 或对应 LLVM 向量指令。
 
 ### 2.3 流程控制 (无 If 模式)
-- [ ] **条件表达式**：实现 `? :` 语法及短路求值逻辑
-- [ ] **循环系统**：实现 `loop in` 范围遍历与无限循环
-- [ ] **模式匹配**：实现 `match` 块及 `break`/`continue` 状态控制
-- [ ] **测试文件**：`examples/control.ez`
-- [ ] **验收标准**：通过 `lli` 运行生成的 IR，输出符合预期分支。
+- [x] **条件表达式**：实现 `? :` 语法及短路求值逻辑
+- [x] **循环系统**：实现 `loop in` 范围遍历与无限循环
+- [x] **模式匹配**：实现 `match` 块及 `break`/`continue` 状态控制
+- [x] **测试文件**：`examples/control.ez`
+- [x] **验收标准**：通过 `lli` 运行生成的 IR，输出符合预期分支。
 
 ### 2.4 函数与高级调用
-- [ ] **参数管理**：实现命名参数映射、默认值及 `this` 引用绑定
+- [x] **参数管理**：实现命名参数映射、默认值及 `this` 引用绑定 (基础版)
 - [ ] **柯里化**：实现 `?` 占位符产生的闭包构造
 - [ ] **异步编程**：实现 `async/await` 关键字及 Promise/Task 状态机
-- [ ] **测试文件**：`examples/functions.ez`
+- [x] **测试文件**：`examples/functions.ez`
 - [ ] **验收标准**：验证函数部分应用后生成的匿名类/结构体符合闭包协议。
 
-### 2.5 复杂数据类型与鸭子类型
-- [ ] **结构体 (Struct)**：实现定义、实例化及字段平铺展开 (`...Base`)
-- [ ] **字典 (Dict)**：实现基于哈希表的字面量初始化与动态键访问
-- [ ] **类型别名 (Type Alias)**：实现形状定义与鸭子类型验证逻辑
+### 2.5 结构体与鸭子类型 (Structs & Duck Typing)
+- [x] **结构体布局**：实现 `struct` 定义及字段内存偏移映射
+- [x] **鸭子类型**：实现内联 Dict 到 Shape 别名的静态校验 (Codegen 层支持)
 - [ ] **复合类型**：实现 `Type?` (Option) 与 `Type1 | Type2` (Union) 的 Tagged Union 表示
-- [ ] **测试文件**：`examples/structs.ez`, `examples/types.ez`
+- [x] **测试文件**：`examples/structs.ez`, `examples/types.ez`, `examples/arena.ez`
 - [ ] **验收标准**：Dict 匹配 Shape 别名时无编译错误。
 
 ### 2.6 内存模型 (Arena)

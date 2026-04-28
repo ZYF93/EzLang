@@ -79,6 +79,10 @@ class EzTypes:
             "Void": self.void,
         }
 
+    def define_type(self, name: str, llvm_type: ir.Type):
+        """注册新类型。"""
+        self._name_map[name] = llvm_type
+
     def resolve(self, name: str) -> Optional[ir.Type]:
         """根据 EzLang 类型名解析为 LLVM IR 类型。"""
         return self._name_map.get(name)
@@ -106,11 +110,6 @@ class CompileContext:
 
     def __init__(self, module_name: str = "ezlang_module",
                  target: Optional[TargetConfig] = None):
-        # 初始化 llvmlite 绑定层
-        binding.initialize()
-        binding.initialize_native_target()
-        binding.initialize_native_asmprinter()
-
         # LLVM Module
         self.module = ir.Module(name=module_name)
         self.module.triple = (target or TargetConfig()).triple
