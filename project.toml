@@ -1,0 +1,28 @@
+[project]
+name = "ezlang"
+version = "0.1.0"
+description = "A simple and efficient programming language"
+
+[workspace]
+members = ["./packages/**", "./apps/**"]
+
+[[output]]
+arch = "wasm"
+os = "wasi"
+dir = "./dist/wasm"
+
+[[output]]
+arch = "x86_64"
+os = "linux"
+dir = "./dist/x86_64"
+
+[[plugins]]
+name = "backend"
+args = ["release=true"]
+
+[[plugins]]
+name = "frontend"
+
+[deps]
+std = "./lib/std.ez"
+xxx = "0.1.0"
