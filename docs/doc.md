@@ -1,6 +1,6 @@
 # EzLang 语言规格说明书
 
-EzLang 是一门以表达式为中心、采用值语义为主的系统编程语言。它支持强类型、泛型、内置结构体、可选类型、联合类型、异步与元编程，并结合 Arena 内存模型实现高效内存管理。
+EzLang 是一门以表达式为中心、采用值语义为主的系统编程语言。它支持强类型、泛型、内置结构体、可选类型、联合类型、元编程与 Flow 并发运行时，并结合 Arena 内存模型实现高效内存管理与高性能。
 
 ## 1. 语言概览与基础规则
 
@@ -14,7 +14,7 @@ let a = 1; // 语句由 ; 分隔，表达式可以直接作为语句使用
 ### 语义说明与规范
 * **区分大小写**。
 * 标识符、关键字、类型名不允许包含空白字符。
-* **关键字**：`let`, `const`, `static`, `struct`, `type`, `declare`, `loop`, `await`, `async`, `break`, `continue`, `import`, `export`, `from`, `match`, `catch`, `throw`, `typeof`
+* **关键字**：`let`, `const`, `static`, `struct`, `type`, `declare`, `loop`, `break`, `continue`, `import`, `export`, `from`, `match`, `catch`, `throw`, `flow`,  `typeof`
 * **命名规范**：类型名应以大写字母开头（如 `User`, `Result`），变量名应以小写字母开头（如 `user`, `count`）。
 
 ### LLVM 映射
@@ -152,9 +152,9 @@ struct Date {
 }
 
 struct Error {
-    code: I32
+    code:    I32    // 正值为业务错误，负值为系统错误（见 stdlib ErrCode 常量）
     message: Str
-    data: Blob?
+    data:    Blob?
 
     toString = (this: Error) => Str
 }
@@ -169,7 +169,7 @@ struct Blob {
 ```
 
 ### 语义说明与规范
-* **结构体基础**：定义支持 `struct Name<T> { ...Base?; field: Type = default?; method = (this: Type, args...) => expr?; }`。支持名称参数初始化与默认字段值。
+* **结构体基础**：定义支持 `struct Name<T> { ...Base?; field: Type = default?; method = (this: Type, args...) => expr?; }`。支持名称参数初始化与默认字段值。结构体使用静态布局。
 * **组合与复用**：`...Base` 将基础结构体字段平铺到当前结构体开头，实现布局复用。实例化时复制基础结构的内存并写入新增字段。
 * **类型检查与方法**：每个结构体隐式包含 `I32` 类型标识，用于 `typeof` 和运行时检查。方法是内联函数，`this` 显式绑定到实例。
 * **内置结构体**：提供语言层面的通用数据结构封装。
@@ -203,9 +203,10 @@ let copy = count
 * `static`：全局静态变量，生命周期贯穿程序。
 * **值语义**：赋值默认是值语义，`a = b` 会进行全量拷贝。函数参数默认按值传递（除 `this` 使用引用语义外）。
 * **Arena 内存模型**：
-  * 每个作用域对应一个 Arena 游标。临时分配在连续内存区完成，作用域结束时回退游标。语言层不提供显式 `free`。
+  * 每个作用域对应一个 Arena 游标。临时分配在连续内存区完成，作用域结束时回退游标（rollback arena cursor）。语言层不提供显式 `free`。
   * 跨作用域返回时，值被复制至父级 Arena 游标所管理的空间，不会出现悬垂引用。
-  * 线程独占 Arena，配合值语义实现无锁并发。
+  * 线程独占 Arena，配合值语义实现无锁并发。自动按 `alignof(T)` 对齐。
+  * Arena 会智能的调度内存，例如重新赋值时如果新值需要的内存比旧值大，则会重新分配一块新的内存，并将旧内存标记为可重新分配。
 
 ### LLVM 映射
 * 局部变量映射为 `alloca` 或 Arena 内存地址。拷贝使用 `llvm.memcpy`。
@@ -231,22 +232,16 @@ const walk = (x: I32): I32 => {
     return walk(x = x + 1)
 }
 
-// 异步函数
-async const fetchData = (this: User, id: I32) => {
-    // await logic
-}
-
 // 柯里化与参数占位
 let addTwo = fn(a = 2, b = ?)
 ```
 
 ### 语义说明与规范
-* 显式声明 `this`，没有隐式上下文。`obj.fn()` 等价于 `fn(this = obj)`。`this` 总是以引用语义传递，避免结构体拷贝。
+* 显式声明 `this`，没有隐式上下文。`obj.fn()` 等价于 `fn(this = obj)`。`this` 总是以引用语义传递，避免结构体拷贝。普通变量使用值语义。
 * 函数调用仅支持命名参数（如 `fn(a = 1, b = 2)`），不支持匿名传参。
 * 形参可声明默认值，调用时省略该参数即使用默认值。
 * 函数体使用 `{ ... }` block 时，必须通过 `return` 显式返回值，最后一个表达式不会隐式作为返回值。
 * `?` 占位符支持部分应用与柯里化，生成等待剩余参数的函数。
-* `async` 函数内部可使用 `await`。
 
 ### LLVM 映射
 * 具名参数在编译期重排以生成标准 `call`。
@@ -254,13 +249,52 @@ let addTwo = fn(a = 2, b = ?)
 
 ---
 
-## 6. 流程控制
+## 6. Flow 并发运行时
+
+### 语法
+```ez
+const ret = flow {
+    const a = fetchA()
+    const b = fetchB()
+    const ret2 = race(
+        pl = [
+            () => fetchA(),
+            () => fetchB()
+        ],
+        timeout = 3000
+    )
+    const err = catch {
+        fetch()
+    }
+    (typeof err & Error == Error) ? print(msg = err.message)
+    return a + b + ret2
+}
+```
+
+### 语义说明与规范
+* **flow**：`flow { ... }` 为并发调度作用域。flow 不改变程序的顺序语义。flow 内代码在语义上严格按源码顺序执行，但 runtime 可对无依赖阻塞操作进行调度优化，且调度不得改变可观察行为。
+* **阻塞操作**：flow 外部如 `fetch()` 为同步阻塞。flow 内部如 `fetch()` 允许挂起当前执行点并调度其它可运行逻辑。
+* **自动依赖等待**：读取未完成阻塞结果时，runtime 自动等待依赖。
+* **flow 返回**：flow 返回前必须保证所有前序语义操作完成，且所有副作用已提交。
+* **race 函数**：并发运行所有分支，返回首个完成值，自动取消其它分支；`timeout` 超时则取消所有任务并 `throw Error(code = errTimeout, ...)`；`timeout` 不填默认永不超时。
+* **cancel**：取消不会立即终止同步代码。取消仅中断 IO、sleep、timer、wait 等 suspend source。底层 suspend source 被取消时，`throw Error(code = errCancel, message = "操作已取消")` 并沿同步调用栈传播；可在 `catch {}` 中通过 `err.code == errCancel` 判断并特殊处理。
+* **非阻塞同步代码**：普通同步 CPU 代码不会被中断。
+* **副作用一致性**：runtime 不允许改变副作用顺序、锁语义、可观察行为。
+
+### LLVM 映射
+* **flow**：lowering 为状态机与调度点。
+* **suspend source**：映射为 epoll、io_uring、kqueue、timerfd 等平台等待机制。
+* **cancel**：取消底层等待源。
+
+---
+
+## 7. 流程控制
 
 ### 语法
 ```ez
 // 循环与范围
 loop i in 0...10 { 
-    // await async_function()
+    print(msg = i)
 }
 
 // 块条件语句
@@ -289,20 +323,22 @@ const err = catch {
 ```
 
 ### 语义说明与规范
-* `? :` 既是表达式也是流程控制，不使用 `if/else`。`condition ? expression` 或 `condition ? { block }` 是条件语句，条件为真执行，否则跳过。
-* `0...10` 表示左闭右开区间 `[0, 10)`。
+* **条件表达式**：`condition ? expr : expr`。既是表达式也是流程控制，不使用 `if/else`。`condition ? expression` 或 `condition ? { block }` 是条件语句，条件为真执行，否则跳过。
+* **loop**：`0...10` 表示左闭右开区间 `[0, 10)`。
 * 块表达式 `{ ... }` 返回值为 `Void`。
-* `match` 从上到下依次求值，首次匹配后停止（除非使用 `continue` 继续执行后续分支）。
-* `break` 退出当前循环或 `match`。
-* `catch` 用于捕获 `throw` 抛出的异常值。
+* **match**：从上到下依次求值，匹配后继续下一条，除非显式 `break`。
+* **continue**：跳过当前 match 的后续分支，继续执行下一条。
+* **break**：退出当前 `loop` 或 `match`。
+* **throw**：抛出异常，会沿同步调用栈传播，直到被 `catch` 捕获或到达程序的顶层，导致程序终止。
+* **catch**：用于捕获 `throw` 抛出的异常值。
 
 ### LLVM 映射
-* 循环映射为 `br` 与标签结构。
+* 循环映射为 `br` 与 `phi` 节点结构。
 * 条件选择映射为 `phi` 节点或分支跳转。
 
 ---
 
-## 7. 运算符、表达式与 SIMD
+## 8. 运算符、表达式与 SIMD
 
 ### 语法
 ```ez
@@ -321,7 +357,7 @@ a &= 0b1111
 let v1: Vec<I32>[4] = Vec[1, 2, 3, 4]
 let v2: Vec<I32>[4] = Vec[5, 6, 7, 8]
 let vSum = v1 + v2
-let scaled = v1 * 2  // 标量广播
+let scaled = v1 * 2  // 标量自动广播
 let masked = (v1 < v2) ? v1 : v2
 ```
 
@@ -330,7 +366,7 @@ let masked = (v1 < v2) ? v1 : v2
 * **逻辑与比较运算**：支持 `&&`, `||`, `!` 与 `==`, `!=`, `<`, `>`, `<=`, `>=`。逻辑运算支持短路求值。不支持结构体/联合类型直接比较（除非实现相关方法）。
 * **复合赋值**：如 `+=`, `<<=` 等价于展开运算，但左操作数只求值一次。
 * **优先级**：`!` > `*`, `/`, `%` > `+`, `-` > `<<`, `>>` > `&` > `^` > `|` > 比较 > `&&` > `||`。位运算 `&` 优先级高于比较运算 `==` 但低于移位。建议显式加括号以避免歧义。
-* **SIMD 语义**：`Vec<Type>[N]` 操作并行应用于元素。向量长度必须匹配。标量与向量混合运算时，标量自动广播成等长向量后再计算。
+* **SIMD 语义**：`Vec<Type>[N]` 操作逐元素并行执行。向量长度必须匹配。标量与向量混合运算时，标量自动广播成等长向量后再计算。
 
 ### LLVM 映射
 * 基本运算符映射为相应 LLVM 指令（如 `add`, `sub`, `icmp`, `fcmp`, `shl`, `and`, `sdiv`/`udiv`, `srem`/`urem` 等）。
@@ -340,7 +376,7 @@ let masked = (v1 < v2) ? v1 : v2
 
 ---
 
-## 8. 模块系统与外部链接
+## 9. 模块系统与外部链接
 
 ### 语法
 ```ez
@@ -354,9 +390,9 @@ declare const malloc: (size: I64) => Blob
 ```
 
 ### 语义说明与规范
-* `import` 将外部导出项引入当前作用域；`export` 将项暴露给其他模块。
-* 模块路径支持相对与绝对路径，包含 `.ez`, `.ll`, `.bc`, `.o` 等。引入 llvm 支持的可链接文件时，自动从同路径 `.d.ez` 导入对应声明。
-* `.d.ez` 文件和 `declare` 用于声明外部库符号，支持 C ABI 兼容的外部库调用。
+* **import**：编译期导入，将外部导出项引入当前作用域；**export**：导出符号，将项暴露给其他模块。
+* 模块路径支持相对与绝对路径，包含 `.ez`, `.ll`, `.bc`, `.o` 等。引入 llvm 支持的 object file / 链接文件时，自动从同路径 `.d.ez` 导入对应声明。
+* **declare / .d.ez**：用于声明外部 ABI 符号，支持 C ABI 兼容的外部库调用，LLVM IR，或 object file。`.d.ez` 用于外部声明文件。
 * 模块解析在编译时完成，无运行时性能影响。
 * EzLang 不存在隐式入口函数，文件内定义的任意函数均需显式调用。
 
@@ -366,7 +402,7 @@ declare const malloc: (size: I64) => Blob
 
 ---
 
-## 9. 元编程、语法糖与安全机制
+## 10. 元编程、语法糖与安全机制
 
 ### 语法
 ```ez
@@ -399,10 +435,10 @@ let isError = typeof err & Error == Error
 ### 语义说明与规范
 * **元编程与装饰器**：`@Dec` 将变量包装为 `Meta<T>`。`Meta<T>` 包含 `value`, `getter`, `setter`, `type`, `name`，访问时通过函数指针调用拦截逻辑。
 * **标记语法**：XML 风格标记语法被自动翻译编译为普通函数调用与结构体构造表达式。
-* **管道与插值**：管道 `->` 配合 `%` 占位符重写为命名参数调用；字符串插值生成最小内存复制的拼接逻辑。
+* **管道与插值**：管道 `->` 配合 `%` 占位符重写为命名参数调用（如 `a -> fn(x = %)` 重写为 `fn(x = a)`）；字符串插值编译为最小内存复制拼接逻辑。
 * **类型安全机制**：
   * `Type! expr`：无检查的类型断言，适用于强制拆包或位级重解释。
-  * `typeof`：基于结构体头部的 TypeID 进行快速类型判断，返回运行时类型标识或结构体类型，而非类型别名。
+  * `typeof`：基于结构体头部的 TypeID 进行快速类型判断，返回运行时结构体类型标识或结构体类型，而非类型别名。
 
 ### LLVM 映射
 * 装饰器生成 `Meta<T>` 结构体，按值传递，拦截逻辑表现为 `call` 指令调用 `getter`/`setter`。

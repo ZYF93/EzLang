@@ -12,7 +12,7 @@ members = ["./packages/**", "./apps/**"]
 
 [[output]]
 arch = "wasm"
-os = "wasi"
+os = "emcc"
 dir = "./dist/wasm"
 
 [[output]]

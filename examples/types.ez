@@ -8,5 +8,3 @@ let e: Str = "Hello EzLang";
 // 负面用例：类型不匹配（虽然目前的编译器还不强制报错，但语法应支持）
 // let f: I32 = "wrong"; 
 
-// 验证 WASI fd_write 声明
-declare const fd_write: (fd: I32, iovs: I32, iovs_len: I32, nwritten: I32) => I32;

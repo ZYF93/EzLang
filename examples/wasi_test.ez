@@ -1,4 +1,0 @@
-declare const print: (msg: Str) => Void;
-
-let message = "Hello World";
-print(msg = message);

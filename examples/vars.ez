@@ -1,10 +1,10 @@
 // vars.ez - 验证变量声明与值语义
 let count = 10;
-const PI = 3.14;
-static GLOBAL_VAL = 100;
+const pi = 3.14;
+static global_val = 100;
 
 let copy = count; // 值语义拷贝
 count = 20;
 
 // 负面用例：const 修改（未来语义分析应拦截）
-// PI = 3.15;
+// pi = 3.15;

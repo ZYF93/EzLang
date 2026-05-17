@@ -7,10 +7,8 @@ const create = () => {
 };
 
 const run = () => {
-    let result = {
-        let x = 10;
-        let p = Data(val = x);
-        p; // 提升到 run 作用域
-    };
+    let x = 10;
+    let p = Data(val = x);
+    let result = p;
     return create();
 };
