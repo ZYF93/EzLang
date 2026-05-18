@@ -380,25 +380,54 @@ let masked = (v1 < v2) ? v1 : v2
 
 ### 语法
 ```ez
+// 模块导入导出
 from "./std.ez" import {print as log}
-from "../libs/mylib.ll" import {func}  // 自动从 mylib.d.ez 导入 declare
 export let x = 1
 
-declare const python_func: (arg: I32) => I32
-declare const java_method: (obj: Blob) => Void
-declare const malloc: (size: I64) => Blob
+// extern 语法：按目标平台引用外部 ABI 库
+// 支持：静态库(.a/.lib), 动态库(.so/.dylib/.dll), 目标文件(.o/.bc), LLVM IR(.ll), 框架(.framework)
+// 所有目标平台均链接此库
+extern "./libs/libcrypto.a"
+// 仅 linux 目标链接
+extern "./libs/libssl.so" for linux
+// 多个目标平台
+extern "./libs/win32.lib" for windows
+// Android/iOS 各自的库
+extern "./libs/android/libjni.a" for android
+extern "./libs/ios/objc.framework" for ios
+// WebAssembly 导入 JS 模块
+extern "./js/bindings.js" for emcc
+// 链接 LLVM IR 模块或字节码
+extern "./runtime.ll"
+extern "./runtime.bc" for macos
+
+// 声明外部库符号（与 extern 配合使用）
+// 所有外部符号必须通过 declare 显式声明，支持类型安全的 C ABI 调用
+declare const crypto_hash: (data: Blob, len: I64) => Blob
+declare const ssl_connect: (host: Str, port: I32) => I32
+declare const curl_easy_init: () => Blob
+declare static version: Str
 ```
 
 ### 语义说明与规范
-* **import**：编译期导入，将外部导出项引入当前作用域；**export**：导出符号，将项暴露给其他模块。
-* 模块路径支持相对与绝对路径，包含 `.ez`, `.ll`, `.bc`, `.o` 等。引入 llvm 支持的 object file / 链接文件时，自动从同路径 `.d.ez` 导入对应声明。
-* **declare / .d.ez**：用于声明外部 ABI 符号，支持 C ABI 兼容的外部库调用，LLVM IR，或 object file。`.d.ez` 用于外部声明文件。
-* 模块解析在编译时完成，无运行时性能影响。
+* **import / export**：编译期导入，将外部 EzLang 模块的导出项引入当前作用域；**export**：导出符号，将项暴露给其他模块。
+  * 仅支持 `.ez` 源文件导入，不支持直接导入二进制目标文件。
+* **extern**：引用外部 ABI 库或编译产物，支持按编译目标平台按需链接。
+  * 无 `for` 子句时，所有目标平台均链接该库。
+  * `for target` 子句指定仅在编译该目标时链接，支持 `linux`, `macos`, `windows`, `android`, `ios`, `emcc`。
+  * 支持格式：静态库 (`.a`, `.lib`), 动态库 (`.so`, `.dylib`, `.dll`), 目标文件 (`.o`), LLVM IR (`.ll`), LLVM 字节码 (`.bc`), 框架 (`.framework`), JS 模块 (`.js` for emcc)。
+  * `emcc` 目标导入 JS 模块时，编译时自动转换为 Emscripten 绑定。
+* **declare**：声明外部库符号，用于类型检查和链接时符号解析。
+  * 可声明函数、全局变量、静态变量。
+  * 声明的符号必须在至少一个 `extern` 库中存在，否则链接失败。
+  * 所有外部符号必须显式声明，支持 C ABI 兼容的外部库调用。
 * EzLang 不存在隐式入口函数，文件内定义的任意函数均需显式调用。
 
 ### LLVM 映射
-* 模块导入通过编译时符号链接实现。
-* 外部链接通过 `.d.ez` 和 `declare` 生成 LLVM `extern` 声明，直接支持外部 C ABI 调用。
+* EzLang 模块导入通过编译时符号解析与合并实现。
+* `extern` 库路径传递给 LLVM 链接器，`for target` 子句在编译期根据目标平台过滤。
+* `declare` 生成 LLVM `external global` 或 `declare` 声明，使用 C ABI 调用约定。
+* `extern` 和 `declare` 配合实现零开销外部库链接，无运行时性能损耗。
 
 ---
 

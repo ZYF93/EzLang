@@ -93,10 +93,13 @@
 ### 1.7 模块系统语法
 - [ ] 支持 `import` / `export` 声明
 - [ ] 支持 `from "path" import { ... }`
-- [ ] 支持 `declare` 外部函数声明
-- [ ] 支持 `.d.ez` 声明文件解析
+- [ ] 支持 `declare` 外部函数/变量/类型声明
+- [ ] 支持 `extern "path"` 外部库引用（所有目标）
+- [ ] 支持 `extern "path" for target` 按目标平台按需引用
 - [ ] 编写 `examples/modules.ez` 测试用例
+- [ ] 编写 `examples/extern.ez` 外部库链接测试用例
 - [ ] 编写测试验证模块系统解析
+- [ ] 编写测试验证 extern 语法解析
 
 ---
 
@@ -160,6 +163,14 @@
 - [ ] 实现数据流依赖分析
 - [ ] 编写 `examples/flow.ez` 测试用例
 - [ ] 编写测试验证并发语义分析
+
+### 2.7 Extern 语义分析
+- [ ] 实现 `extern` 库路径解析与存在性检查
+- [ ] 实现 `for target` 子句目标平台验证
+- [ ] 实现 `declare` 符号与 `extern` 库的关联检查
+- [ ] 实现跨模块 extern 符号导出检查
+- [ ] 实现按编译目标过滤 extern 引用
+- [ ] 编写测试验证 extern 语义检查
 
 ---
 
@@ -234,10 +245,14 @@
 ### 3.8 模块系统代码生成
 - [ ] 实现 `import` 符号解析
 - [ ] 实现 `export` 符号导出
-- [ ] 实现 `declare` 外部函数声明
-- [ ] 实现 `.ll` / `.bc` / `.o` 文件链接
-- [ ] 实现 `.d.ez` 声明文件加载
+- [ ] 实现 `declare` 外部函数/变量声明
+- [ ] 实现 `extern` 库路径传递给 LLVM 链接器
+- [ ] 实现 `for target` 子句按编译目标过滤
+- [ ] 实现所有外部格式统一链接（`.a` / `.so` / `.dylib` / `.lib` / `.o` / `.ll` / `.bc` / `.framework` / `.js`）
+- [ ] 实现 `declare` 符号与 extern 库的关联验证
+- [ ] 实现 Emscripten JS 模块绑定生成
 - [ ] 编写测试验证模块系统
+- [ ] 编写测试验证 extern 链接
 
 ---
 
@@ -495,16 +510,16 @@
 
 ## 里程碑
 
-| 里程碑 | 描述 | 交付物 |
-|--------|------|--------|
-| M1 | 编译器前端完成 | ANTLR 语法, 解析器, 语义分析器 |
-| M2 | LLVM 代码生成完成 | 可编译 .ez 到原生可执行文件 |
-| M3 | 标准库基础完成 | std/mem, std/io, std/fs, std/os, std/time |
-| M4 | Flow 运行时完成 | flow {} 并发调度与 IO suspend |
-| M5 | CLI 工具链完成 | ez build / run / install / fmt / release |
-| M6 | 标准库网络完成 | std/net HTTP/TCP/UDP/WebSocket |
-| M7 | 多平台编译完成 | Linux/macOS/Windows/Android/iOS/emcc |
-| M8 | 1.0 发布 | 完整文档, 所有测试通过 |
+| 里程碑 | 描述              | 交付物                                    |
+| ------ | ----------------- | ----------------------------------------- |
+| M1     | 编译器前端完成    | ANTLR 语法, 解析器, 语义分析器            |
+| M2     | LLVM 代码生成完成 | 可编译 .ez 到原生可执行文件               |
+| M3     | 标准库基础完成    | std/mem, std/io, std/fs, std/os, std/time |
+| M4     | Flow 运行时完成   | flow {} 并发调度与 IO suspend             |
+| M5     | CLI 工具链完成    | ez build / run / install / fmt / release  |
+| M6     | 标准库网络完成    | std/net HTTP/TCP/UDP/WebSocket            |
+| M7     | 多平台编译完成    | Linux/macOS/Windows/Android/iOS/emcc      |
+| M8     | 1.0 发布          | 完整文档, 所有测试通过                    |
 
 ---
 

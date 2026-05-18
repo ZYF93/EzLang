@@ -37,6 +37,22 @@ EzLang 提供了开箱即用的命令行工具链（CLI），并采用 `project.
 * `registry` (字符串)：包管理远端服务的具体地址（如 `"https://www.xxx.com"`），指定本包发布的目标中心仓库或拉取依赖的源。
 * `optimize` (数字)：优化等级，0–3，默认值为 2。
 
+### `[extern]`
+全局外部库配置，为所有模块提供默认的 extern 搜索路径。
+* `search_paths` (字符串数组)：外部库搜索路径列表，编译器按顺序查找 `extern` 引用的库文件。
+* 支持按目标平台配置：`[extern.linux]`, `[extern.macos]`, `[extern.windows]`, `[extern.android]`, `[extern.ios]`, `[extern.emcc]`
+
+```toml
+[extern]
+search_paths = ["./libs", "/usr/local/lib"]
+
+[extern.linux]
+search_paths = ["./libs/linux"]
+
+[extern.windows]
+search_paths = ["C:/Program Files/MyLib/lib"]
+```
+
 ### `[workspace]`
 用于单一代码库（Monorepo）下的多包管理。
 * `members` (字符串数组)：工作区子模块的路径匹配列表，支持 glob 语法（如 `["./packages/**", "./apps/**"]`）。
