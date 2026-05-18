@@ -93,7 +93,7 @@ struct Pair<T, U> {
     swap = (this: Pair<T, U>) => Pair<U, T>(first = this.second, second = this.first)
 }
 
-async const main = () => {
+const main = () => {
     let p = Pair(first = 42, second = "hello")
     let swapped = p.swap()
     swapped.first -> print(msg = %)
