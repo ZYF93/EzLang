@@ -24,9 +24,11 @@
 
 ## 阶段 1: 编译器前端 (ANTLR4 语法与词法)
 
+> 📚 **参考文档**: [`docs/doc.md`](./docs/doc.md) - EzLang 语言规格说明书，包含完整的语法定义、语义规范和 LLVM 映射
+
 ### 1.1 基础语法定义
 - [ ] 编写 `grammar/EzLang.g4` 基础词法规则
-  - 关键字: `let`, `const`, `static`, `struct`, `type`, `declare`, `loop`, `break`, `continue`, `import`, `export`, `from`, `match`, `catch`, `throw`, `flow`, `typeof`
+  - 关键字: `let`, `const`, `static`, `struct`, `type`, `declare`, `loop`, `break`, `continue`, `import`, `export`, `from`, `match`, `catch`, `throw`, `flow`, `typeof` (见 [doc.md §1](./docs/doc.md#1-语言概览与基础规则))
   - 标识符与字面量规则
   - 注释规则 (单行 `//`, 块注释 `/* */`)
 - [ ] 生成 ANTLR4 Python 解析器代码
@@ -34,7 +36,7 @@
 - [ ] 编写测试验证词法分析器正确工作
 
 ### 1.2 类型系统语法
-- [ ] 扩展语法支持基本类型 (`I8`, `I32`, `I64`, `U8`, `U32`, `U64`, `F32`, `F64`, `Str`, `Bool`, `Void`)
+- [ ] 扩展语法支持基本类型 (`I8`, `I32`, `I64`, `U8`, `U32`, `U64`, `F32`, `F64`, `Str`, `Bool`, `Void`) (见 [doc.md §2](./docs/doc.md#2-类型系统与泛型))
 - [ ] 支持可选类型 `Type?`
 - [ ] 支持联合类型 `Type1 | Type2`
 - [ ] 支持数组类型 `Type[]` / `List<Type>`
@@ -46,7 +48,7 @@
 - [ ] 编写测试验证类型语法解析
 
 ### 1.3 结构体与方法语法
-- [ ] 支持 `struct Name { ... }` 定义
+- [ ] 支持 `struct Name { ... }` 定义 (见 [doc.md §3](./docs/doc.md#3-结构体组合与内置对象))
 - [ ] 支持结构体字段与默认值 `field: Type = default`
 - [ ] 支持结构体展开 `...Base`
 - [ ] 支持方法定义 `method = (this: Type, args...) => expr`
@@ -56,10 +58,10 @@
 - [ ] 编写测试验证结构体语法解析
 
 ### 1.4 函数与表达式语法
-- [ ] 支持函数字面量 `(name: Type, ...) => expr`
+- [ ] 支持函数字面量 `(name: Type, ...) => expr` (见 [doc.md §5](./docs/doc.md#5-函数与上下文绑定))
 - [ ] 支持具名参数调用 `fn(a = 1, b = 2)`
 - [ ] 支持 `return` 语句
-- [ ] 支持管道语法 `expr -> fn(x = %)`
+- [ ] 支持管道语法 `expr -> fn(x = %)` (见 [doc.md §10](./docs/doc.md#10-元编程语法糖与安全机制))
 - [ ] 支持柯里化占位符 `?`
 - [ ] 支持字符串插值 `"Hello {{name}}"`
 - [ ] 支持标记语法 `<tag attr=value>...</tag>`
@@ -68,18 +70,18 @@
 - [ ] 编写测试验证函数与表达式解析
 
 ### 1.5 流程控制语法
-- [ ] 支持条件表达式 `cond ? expr : expr`
+- [ ] 支持条件表达式 `cond ? expr : expr` (见 [doc.md §7](./docs/doc.md#7-流程控制))
 - [ ] 支持条件语句 `cond ? { block }`
 - [ ] 支持 `loop` 循环与范围 `loop i in 0...10 { }`
 - [ ] 支持 `match` 模式匹配
 - [ ] 支持 `break` / `continue`
 - [ ] 支持 `throw` / `catch` 异常处理
-- [ ] 支持 `flow { }` 并发块
+- [ ] 支持 `flow { }` 并发块 (见 [doc.md §6](./docs/doc.md#6-flow-并发运行时))
 - [ ] 编写 `examples/control.ez` 测试用例
 - [ ] 编写测试验证流程控制解析
 
 ### 1.6 运算符与 SIMD 语法
-- [ ] 支持算术运算符 `+`, `-`, `*`, `/`, `%`
+- [ ] 支持算术运算符 `+`, `-`, `*`, `/`, `%` (见 [doc.md §8](./docs/doc.md#8-运算符表达式与-simd))
 - [ ] 支持位运算符 `&`, `|`, `^`, `<<`, `>>`
 - [ ] 支持比较运算符 `==`, `!=`, `<`, `>`, `<=`, `>=`
 - [ ] 支持逻辑运算符 `&&`, `||`, `!`
@@ -91,7 +93,7 @@
 - [ ] 编写测试验证运算符解析与优先级
 
 ### 1.7 模块系统语法
-- [ ] 支持 `import` / `export` 声明
+- [ ] 支持 `import` / `export` 声明 (见 [doc.md §9](./docs/doc.md#9-模块系统与外部链接))
 - [ ] 支持 `from "path" import { ... }`
 - [ ] 支持 `declare` 外部函数/变量/类型声明
 - [ ] 支持 `extern "path"` 外部库引用（所有目标）
@@ -105,8 +107,10 @@
 
 ## 阶段 2: 语义分析器
 
+> 📚 **参考文档**: [`docs/doc.md`](./docs/doc.md) - 语义规范与内存模型
+
 ### 2.1 符号表与作用域
-- [ ] 实现作用域栈 (Scope Stack)
+- [ ] 实现作用域栈 (Scope Stack) (见 [doc.md §4](./docs/doc.md#4-变量作用域与内存模型))
 - [ ] 实现符号表 (Symbol Table)
 - [ ] 实现变量声明检查 (重复声明检查)
 - [ ] 实现变量引用检查 (未声明变量)
@@ -115,21 +119,21 @@
 - [ ] 编写测试验证符号解析
 
 ### 2.2 类型检查器
-- [ ] 实现基本类型推导与检查
+- [ ] 实现基本类型推导与检查 (见 [doc.md §2](./docs/doc.md#2-类型系统与泛型))
 - [ ] 实现可选类型 `?` 拆包检查
 - [ ] 实现联合类型 `|` 类型检查
 - [ ] 实现数组类型检查
 - [ ] 实现 SIMD 向量类型检查
 - [ ] 实现结构体成员访问类型检查
-- [ ] 实现函数签名匹配检查
+- [ ] 实现函数签名匹配检查 (见 [doc.md §5](./docs/doc.md#5-函数与上下文绑定))
 - [ ] 实现泛型单态化 (Monomorphization)
 - [ ] 实现 `typeof` 类型运算
-- [ ] 实现类型断言 `Type! expr` 检查
+- [ ] 实现类型断言 `Type! expr` 检查 (见 [doc.md §10](./docs/doc.md#10-元编程语法糖与安全机制))
 - [ ] 编写 `examples/type_checks.ez` 测试用例
 - [ ] 编写测试验证类型检查
 
 ### 2.3 结构体与方法语义
-- [ ] 实现结构体布局计算与对齐
+- [ ] 实现结构体布局计算与对齐 (见 [doc.md §3](./docs/doc.md#3-结构体组合与内置对象))
 - [ ] 实现结构体展开 `...Base` 语义
 - [ ] 实现方法 `this` 参数绑定检查
 - [ ] 实现字段默认值处理
@@ -138,7 +142,7 @@
 - [ ] 编写测试验证结构体语义
 
 ### 2.4 函数语义检查
-- [ ] 实现参数命名检查与重排
+- [ ] 实现参数命名检查与重排 (见 [doc.md §5](./docs/doc.md#5-函数与上下文绑定))
 - [ ] 实现默认参数处理
 - [ ] 实现返回值类型检查
 - [ ] 实现 `return` 语句位置检查
@@ -149,7 +153,7 @@
 - [ ] 编写测试验证函数语义
 
 ### 2.5 Arena 内存模型分析
-- [ ] 实现作用域与 Arena 游标映射
+- [ ] 实现作用域与 Arena 游标映射 (见 [doc.md §4](./docs/doc.md#4-变量作用域与内存模型))
 - [ ] 实现跨作用域返回值拷贝分析
 - [ ] 实现值语义拷贝点标记
 - [ ] 实现内存对齐检查
@@ -157,7 +161,7 @@
 - [ ] 编写测试验证内存模型分析
 
 ### 2.6 Flow 并发语义分析
-- [ ] 实现 `flow { }` 块检测
+- [ ] 实现 `flow { }` 块检测 (见 [doc.md §6](./docs/doc.md#6-flow-并发运行时))
 - [ ] 实现阻塞操作 suspend point 标记
 - [ ] 实现 `race()` 函数语义分析
 - [ ] 实现数据流依赖分析
@@ -165,7 +169,7 @@
 - [ ] 编写测试验证并发语义分析
 
 ### 2.7 Extern 语义分析
-- [ ] 实现 `extern` 库路径解析与存在性检查
+- [ ] 实现 `extern` 库路径解析与存在性检查 (见 [doc.md §9](./docs/doc.md#9-模块系统与外部链接))
 - [ ] 实现 `for target` 子句目标平台验证
 - [ ] 实现 `declare` 符号与 `extern` 库的关联检查
 - [ ] 实现跨模块 extern 符号导出检查
@@ -176,8 +180,10 @@
 
 ## 阶段 3: LLVM IR 代码生成 (llvmlite)
 
+> 📚 **参考文档**: [`docs/doc.md`](./docs/doc.md) - LLVM 映射规范
+
 ### 3.1 基础类型映射
-- [ ] 实现整数类型映射 (I8, I32, I64, U8, etc.)
+- [ ] 实现整数类型映射 (I8, I32, I64, U8, etc.) (见 [doc.md §2 LLVM 映射](./docs/doc.md#2-类型系统与泛型))
 - [ ] 实现浮点类型映射 (F32, F64)
 - [ ] 实现 `Str` 类型映射与内存布局
 - [ ] 实现 `Bool` 类型映射
@@ -194,7 +200,7 @@
 - [ ] 编写测试验证复合类型 IR 生成
 
 ### 3.3 结构体与方法代码生成
-- [ ] 实现结构体类型 LLVM 映射
+- [ ] 实现结构体类型 LLVM 映射 (见 [doc.md §3 LLVM 映射](./docs/doc.md#3-结构体组合与内置对象))
 - [ ] 实现结构体字段 `getelementptr` 访问
 - [ ] 实现结构体初始化与默认值
 - [ ] 实现结构体展开 `...Base` memcpy
@@ -204,7 +210,7 @@
 - [ ] 编写测试验证结构体 IR 生成
 
 ### 3.4 表达式与运算符代码生成
-- [ ] 实现算术运算符 IR 生成 (`add`, `sub`, `mul`, `sdiv`/`udiv`, `srem`/`urem`)
+- [ ] 实现算术运算符 IR 生成 (`add`, `sub`, `mul`, `sdiv`/`udiv`, `srem`/`urem`) (见 [doc.md §8 LLVM 映射](./docs/doc.md#8-运算符表达式与-simd))
 - [ ] 实现位运算符 IR 生成 (`and`, `or`, `xor`, `shl`, `lshr`/`ashr`)
 - [ ] 实现比较运算符 IR 生成 (`icmp`, `fcmp`)
 - [ ] 实现逻辑运算符短路求值 (分支 + phi)
@@ -213,7 +219,7 @@
 - [ ] 编写测试验证表达式 IR 生成
 
 ### 3.5 变量与内存代码生成
-- [ ] 实现 `let` / `const` 局部变量 `alloca`
+- [ ] 实现 `let` / `const` 局部变量 `alloca` (见 [doc.md §4 LLVM 映射](./docs/doc.md#4-变量作用域与内存模型))
 - [ ] 实现 `static` 全局变量
 - [ ] 实现值语义拷贝 `llvm.memcpy`
 - [ ] 实现 Arena 分配器集成
@@ -222,7 +228,7 @@
 - [ ] 编写测试验证内存模型 IR 生成
 
 ### 3.6 流程控制代码生成
-- [ ] 实现条件表达式 `phi` 节点
+- [ ] 实现条件表达式 `phi` 节点 (见 [doc.md §7 LLVM 映射](./docs/doc.md#7-流程控制))
 - [ ] 实现条件语句分支跳转
 - [ ] 实现 `loop` 循环结构 (br + phi)
 - [ ] 实现 `match` 模式匹配代码生成
@@ -231,7 +237,7 @@
 - [ ] 编写测试验证流程控制 IR 生成
 
 ### 3.7 函数代码生成
-- [ ] 实现函数定义与基本块
+- [ ] 实现函数定义与基本块 (见 [doc.md §5 LLVM 映射](./docs/doc.md#5-函数与上下文绑定))
 - [ ] 实现具名参数重排
 - [ ] 实现默认参数注入
 - [ ] 实现 `return` 语句
@@ -243,7 +249,7 @@
 - [ ] 编写测试验证函数 IR 生成
 
 ### 3.8 模块系统代码生成
-- [ ] 实现 `import` 符号解析
+- [ ] 实现 `import` 符号解析 (见 [doc.md §9 LLVM 映射](./docs/doc.md#9-模块系统与外部链接))
 - [ ] 实现 `export` 符号导出
 - [ ] 实现 `declare` 外部函数/变量声明
 - [ ] 实现 `extern` 库路径传递给 LLVM 链接器
@@ -258,15 +264,17 @@
 
 ## 阶段 4: 标准库实现 (packages/std)
 
+> 📚 **参考文档**: [`docs/stdlib.md`](./docs/stdlib.md) - EzLang 标准库设计文档
+
 ### 4.1 内存与错误处理 (`std/mem`)
-- [ ] 实现 `copy(dst, src, count)` → `llvm.memcpy`
+- [ ] 实现 `copy(dst, src, count)` → `llvm.memcpy` (见 [stdlib.md §1](./docs/stdlib.md#1-内存与错误处理-stdmem))
 - [ ] 实现 `memset(dst, value, count)` → `llvm.memset`
 - [ ] 实现 `allocRaw(size)` → Arena 分配
 - [ ] 定义 `errCancel`, `errTimeout`, `errUnsupported`, `errIO`, `errNotFound`, `errPermission` 常量
 - [ ] 编写测试验证 `std/mem`
 
 ### 4.2 输入输出 (`std/io`)
-- [ ] 实现 `print(msg)` → 平台相关输出
+- [ ] 实现 `print(msg)` → 平台相关输出 (见 [stdlib.md §2](./docs/stdlib.md#2-输入输出-stdio))
   - Linux/macOS/Windows: `printf` / `stdout`
   - Android: `__android_log_print`
   - iOS: `NSLog`
@@ -277,7 +285,7 @@
 - [ ] 编写测试验证 `std/io`
 
 ### 4.3 文件系统 (`std/fs`)
-- [ ] 定义 `FileStat` 结构体
+- [ ] 定义 `FileStat` 结构体 (见 [stdlib.md §3](./docs/stdlib.md#3-文件系统-stdfs))
 - [ ] 实现 `readFile(path)` → `Blob?`
 - [ ] 实现 `writeFile(path, content)` → `Bool`
 - [ ] 实现 `appendFile(path, content)` → `Bool`
@@ -294,7 +302,7 @@
 - [ ] 编写测试验证 `std/fs`
 
 ### 4.4 操作系统接口 (`std/os`)
-- [ ] 实现 `args()` → `Str[]`
+- [ ] 实现 `args()` → `Str[]` (见 [stdlib.md §4](./docs/stdlib.md#4-操作系统接口-stdos))
 - [ ] 实现 `env(key)` → `Str?`
 - [ ] 实现 `setEnv(key, value)` → `Bool`
 - [ ] 实现 `cwd()` → `Str`
@@ -305,7 +313,7 @@
 - [ ] 编写测试验证 `std/os`
 
 ### 4.5 时间 (`std/time`)
-- [ ] 定义 `Duration` 结构体与方法
+- [ ] 定义 `Duration` 结构体与方法 (见 [stdlib.md §5](./docs/stdlib.md#5-时间-stdtime))
 - [ ] 实现 `now()` → `Date`
 - [ ] 实现 `timestamp()` → `I64`
 - [ ] 实现 `sleep(ms)` → 同步阻塞 (flow 外) / suspend point (flow 内)
@@ -313,7 +321,7 @@
 - [ ] 编写测试验证 `std/time`
 
 ### 4.6 网络 HTTP 客户端 (`std/net/http`)
-- [ ] 定义 `Headers` 类型
+- [ ] 定义 `Headers` 类型 (见 [stdlib.md §6](./docs/stdlib.md#6-网络-stdnet))
 - [ ] 定义 `HttpRequest` 结构体
 - [ ] 定义 `HttpResponse` 结构体与 `text()` 方法
 - [ ] 实现 `fetch(url)` → `HttpResponse?`
@@ -326,14 +334,14 @@
 - [ ] 编写测试验证 HTTP 客户端
 
 ### 4.7 网络 HTTP 服务端 (`std/net/http`)
-- [ ] 定义 `RouteHandler` 类型
+- [ ] 定义 `RouteHandler` 类型 (见 [stdlib.md §6.2](./docs/stdlib.md#62-http-服务端))
 - [ ] 定义 `HttpServer` 结构体与方法 (`on`, `start`, `stop`)
 - [ ] 实现 `createServer(host, port)` → `HttpServer`
 - [ ] 实现 flow 内并发调度
 - [ ] 编写测试验证 HTTP 服务端 (桌面平台)
 
 ### 4.8 网络 TCP/UDP (`std/net`)
-- [ ] 定义 `TcpConn` 结构体 (`read`, `write`, `close`)
+- [ ] 定义 `TcpConn` 结构体 (`read`, `write`, `close`) (见 [stdlib.md §6.3-6.4](./docs/stdlib.md#63-tcp))
 - [ ] 定义 `TcpListener` 结构体 (`accept`, `close`)
 - [ ] 实现 `tcpConnect(host, port)` → `TcpConn?`
 - [ ] 实现 `tcpListen(host, port)` → `TcpListener?`
@@ -342,18 +350,18 @@
 - [ ] 编写测试验证 TCP/UDP
 
 ### 4.9 WebSocket (`std/net/ws`)
-- [ ] 定义 `WsConn` 结构体 (`send`, `recv`, `close`)
+- [ ] 定义 `WsConn` 结构体 (`send`, `recv`, `close`) (见 [stdlib.md §6.5](./docs/stdlib.md#65-websocket))
 - [ ] 实现 `wsConnect(url)` → `WsConn?`
 - [ ] 实现 flow 内 `recv()` suspend point
 - [ ] 编写测试验证 WebSocket
 
 ### 4.10 数据结构扩展 (`std/collections`)
-- [ ] 实现 `List<T>` 扩展方法 (`push`, `pop`, `shift`, `unshift`, `sort`, `filter`, `map`, `find`, `len`, `slice`)
+- [ ] 实现 `List<T>` 扩展方法 (`push`, `pop`, `shift`, `unshift`, `sort`, `filter`, `map`, `find`, `len`, `slice`) (见 [stdlib.md §7](./docs/stdlib.md#7-数据结构扩展-stdcollections))
 - [ ] 实现 `Dict<K, V>` 扩展方法 (`keys`, `values`, `has`, `delete`, `len`)
 - [ ] 编写测试验证集合扩展
 
 ### 4.11 格式化与编码 (`std/fmt`)
-- [ ] 实现 `toString<T>(value)` → `Str`
+- [ ] 实现 `toString<T>(value)` → `Str` (见 [stdlib.md §8](./docs/stdlib.md#8-格式化与编码-stdfmt))
 - [ ] 实现 `parseInt(s)` → `I32?`
 - [ ] 实现 `parseI64(s)` → `I64?`
 - [ ] 实现 `parseF64(s)` → `F64?`
@@ -372,8 +380,10 @@
 
 ## 阶段 5: Flow 运行时 (Runtime)
 
+> 📚 **参考文档**: [`docs/doc.md`](./docs/doc.md) §6 - Flow 并发语义
+
 ### 5.1 运行时核心
-- [ ] 实现协程调度器 (协作式多任务)
+- [ ] 实现协程调度器 (协作式多任务) (见 [doc.md §6](./docs/doc.md#6-flow-并发运行时))
 - [ ] 实现 suspend point 机制
 - [ ] 实现 wakeup 回调注册
 - [ ] 实现事件循环 (epoll / kqueue / IOCP / WASI)
@@ -388,7 +398,7 @@
 - [ ] 编写测试验证 IO 事件
 
 ### 5.3 Race 与 Cancel
-- [ ] 实现 `race(pl, timeout)` 函数
+- [ ] 实现 `race(pl, timeout)` 函数 (见 [doc.md §6](./docs/doc.md#6-flow-并发运行时))
 - [ ] 实现任务取消传播
 - [ ] 实现 `errCancel` / `errTimeout` 错误抛出
 - [ ] 实现 suspend source 取消
@@ -398,31 +408,33 @@
 
 ## 阶段 6: CLI 工具链实现
 
+> 📚 **参考文档**: [`docs/toolchain.md`](./docs/toolchain.md) - EzLang 工具链与项目配置指南
+
 ### 6.1 `ez` 命令入口
-- [ ] 实现 CLI 参数解析 (argparse / click)
+- [ ] 实现 CLI 参数解析 (argparse / click) (见 [toolchain.md §1](./docs/toolchain.md#1-命令行工具-cli))
 - [ ] 实现子命令路由
 - [ ] 实现全局选项 (`--help`, `--version`, `-v` verbose)
 - [ ] 编写 `cli/ez.py` 入口文件
 
 ### 6.2 `ez build` 编译命令
-- [ ] 实现 `project.toml` 解析 (`[project]`, `[[output]]`)
+- [ ] 实现 `project.toml` 解析 (`[project]`, `[[output]]`) (见 [toolchain.md §2](./docs/toolchain.md#2-projecttoml-字段与枚举说明))
 - [ ] 实现源文件发现与依赖图
 - [ ] 实现编译管道: parse → semantic → IR → object
-- [ ] 实现多目标交叉编译 (arch + os)
+- [ ] 实现多目标交叉编译 (arch + os) (见 [toolchain.md §3-4](./docs/toolchain.md#3-projecttoml-完整示例))
 - [ ] 实现优化等级支持 (`optimize = 0-3`)
 - [ ] 实现插件加载 (`[[plugins]]`)
 - [ ] 实现输出目录管理 (`dir`)
 - [ ] 编写测试验证 `ez build`
 
 ### 6.3 `ez run` 运行命令
-- [ ] 实现本地可执行文件构建与运行
+- [ ] 实现本地可执行文件构建与运行 (见 [toolchain.md §1.3](./docs/toolchain.md#1-命令行工具-cli))
 - [ ] 实现 stdin/stdout 重定向
 - [ ] 实现退出码透传
 - [ ] 验证非本地目标报错 (android/ios/emcc)
 - [ ] 编写测试验证 `ez run`
 
 ### 6.4 `ez install` 依赖安装
-- [ ] 实现 `[deps]` 解析
+- [ ] 实现 `[deps]` 解析 (见 [toolchain.md §2.6](./docs/toolchain.md#2-projecttoml-字段与枚举说明))
 - [ ] 实现本地路径依赖 (`"./lib/std.ez"`)
 - [ ] 实现 Workspace 内部依赖 (`"@workspace"`)
 - [ ] 实现版本号远端依赖下载 (`"0.1.0"`)
@@ -437,7 +449,7 @@
 - [ ] 编写测试验证 `ez fmt`
 
 ### 6.6 `ez release` 发布命令
-- [ ] 实现包元数据收集
+- [ ] 实现包元数据收集 (见 [toolchain.md §2.1](./docs/toolchain.md#2-projecttoml-字段与枚举说明))
 - [ ] 实现注册表 API 调用 (`registry` 字段)
 - [ ] 实现包文件打包与上传
 - [ ] 实现版本号验证
@@ -450,7 +462,7 @@
 
 ### 7.1 编译器端到端测试
 - [ ] 编译 `examples/hello.ez` 并运行验证输出
-- [ ] 编译 `examples/types.ez` 验证类型系统
+- [ ] 编译 `examples/types.ez` 验证类型系统 (见 [doc.md §2](./docs/doc.md#2-类型系统与泛型))
 - [ ] 编译 `examples/structs.ez` 验证结构体
 - [ ] 编译 `examples/functions.ez` 验证函数
 - [ ] 编译 `examples/control.ez` 验证流程控制
@@ -459,7 +471,7 @@
 - [ ] 编译 `examples/arena.ez` 验证内存模型
 
 ### 7.2 标准库集成测试
-- [ ] `std/io` 打印与输入测试
+- [ ] `std/io` 打印与输入测试 (见 [stdlib.md §2](./docs/stdlib.md#2-输入输出-stdio))
 - [ ] `std/fs` 文件读写测试
 - [ ] `std/os` 系统调用测试
 - [ ] `std/time` 时间与睡眠测试
@@ -469,29 +481,29 @@
 - [ ] `std/fmt` 编码解码测试
 
 ### 7.3 Flow 并发集成测试
-- [ ] 测试 flow 内无依赖 IO 并发
+- [ ] 测试 flow 内无依赖 IO 并发 (见 [doc.md §6](./docs/doc.md#6-flow-并发运行时))
 - [ ] 测试 flow 内有依赖自动等待
 - [ ] 测试 race 取首个完成结果
 - [ ] 测试 race timeout 取消
 - [ ] 测试 cancel 传播与错误处理
 
 ### 7.4 多平台编译测试
-- [ ] Linux x86_64 编译与运行
+- [ ] Linux x86_64 编译与运行 (见 [toolchain.md §4](./docs/toolchain.md#4-交叉编译说明))
 - [ ] macOS aarch64 编译与运行
 - [ ] Windows x86_64 交叉编译
-- [ ] Android aarch64 交叉编译
-- [ ] iOS aarch64 交叉编译
-- [ ] Emscripten wasm32 编译
+- [ ] Android aarch64 交叉编译 (见 [ez-android-ui.md](./docs/ez-android-ui.md))
+- [ ] iOS aarch64 交叉编译 (见 [ez-ios-ui.md](./docs/ez-ios-ui.md))
+- [ ] Emscripten wasm32 编译 (见 [ez-web-ui.md](./docs/ez-web-ui.md))
 
 ---
 
 ## 阶段 8: 文档与收尾
 
 ### 8.1 文档完善
-- [ ] 编写编译器架构文档
+- [ ] 编写编译器架构文档 (见 [docs/](./docs/) - 已有基础文档待扩展)
 - [ ] 编写运行时设计文档
-- [ ] 编写 CLI 工具使用手册
-- [ ] 编写标准库 API 文档
+- [ ] 编写 CLI 工具使用手册 (见 [toolchain.md](./docs/toolchain.md))
+- [ ] 编写标准库 API 文档 (见 [stdlib.md](./docs/stdlib.md))
 - [ ] 编写示例教程
 
 ### 8.2 性能优化
