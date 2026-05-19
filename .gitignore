@@ -151,3 +151,15 @@ vite.config.ts.timestamp-*
 
 # WASM files
 *.wasm
+
+# 忽略根目录的虚拟环境文件/目录
+**/venv/bin/
+**/venv/include/
+**/venv/lib/
+**/venv/lib64/
+**/venv/share/
+**/venv/pyvenv.cfg
+
+# 忽略pip相关的日志和缓存
+pip-log.txt
+pip-delete-this-directory.txt

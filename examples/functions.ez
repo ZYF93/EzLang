@@ -1,4 +1,6 @@
 // functions.ez - 验证函数调用、命名参数、默认参数
+
+// 基本函数
 const add = (a: I32, b: I32 = 1) => {
     return a + b;
 };
@@ -7,9 +9,26 @@ const scale = (value: I32, factor: I32 = 2) => {
     return value * factor;
 };
 
+// 递归函数
 const fib = (n: I32) => {
     return (n <= 1) ? n : fib(n = n - 1) + fib(n = n - 2);
 };
+
+// 函数类型
+type BinaryFn = (a: I32, b: I32) => I32;
+
+// 柯里化
+const addTwo = add(a = 2, b = ?);
+
+// 管道语法
+const piped = 10 -> add(a = %, b = 5);
+const result = 100
+    -> add(a = %, b = 50)
+    -> scale(value = %, factor = 2);
+
+// 字符串插值
+const name = "World";
+const greeting = "Hello {{name}}!";
 
 const run = () => {
     let reordered = add(b = 2, a = 1);

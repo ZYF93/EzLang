@@ -1,18 +1,50 @@
 // control.ez - 验证控制流
+
 let x = 10;
+
+// 条件语句
 (x > 5) ? {
     x = x + 1;
 } : {
     x = x - 1;
 };
 
+// 单行条件
+(x > 0) ? print(msg = "positive");
+
+// 条件表达式
+let y = (x > 5) ? 100 : 200;
+
+// 循环
 loop i in 0...10 {
     (i == 5) ? break;
+    (i == 3) ? continue;
+    print(msg = i);
 }
 
+// 无限循环
+let counter = 0;
+loop {
+    counter = counter + 1;
+    (counter >= 10) ? break;
+}
+
+// match 模式匹配
 let result = 0;
 match {
     (x == 10) ? { result = 1; },
     (x == 20) ? { result = 2; },
     (true) ? { result = 3; }
 }
+
+// throw / catch 异常处理
+const caught = catch {
+    throw Error(code = 404, message = "Not Found");
+};
+
+// flow 并发块
+const flow_result = flow {
+    const a = fetchData(url = "a");
+    const b = fetchData(url = "b");
+    return a + b;
+};
