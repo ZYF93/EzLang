@@ -4,6 +4,24 @@
 
 ---
 
+## 开发原则
+
+1. **TDD 优先**: 先写 `examples/*.ez` 测试用例，在测试代码中引入`examples/*.ez` 再写编译器代码让测试通过
+2. **语法先行**: 每次语言特性或语法改动，优先修改 `grammar/EzLang.g4`，然后使用 ANTLR4 CLI 工具重新生成解析器代码
+3. **小步提交**: 每个小功能完成即提交，保持主分支可运行
+4. **平台抽象**: 标准库上层 API 统一，底层通过 `declare` 链接不同平台实现
+5. **值语义**: 默认按值传递，利用 Arena 自动管理内存，避免显式 `free`
+6. **Flow 语义**: 所有阻塞 IO 在 flow 内自动并发，flow 外同步阻塞，不引入 async/await
+7. **一致性**: 确保语法和[`docs/doc.md`](./docs/doc.md)完全一致，不允许私自修改语法。
+
+### ANTLR4 代码生成命令
+```bash
+cd grammar
+antlr4 -Dlanguage=Python3 -o ../compiler/src/parser EzLang.g4
+```
+
+---
+
 ## 阶段 0: 项目基础设施
 
 ### 0.1 项目结构初始化
@@ -532,20 +550,3 @@
 | M6     | 标准库网络完成    | std/net HTTP/TCP/UDP/WebSocket            |
 | M7     | 多平台编译完成    | Linux/macOS/Windows/Android/iOS/emcc      |
 | M8     | 1.0 发布          | 完整文档, 所有测试通过                    |
-
----
-
-## 开发原则
-
-1. **TDD 优先**: 先写 `examples/*.ez` 测试用例，再写编译器代码让测试通过
-2. **语法先行**: 每次语言特性或语法改动，优先修改 `grammar/EzLang.g4`，然后使用 ANTLR4 CLI 工具重新生成解析器代码
-3. **小步提交**: 每个小功能完成即提交，保持主分支可运行
-4. **平台抽象**: 标准库上层 API 统一，底层通过 `declare` 链接不同平台实现
-5. **值语义**: 默认按值传递，利用 Arena 自动管理内存，避免显式 `free`
-6. **Flow 语义**: 所有阻塞 IO 在 flow 内自动并发，flow 外同步阻塞，不引入 async/await
-
-### ANTLR4 代码生成命令
-```bash
-cd grammar
-antlr4 -Dlanguage=Python3 -o ../compiler/src/parser EzLang.g4
-```
