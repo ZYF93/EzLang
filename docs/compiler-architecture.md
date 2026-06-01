@@ -1,0 +1,62 @@
+# EzLang 编译器架构
+
+EzLang 编译器采用小型分层结构，目标是把 `.ez` 源码转换为 LLVM IR，并由 CLI 进一步生成目标平台对象文件。
+
+## 编译阶段
+
+1. **词法与语法分析**
+   - 语法定义位于 [grammar/EzLang.g4](../grammar/EzLang.g4)。
+   - 使用 ANTLR4 生成 Python 解析器到 [compiler/src/parser/](../compiler/src/parser/)。
+   - 解析入口是 `compilationUnit`。
+
+2. **语义分析**
+   - 实现位于 [compiler/src/semantic/analyzer.py](../compiler/src/semantic/analyzer.py)。
+   - 负责符号表、作用域、类型检查、flow suspend point 分析、extern 与 declare 关联。
+   - 符号和类型结构位于 [compiler/src/semantic/symbols.py](../compiler/src/semantic/symbols.py)。
+
+3. **LLVM IR 生成**
+   - 实现位于 [compiler/src/codegen/llvm_codegen.py](../compiler/src/codegen/llvm_codegen.py)。
+   - 使用 llvmlite 构建 Module、Function、BasicBlock 与指令。
+   - 内建 Arena、Dict、Flow hook 和部分标准库 intrinsic 在此层生成。
+
+4. **CLI 工具链**
+   - 实现位于 [cli/ez.py](../cli/ez.py)。
+   - 负责读取 `project.toml`、发现 import 依赖、调用语义分析和 codegen、写出 `.ll` / `.o`，并在本机目标下链接运行。
+
+## 重要数据流
+
+```text
+.ez 源码
+  -> ANTLR Lexer/Parser
+  -> Parse Tree
+  -> SemanticAnalyzer
+  -> LLVMCodeGenerator
+  -> LLVM IR
+  -> object / executable
+```
+
+## 模块与标准库
+
+- 用户源码通过 `from "path" import { ... }` 导入模块。
+- CLI 会先展开依赖图，再把源码按依赖顺序合并编译。
+- 标准库位于 [packages/std/](../packages/std/)。
+- 标准库上层 `.ez` 文件只暴露统一 API；平台实现通过 `@std/native/*.c` 或 `@std/emcc/*.js` 封装。
+
+## 内存模型
+
+- 编译器内建 Arena 分配器，默认用于聚合值和临时结构。
+- 块作用域进入时保存 Arena 游标，退出时恢复。
+- 跨作用域返回聚合值时按值加载，避免返回已回收区域的指针。
+
+## Flow 模型
+
+- `flow {}` 在语义层记录阻塞调用和依赖关系。
+- LLVM 层插入 `__ezrt_flow_enter`、`__ezrt_flow_exit`、`__ezrt_sleep`、`__ezrt_race` 等运行时 hook。
+- 当前运行时 hook 是稳定 ABI 边界，后续可替换为真实调度器实现。
+
+## 外部链接
+
+- `extern "..." for target` 会被语义层和 codegen 按目标过滤。
+- `declare` 默认绑定到最近的 active extern。
+- `std/mem` 的 `copy` / `set` / `allocRaw` 是 compiler builtin，不需要 extern。
+- 尚未实现的 `std/collections` 泛型扩展会明确报错，避免生成悬空 LLVM declare。

@@ -1,0 +1,27 @@
+// std/time.ez - 时间标准库
+// 依赖: EzLang 标准库封装层（C/JS）
+
+extern "@std/native/time.c" for linux;
+extern "@std/native/time.c" for macos;
+extern "@std/native/time.c" for windows;
+extern "@std/native/time.c" for android;
+extern "@std/native/time.c" for ios;
+extern "@std/emcc/time.js" for emcc;
+
+// === 时间间隔结构体 ===
+export struct Duration {
+    ms: I64;
+};
+
+// === 时间函数 ===
+export declare const now: () => Date;
+export declare const timestamp: () => I64;
+export declare const sleep: (ms: I64) => Void;
+
+// === Date 方法 ===
+export declare const getYear: (this: Date) => I32;
+export declare const getMonth: (this: Date) => I32;
+export declare const getDay: (this: Date) => I32;
+export declare const add: (this: Date, year: I32?, month: I32?, day: I32?, hour: I32?, minute: I32?, second: I32?) => Void;
+export declare const sub: (this: Date, year: I32?, month: I32?, day: I32?, hour: I32?, minute: I32?, second: I32?) => Void;
+export declare const format: (this: Date, fmt: Str) => Str;

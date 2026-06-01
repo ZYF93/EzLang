@@ -1,0 +1,21 @@
+// std/collections.ez - 数据结构扩展标准库
+// 泛型模板函数，由编译器单态化生成，无需外部链接
+
+// === List<T> 扩展方法 ===
+export declare const listPush: <T>(list: List<T>, item: T) => Void;
+export declare const listPop: <T>(list: List<T>) => T?;
+export declare const listShift: <T>(list: List<T>) => T?;
+export declare const listUnshift: <T>(list: List<T>, item: T) => Void;
+export declare const listSort: <T>(list: List<T>, cmp: (a: T, b: T) => I32) => Void;
+export declare const listFilter: <T>(list: List<T>, pred: (item: T) => Bool) => List<T>;
+export declare const listMap: <T, U>(list: List<T>, f: (item: T) => U) => List<U>;
+export declare const listFind: <T>(list: List<T>, pred: (item: T) => Bool) => T?;
+export declare const listLen: <T>(list: List<T>) => I64;
+export declare const listSlice: <T>(list: List<T>, start: I64, end: I64) => List<T>;
+
+// === Dict<K, V> 扩展方法 ===
+export declare const dictKeys: <K, V>(dict: Dict<K, V>) => K[];
+export declare const dictValues: <K, V>(dict: Dict<K, V>) => V[];
+export declare const dictHas: <K, V>(dict: Dict<K, V>, key: K) => Bool;
+export declare const dictDelete: <K, V>(dict: Dict<K, V>, key: K) => Bool;
+export declare const dictLen: <K, V>(dict: Dict<K, V>) => I64;

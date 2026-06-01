@@ -23,8 +23,10 @@ TYPEOF: 'typeof';
 RETURN: 'return';
 IN: 'in';
 FOR: 'for';
+AS: 'as';
+EXTERN: 'extern';
 
-// 基本类型
+// 基本类型关键字
 I8: 'I8';
 I32: 'I32';
 I64: 'I64';
@@ -47,14 +49,16 @@ ANDROID: 'android';
 IOS: 'ios';
 EMCC: 'emcc';
 
-// 标识符
-IDENTIFIER: [a-zA-Z_] [a-zA-Z0-9_]*;
-
-// 字面量
-INTEGER_LITERAL: '-'? (DECIMAL | BINARY | OCTAL | HEX);
-FLOAT_LITERAL: '-'? (DECIMAL '.' DECIMAL? EXPONENT? | DECIMAL EXPONENT);
-STRING_LITERAL: '"' (~["\\\r\n] | '\\' .)* '"';
+// 字面量（BOOL_LITERAL 必须在 IDENTIFIER 之前，否则 true/false 被识别为标识符）
 BOOL_LITERAL: 'true' | 'false';
+INTEGER_LITERAL: DECIMAL | BINARY | OCTAL | HEX;
+FLOAT_LITERAL: DECIMAL '.' DECIMAL EXPONENT? | DECIMAL EXPONENT;
+STRING_LITERAL: '"' (~["\\\r\n] | '\\' .)* '"';
+
+// 标识符（必须在所有关键字和字面量之后）
+// 类型名以大写字母开头（如 User, Point），变量名以小写或下划线开头（如 user, count）
+TYPE_IDENTIFIER: [A-Z] [a-zA-Z0-9_]*;
+VAR_IDENTIFIER: [a-z_] [a-zA-Z0-9_]*;
 
 // 标点符号
 LPAREN: '(';
@@ -100,9 +104,9 @@ PIPE_ASSIGN: '|=';
 CARET_ASSIGN: '^=';
 SHL_ASSIGN: '<<=';
 SHR_ASSIGN: '>>=';
-ARROW: '->';
+FAT_ARROW: '=>';
+THIN_ARROW: '->';
 ELLIPSIS: '...';
-SPREAD: '...';
 
 // 注释
 LINE_COMMENT: '//' ~[\r\n]* -> channel(HIDDEN);
@@ -125,20 +129,22 @@ compilationUnit: (statement | declaration | externDecl)* EOF;
 
 // 声明
 declaration:
-    variableDecl
+    functionDecl
+    | variableDecl
     | structDecl
     | typeAliasDecl
-    | functionDecl
     | importDecl
     | exportDecl
     | declareDecl;
 
 // 变量声明
-variableDecl: (LET | CONST | STATIC) IDENTIFIER (':' type_)? ASSIGN expression ';'?;
+variableDecl: decorator* (LET | CONST | STATIC) VAR_IDENTIFIER (':' type_)? ASSIGN expression ';'?;
+
+decorator: AT VAR_IDENTIFIER;
 
 // 结构体声明
 structDecl:
-    STRUCT IDENTIFIER genericParams? '{' structMember* '}';
+    STRUCT TYPE_IDENTIFIER genericParams? '{' structMember* '}' ';'?;
 
 structMember:
     structField
@@ -148,25 +154,25 @@ structMember:
 structSpread: ELLIPSIS type_ ';'?;
 
 structField:
-    IDENTIFIER ':' type_ (ASSIGN expression)? ';'?;
+    VAR_IDENTIFIER ':' type_ (ASSIGN expression)? ';'?;
 
 structMethod:
-    IDENTIFIER ASSIGN functionLiteral ';'?;
+    VAR_IDENTIFIER ASSIGN functionLiteral ';'?;
 
 // 类型别名
 typeAliasDecl:
-    TYPE IDENTIFIER genericParams? ASSIGN typeShape ';'?;
+    TYPE TYPE_IDENTIFIER genericParams? ASSIGN (typeShape | type_) ';'?;
 
 typeShape: '{' (typeShapeMember | typeShapeSpread)* '}';
 
 typeShapeMember:
-    (IDENTIFIER | '[' IDENTIFIER ':' type_ ']') ':' type_ ';'?;
+    (VAR_IDENTIFIER | '[' VAR_IDENTIFIER ':' type_ ']') ':' type_ (ASSIGN expression)? ';'?;
 
 typeShapeSpread: ELLIPSIS type_ ';'?;
 
 // 函数声明
 functionDecl:
-    (LET | CONST) IDENTIFIER genericParams? ASSIGN functionLiteral ';'?;
+    (LET | CONST) VAR_IDENTIFIER genericParams? ASSIGN functionLiteral ';'?;
 
 // 导入导出
 importDecl:
@@ -176,10 +182,13 @@ importSpecList:
     importSpec (',' importSpec)* ','?;
 
 importSpec:
-    IDENTIFIER (AS IDENTIFIER)?;
+    importName (AS importName)?;
+
+importName:
+    TYPE_IDENTIFIER | VAR_IDENTIFIER;
 
 exportDecl:
-    EXPORT (variableDecl | structDecl | typeAliasDecl | functionDecl);
+    EXPORT (functionDecl | variableDecl | structDecl | typeAliasDecl | declareDecl);
 
 // extern 声明
 externDecl:
@@ -190,52 +199,64 @@ targetPlatform:
 
 // declare 声明
 declareDecl:
-    DECLARE (LET | CONST | STATIC) IDENTIFIER ':' type_ ';'?;
+    DECLARE (LET | CONST | STATIC) VAR_IDENTIFIER ':' type_ ';'?;
 
 // ==================== 类型 ====================
 
 type_:
-    type_ QUESTION                           # optionalType
-    | type_ PIPE type_                       # unionType
-    | type_ '[' ']'                          # arrayType
-    | VEC '<' type_ '>' '[' INTEGER_LITERAL ']'  # vecType
-    | LIST '<' type_ '>'                     # listType
-    | functionType                           # functionTypeRef
-    | LANGLE typeList RANGLE '=>' type_      # genericFunctionType
-    | baseType                               # baseTypeRef
-    | TYPEOF expression                      # typeofType
-    | '(' type_ ')'                          # parenType;
+    type_ QUESTION                                               # optionalType
+    | type_ PIPE type_                                           # unionType
+    | type_ '[' ']'                                              # arrayType
+    | VEC '<' type_ '>' '[' INTEGER_LITERAL ']'                  # vecType
+    | LIST '<' type_ '>'                                         # listType
+    | LANGLE typeList RANGLE '(' paramTypeList? ')' FAT_ARROW type_  # genericParamFunctionType
+    | functionType                                               # functionTypeRef
+    | LANGLE typeList RANGLE FAT_ARROW type_                     # genericFunctionType
+    | baseType                                                   # baseTypeRef
+    | TYPEOF expression                                          # typeofType
+    | '(' type_ ')'                                              # parenType;
 
 baseType:
     I8 | I32 | I64 | U8 | U32 | U64 | F32 | F64 | STR | BOOL | VOID
-    | IDENTIFIER genericArgs?;
+    | TYPE_IDENTIFIER genericArgs?;
 
-genericParams: LANGLE IDENTIFIER (',' IDENTIFIER)* RANGLE;
+genericParams: LANGLE TYPE_IDENTIFIER (',' TYPE_IDENTIFIER)* RANGLE;
 
 genericArgs: LANGLE type_ (',' type_)* RANGLE;
 
 typeList: type_ (',' type_)*;
 
 functionType:
-    '(' paramTypeList? ')' ARROW type_;
+    '(' paramTypeList? ')' FAT_ARROW type_;
 
 paramTypeList:
     paramType (',' paramType)* ','?;
 
 paramType:
-    IDENTIFIER ':' type_;
+    VAR_IDENTIFIER ':' type_;
 
 // ==================== 表达式 ====================
 
 expression:
-    lambdaExpression;
+    assignmentExpression;
 
-lambdaExpression:
-    conditionalExpression;
+assignmentExpression:
+    pipelineExpression (assignmentOperator assignmentExpression)?;
+
+assignmentOperator:
+    ASSIGN | PLUS_ASSIGN | MINUS_ASSIGN | STAR_ASSIGN | SLASH_ASSIGN
+    | PERCENT_ASSIGN | AMPERSAND_ASSIGN | PIPE_ASSIGN | CARET_ASSIGN
+    | SHL_ASSIGN | SHR_ASSIGN;
+
+pipelineExpression:
+    conditionalExpression (THIN_ARROW VAR_IDENTIFIER genericArgs? '(' pipelineArgList? ')')?;
 
 // 条件表达式
 conditionalExpression:
-    orExpression (QUESTION orExpression COLON orExpression)?;
+    rangeExpression (QUESTION conditionalExpression COLON conditionalExpression)?;
+
+rangeExpression:
+    orExpression (ELLIPSIS orExpression)?;
 
 orExpression:
     andExpression (OR andExpression)*;
@@ -274,29 +295,37 @@ unaryExpression:
 
 // 后缀表达式
 postfixExpression:
-    primaryExpression
-    | postfixExpression '.' IDENTIFIER               # memberAccess
-    | postfixExpression '(' namedArgList? ')'       # call
-    | postfixExpression '[' expression ']'          # index
-    | postfixExpression BANG                        # typeAssertion
-    | postfixExpression QUESTION                    # optionalUnwrap
-    | postfixExpression ARROW IDENTIFIER '(' pipelineArgList? ')'  # pipeline;
+    primaryExpression                                                    # primaryExpr
+    | postfixExpression '.' VAR_IDENTIFIER                                   # memberAccess
+    | postfixExpression '(' namedArgList? ')'                           # call
+    | postfixExpression '[' expression ']'                              # index
+    | postfixExpression BANG                                            # typeAssertion
+    | postfixExpression QUESTION                                        # optionalUnwrap
+    | postfixExpression THIN_ARROW VAR_IDENTIFIER genericArgs? '(' pipelineArgList? ')'   # pipeline;
 
 // 主表达式
+// structLiteral 必须在 identifierExpr 之前，否则 Point(x=1) 会被误解析为函数调用
 primaryExpression:
-    literal
-    | IDENTIFIER genericArgs?
-    | '(' expression ')'
-    | block
-    | structLiteral
-    | arrayLiteral
-    | vecLiteral
-    | functionLiteral
-    | flowBlock
-    | matchBlock
-    | catchBlock
-    | loopExpr
-    | ifLikeExpr;
+    literal                                                             # literalExpr
+    | structLiteral                                                      # structLiteralExpr
+    | (VAR_IDENTIFIER | TYPE_IDENTIFIER) genericArgs?                           # identifierExpr
+    | '(' expression ')'                                                 # parenExpr
+    | QUESTION                                                           # placeholderExpr
+    | dictLiteral                                                        # dictExpr
+    | block                                                              # blockExpr
+    | arrayLiteral                                                       # arrayLiteralExpr
+    | vecLiteral                                                         # vecLiteralExpr
+    | functionLiteral                                                    # fnLiteralExpr
+    | flowBlock                                                          # flowBlockExpr
+    | matchBlock                                                         # matchBlockExpr
+    | catchBlock                                                         # catchBlockExpr
+    | loopExpr                                                           # loopPrimaryExpr
+    | ifLikeExpr                                                         # ifLikePrimaryExpr
+    | typeofExpr                                                         # typeofPrimaryExpr
+    | markupLiteral                                                      # markupExpr;
+
+typeofExpr:
+    TYPEOF (expression | type_);
 
 // 字面量
 literal:
@@ -310,25 +339,32 @@ namedArgList:
     namedArg (',' namedArg)* ','?;
 
 namedArg:
-    IDENTIFIER '=' expression;
+    VAR_IDENTIFIER '=' expression;
 
 // 管道参数列表
 pipelineArgList:
     pipelineArg (',' pipelineArg)* ','?;
 
 pipelineArg:
-    IDENTIFIER '=' (expression | '%');
+    VAR_IDENTIFIER '=' (expression | '%');
 
 // 结构体字面量
 structLiteral:
-    IDENTIFIER genericArgs? '(' structFieldInitList? ')';
+    TYPE_IDENTIFIER genericArgs? '(' structFieldInitList? ')';
 
 structFieldInitList:
     structFieldInit (',' structFieldInit)* ','?;
 
 structFieldInit:
     ELLIPSIS expression
-    | IDENTIFIER '=' expression;
+    | VAR_IDENTIFIER '=' expression;
+
+// 字典字面量
+dictLiteral:
+    '{' (dictField (',' dictField)* ','?)? '}';
+
+dictField:
+    VAR_IDENTIFIER (':' type_)? ASSIGN expression;
 
 // 数组字面量
 arrayLiteral:
@@ -341,15 +377,28 @@ vecLiteral:
 expressionList:
     expression (',' expression)* ','?;
 
+// XML 风格标记字面量
+markupLiteral:
+    LANGLE VAR_IDENTIFIER markupAttr* SLASH RANGLE
+    | LANGLE VAR_IDENTIFIER markupAttr* RANGLE markupChild* LANGLE SLASH VAR_IDENTIFIER RANGLE;
+
+markupAttr:
+    VAR_IDENTIFIER ASSIGN (STRING_LITERAL | INTEGER_LITERAL | BOOL_LITERAL | expression);
+
+markupChild:
+    STRING_LITERAL
+    | markupLiteral
+    | LBRACE expression RBRACE;
+
 // 函数字面量
 functionLiteral:
-    genericParams? '(' paramList? ')' (':' type_)? ARROW (expression | block);
+    genericParams? '(' paramList? ')' (':' type_)? FAT_ARROW (expression | block);
 
 paramList:
     param (',' param)* ','?;
 
 param:
-    IDENTIFIER ':' type_ (ASSIGN expression)?;
+    VAR_IDENTIFIER ':' type_ (ASSIGN expression)?;
 
 // 块
 block:
@@ -364,7 +413,7 @@ matchBlock:
     MATCH '{' matchClause* '}';
 
 matchClause:
-    '(' expression ')' QUESTION (expression | block) ','?;
+    '(' expression ')' QUESTION (statement | block) ','?;
 
 // catch 块
 catchBlock:
@@ -376,14 +425,13 @@ ifLikeExpr:
 
 // 循环表达式
 loopExpr:
-    LOOP (IDENTIFIER IN expression)? block;
+    LOOP (VAR_IDENTIFIER IN rangeExpression)? block;
 
 // ==================== 语句 ====================
 
 statement:
     declaration
     | expressionStatement
-    | assignmentStatement
     | returnStatement
     | breakStatement
     | continueStatement
@@ -391,14 +439,6 @@ statement:
 
 expressionStatement:
     expression ';'?;
-
-assignmentStatement:
-    expression assignmentOperator expression ';'?;
-
-assignmentOperator:
-    ASSIGN | PLUS_ASSIGN | MINUS_ASSIGN | STAR_ASSIGN | SLASH_ASSIGN
-    | PERCENT_ASSIGN | AMPERSAND_ASSIGN | PIPE_ASSIGN | CARET_ASSIGN
-    | SHL_ASSIGN | SHR_ASSIGN;
 
 returnStatement:
     RETURN expression? ';'?;

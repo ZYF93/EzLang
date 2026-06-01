@@ -1,14 +1,12 @@
 // arena.ez - 验证内存模型
 struct Data { val: I32; };
 
-const create = () => {
+const create = (): Data => {
     let d = Data(val = 42);
     return d; // 提升到父作用域
 };
 
-const run = () => {
-    let x = 10;
-    let p = Data(val = x);
-    let result = p;
-    return create();
-};
+let x = 10;
+let p = Data(val = x);
+let result = p;
+let created = create();

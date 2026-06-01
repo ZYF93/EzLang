@@ -1,0 +1,21 @@
+// std/mem.ez - 内存与错误处理标准库
+// copy/set 映射到 LLVM 内建函数，无需外部链接
+
+// === 内存操作（编译器内建函数） ===
+
+// 内存拷贝：将 src 的 count 字节拷贝到 dst
+export declare const copy: (dst: Blob, src: Blob, count: I64) => Void;
+
+// 内存设置：将 dst 的 count 字节设置为 value
+export declare const set: (dst: Blob, value: U8, count: I64) => Void;
+
+// 原始内存分配：从 Arena 分配 size 字节并返回 Blob 视图
+export declare const allocRaw: (size: I64) => Blob;
+
+// === 错误码常量 ===
+export const errCancel: I32 = 1;
+export const errTimeout: I32 = 2;
+export const errUnsupported: I32 = 3;
+export const errIO: I32 = 4;
+export const errNotFound: I32 = 5;
+export const errPermission: I32 = 6;

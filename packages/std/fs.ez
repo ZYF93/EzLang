@@ -1,0 +1,34 @@
+// std/fs.ez - 文件系统标准库
+// 依赖: EzLang 标准库封装层（C/JS）
+
+extern "@std/native/fs.c" for linux;
+extern "@std/native/fs.c" for macos;
+extern "@std/native/fs.c" for windows;
+extern "@std/native/fs.c" for android;
+extern "@std/native/fs.c" for ios;
+extern "@std/emcc/fs.js" for emcc;
+
+// === 文件状态结构体 ===
+export struct FileStat {
+    size: I64;
+    isDir: Bool;
+    modified: I64;
+    created: I64;
+};
+
+// === 文件读写 ===
+export declare const readFile: (path: Str) => Blob;
+export declare const writeFile: (path: Str, content: Blob) => Bool;
+export declare const appendFile: (path: Str, content: Blob) => Bool;
+export declare const removeFile: (path: Str) => Bool;
+
+// === 目录操作 ===
+export declare const mkdir: (path: Str) => Bool;
+export declare const removeDir: (path: Str, recursive: Bool) => Bool;
+export declare const listDir: (path: Str) => Str[];
+
+// === 路径查询 ===
+export declare const exists: (path: Str) => Bool;
+export declare const isDir: (path: Str) => Bool;
+export declare const stat: (path: Str) => FileStat?;
+export declare const absPath: (path: Str) => Str;

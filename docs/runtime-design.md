@@ -1,0 +1,62 @@
+# EzLang 运行时设计
+
+EzLang 运行时围绕三个核心目标设计：Arena 内存管理、Flow 并发调度、标准库平台适配。
+
+## Arena 内存管理
+
+编译器在每个 LLVM module 中生成 Arena 基础设施：
+
+- `__arena_buffer`：默认 1MB 缓冲区。
+- `__arena_cursor`：当前分配游标。
+- `__arena_alloc(size, align)`：按对齐分配内存。
+- `__arena_save()`：保存游标。
+- `__arena_restore(cursor)`：恢复游标。
+
+块作用域自动保存和恢复游标。聚合值默认分配在 Arena 中，返回聚合值时由 codegen 生成按值 load。
+
+## Flow 运行时 ABI
+
+Flow 并发相关 hook：
+
+- `__ezrt_flow_enter()`：进入 flow 块。
+- `__ezrt_flow_exit()`：离开 flow 块。
+- `__ezrt_sleep(ms)`：flow 内 sleep suspend point。
+- `__ezrt_race(task, timeout)`：race 调度入口。
+
+当前 codegen 保持这些 hook 的 ABI 稳定。具体平台可替换为 epoll、kqueue、IOCP、WASI 或浏览器事件循环。
+
+## 阻塞调用与 suspend point
+
+语义分析器维护阻塞调用集合，例如：
+
+- 文件 IO：`readFile`、`writeFile`、`appendFile`
+- 网络 IO：`fetch`、`tcpConnect`、`accept`、`read`、`write`、`recv`、`send`
+- 时间：`sleep`
+
+在 `flow {}` 内出现这些调用时，会记录 suspend point 和数据依赖，供后续运行时调度使用。
+
+## 标准库平台适配
+
+标准库的 `.ez` 文件提供统一 API，底层通过 wrapper 分平台实现：
+
+- 原生平台：`packages/std/native/*.c`
+- Emscripten：`packages/std/emcc/*.js`
+
+例如 `std/fs`：
+
+- 桌面和移动平台走 C 封装。
+- Android/iOS 相对路径会映射到沙盒根目录。
+- emcc 使用 MEMFS，浏览器环境可挂载 `/ezdata` 到 IDBFS 并调用 `FS.syncfs`。
+
+## 错误处理
+
+标准库错误码位于 `std/mem`：
+
+- `errCancel`
+- `errTimeout`
+- `errUnsupported`
+- `errIO`
+- `errNotFound`
+- `errPermission`
+
+运行时错误后续应统一携带：错误码、消息、源位置、调用栈片段。

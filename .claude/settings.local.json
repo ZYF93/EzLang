@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(antlr4 -Dlanguage=Python3 -o ../compiler/src/parser EzLang.g4)"
+    ]
+  }
+}

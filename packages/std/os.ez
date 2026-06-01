@@ -1,0 +1,27 @@
+// std/os.ez - 操作系统接口标准库
+// 依赖: EzLang 标准库封装层（C/JS）
+
+extern "@std/native/os.c" for linux;
+extern "@std/native/os.c" for macos;
+extern "@std/native/os.c" for windows;
+extern "@std/native/os.c" for android;
+extern "@std/native/os.c" for ios;
+extern "@std/emcc/os.js" for emcc;
+
+// === 命令行参数 ===
+export declare const args: () => Str[];
+
+// === 环境变量 ===
+export declare const env: (key: Str) => Str?;
+export declare const setEnv: (key: Str, value: Str) => Bool;
+
+// === 工作目录 ===
+export declare const cwd: () => Str;
+
+// === 进程控制 ===
+export declare const exit: (code: I32) => Void;
+export declare const pid: () => I32;
+
+// === 系统信息 ===
+export declare const platform: () => Str;
+export declare const arch: () => Str;

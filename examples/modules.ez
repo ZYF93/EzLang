@@ -5,12 +5,12 @@ from "./std.ez" import { print, println };
 from "./math.ez" import { add, sub as subtract };
 
 // 导出声明
-export const PI: F64 = 3.14159265359;
+export const pi: F64 = 3.14159265359;
 
 export struct Vector {
     x: F64;
     y: F64;
-    length = (this: Vector) => F64 => {
+    length = (this: Vector): F64 => {
         return sqrt(x = this.x * this.x + this.y * this.y);
     };
 };

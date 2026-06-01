@@ -56,7 +56,7 @@ type DynamicShape = {
 
 // 字典字面量
 let dict = {
-    prop1: I32 = 100;
-    prop2: Str = "value";
+    prop1: I32 = 100,
+    prop2: Str = "value"
 };
 

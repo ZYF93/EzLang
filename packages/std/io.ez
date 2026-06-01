@@ -1,0 +1,17 @@
+// std/io.ez - 输入输出标准库
+// 依赖: EzLang 标准库封装层（C/JS）
+
+extern "@std/native/io.c" for linux;
+extern "@std/native/io.c" for macos;
+extern "@std/native/io.c" for windows;
+extern "@std/native/io.c" for android;
+extern "@std/native/io.c" for ios;
+extern "@std/emcc/io.js" for emcc;
+
+// === 输出函数 ===
+export declare const print: (msg: Str) => Void;
+export declare const println: (msg: Str) => Void;
+export declare const error: (msg: Str) => Void;
+
+// === 输入函数 ===
+export declare const readLine: () => Str?;

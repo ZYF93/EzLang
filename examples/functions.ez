@@ -29,6 +29,18 @@ const result = 100
 // 字符串插值
 const name = "World";
 const greeting = "Hello {{name}}!";
+const ui = <text color="blue">
+    "Welcome"
+    <div id=1 />
+    {1 + 2}
+</text>;
+
+// 装饰器语法
+const log = (this: Meta<I32>): Void => {
+    return;
+};
+
+@log let watched = 1;
 
 const run = () => {
     let reordered = add(b = 2, a = 1);

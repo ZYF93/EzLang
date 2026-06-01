@@ -1,0 +1,34 @@
+// std/fmt.ez - 格式化与编码标准库
+// 依赖: EzLang 标准库封装层（C/JS）
+
+extern "@std/native/fmt.c" for linux;
+extern "@std/native/fmt.c" for macos;
+extern "@std/native/fmt.c" for windows;
+extern "@std/native/fmt.c" for android;
+extern "@std/native/fmt.c" for ios;
+extern "@std/emcc/fmt.js" for emcc;
+
+// === 字符串与数值转换 ===
+export declare const toString: <T>(value: T) => Str;
+export declare const parseInt: (s: Str) => I32?;
+export declare const parseI64: (s: Str) => I64?;
+export declare const parseF64: (s: Str) => F64?;
+
+// === 字符串格式化 ===
+export declare const format: (template: Str, args: Str[]) => Str;
+
+// === Base64 编码 ===
+export declare const b64Encode: (data: Blob) => Str;
+export declare const b64Decode: (s: Str) => Blob?;
+
+// === JSON 编解码 ===
+export declare const jsonStringify: <T>(data: T) => Str;
+export declare const jsonParse: <T>(s: Str) => T;
+
+// === MessagePack 编解码 ===
+export declare const msgpackEncode: <T>(data: T) => Blob;
+export declare const msgpackDecode: <T>(data: Blob) => T;
+
+// === URL 编码 ===
+export declare const urlEncode: (s: Str) => Str;
+export declare const urlDecode: (s: Str) => Str?;

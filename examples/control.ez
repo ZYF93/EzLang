@@ -1,5 +1,22 @@
 // control.ez - 验证控制流
 
+struct Error {
+    code: I32;
+    message: Str;
+};
+
+const print = (msg: Str): Void => {
+    return;
+};
+
+const printInt = (msg: I32): Void => {
+    return;
+};
+
+const fetchData = (url: Str): I32 => {
+    return 1;
+};
+
 let x = 10;
 
 // 条件语句
@@ -19,7 +36,7 @@ let y = (x > 5) ? 100 : 200;
 loop i in 0...10 {
     (i == 5) ? break;
     (i == 3) ? continue;
-    print(msg = i);
+    printInt(msg = i);
 }
 
 // 无限循环

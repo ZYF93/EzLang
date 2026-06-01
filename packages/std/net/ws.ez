@@ -1,0 +1,15 @@
+// std/net/ws.ez - WebSocket 标准库
+// 依赖: EzLang 标准库封装层（C/JS）
+
+extern "@std/native/net/ws.c" for linux;
+extern "@std/native/net/ws.c" for macos;
+extern "@std/native/net/ws.c" for windows;
+extern "@std/native/net/ws.c" for android;
+extern "@std/native/net/ws.c" for ios;
+extern "@std/emcc/net/ws.js" for emcc;
+
+export struct WsConn {
+    handle: I64;
+};
+
+export declare const wsConnect: (url: Str) => WsConn?;

@@ -1,0 +1,25 @@
+// std/net/tcp.ez - TCP/UDP 标准库
+// 依赖: EzLang 标准库封装层（C/JS）
+
+extern "@std/native/net/tcp.c" for linux;
+extern "@std/native/net/tcp.c" for macos;
+extern "@std/native/net/tcp.c" for windows;
+extern "@std/native/net/tcp.c" for android;
+extern "@std/native/net/tcp.c" for ios;
+extern "@std/emcc/net/tcp.js" for emcc;
+
+export struct TcpConn {
+    handle: I64;
+};
+
+export struct TcpListener {
+    handle: I64;
+};
+
+export struct UdpSocket {
+    handle: I64;
+};
+
+export declare const tcpConnect: (host: Str, port: I32) => TcpConn?;
+export declare const tcpListen: (host: Str, port: I32) => TcpListener?;
+export declare const udpBind: (host: Str, port: I32) => UdpSocket?;
