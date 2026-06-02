@@ -1,0 +1,110 @@
+// ez-android-ui - Android View 绑定包
+// 当前提供可编译链接的 ABI 占位；真实 JNI/View 桥接后续接入。
+
+extern "@pkg/ez-android-ui/native/android_ui.c" for linux;
+extern "@pkg/ez-android-ui/native/android_ui.c" for macos;
+extern "@pkg/ez-android-ui/native/android_ui.c" for windows;
+extern "@pkg/ez-android-ui/native/android_ui.c" for android;
+extern "@pkg/ez-android-ui/native/android_ui.c" for ios;
+extern "@pkg/ez-android-ui/native/android_ui.c" for emcc;
+
+export struct Node { id: I32; };
+export struct Color { value: I32; };
+
+export struct TouchEvent {
+    action: Str;
+    x: F32;
+    y: F32;
+};
+
+export struct TextChangedEvent {
+    text: Str;
+    start: I32;
+    count: I32;
+};
+
+export type ClickHandler = () => Void;
+export type TouchHandler = (e: TouchEvent) => Void;
+export type TextChangeHandler = (e: TextChangedEvent) => Void;
+export type CheckChangeHandler = (checked: Bool) => Void;
+
+export const dp: Str = "dp";
+export const sp: Str = "sp";
+export const px: Str = "px";
+export const matchParent: I32 = -1;
+export const wrapContent: I32 = -2;
+
+export const gravity.left: I32 = 0x03;
+export const gravity.right: I32 = 0x05;
+export const gravity.top: I32 = 0x30;
+export const gravity.bottom: I32 = 0x50;
+export const gravity.centerH: I32 = 0x01;
+export const gravity.centerV: I32 = 0x10;
+export const gravity.center: I32 = 0x11;
+
+export const inputType.text: I32 = 0x00000001;
+export const inputType.number: I32 = 0x00000002;
+export const inputType.phone: I32 = 0x00000003;
+export const inputType.email: I32 = 0x00000021;
+export const inputType.password: I32 = 0x00000081;
+
+export const permission.camera: Str = "android.permission.CAMERA";
+export const permission.recordAudio: Str = "android.permission.RECORD_AUDIO";
+export const permission.readMedia: Str = "android.permission.READ_MEDIA_IMAGES";
+export const permission.fineLocation: Str = "android.permission.ACCESS_FINE_LOCATION";
+export const permission.coarseLocation: Str = "android.permission.ACCESS_COARSE_LOCATION";
+export const permission.notifications: Str = "android.permission.POST_NOTIFICATIONS";
+export const permission.readContacts: Str = "android.permission.READ_CONTACTS";
+export const permission.useBiometric: Str = "android.permission.USE_BIOMETRIC";
+
+export declare const createView: () => Node;
+export declare const createLinearLayout: (orientation: Str) => Node;
+export declare const createFrameLayout: () => Node;
+export declare const createScrollView: () => Node;
+export declare const createTextView: () => Node;
+export declare const createEditText: () => Node;
+export declare const createButton: () => Node;
+export declare const createImageView: () => Node;
+export declare const destroyNode: (node: Node) => Void;
+
+export declare const addView: (parent: Node, child: Node) => Void;
+export declare const addViewAt: (parent: Node, child: Node, index: I32) => Void;
+export declare const removeView: (parent: Node, child: Node) => Void;
+export declare const removeAllViews: (parent: Node) => Void;
+export declare const getChildAt: (parent: Node, index: I32) => Node?;
+export declare const getChildCount: (parent: Node) => I32;
+export declare const getParent: (node: Node) => Node?;
+
+export declare const setLayoutWidth: (node: Node, value: I32) => Void;
+export declare const setLayoutHeight: (node: Node, value: I32) => Void;
+export declare const setMargin: (node: Node, left: I32, top: I32, right: I32, bottom: I32) => Void;
+export declare const setPadding: (node: Node, left: I32, top: I32, right: I32, bottom: I32) => Void;
+export declare const setGravity: (node: Node, gravity: I32) => Void;
+
+export declare const setText: (node: Node, text: Str) => Void;
+export declare const getText: (node: Node) => Str;
+export declare const setTextSize: (node: Node, sp: F32) => Void;
+export declare const setTextColor: (node: Node, color: Color) => Void;
+export declare const setBackgroundColor: (node: Node, color: Color) => Void;
+export declare const setVisibility: (node: Node, v: I32) => Void;
+export declare const setEnabled: (node: Node, enabled: Bool) => Void;
+
+export declare const setOnClick: (node: Node, handler: ClickHandler) => Void;
+export declare const setOnTouch: (node: Node, handler: TouchHandler) => Void;
+export declare const setOnTextChanged: (node: Node, handler: TextChangeHandler) => Void;
+export declare const clearOnClick: (node: Node) => Void;
+
+export declare const runOnMainThread: (work: () => Void) => Void;
+export declare const postFrame: (work: () => Void) => I64;
+export declare const cancelFrame: (token: I64) => Void;
+export declare const postDelayed: (work: () => Void, ms: I64) => I64;
+export declare const cancelDelayed: (token: I64) => Void;
+export declare const isMainThread: () => Bool;
+
+export declare const getRootView: () => Node;
+export declare const getScreenDensity: () => F32;
+export declare const getScreenWidth: () => I32;
+export declare const getScreenHeight: () => I32;
+
+export declare const requestPermission: (perm: Str) => Bool;
+export declare const queryPermission: (perm: Str) => Str;

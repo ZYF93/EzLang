@@ -1,6 +1,44 @@
 // EzLang std/net/tcp Emscripten JS 封装层
 mergeInto(LibraryManager.library, {
-  tcpConnect: function (host, port) { return 0; },
-  tcpListen: function (host, port) { return 0; },
-  udpBind: function (host, port) { return 0; },
+  tcpConnect: function (ret, host, port) {
+    HEAPU8[ret] = 0;
+    setValue(ret + 8, 0, 'i64');
+  },
+  tcpListen: function (ret, host, port) {
+    HEAPU8[ret] = 0;
+    setValue(ret + 8, 0, 'i64');
+  },
+  tcpAccept: function (ret, listener) {
+    HEAPU8[ret] = 0;
+    setValue(ret + 8, 0, 'i64');
+  },
+  tcpRead: function (ret, conn, maxBytes) {
+    HEAPU8[ret] = 0;
+    setValue(ret + 8, 0, '*');
+    setValue(ret + 16, 0, 'i64');
+  },
+  tcpWrite: function (conn, data) {
+    return -1;
+  },
+  tcpClose: function (conn) {
+    return 0;
+  },
+  tcpListenerClose: function (listener) {
+    return 0;
+  },
+  udpBind: function (ret, host, port) {
+    HEAPU8[ret] = 0;
+    setValue(ret + 8, 0, 'i64');
+  },
+  udpSend: function (socket, host, port, data) {
+    return -1;
+  },
+  udpRecv: function (ret, socket, maxBytes) {
+    HEAPU8[ret] = 0;
+    setValue(ret + 8, 0, '*');
+    setValue(ret + 16, 0, 'i64');
+  },
+  udpClose: function (socket) {
+    return 0;
+  },
 });

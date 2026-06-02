@@ -156,6 +156,19 @@ class TestSemantic:
         assert anal.symbols.has_errors()
         assert any('不匹配' in e for e in anal.symbols.errors)
 
+    def test_typeof_returns_type_id_i32(self):
+        """typeof 返回稳定类型标识，语义类型应为 I32。"""
+        anal = analyze('let t: I32 = typeof 42;')
+        assert not anal.symbols.has_errors(), f'错误: {anal.symbols.errors}'
+        sym = anal.symbols.resolve('t')
+        assert sym is not None
+        assert sym.type is not None
+        assert sym.type.name == 'I32'
+
+        mismatch = analyze('let t: Str = typeof 42;')
+        assert mismatch.symbols.has_errors()
+        assert any('不匹配' in e for e in mismatch.symbols.errors)
+
     def test_binary_op_same_types(self):
         """同类型运算不应报类型错误"""
         anal = analyze('let x = 1 + 2; let y = 3.0 + 4.0;')
@@ -541,6 +554,16 @@ class TestSemantic:
         anal = analyze('const r = race(task = 1, timeout = 10);')
         assert any('race' in e and 'flow' in e for e in anal.symbols.errors)
 
+    def test_race_pl_syntax_semantic(self):
+        """文档接口 race(pl=[...], timeout=...) 在 flow 内合法。"""
+        anal = analyze('''
+        const r = flow {
+            return race(pl = [() => { return 1; }, () => { return 2; }], timeout = 10);
+        };
+        ''')
+        assert not anal.symbols.has_errors(), f'语义错误: {anal.symbols.errors}'
+        assert len(anal.race_calls) == 1
+
     def test_flow_dependency_records_reads(self):
         """读取 suspend 结果应记录数据流依赖"""
         anal = analyze('''
@@ -649,3 +672,30 @@ class TestSemantic:
         assert sym.kind == SymbolKind.EXTERN_DECLARE
         assert sym.exported
         assert anal.declare_extern_map['native_add'] == str(lib)
+
+    def test_p0_documented_syntax_semantic_metadata(self):
+        """P0 文档语法应记录语义元数据"""
+        anal = analyze('''
+        struct Date {
+            timestamp: I64;
+            add(this: Date, year: I32?) => Void;
+        };
+        type Headers = { [key: Str]: Str };
+        rp let cache: I32[] = [];
+        wp let queue: I32[] = [];
+        let arr: I32[]?;
+        let headers = { "Content-Type" = "text/plain", ["Accept"] = "application/json" };
+        let ptr: *I8;
+        const result = flow {
+            const p = parallel { return 1; };
+            return p;
+        };
+        ''')
+        assert not anal.symbols.has_errors(), f'语义错误: {anal.symbols.errors}'
+        assert anal.symbols.resolve('cache').lock_policy == 'read_preferred'
+        assert anal.symbols.resolve('queue').lock_policy == 'write_preferred'
+        assert anal.symbols.resolve('arr').type.kind.name == 'OPTIONAL'
+        assert anal.symbols.resolve('Headers').type.kind.name == 'DICT'
+        assert anal.symbols.resolve('ptr').type.kind.name == 'POINTER'
+        assert len(anal.parallel_blocks) == 1
+        assert any(p['name'] == 'parallel' for p in anal.suspend_points)

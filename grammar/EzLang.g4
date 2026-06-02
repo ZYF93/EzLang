@@ -19,6 +19,9 @@ MATCH: 'match';
 CATCH: 'catch';
 THROW: 'throw';
 FLOW: 'flow';
+PARALLEL: 'parallel';
+RP: 'rp';
+WP: 'wp';
 TYPEOF: 'typeof';
 RETURN: 'return';
 IN: 'in';
@@ -138,7 +141,11 @@ declaration:
     | declareDecl;
 
 // 变量声明
-variableDecl: decorator* (LET | CONST | STATIC) VAR_IDENTIFIER (':' type_)? ASSIGN expression ';'?;
+variableDecl: decorator* lockPrefix? (LET | CONST | STATIC) qualifiedVarName (':' type_)? (ASSIGN expression)? ';'?;
+
+lockPrefix: RP | WP;
+
+qualifiedVarName: VAR_IDENTIFIER (DOT VAR_IDENTIFIER)*;
 
 decorator: AT VAR_IDENTIFIER;
 
@@ -157,7 +164,7 @@ structField:
     VAR_IDENTIFIER ':' type_ (ASSIGN expression)? ';'?;
 
 structMethod:
-    VAR_IDENTIFIER ASSIGN functionLiteral ';'?;
+    VAR_IDENTIFIER (ASSIGN functionLiteral | functionSignature) ';'?;
 
 // 类型别名
 typeAliasDecl:
@@ -199,7 +206,7 @@ targetPlatform:
 
 // declare 声明
 declareDecl:
-    DECLARE (LET | CONST | STATIC) VAR_IDENTIFIER ':' type_ ';'?;
+    DECLARE (LET | CONST | STATIC) qualifiedVarName ':' type_ ';'?;
 
 // ==================== 类型 ====================
 
@@ -207,11 +214,13 @@ type_:
     type_ QUESTION                                               # optionalType
     | type_ PIPE type_                                           # unionType
     | type_ '[' ']'                                              # arrayType
+    | STAR type_                                                  # pointerType
     | VEC '<' type_ '>' '[' INTEGER_LITERAL ']'                  # vecType
     | LIST '<' type_ '>'                                         # listType
     | LANGLE typeList RANGLE '(' paramTypeList? ')' FAT_ARROW type_  # genericParamFunctionType
     | functionType                                               # functionTypeRef
     | LANGLE typeList RANGLE FAT_ARROW type_                     # genericFunctionType
+    | typeShape                                                  # typeShapeType
     | baseType                                                   # baseTypeRef
     | TYPEOF expression                                          # typeofType
     | '(' type_ ')'                                              # parenType;
@@ -317,6 +326,7 @@ primaryExpression:
     | vecLiteral                                                         # vecLiteralExpr
     | functionLiteral                                                    # fnLiteralExpr
     | flowBlock                                                          # flowBlockExpr
+    | parallelBlock                                                      # parallelBlockExpr
     | matchBlock                                                         # matchBlockExpr
     | catchBlock                                                         # catchBlockExpr
     | loopExpr                                                           # loopPrimaryExpr
@@ -364,7 +374,12 @@ dictLiteral:
     '{' (dictField (',' dictField)* ','?)? '}';
 
 dictField:
-    VAR_IDENTIFIER (':' type_)? ASSIGN expression;
+    dictKey (':' type_)? ASSIGN expression;
+
+dictKey:
+    VAR_IDENTIFIER
+    | STRING_LITERAL
+    | LBRACK expression RBRACK;
 
 // 数组字面量
 arrayLiteral:
@@ -394,6 +409,9 @@ markupChild:
 functionLiteral:
     genericParams? '(' paramList? ')' (':' type_)? FAT_ARROW (expression | block);
 
+functionSignature:
+    genericParams? '(' paramList? ')' FAT_ARROW type_;
+
 paramList:
     param (',' param)* ','?;
 
@@ -407,6 +425,10 @@ block:
 // flow 块
 flowBlock:
     FLOW block;
+
+// parallel 块
+parallelBlock:
+    PARALLEL block;
 
 // match 块
 matchBlock:

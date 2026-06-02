@@ -1,10 +1,14 @@
 // EzLang std/os Emscripten JS 封装层
 mergeInto(LibraryManager.library, {
-  args: function () {
-    return 0;
+  args: function (ret) {
+    setValue(ret, 0, '*');
+    setValue(ret + 8, 0, 'i64');
+    setValue(ret + 16, 0, 'i64');
+    setValue(ret + 24, 0, 'i64');
   },
-  env: function (key) {
-    return 0;
+  env: function (ret, key) {
+    HEAPU8[ret] = 0;
+    setValue(ret + 8, 0, '*');
   },
   setEnv: function (key, value) {
     return 0;

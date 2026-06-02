@@ -1,0 +1,22 @@
+// std/debug.ez - 调试与诊断工具标准库
+// 依赖: EzLang 标准库封装层（C/JS）
+
+extern "@std/native/debug.c" for linux;
+extern "@std/native/debug.c" for macos;
+extern "@std/native/debug.c" for windows;
+extern "@std/native/debug.c" for android;
+extern "@std/native/debug.c" for ios;
+extern "@std/emcc/debug.js" for emcc;
+
+// === 基础诊断 ===
+export declare const debugPrint: (msg: Str) => Void;
+export declare const debugAssert: (condition: Bool, msg: Str) => Void;
+export declare const debugCrash: (msg: Str) => Void;
+
+// === 代码位置与运行时信息 ===
+export declare const debugLocation: (file: Str, line: I32, column: I32) => Str;
+export declare const debugRuntimeInfo: () => Str;
+
+// === 数据检查 ===
+export declare const debugHex: (data: Blob) => Str;
+export declare const debugStack: () => Str?;

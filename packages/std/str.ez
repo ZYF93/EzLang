@@ -1,0 +1,36 @@
+// std/str.ez - UTF-8 字符串标准库
+// 依赖: EzLang 标准库封装层（C/JS）
+
+extern "@std/native/str.c" for linux;
+extern "@std/native/str.c" for macos;
+extern "@std/native/str.c" for windows;
+extern "@std/native/str.c" for android;
+extern "@std/native/str.c" for ios;
+extern "@std/emcc/str.js" for emcc;
+
+// === 长度与空值 ===
+export declare const strByteLen: (s: Str) => I64;
+export declare const strCharLen: (s: Str) => I64;
+export declare const strIsEmpty: (s: Str) => Bool;
+export declare const strIsValidUtf8: (s: Str) => Bool;
+
+// === 切片与字符访问 ===
+export declare const strSliceBytes: (s: Str, start: I64, end: I64) => Str;
+export declare const strSliceChars: (s: Str, start: I64, end: I64) => Str;
+export declare const strCharAt: (s: Str, index: I64) => Str?;
+export declare const strToBytes: (s: Str) => Blob;
+export declare const strFromBytes: (data: Blob) => Str?;
+
+// === 查询与匹配 ===
+export declare const strContains: (s: Str, needle: Str) => Bool;
+export declare const strStartsWith: (s: Str, prefix: Str) => Bool;
+export declare const strEndsWith: (s: Str, suffix: Str) => Bool;
+export declare const strIndexOf: (s: Str, needle: Str) => I64;
+
+// === 组合与变换 ===
+export declare const strSplit: (s: Str, sep: Str) => Str[];
+export declare const strJoin: (parts: Str[], sep: Str) => Str;
+export declare const strTrim: (s: Str) => Str;
+export declare const strReplace: (s: Str, old: Str, newValue: Str) => Str;
+export declare const strToLower: (s: Str) => Str;
+export declare const strToUpper: (s: Str) => Str;

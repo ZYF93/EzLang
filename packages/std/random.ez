@@ -1,0 +1,26 @@
+// std/random.ez - 随机数标准库
+// 依赖: EzLang 标准库封装层（C/JS）
+
+extern "@std/native/random.c" for linux;
+extern "@std/native/random.c" for macos;
+extern "@std/native/random.c" for windows;
+extern "@std/native/random.c" for android;
+extern "@std/native/random.c" for ios;
+extern "@std/emcc/random.js" for emcc;
+
+// === 确定性随机源 ===
+export struct RandomSource {
+    state: U64;
+};
+
+export declare const randomSeed: (seed: U64) => RandomSource;
+export declare const randomNextU32: (this: RandomSource) => U32;
+export declare const randomNextU64: (this: RandomSource) => U64;
+export declare const randomRangeI64: (this: RandomSource, minValue: I64, maxValue: I64) => I64;
+export declare const randomRangeF64: (this: RandomSource, minValue: F64, maxValue: F64) => F64;
+export declare const randomShuffleBytes: (this: RandomSource, data: Blob) => Blob;
+
+// === 系统安全随机 ===
+export declare const randomEntropy: (size: I64) => Blob?;
+export declare const randomSecureBytes: (size: I64) => Blob?;
+export declare const randomSecureU64: () => U64?;

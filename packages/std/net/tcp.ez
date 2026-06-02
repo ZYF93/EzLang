@@ -22,4 +22,12 @@ export struct UdpSocket {
 
 export declare const tcpConnect: (host: Str, port: I32) => TcpConn?;
 export declare const tcpListen: (host: Str, port: I32) => TcpListener?;
+export declare const tcpAccept: (listener: TcpListener) => TcpConn?;
+export declare const tcpRead: (conn: TcpConn, maxBytes: I64) => Blob?;
+export declare const tcpWrite: (conn: TcpConn, data: Blob) => I64;
+export declare const tcpClose: (conn: TcpConn) => Bool;
+export declare const tcpListenerClose: (listener: TcpListener) => Bool;
 export declare const udpBind: (host: Str, port: I32) => UdpSocket?;
+export declare const udpSend: (socket: UdpSocket, host: Str, port: I32, data: Blob) => I64;
+export declare const udpRecv: (socket: UdpSocket, maxBytes: I64) => Blob?;
+export declare const udpClose: (socket: UdpSocket) => Bool;

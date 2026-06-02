@@ -1,0 +1,45 @@
+// std/log.ez - 结构化日志标准库
+// 依赖: EzLang 标准库封装层（C/JS）
+
+extern "@std/native/log.c" for linux;
+extern "@std/native/log.c" for macos;
+extern "@std/native/log.c" for windows;
+extern "@std/native/log.c" for android;
+extern "@std/native/log.c" for ios;
+extern "@std/emcc/log.js" for emcc;
+
+// === 日志级别 ===
+export const logTrace: I32 = 0;
+export const logDebug: I32 = 1;
+export const logInfo: I32 = 2;
+export const logWarn: I32 = 3;
+export const logError: I32 = 4;
+
+// === 输出目标 ===
+export const logTargetStderr: I32 = 0;
+export const logTargetStdout: I32 = 1;
+export const logTargetConsole: I32 = 2;
+
+export struct LogConfig {
+    minLevel: I32;
+    target: I32;
+    includeTimestamp: Bool;
+    includeLocation: Bool;
+};
+
+// === 配置 ===
+export declare const logDefaultConfig: () => LogConfig;
+export declare const logConfigure: (config: LogConfig) => Void;
+export declare const logSetLevel: (level: I32) => Void;
+
+// === 记录日志 ===
+export declare const logWrite: (level: I32, msg: Str) => Void;
+export declare const logWriteFields: (level: I32, msg: Str, fields: Str[]) => Void;
+export declare const logWriteAt: (level: I32, msg: Str, file: Str, line: I32, column: I32, fields: Str[]) => Void;
+
+// === 便捷函数 ===
+export declare const logTraceMsg: (msg: Str) => Void;
+export declare const logDebugMsg: (msg: Str) => Void;
+export declare const logInfoMsg: (msg: Str) => Void;
+export declare const logWarnMsg: (msg: Str) => Void;
+export declare const logErrorMsg: (msg: Str) => Void;

@@ -1,0 +1,17 @@
+// std/crypto.ez - 加密哈希与消息认证码标准库
+// 依赖: 成熟平台加密库封装；不自行实现加密算法
+
+extern "@std/native/crypto.c" for linux;
+extern "@std/native/crypto.c" for macos;
+extern "@std/native/crypto.c" for windows;
+extern "@std/native/crypto.c" for android;
+extern "@std/native/crypto.c" for ios;
+extern "@std/emcc/crypto.js" for emcc;
+
+// === 加密哈希 ===
+export declare const cryptoSha256: (data: Blob) => Blob?;
+export declare const cryptoSha512: (data: Blob) => Blob?;
+
+// === 哈希消息认证码 ===
+export declare const cryptoHmacSha256: (key: Blob, data: Blob) => Blob?;
+export declare const cryptoHmacSha512: (key: Blob, data: Blob) => Blob?;

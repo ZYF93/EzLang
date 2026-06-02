@@ -3,12 +3,11 @@
 const fetch = (url: Str): Str => { return url; };
 const readFile = (path: Str): Str => { return path; };
 const sleep = (ms: I32): Void => { return; };
-const race = (task: Str, timeout: I32): Str => { return task; };
 
 const data = flow {
     const a = fetch(url = "https://example.com/a");
     const b = readFile(path = "input.txt");
     sleep(ms = 10);
-    const fastest = race(task = a, timeout = 1000);
+    const fastest = race(pl = [() => { return 1; }, () => { return 2; }], timeout = 1000);
     return fastest;
 };

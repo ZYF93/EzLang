@@ -13,3 +13,6 @@ export struct WsConn {
 };
 
 export declare const wsConnect: (url: Str) => WsConn?;
+export declare const wsSend: (conn: WsConn, data: Blob) => I64;
+export declare const wsRecv: (conn: WsConn, maxBytes: I64) => Blob?;
+export declare const wsClose: (conn: WsConn) => Bool;

@@ -12,9 +12,11 @@ from runtime import (
     EzRuntimeError,
     FakeIOSource,
     FlowScope,
+    LockPolicy,
     Future,
     TaskState,
     TimerSource,
+    VariableLock,
     errCancel,
     errTimeout,
 )
@@ -279,6 +281,109 @@ def test_flow_scope_finish_waits_for_side_effects():
     assert loop.run(loop.spawn(main())) == "done"
     assert done == [15]
     assert loop.now == 15
+
+
+def test_parallel_task_can_run_while_owner_waits_later():
+    loop = EventLoop()
+    order = []
+
+    def worker():
+        yield loop.sleep(10)
+        order.append(("worker", loop.now))
+        return 5
+
+    def main():
+        task = loop.parallel(worker)
+        yield loop.sleep(3)
+        order.append(("main", loop.now))
+        result = yield from loop.wait(task)
+        return result + 1
+
+    assert loop.run(loop.spawn(main())) == 6
+    assert order == [("main", 3), ("worker", 10)]
+
+
+def test_variable_lock_ordered_policy_respects_arrival_order():
+    loop = EventLoop()
+    lock = VariableLock(loop, LockPolicy.ORDERED)
+    events = []
+
+    def reader():
+        yield from lock.read()
+        events.append("read")
+        yield loop.sleep(2)
+        lock.release_read()
+
+    def writer():
+        yield from lock.write()
+        events.append("write")
+        lock.release_write()
+
+    loop.spawn(reader())
+    loop.spawn(writer())
+    loop.spawn(reader())
+    loop.run()
+
+    assert events == ["read", "write", "read"]
+
+
+def test_variable_lock_write_preferred_grants_writer_before_waiting_readers():
+    loop = EventLoop()
+    lock = VariableLock(loop, LockPolicy.WRITE_PREFERRED)
+    events = []
+
+    def holding_reader():
+        yield from lock.read()
+        events.append("r1")
+        yield loop.sleep(5)
+        lock.release_read()
+
+    def waiting_reader():
+        yield from lock.read()
+        events.append("r2")
+        lock.release_read()
+
+    def writer():
+        yield from lock.write()
+        events.append("w")
+        lock.release_write()
+
+    loop.spawn(holding_reader())
+    loop.spawn(waiting_reader())
+    loop.spawn(writer())
+    loop.run()
+
+    assert events == ["r1", "w", "r2"]
+
+
+def test_variable_lock_read_preferred_promotes_starved_writer_after_1ms():
+    loop = EventLoop()
+    lock = VariableLock(loop, LockPolicy.READ_PREFERRED)
+    events = []
+
+    def holding_reader():
+        yield from lock.read()
+        events.append("r1")
+        yield loop.sleep(5)
+        lock.release_read()
+
+    def writer():
+        yield from lock.write()
+        events.append("w")
+        lock.release_write()
+
+    def late_reader():
+        yield loop.sleep(2)
+        yield from lock.read()
+        events.append("r2")
+        lock.release_read()
+
+    loop.spawn(holding_reader())
+    loop.spawn(writer())
+    loop.spawn(late_reader())
+    loop.run()
+
+    assert events == ["r1", "w", "r2"]
 
 
 def test_fake_io_source_wakes_task_with_result():

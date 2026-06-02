@@ -117,6 +117,10 @@ class FlowScope:
         self.tasks[name] = task
         return task
 
+    def parallel(self, name: str, fn: Callable[[], Any]) -> Task:
+        """启动 parallel 任务；读取该任务时使用 get/wait 自动等待。"""
+        return self.spawn_task(name, fn())
+
     def get(self, name: str):
         return (yield from self.loop.wait(self.tasks[name]))
 
@@ -125,6 +129,131 @@ class FlowScope:
         for task in self.tasks.values():
             result = yield from self.loop.wait(task)
         return result
+
+
+class LockPolicy(str, Enum):
+    ORDERED = "ordered"
+    READ_PREFERRED = "read_preferred"
+    WRITE_PREFERRED = "write_preferred"
+
+
+@dataclass
+class _LockRequest:
+    mode: str
+    future: Future
+    task: Optional[Task]
+    requested_at: int
+
+
+class VariableLock:
+    """运行时变量读写锁，支持顺序、读优先、写优先三种策略。"""
+
+    def __init__(self, loop: EventLoop, policy=LockPolicy.ORDERED):
+        self.loop = loop
+        self.policy = LockPolicy(policy)
+        self.readers = 0
+        self.writer = False
+        self.queue: Deque[_LockRequest] = deque()
+
+    def read(self):
+        return self._acquire("read")
+
+    def write(self):
+        return self._acquire("write")
+
+    def release_read(self):
+        if self.readers <= 0:
+            raise EzRuntimeError(errIO, "read lock not held")
+        self.readers -= 1
+        self._drain()
+
+    def release_write(self):
+        if not self.writer:
+            raise EzRuntimeError(errIO, "write lock not held")
+        self.writer = False
+        self._drain()
+
+    def _acquire(self, mode: str):
+        future = Future()
+        request = _LockRequest(mode=mode, future=future, task=self.loop.current_task, requested_at=self.loop.now)
+        self.queue.append(request)
+        self._drain()
+        return self.loop.wait(future)
+
+    def _drain(self):
+        if self.writer:
+            return
+        if self.readers > 0:
+            if self.policy == LockPolicy.READ_PREFERRED:
+                if self._first_waiting_writer(min_wait_ms=1) is None:
+                    self._grant_readers(before_writer=False)
+            return
+        if not self.queue:
+            return
+
+        if self.policy == LockPolicy.WRITE_PREFERRED:
+            writer = self._pop_first("write")
+            if writer is not None:
+                self._grant_writer(writer)
+                return
+            self._grant_readers(before_writer=False)
+            return
+
+        if self.policy == LockPolicy.READ_PREFERRED:
+            starved_writer = self._first_waiting_writer(min_wait_ms=1)
+            if starved_writer is not None:
+                self.queue.remove(starved_writer)
+                self._grant_writer(starved_writer)
+                return
+            self._grant_readers(before_writer=False)
+            if self.readers == 0 and self.queue:
+                request = self.queue.popleft()
+                if request.mode == "write":
+                    self._grant_writer(request)
+                else:
+                    self._grant_reader(request)
+            return
+
+        request = self.queue.popleft()
+        if request.mode == "write":
+            self._grant_writer(request)
+        else:
+            self._grant_reader(request)
+            self._grant_readers(before_writer=True)
+
+    def _grant_readers(self, *, before_writer: bool):
+        granted = []
+        for request in list(self.queue):
+            if request.mode == "write" and before_writer:
+                break
+            if request.mode == "read":
+                granted.append(request)
+        for request in granted:
+            self.queue.remove(request)
+            self._grant_reader(request)
+
+    def _grant_reader(self, request: _LockRequest):
+        self.readers += 1
+        request.future.set_result(self)
+        self.loop.wake_waiters(request.future)
+
+    def _grant_writer(self, request: _LockRequest):
+        self.writer = True
+        request.future.set_result(self)
+        self.loop.wake_waiters(request.future)
+
+    def _pop_first(self, mode: str) -> Optional[_LockRequest]:
+        for request in self.queue:
+            if request.mode == mode:
+                self.queue.remove(request)
+                return request
+        return None
+
+    def _first_waiting_writer(self, *, min_wait_ms: int) -> Optional[_LockRequest]:
+        for request in self.queue:
+            if request.mode == "write" and self.loop.now - request.requested_at >= min_wait_ms:
+                return request
+        return None
 
 
 class EventLoop:
@@ -146,6 +275,10 @@ class EventLoop:
         self.tasks.append(task)
         self.ready.append(task)
         return task
+
+    def parallel(self, fn: Callable[[], Any]) -> Task:
+        """启动一个并行任务，返回可被 wait 的 Task。"""
+        return self.spawn(fn(), parent=self.current_task)
 
     def sleep(self, ms: int, result: Any = None) -> TimerSource:
         return TimerSource(ms, result=result)

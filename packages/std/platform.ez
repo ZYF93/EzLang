@@ -1,0 +1,28 @@
+// std/platform.ez - 平台能力检测标准库
+// 依赖: EzLang 标准库封装层（C/JS）
+
+extern "@std/native/platform.c" for linux;
+extern "@std/native/platform.c" for macos;
+extern "@std/native/platform.c" for windows;
+extern "@std/native/platform.c" for android;
+extern "@std/native/platform.c" for ios;
+extern "@std/emcc/platform.js" for emcc;
+
+// === 目标信息 ===
+export declare const platformOS: () => Str;
+export declare const platformArch: () => Str;
+export declare const platformIsLittleEndian: () => Bool;
+export declare const platformPointerBits: () => I32;
+
+// === 资源信息 ===
+export declare const platformPageSize: () => I64;
+export declare const platformCpuCount: () => I32;
+export declare const platformMemoryLimit: () => I64;
+
+// === 能力检测 ===
+export declare const platformHasThreads: () => Bool;
+export declare const platformHasFileSystem: () => Bool;
+export declare const platformHasNetwork: () => Bool;
+export declare const platformHasCrypto: () => Bool;
+export declare const platformHasDom: () => Bool;
+export declare const platformHasSubprocess: () => Bool;

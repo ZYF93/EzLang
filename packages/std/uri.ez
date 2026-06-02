@@ -1,0 +1,43 @@
+// std/uri.ez - 统一资源定位符标准库
+// 依赖: EzLang 标准库封装层（C/JS）
+
+extern "@std/native/uri.c" for linux;
+extern "@std/native/uri.c" for macos;
+extern "@std/native/uri.c" for windows;
+extern "@std/native/uri.c" for android;
+extern "@std/native/uri.c" for ios;
+extern "@std/emcc/uri.js" for emcc;
+
+// === URL 解析结果 ===
+export struct UriParts {
+    scheme: Str;
+    userInfo: Str;
+    host: Str;
+    port: I32;
+    path: Str;
+    query: Str;
+    fragment: Str;
+};
+
+// === URL 解析与构造 ===
+export declare const uriParse: (url: Str) => UriParts?;
+export declare const uriBuild: (parts: UriParts) => Str;
+export declare const uriNormalize: (url: Str) => Str;
+
+// === 字段读取 ===
+export declare const uriScheme: (url: Str) => Str?;
+export declare const uriHost: (url: Str) => Str?;
+export declare const uriPort: (url: Str) => I32?;
+export declare const uriPath: (url: Str) => Str;
+export declare const uriQuery: (url: Str) => Str?;
+export declare const uriFragment: (url: Str) => Str?;
+
+// === 编解码 ===
+export declare const uriEncodeQuery: (s: Str) => Str;
+export declare const uriDecodeQuery: (s: Str) => Str?;
+export declare const uriEncodePathSegment: (s: Str) => Str;
+export declare const uriDecodePathSegment: (s: Str) => Str?;
+
+// === 查询参数 ===
+export declare const uriQueryGet: (query: Str, key: Str) => Str?;
+export declare const uriQuerySet: (query: Str, key: Str, value: Str) => Str;

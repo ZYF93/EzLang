@@ -2,6 +2,8 @@
 
 `ez-android-ui` 提供面向 `android` 目标的**原生 View 底层绑定**（基于 Android NDK + JNI）。包本身不做框架和调度——这些由使用者自行实现。所有 UI 原语均为同步 JNI 调用，**View 树修改必须在主线程执行**，包提供主线程调度桥接。
 
+> **当前实现状态**：仓库内已提供可编译链接的 ABI 占位，真实 JNI/View 桥接尚未接入。当前 native wrapper 返回零句柄、空字符串、空可选值、`false` 或执行 no-op，用于明确表示不可用；后续接入平台实现时保持这些公开签名。
+
 > **Fiber 调度可行性**：完全可行。EzLang 的 `flow` 已是协作式调度器，reconcile（差量计算）阶段在 `flow` 内并发运行；commit（View 修改）阶段通过 `runOnMainThread` 桥接回 UI 线程，架构与 React Native Fabric 一致。
 
 > **使用前提**：`project.toml` 中 `os = "android"`，`sdk` 指向 NDK 路径。

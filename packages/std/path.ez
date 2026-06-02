@@ -1,0 +1,33 @@
+// std/path.ez - 纯路径处理标准库
+// 依赖: EzLang 标准库封装层（C/JS）
+
+extern "@std/native/path.c" for linux;
+extern "@std/native/path.c" for macos;
+extern "@std/native/path.c" for windows;
+extern "@std/native/path.c" for android;
+extern "@std/native/path.c" for ios;
+extern "@std/emcc/path.js" for emcc;
+
+// === 路径拆分结果 ===
+export struct PathParts {
+    root: Str;
+    dir: Str;
+    base: Str;
+    name: Str;
+    ext: Str;
+};
+
+// === 平台路径规则 ===
+export declare const pathSeparator: () => Str;
+export declare const pathJoin: (parts: Str[]) => Str;
+export declare const pathNormalize: (path: Str) => Str;
+export declare const pathDir: (path: Str) => Str;
+export declare const pathBase: (path: Str) => Str;
+export declare const pathExt: (path: Str) => Str;
+export declare const pathIsAbs: (path: Str) => Bool;
+export declare const pathRelative: (fromPath: Str, toPath: Str) => Str;
+export declare const pathParse: (path: Str) => PathParts;
+
+// === file URL 转换 ===
+export declare const pathToFileUrl: (path: Str) => Str;
+export declare const pathFromFileUrl: (url: Str) => Str?;

@@ -1,0 +1,102 @@
+// ez-web-ui - WebAssembly DOM 绑定包
+// 当前提供可编译链接的 DOM ABI；emcc wrapper 在浏览器环境中操作 DOM，其他平台返回不可用结果。
+
+extern "@pkg/ez-web-ui/native/web_ui.c" for linux;
+extern "@pkg/ez-web-ui/native/web_ui.c" for macos;
+extern "@pkg/ez-web-ui/native/web_ui.c" for windows;
+extern "@pkg/ez-web-ui/native/web_ui.c" for android;
+extern "@pkg/ez-web-ui/native/web_ui.c" for ios;
+extern "@pkg/ez-web-ui/emcc/web_ui.js" for emcc;
+
+export struct Node { id: I32; };
+
+export struct Event {
+    eventType: Str;
+    targetId: I32;
+    data: Blob?;
+};
+
+export struct Rect {
+    x: F32;
+    y: F32;
+    width: F32;
+    height: F32;
+};
+
+export type Attrs = { [key: Str]: Str };
+export type Styles = { [key: Str]: Str };
+export type EventHandler = (e: Event) => Void;
+
+export const permission.geolocation: Str = "geolocation";
+export const permission.camera: Str = "camera";
+export const permission.microphone: Str = "microphone";
+export const permission.notifications: Str = "notifications";
+export const permission.clipboard: Str = "clipboard-read";
+
+export declare const createElement: (tag: Str) => Node;
+export declare const createTextNode: (content: Str) => Node;
+export declare const destroyNode: (node: Node) => Void;
+
+export declare const appendChild: (parent: Node, child: Node) => Void;
+export declare const insertBefore: (parent: Node, child: Node, ref: Node) => Void;
+export declare const removeChild: (parent: Node, child: Node) => Void;
+export declare const replaceChild: (parent: Node, newChild: Node, oldChild: Node) => Void;
+export declare const getParent: (node: Node) => Node?;
+export declare const getChildren: (node: Node) => Node[];
+export declare const getHostNode: (selector: Str) => Node?;
+
+export declare const getAttribute: (node: Node, key: Str) => Str?;
+export declare const setAttribute: (node: Node, key: Str, value: Str) => Void;
+export declare const removeAttribute: (node: Node, key: Str) => Void;
+export declare const setAttributes: (node: Node, attrs: Attrs) => Void;
+export declare const getProperty: (node: Node, key: Str) => Str;
+export declare const setProperty: (node: Node, key: Str, value: Str) => Void;
+
+export declare const getStyle: (node: Node, prop: Str) => Str;
+export declare const setStyle: (node: Node, prop: Str, value: Str) => Void;
+export declare const setStyles: (node: Node, styles: Styles) => Void;
+export declare const addClass: (node: Node, name: Str) => Void;
+export declare const removeClass: (node: Node, name: Str) => Void;
+export declare const hasClass: (node: Node, name: Str) => Bool;
+export declare const setClassName: (node: Node, name: Str) => Void;
+export declare const getComputedStyle: (node: Node, prop: Str) => Str;
+
+export declare const getTextContent: (node: Node) => Str;
+export declare const setTextContent: (node: Node, text: Str) => Void;
+export declare const getInnerHTML: (node: Node) => Str;
+export declare const setInnerHTML: (node: Node, html: Str) => Void;
+
+export declare const addEventListener: (node: Node, event: Str, handler: EventHandler, capture: Bool) => Void;
+export declare const removeEventListener: (node: Node, event: Str, handler: EventHandler) => Void;
+export declare const delegateEvent: (parent: Node, event: Str, selector: Str, handler: EventHandler) => Void;
+export declare const getEventValue: (e: Event) => Str;
+export declare const getEventKey: (e: Event) => Str;
+export declare const getEventClientX: (e: Event) => F32;
+export declare const getEventClientY: (e: Event) => F32;
+export declare const preventDefault: (e: Event) => Void;
+export declare const stopPropagation: (e: Event) => Void;
+
+export declare const getBoundingRect: (node: Node) => Rect;
+export declare const getScrollTop: (node: Node) => F32;
+export declare const getScrollLeft: (node: Node) => F32;
+export declare const setScrollTop: (node: Node, value: F32) => Void;
+export declare const focus_: (node: Node) => Void;
+export declare const blur_: (node: Node) => Void;
+
+export declare const scheduleFrame: (cb: () => Void) => I32;
+export declare const cancelFrame: (id: I32) => Void;
+export declare const scheduleMicrotask: (cb: () => Void) => Void;
+export declare const scheduleIdle: (cb: (deadline: F64) => Void) => I32;
+export declare const cancelIdle: (id: I32) => Void;
+
+export declare const requestPermission: (perm: Str) => Bool;
+export declare const queryPermission: (perm: Str) => Str;
+
+export declare const getWindowWidth: () => F32;
+export declare const getWindowHeight: () => F32;
+export declare const getDocumentNode: () => Node;
+export declare const getBodyNode: () => Node;
+export declare const getLocation: () => Str;
+export declare const setLocation: (url: Str) => Void;
+export declare const historyPush: (url: Str) => Void;
+export declare const historyReplace: (url: Str) => Void;

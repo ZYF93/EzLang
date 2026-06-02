@@ -25,6 +25,7 @@ class TypeKind(Enum):
     UNION = auto()       # T1 | T2
     FUNCTION = auto()    # (params) => returnType
     STRUCT = auto()      # struct 类型
+    POINTER = auto()     # *T 指针类型
 
 
 class Type:
@@ -47,6 +48,7 @@ class Type:
         self.return_type: Optional[Type] = None    # 函数返回类型
         self.union_types: list[Type] = []          # 联合类型的成员类型
         self.fields: dict[str, "Type"] = {}        # 结构体字段名→类型映射
+        self.pointee_type: Optional[Type] = None    # 指针指向的类型
 
     def __repr__(self):
         if self.kind == TypeKind.ARRAY:
@@ -66,6 +68,8 @@ class Type:
         if self.kind == TypeKind.FUNCTION:
             params = ", ".join(str(p) for p in self.param_types)
             return f"({params}) => {self.return_type}"
+        if self.kind == TypeKind.POINTER:
+            return f"*{self.pointee_type}"
         opt = "?" if self.is_optional else ""
         return f"{self.name}{opt}"
 
@@ -86,6 +90,8 @@ class Type:
             return self.union_types == other.union_types
         if self.kind == TypeKind.FUNCTION:
             return self.param_types == other.param_types and self.return_type == other.return_type
+        if self.kind == TypeKind.POINTER:
+            return self.pointee_type == other.pointee_type
         return self.name == other.name
 
     def is_numeric(self) -> bool:
@@ -108,11 +114,22 @@ class Type:
         """检查两类型是否兼容（可用于赋值、运算等）"""
         if self == other:
             return True
+        # T 可以赋给 T?，T? 在需要 T 的位置由解包语义处理。
+        if self.kind == TypeKind.OPTIONAL and self.element_type is not None:
+            return self.element_type.compatible_with(other)
+        if other.kind == TypeKind.OPTIONAL and other.element_type is not None:
+            return self.compatible_with(other.element_type)
         # 数值类型之间可以隐式转换
         if self.is_numeric() and other.is_numeric():
             return True
         # List<T> 和 T[] 使用同一种运行时表示
         if {self.kind, other.kind} == {TypeKind.ARRAY, TypeKind.LIST}:
+            if self.element_type is None or other.element_type is None:
+                return True
+            return self.element_type.compatible_with(other.element_type)
+        if self.kind in (TypeKind.ARRAY, TypeKind.LIST) and other.kind in (TypeKind.ARRAY, TypeKind.LIST):
+            if self.element_type is None or other.element_type is None:
+                return True
             return self.element_type.compatible_with(other.element_type)
         if self.kind == TypeKind.DICT and other.kind == TypeKind.DICT:
             if self.key_type is None or self.value_type is None:
@@ -136,6 +153,10 @@ class Type:
             return any(other.compatible_with(t) for t in self.union_types)
         if other.kind == TypeKind.UNION and other.union_types:
             return any(self.compatible_with(t) for t in other.union_types)
+        if self.kind == TypeKind.POINTER and other.kind == TypeKind.POINTER:
+            if self.pointee_type is None or other.pointee_type is None:
+                return True
+            return self.pointee_type.compatible_with(other.pointee_type)
         return False
 
 
@@ -150,6 +171,7 @@ class Symbol:
         mutable: bool = True,
         exported: bool = False,
         line: int = 0,
+        lock_policy: str = "ordered",
     ):
         self.name = name
         self.kind = kind
@@ -157,6 +179,7 @@ class Symbol:
         self.mutable = mutable
         self.exported = exported
         self.line = line
+        self.lock_policy = lock_policy
 
     def __repr__(self):
         return f"Symbol({self.name}, {self.kind}, {self.type})"

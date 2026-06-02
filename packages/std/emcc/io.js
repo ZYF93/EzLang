@@ -9,7 +9,8 @@ mergeInto(LibraryManager.library, {
   error: function (msg) {
     console.error(UTF8ToString(msg));
   },
-  readLine: function () {
-    return 0;
+  readLine: function (ret) {
+    HEAPU8[ret] = 0;
+    setValue(ret + 8, 0, '*');
   },
 });

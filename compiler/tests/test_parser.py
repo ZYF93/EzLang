@@ -154,6 +154,27 @@ class TestParser:
         ''')
         assert len(errors) == 0, f'解析错误: {errors}'
 
+    def test_p0_documented_syntax_parses(self):
+        """P0 文档语法应能进入解析器"""
+        tree, errors = parse_source('''
+        struct Date {
+            timestamp: I64;
+            add(this: Date, year: I32?) => Void;
+        };
+        type Headers = { [key: Str]: Str };
+        declare const requestPermissions: (perms: Str[]) => { [key: Str]: Bool };
+        const permission.camera: Str = "camera";
+        const gravity.left: I32 = 0x03;
+        const contentMode.scaleToFill: I32 = 0;
+        rp let cache: I32[] = [];
+        wp let queue: I32[] = [];
+        let arr: I32[]?;
+        let headers = { "Content-Type" = "text/plain", ["Accept"] = "application/json" };
+        let ptr: *I8;
+        const p = parallel { return 1; };
+        ''')
+        assert len(errors) == 0, f'解析错误: {errors}'
+
     def test_all_examples(self):
         """测试所有示例文件可解析"""
         for ez_file in all_example_files():

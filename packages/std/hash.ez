@@ -1,0 +1,20 @@
+// std/hash.ez - 非加密哈希与校验和标准库
+// 依赖: EzLang 标准库封装层（C/JS）
+
+extern "@std/native/hash.c" for linux;
+extern "@std/native/hash.c" for macos;
+extern "@std/native/hash.c" for windows;
+extern "@std/native/hash.c" for android;
+extern "@std/native/hash.c" for ios;
+extern "@std/emcc/hash.js" for emcc;
+
+// === 非加密哈希 ===
+export declare const hashFnv1a32: (data: Blob) => U32;
+export declare const hashFnv1a64: (data: Blob) => U64;
+export declare const hashStrFnv1a32: (s: Str) => U32;
+export declare const hashStrFnv1a64: (s: Str) => U64;
+export declare const hashCombineU64: (seed: U64, value: U64) => U64;
+
+// === 校验和 ===
+export declare const crc32: (data: Blob) => U32;
+export declare const crc32Str: (s: Str) => U32;

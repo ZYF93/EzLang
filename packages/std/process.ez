@@ -1,0 +1,38 @@
+// std/process.ez - 外部进程调用标准库
+// 依赖: EzLang 标准库封装层（C/JS）
+
+extern "@std/native/process.c" for linux;
+extern "@std/native/process.c" for macos;
+extern "@std/native/process.c" for windows;
+extern "@std/native/process.c" for android;
+extern "@std/native/process.c" for ios;
+extern "@std/emcc/process.js" for emcc;
+
+export struct Command {
+    program: Str;
+    args: Str[];
+    cwd: Str;
+    env: Str[];
+    stdin: Blob;
+};
+
+export struct Process {
+    handle: I64;
+    pid: I64;
+};
+
+export struct ProcessResult {
+    exitCode: I32;
+    stdout: Blob;
+    stderr: Blob;
+    ok: Bool;
+};
+
+// === 进程执行 ===
+export declare const processExec: (command: Command) => ProcessResult?;
+export declare const processSpawn: (command: Command) => Process?;
+export declare const processWait: (process: Process) => ProcessResult?;
+export declare const processTerminate: (process: Process) => Bool;
+
+// === 当前程序 ===
+export declare const processCurrentPath: () => Str?;

@@ -1,14 +1,14 @@
 // EzLang std/fs Emscripten JS 封装层
-// 使用 MEMFS 作为默认文件系统；浏览器环境可把 /ezdata 挂载到 IDBFS。
+// 默认使用 Emscripten MEMFS；浏览器环境可按需把 /ezdata 挂到 IDBFS。
 (function () {
   var EZFS_IDBFS_ROOT = '/ezdata';
   var EZFS_IDBFS_READY = false;
 
-  function ezfsPath(path) {
+  function pathText(path) {
     return UTF8ToString(path || 0);
   }
 
-  function ezfsOk(fn) {
+  function ok(fn) {
     try {
       fn();
       return 1;
@@ -17,7 +17,7 @@
     }
   }
 
-  function ezfsEnsureParent(path) {
+  function ensureParent(path) {
     var parts = path.split('/');
     parts.pop();
     var current = path.charAt(0) === '/' ? '/' : '';
@@ -25,52 +25,36 @@
       var part = parts[i];
       if (!part) continue;
       current = current === '/' ? '/' + part : current + '/' + part;
-      try {
-        FS.mkdir(current);
-      } catch (e) {
-        // 目录已存在时忽略；其它错误交给后续文件操作暴露。
-      }
+      try { FS.mkdir(current); } catch (e) {}
     }
   }
 
-  function ezfsEnsureIdbfs() {
+  function ensureIdbfs() {
     if (EZFS_IDBFS_READY || typeof IDBFS === 'undefined') return;
-    try {
-      FS.mkdir(EZFS_IDBFS_ROOT);
-    } catch (e) {
-      // 已存在则忽略。
-    }
+    try { FS.mkdir(EZFS_IDBFS_ROOT); } catch (e) {}
     try {
       FS.mount(IDBFS, {}, EZFS_IDBFS_ROOT);
       FS.syncfs(true, function () {});
       EZFS_IDBFS_READY = true;
-    } catch (e) {
-      // 非浏览器或未启用 IDBFS 时继续使用 MEMFS。
-    }
+    } catch (e) {}
   }
 
-  function ezfsSync() {
+  function syncFs() {
     if (!EZFS_IDBFS_READY) return;
-    try {
-      FS.syncfs(false, function () {});
-    } catch (e) {
-      // 同步失败不影响本次内存态文件操作结果。
-    }
+    try { FS.syncfs(false, function () {}); } catch (e) {}
   }
 
-  function ezfsAllocBlob(bytes) {
+  function writeBlob(ret, bytes) {
     var dataPtr = 0;
     if (bytes.length > 0) {
       dataPtr = _malloc(bytes.length);
       HEAPU8.set(bytes, dataPtr);
     }
-    var blobPtr = _malloc(16);
-    setValue(blobPtr, dataPtr, '*');
-    setValue(blobPtr + 8, bytes.length, 'i64');
-    return blobPtr;
+    setValue(ret, dataPtr, '*');
+    setValue(ret + 8, bytes.length, 'i64');
   }
 
-  function ezfsBlobBytes(blobPtr) {
+  function blobBytes(blobPtr) {
     if (!blobPtr) return new Uint8Array(0);
     var dataPtr = getValue(blobPtr, '*');
     var size = Number(getValue(blobPtr + 8, 'i64'));
@@ -78,131 +62,118 @@
     return HEAPU8.slice(dataPtr, dataPtr + size);
   }
 
-  function ezfsWrite(pathPtr, blobPtr, append) {
-    return ezfsOk(function () {
-      ezfsEnsureIdbfs();
-      var path = ezfsPath(pathPtr);
-      ezfsEnsureParent(path);
-      var data = ezfsBlobBytes(blobPtr);
+  function writeStrList(ret, entries) {
+    var ptrSize = typeof POINTER_SIZE !== 'undefined' ? POINTER_SIZE : 4;
+    var pageCount = entries.length === 0 ? 0 : Math.ceil(entries.length / 8);
+    var pagesPtr = pageCount === 0 ? 0 : _malloc(pageCount * ptrSize);
+    for (var page = 0; page < pageCount; page++) {
+      var pagePtr = _malloc(8 * ptrSize);
+      setValue(pagesPtr + page * ptrSize, pagePtr, '*');
+      for (var offset = 0; offset < 8; offset++) {
+        var idx = page * 8 + offset;
+        setValue(pagePtr + offset * ptrSize, idx < entries.length ? stringToNewUTF8(entries[idx]) : 0, '*');
+      }
+    }
+    setValue(ret, pagesPtr, '*');
+    setValue(ret + 8, entries.length, 'i64');
+    setValue(ret + 16, pageCount * 8, 'i64');
+    setValue(ret + 24, pageCount, 'i64');
+  }
+
+  function writeStat(ret, info) {
+    HEAPU8[ret] = info ? 1 : 0;
+    var base = ret + 8;
+    setValue(base, info ? (info.size || 0) : 0, 'i64');
+    setValue(base + 8, info && FS.isDir(info.mode) ? 1 : 0, 'i8');
+    setValue(base + 16, info && info.mtime ? info.mtime.getTime() : 0, 'i64');
+    setValue(base + 24, info && info.ctime ? info.ctime.getTime() : 0, 'i64');
+  }
+
+  function writeFileImpl(pathPtr, blobPtr, append) {
+    return ok(function () {
+      ensureIdbfs();
+      var path = pathText(pathPtr);
+      ensureParent(path);
+      var data = blobBytes(blobPtr);
       if (append) {
         var oldData = new Uint8Array(0);
-        try {
-          oldData = FS.readFile(path, { encoding: 'binary' });
-        } catch (e) {
-          oldData = new Uint8Array(0);
-        }
+        try { oldData = FS.readFile(path, { encoding: 'binary' }); } catch (e) {}
         var merged = new Uint8Array(oldData.length + data.length);
         merged.set(oldData, 0);
         merged.set(data, oldData.length);
         data = merged;
       }
       FS.writeFile(path, data, { encoding: 'binary' });
-      ezfsSync();
+      syncFs();
     });
   }
 
+  function removeTree(path) {
+    var entries = FS.readdir(path);
+    for (var i = 0; i < entries.length; i++) {
+      var name = entries[i];
+      if (name === '.' || name === '..') continue;
+      var child = path.replace(/\/$/, '') + '/' + name;
+      if (FS.isDir(FS.stat(child).mode)) removeTree(child);
+      else FS.unlink(child);
+    }
+    FS.rmdir(path);
+  }
+
   mergeInto(LibraryManager.library, {
-    readFile: function (path) {
+    readFile: function (ret, path) {
       try {
-        ezfsEnsureIdbfs();
-        return ezfsAllocBlob(FS.readFile(ezfsPath(path), { encoding: 'binary' }));
+        ensureIdbfs();
+        writeBlob(ret, FS.readFile(pathText(path), { encoding: 'binary' }));
       } catch (e) {
-        return ezfsAllocBlob(new Uint8Array(0));
+        writeBlob(ret, new Uint8Array(0));
       }
     },
     writeFile: function (path, content) {
-      return ezfsWrite(path, content, false);
+      return writeFileImpl(path, content, false);
     },
     appendFile: function (path, content) {
-      return ezfsWrite(path, content, true);
+      return writeFileImpl(path, content, true);
     },
     removeFile: function (path) {
-      return ezfsOk(function () {
-        ezfsEnsureIdbfs();
-        FS.unlink(ezfsPath(path));
-        ezfsSync();
-      });
+      return ok(function () { ensureIdbfs(); FS.unlink(pathText(path)); syncFs(); });
     },
     mkdir: function (path) {
-      return ezfsOk(function () {
-        ezfsEnsureIdbfs();
-        FS.mkdirTree(ezfsPath(path));
-        ezfsSync();
-      });
+      return ok(function () { ensureIdbfs(); FS.mkdirTree(pathText(path)); syncFs(); });
     },
     removeDir: function (path, recursive) {
-      return ezfsOk(function () {
-        ezfsEnsureIdbfs();
-        var target = ezfsPath(path);
-        if (recursive) {
-          var entries = FS.readdir(target);
-          for (var i = 0; i < entries.length; i++) {
-            var name = entries[i];
-            if (name === '.' || name === '..') continue;
-            var child = target.replace(/\/$/, '') + '/' + name;
-            var mode = FS.stat(child).mode;
-            if (FS.isDir(mode)) {
-              LibraryManager.library.removeDir(stringToNewUTF8(child), 1);
-            } else {
-              FS.unlink(child);
-            }
-          }
-        }
-        FS.rmdir(target);
-        ezfsSync();
+      return ok(function () {
+        ensureIdbfs();
+        var target = pathText(path);
+        if (recursive) removeTree(target);
+        else FS.rmdir(target);
+        syncFs();
       });
     },
-    listDir: function (path) {
+    listDir: function (ret, path) {
       try {
-        ezfsEnsureIdbfs();
-        var entries = FS.readdir(ezfsPath(path)).filter(function (name) {
-          return name !== '.' && name !== '..';
-        });
-        var joined = entries.join('\n');
-        return stringToNewUTF8(joined);
+        ensureIdbfs();
+        writeStrList(ret, FS.readdir(pathText(path)).filter(function (name) { return name !== '.' && name !== '..'; }));
       } catch (e) {
-        return 0;
+        writeStrList(ret, []);
       }
     },
     exists: function (path) {
-      try {
-        ezfsEnsureIdbfs();
-        FS.stat(ezfsPath(path));
-        return 1;
-      } catch (e) {
-        return 0;
-      }
+      return ok(function () { ensureIdbfs(); FS.stat(pathText(path)); });
     },
     isDir: function (path) {
-      try {
-        ezfsEnsureIdbfs();
-        return FS.isDir(FS.stat(ezfsPath(path)).mode) ? 1 : 0;
-      } catch (e) {
-        return 0;
-      }
+      try { ensureIdbfs(); return FS.isDir(FS.stat(pathText(path)).mode) ? 1 : 0; } catch (e) { return 0; }
     },
-    stat: function (path) {
-      try {
-        ezfsEnsureIdbfs();
-        var info = FS.stat(ezfsPath(path));
-        var ptr = _malloc(32);
-        setValue(ptr, info.size || 0, 'i64');
-        setValue(ptr + 8, FS.isDir(info.mode) ? 1 : 0, 'i8');
-        setValue(ptr + 16, Math.floor((info.mtime ? info.mtime.getTime() : 0) / 1000), 'i64');
-        setValue(ptr + 24, Math.floor((info.ctime ? info.ctime.getTime() : 0) / 1000), 'i64');
-        return ptr;
-      } catch (e) {
-        return 0;
-      }
+    stat: function (ret, path) {
+      try { ensureIdbfs(); writeStat(ret, FS.stat(pathText(path))); } catch (e) { writeStat(ret, null); }
     },
     absPath: function (path) {
-      var raw = ezfsPath(path);
-      if (raw.charAt(0) === '/') return path;
-      return stringToNewUTF8('/' + raw);
+      var raw = pathText(path);
+      return raw.charAt(0) === '/' ? path : stringToNewUTF8('/' + raw);
     },
     __ez_fs_sync: function () {
-      ezfsEnsureIdbfs();
-      ezfsSync();
+      ensureIdbfs();
+      syncFs();
     },
   });
 })();

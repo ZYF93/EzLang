@@ -6,15 +6,24 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #if defined(_WIN32)
 #include <direct.h>
+#include <sys/stat.h>
 #define EZ_PATH_SEP '\\'
 #else
 #include <dirent.h>
+#include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #define EZ_PATH_SEP '/'
+#endif
+
+#if defined(_WIN32)
+#define EZ_ABI_NAME(name)
+#else
+#define EZ_ABI_NAME(name) __asm__(#name)
 #endif
 
 typedef struct {
@@ -28,6 +37,18 @@ typedef struct {
     int64_t modified;
     int64_t created;
 } FileStat;
+
+typedef struct {
+    char ***pages;
+    int64_t length;
+    int64_t capacity;
+    int64_t page_count;
+} StrList;
+
+typedef struct {
+    bool ok;
+    FileStat value;
+} OptFileStat;
 
 static const char *ez_fs_sandbox_root(void) {
 #if defined(__ANDROID__)
@@ -70,7 +91,87 @@ static bool ez_fs_mkdir_one(const char *path) {
 #if defined(_WIN32)
     return _mkdir(path) == 0;
 #else
-    return mkdir(path, 0777) == 0;
+    return mkdirat(AT_FDCWD, path, 0777) == 0;
+#endif
+}
+
+static bool ez_fs_remove_tree(const char *path) {
+#if defined(_WIN32)
+    return _rmdir(path) == 0;
+#else
+    DIR *dir = opendir(path);
+    if (!dir) return rmdir(path) == 0;
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != NULL) {
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) continue;
+        size_t len = strlen(path) + strlen(entry->d_name) + 2;
+        char *child = (char *)malloc(len);
+        if (!child) {
+            closedir(dir);
+            return false;
+        }
+        snprintf(child, len, "%s/%s", path, entry->d_name);
+        struct stat st;
+        bool ok = lstat(child, &st) == 0;
+        if (ok && S_ISDIR(st.st_mode)) {
+            ok = ez_fs_remove_tree(child);
+        } else if (ok) {
+            ok = remove(child) == 0;
+        }
+        free(child);
+        if (!ok) {
+            closedir(dir);
+            return false;
+        }
+    }
+    closedir(dir);
+    return rmdir(path) == 0;
+#endif
+}
+
+static StrList ez_fs_list_dir(const char *path) {
+#if defined(_WIN32)
+    (void)path;
+    return (StrList){0};
+#else
+    DIR *dir = opendir(path);
+    if (!dir) return (StrList){0};
+    size_t count = 0;
+    size_t cap = 8;
+    char **flat = (char **)calloc(cap, sizeof(char *));
+    if (!flat) {
+        closedir(dir);
+        return (StrList){0};
+    }
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != NULL) {
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) continue;
+        if (count == cap) {
+            cap *= 2;
+            char **next = (char **)realloc(flat, cap * sizeof(char *));
+            if (!next) break;
+            flat = next;
+        }
+        flat[count++] = strdup(entry->d_name);
+    }
+    closedir(dir);
+    int64_t page_count = count == 0 ? 0 : (int64_t)((count + 7) / 8);
+    char ***pages = page_count == 0 ? NULL : (char ***)calloc((size_t)page_count, sizeof(char **));
+    if (page_count > 0 && !pages) {
+        for (size_t i = 0; i < count; ++i) free(flat[i]);
+        free(flat);
+        return (StrList){0};
+    }
+    for (int64_t page = 0; page < page_count; ++page) {
+        pages[page] = (char **)calloc(8, sizeof(char *));
+        if (!pages[page]) continue;
+        for (int64_t offset = 0; offset < 8; ++offset) {
+            size_t idx = (size_t)(page * 8 + offset);
+            if (idx < count) pages[page][offset] = flat[idx];
+        }
+    }
+    free(flat);
+    return (StrList){pages, (int64_t)count, page_count * 8, page_count};
 #endif
 }
 
@@ -119,23 +220,24 @@ Blob readFile(const char *path) {
     return (Blob){data, (int64_t)size};
 }
 
-static bool ez_fs_write(const char *path, Blob content, const char *mode) {
+static bool ez_fs_write(const char *path, const Blob *content, const char *mode) {
+    if (!content) return false;
     char *real_path = ez_fs_path(path);
     if (!real_path) return false;
     ez_fs_ensure_parent(real_path);
     FILE *file = fopen(real_path, mode);
     free(real_path);
     if (!file) return false;
-    size_t written = fwrite(content.data, 1, (size_t)content.size, file);
+    size_t written = fwrite(content->data, 1, (size_t)content->size, file);
     fclose(file);
-    return written == (size_t)content.size;
+    return written == (size_t)content->size;
 }
 
-bool writeFile(const char *path, Blob content) {
+bool writeFile(const char *path, const Blob *content) {
     return ez_fs_write(path, content, "wb");
 }
 
-bool appendFile(const char *path, Blob content) {
+bool appendFile(const char *path, const Blob *content) {
     return ez_fs_write(path, content, "ab");
 }
 
@@ -147,7 +249,8 @@ bool removeFile(const char *path) {
     return ok;
 }
 
-bool mkdir(const char *path) {
+bool ez_std_mkdir(const char *path) EZ_ABI_NAME(mkdir);
+bool ez_std_mkdir(const char *path) {
     char *real_path = ez_fs_path(path);
     if (!real_path) return false;
     ez_fs_ensure_parent(real_path);
@@ -157,21 +260,23 @@ bool mkdir(const char *path) {
 }
 
 bool removeDir(const char *path, bool recursive) {
-    (void)recursive;
     char *real_path = ez_fs_path(path);
     if (!real_path) return false;
 #if defined(_WIN32)
     bool ok = _rmdir(real_path) == 0;
 #else
-    bool ok = rmdir(real_path) == 0;
+    bool ok = recursive ? ez_fs_remove_tree(real_path) : (rmdir(real_path) == 0);
 #endif
     free(real_path);
     return ok;
 }
 
-const char **listDir(const char *path) {
-    (void)path;
-    return NULL;
+StrList listDir(const char *path) {
+    char *real_path = ez_fs_path(path);
+    if (!real_path) return (StrList){0};
+    StrList items = ez_fs_list_dir(real_path);
+    free(real_path);
+    return items;
 }
 
 bool exists(const char *path) {
@@ -192,39 +297,50 @@ bool isDir(const char *path) {
     char *real_path = ez_fs_path(path);
     if (!real_path) return false;
 #if defined(_WIN32)
-    bool ok = false;
+    struct _stat st;
+    bool ok = _stat(real_path, &st) == 0 && (st.st_mode & _S_IFDIR) != 0;
 #else
     struct stat st;
-    bool ok = stat(real_path, &st) == 0 && S_ISDIR(st.st_mode);
+    bool ok = lstat(real_path, &st) == 0 && S_ISDIR(st.st_mode);
 #endif
     free(real_path);
     return ok;
 }
 
-FileStat *stat(const char *path) {
+OptFileStat ez_std_stat(const char *path) EZ_ABI_NAME(stat);
+OptFileStat ez_std_stat(const char *path) {
     char *real_path = ez_fs_path(path);
-    if (!real_path) return NULL;
+    if (!real_path) return (OptFileStat){false, {0}};
 #if defined(_WIN32)
-    free(real_path);
-    return NULL;
-#else
-    struct stat st;
-    if (stat(real_path, &st) != 0) {
+    struct _stat st;
+    if (_stat(real_path, &st) != 0) {
         free(real_path);
-        return NULL;
+        return (OptFileStat){false, {0}};
     }
     free(real_path);
-    FileStat *result = (FileStat *)malloc(sizeof(FileStat));
-    if (!result) return NULL;
-    result->size = (int64_t)st.st_size;
-    result->isDir = S_ISDIR(st.st_mode);
-    result->modified = (int64_t)st.st_mtime;
-#if defined(__APPLE__)
-    result->created = (int64_t)st.st_birthtime;
+    FileStat result;
+    result.size = (int64_t)st.st_size;
+    result.isDir = (st.st_mode & _S_IFDIR) != 0;
+    result.modified = (int64_t)st.st_mtime * 1000;
+    result.created = (int64_t)st.st_ctime * 1000;
+    return (OptFileStat){true, result};
 #else
-    result->created = (int64_t)st.st_ctime;
+    struct stat st;
+    if (lstat(real_path, &st) != 0) {
+        free(real_path);
+        return (OptFileStat){false, {0}};
+    }
+    free(real_path);
+    FileStat result;
+    result.size = (int64_t)st.st_size;
+    result.isDir = S_ISDIR(st.st_mode);
+    result.modified = (int64_t)st.st_mtime * 1000;
+#if defined(__APPLE__)
+    result.created = (int64_t)st.st_birthtime * 1000;
+#else
+    result.created = (int64_t)st.st_ctime * 1000;
 #endif
-    return result;
+    return (OptFileStat){true, result};
 #endif
 }
 

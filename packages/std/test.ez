@@ -1,0 +1,23 @@
+// std/test.ez - 轻量测试框架标准库
+// 依赖: EzLang 标准库封装层（C/JS）
+
+extern "@std/native/test.c" for linux;
+extern "@std/native/test.c" for macos;
+extern "@std/native/test.c" for windows;
+extern "@std/native/test.c" for android;
+extern "@std/native/test.c" for ios;
+extern "@std/emcc/test.js" for emcc;
+
+// === 断言 ===
+export declare const testAssert: (condition: Bool, msg: Str) => Void;
+export declare const testEqualI64: (actual: I64, expected: I64, msg: Str) => Void;
+export declare const testNotEqualI64: (actual: I64, expected: I64, msg: Str) => Void;
+export declare const testEqualStr: (actual: Str, expected: Str, msg: Str) => Void;
+export declare const testSkip: (msg: Str) => Void;
+
+// === 显式注册与统计 ===
+export declare const testRegister: (name: Str) => Void;
+export declare const testPassed: () => I32;
+export declare const testFailed: () => I32;
+export declare const testSkipped: () => I32;
+export declare const testReset: () => Void;

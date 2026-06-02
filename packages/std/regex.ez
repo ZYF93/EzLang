@@ -1,0 +1,38 @@
+// std/regex.ez - 轻量正则/模式匹配标准库
+// 依赖: EzLang 标准库封装层（C/JS）
+
+extern "@std/native/regex.c" for linux;
+extern "@std/native/regex.c" for macos;
+extern "@std/native/regex.c" for windows;
+extern "@std/native/regex.c" for android;
+extern "@std/native/regex.c" for ios;
+extern "@std/emcc/regex.js" for emcc;
+
+// === 正则标志 ===
+export const regexIgnoreCase: I32 = 1;
+export const regexMultiline: I32 = 2;
+export const regexGlobal: I32 = 4;
+
+export struct Regex {
+    pattern: Str;
+    flags: I32;
+    ok: Bool;
+};
+
+export struct RegexMatch {
+    start: I64;
+    end: I64;
+    text: Str;
+    groups: Str[];
+};
+
+// === 编译与匹配 ===
+export declare const regexCompile: (pattern: Str, flags: I32) => Regex;
+export declare const regexIsValid: (regex: Regex) => Bool;
+export declare const regexTest: (regex: Regex, input: Str) => Bool;
+export declare const regexFind: (regex: Regex, input: Str) => RegexMatch?;
+export declare const regexFindAll: (regex: Regex, input: Str) => Str[];
+
+// === 文本变换 ===
+export declare const regexReplace: (regex: Regex, input: Str, replacement: Str) => Str;
+export declare const regexSplit: (regex: Regex, input: Str) => Str[];

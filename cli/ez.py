@@ -72,6 +72,7 @@ class OutputConfig:
     os: str
     dir: Path
     triple: str
+    sdk: Path | None = None
 
 
 @dataclass
@@ -98,6 +99,7 @@ class ProjectConfig:
     registry: str | None = None
     outputs: list[OutputConfig] = field(default_factory=list)
     deps: dict[str, str] = field(default_factory=dict)
+    extern_search_paths: dict[str, list[Path]] = field(default_factory=dict)
     workspace_members: list[str] = field(default_factory=list)
     plugins: list[PluginConfig] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
@@ -127,6 +129,11 @@ def build_parser() -> argparse.ArgumentParser:
     run = subparsers.add_parser("run", help="编译并运行本地目标")
     _add_project_arg(run)
     run.set_defaults(func=cmd_run)
+
+    test = subparsers.add_parser("test", help="编译并执行 EzLang 测试")
+    _add_project_arg(test)
+    test.add_argument("paths", nargs="*", help="测试文件或目录，默认查找 tests/ 下的 .ez 文件")
+    test.set_defaults(func=cmd_test)
 
     install = subparsers.add_parser("install", help="校验依赖安装计划")
     _add_project_arg(install)
@@ -211,15 +218,54 @@ def cmd_run(args) -> int:
         print(f"error: ez run only supports native target {_native_os()}/{_native_arch()}, got {output.os}/{output.arch}", file=sys.stderr)
         return 1
     source_plan = discover_sources(config)
-    module, _ = _compile_project(config, output.os, source_plan)
+    module, libs = _compile_project(config, output.os, source_plan)
     _apply_target_triple(module, output.triple)
     output.dir.mkdir(parents=True, exist_ok=True)
     obj_file = output.dir / f"{config.name}.o"
     exe_file = output.dir / config.name
     obj_file.write_bytes(_emit_object(module, config.optimize, output.triple))
-    _link_executable(obj_file, exe_file)
+    _link_executable(obj_file, exe_file, libs, output.dir, output.os)
     completed = subprocess.run([str(exe_file)])
     return completed.returncode
+
+
+def cmd_test(args) -> int:
+    config = load_project(args.project, require_main=False)
+    output = _select_test_output(config)
+    test_files = _collect_test_files(config, args.paths)
+    if not test_files:
+        print("no tests")
+        return 0
+
+    passed = 0
+    failed = 0
+    for test_file in test_files:
+        try:
+            source_plan = _discover_sources_from(config, test_file)
+            module, libs = _compile_source_plan(config, output.os, source_plan, test_file.parent)
+            test_count = max(_count_test_symbols(test_file.read_text(encoding="utf-8")), 1)
+            ran = False
+            if _can_emit_native_object(output) and 'define i32 @"main"' in str(module):
+                test_dir = config.root / ".ez" / "test" / re.sub(r"\W+", "_", test_file.stem)
+                test_dir.mkdir(parents=True, exist_ok=True)
+                _apply_target_triple(module, output.triple)
+                obj_file = test_dir / f"{test_file.stem}.o"
+                exe_file = test_dir / test_file.stem
+                obj_file.write_bytes(_emit_object(module, config.optimize, output.triple))
+                _link_executable(obj_file, exe_file, libs, test_dir, output.os)
+                completed = subprocess.run([str(exe_file)])
+                ran = True
+                if completed.returncode != 0:
+                    raise CliError(f"运行失败，退出码 {completed.returncode}")
+            passed += test_count
+            suffix = "run" if ran else "compile"
+            print(f"ok {test_file.relative_to(config.root) if test_file.is_relative_to(config.root) else test_file} ({test_count} tests, {suffix})")
+        except CliError as exc:
+            failed += 1
+            print(f"fail {test_file.relative_to(config.root) if test_file.is_relative_to(config.root) else test_file}: {exc}", file=sys.stderr)
+
+    print(f"test result: {passed} passed; {failed} failed")
+    return 0 if failed == 0 else 1
 
 
 def cmd_install(args) -> int:
@@ -298,7 +344,7 @@ def load_project(path: str | Path, *, require_main: bool) -> ProjectConfig:
     name = _required_str(project, "name", "project.name")
     version = _required_str(project, "version", "project.version")
     _validate_semver(version, "project.version")
-    optimize = int(project.get("optimize", 0))
+    optimize = int(project.get("optimize", 2))
     if optimize < 0 or optimize > 3:
         raise CliError("project.optimize 必须在 0..3 之间")
     public = bool(project.get("public", True))
@@ -311,6 +357,7 @@ def load_project(path: str | Path, *, require_main: bool) -> ProjectConfig:
         if not main.exists():
             raise CliError(f"入口文件不存在: {main}")
     outputs = _parse_outputs(data.get("output"), root)
+    extern_search_paths = _parse_extern_config(data.get("extern"), root)
     return ProjectConfig(
         path=project_path,
         root=root,
@@ -322,6 +369,7 @@ def load_project(path: str | Path, *, require_main: bool) -> ProjectConfig:
         registry=registry if isinstance(registry, str) else None,
         outputs=outputs[0],
         deps={k: str(v) for k, v in data.get("deps", {}).items()},
+        extern_search_paths=extern_search_paths,
         workspace_members=list(data.get("workspace", {}).get("members", [])),
         plugins=_parse_plugins(data.get("plugins", [])),
         warnings=outputs[1],
@@ -367,13 +415,49 @@ def _parse_outputs(raw_outputs, root: Path) -> tuple[list[OutputConfig], list[st
             raise CliError(f"不支持的 os: {os_name}")
         triple = _target_triple(arch, os_name)
         out_dir = _resolve_path(root, str(raw.get("dir", "dist")))
-        outputs.append(OutputConfig(arch=arch, os=os_name, dir=out_dir, triple=triple))
+        sdk_value = raw.get("sdk")
+        sdk = _resolve_path(root, sdk_value) if isinstance(sdk_value, str) else None
+        if os_name in {"android", "ios"} and sdk is None:
+            warnings.append(f"{os_name} target has no output.sdk; platform SDK integration will be unavailable")
+        if sdk is not None and not sdk.exists():
+            raise CliError(f"output.sdk 路径不存在: {sdk}")
+        outputs.append(OutputConfig(arch=arch, os=os_name, dir=out_dir, triple=triple, sdk=sdk))
     return outputs, warnings
+
+
+def _parse_extern_config(raw_extern, root: Path) -> dict[str, list[Path]]:
+    """解析 [extern] 与 [extern.<platform>] 的搜索路径。"""
+    result: dict[str, list[Path]] = {"*": []}
+    if raw_extern is None:
+        return result
+    if not isinstance(raw_extern, dict):
+        raise CliError("[extern] 必须是表")
+
+    def parse_paths(value, label: str) -> list[Path]:
+        if value is None:
+            return []
+        if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
+            raise CliError(f"{label}.search_paths 必须是字符串数组")
+        return [_resolve_path(root, item) for item in value]
+
+    result["*"] = parse_paths(raw_extern.get("search_paths"), "extern")
+    for os_name in VALID_OSES:
+        section = raw_extern.get(os_name)
+        if section is None:
+            continue
+        if not isinstance(section, dict):
+            raise CliError(f"[extern.{os_name}] 必须是表")
+        result[os_name] = parse_paths(section.get("search_paths"), f"extern.{os_name}")
+    return result
 
 
 def discover_sources(config: ProjectConfig) -> list[Path]:
     if config.main is None:
         return []
+    return _discover_sources_from(config, config.main)
+
+
+def _discover_sources_from(config: ProjectConfig, entry: Path) -> list[Path]:
     ordered: list[Path] = []
     visiting: set[Path] = set()
     visited: set[Path] = set()
@@ -394,8 +478,23 @@ def discover_sources(config: ProjectConfig) -> list[Path]:
         visited.add(path)
         ordered.append(path)
 
-    visit(config.main)
+    visit(entry)
     return ordered
+
+
+def _compile_source_plan(config: ProjectConfig, compile_target: str, source_plan: list[Path], base_dir: Path):
+    source = "\n".join(_strip_imports(path.read_text(encoding="utf-8")) for path in source_plan)
+    analyzer = analyze(source, base_dir=base_dir, compile_target=compile_target)
+    if analyzer.symbols.has_errors():
+        resolved_errors = _resolve_extern_errors(analyzer.symbols.errors, config, compile_target, base_dir)
+        if resolved_errors:
+            raise CliError("语义错误: " + "; ".join(resolved_errors))
+    module, errors, libs = compile_source(source, module_name=config.name, compile_target=compile_target)
+    errors = _resolve_extern_errors(errors, config, compile_target, base_dir)
+    if errors:
+        raise CliError("编译错误: " + "; ".join(errors))
+    libs = _resolve_extern_libs(libs, config, compile_target, base_dir)
+    return module, libs
 
 
 def _plugin_context(config: ProjectConfig, output: OutputConfig, source_plan: list[Path]) -> dict[str, Any]:
@@ -411,6 +510,7 @@ def _plugin_context(config: ProjectConfig, output: OutputConfig, source_plan: li
             "os": output.os,
             "dir": str(output.dir),
             "triple": output.triple,
+            "sdk": str(output.sdk) if output.sdk is not None else None,
         },
         "sources": [str(path) for path in source_plan],
     }
@@ -487,15 +587,8 @@ def _run_plugin_hook(plugins: list[LoadedPlugin], hook_name: str, context: dict[
 
 def _compile_project(config: ProjectConfig, compile_target: str, source_plan: list[Path] | None = None):
     source_plan = source_plan or discover_sources(config)
-    source = "\n".join(_strip_imports(path.read_text(encoding="utf-8")) for path in source_plan)
     base_dir = config.main.parent if config.main is not None else config.root
-    analyzer = analyze(source, base_dir=base_dir, compile_target=compile_target)
-    if analyzer.symbols.has_errors():
-        raise CliError("语义错误: " + "; ".join(analyzer.symbols.errors))
-    module, errors, libs = compile_source(source, module_name=config.name, compile_target=compile_target)
-    if errors:
-        raise CliError("编译错误: " + "; ".join(errors))
-    return module, libs
+    return _compile_source_plan(config, compile_target, source_plan, base_dir)
 
 
 def _can_emit_native_object(output: OutputConfig) -> bool:
@@ -504,6 +597,66 @@ def _can_emit_native_object(output: OutputConfig) -> bool:
 
 def _can_emit_object(output: OutputConfig) -> bool:
     return llvm is not None and output.triple != ""
+
+
+def _extern_search_roots(config: ProjectConfig, compile_target: str, base_dir: Path) -> list[Path]:
+    roots: list[Path] = [base_dir, config.root]
+    roots.extend(config.extern_search_paths.get("*", []))
+    roots.extend(config.extern_search_paths.get(compile_target, []))
+    unique: list[Path] = []
+    seen: set[Path] = set()
+    for root in roots:
+        resolved = root.resolve()
+        if resolved not in seen:
+            seen.add(resolved)
+            unique.append(resolved)
+    return unique
+
+
+def _is_system_extern(lib: str) -> bool:
+    path = Path(lib)
+    return not path.is_absolute() and path.parent == Path(".") and path.suffix == ""
+
+
+def _resolve_extern_lib(lib, config: ProjectConfig, compile_target: str, base_dir: Path) -> str:
+    raw = str(lib[0] if isinstance(lib, tuple) else lib)
+    if _is_system_extern(raw):
+        return raw
+    path = Path(raw).expanduser()
+    if path.is_absolute():
+        return str(path.resolve())
+    matches: list[Path] = []
+    for root in _extern_search_roots(config, compile_target, base_dir):
+        candidate = (root / path).resolve()
+        if candidate.exists():
+            matches.append(candidate)
+    unique = sorted(dict.fromkeys(matches))
+    if len(unique) > 1:
+        raise CliError(f"extern 路径存在歧义: {raw} -> {', '.join(str(p) for p in unique)}")
+    if len(unique) == 1:
+        return str(unique[0])
+    return str((base_dir / path).resolve())
+
+
+def _resolve_extern_libs(libs, config: ProjectConfig, compile_target: str, base_dir: Path) -> list[str]:
+    return [_resolve_extern_lib(lib, config, compile_target, base_dir) for lib in libs]
+
+
+def _resolve_extern_errors(errors: list[str], config: ProjectConfig, compile_target: str, base_dir: Path) -> list[str]:
+    """如果 extern 缺失可由 project.toml 搜索路径解析，则消除旧诊断。"""
+    resolved_errors: list[str] = []
+    pattern = re.compile(r"extern 路径不存在：'([^']+)'")
+    for error in errors:
+        match = pattern.search(error)
+        if match is None:
+            resolved_errors.append(error)
+            continue
+        raw = match.group(1)
+        resolved = _resolve_extern_lib(raw, config, compile_target, base_dir)
+        if Path(resolved).exists() or _is_system_extern(resolved):
+            continue
+        resolved_errors.append(error + f"。已搜索: {', '.join(str(p) for p in _extern_search_roots(config, compile_target, base_dir))}")
+    return resolved_errors
 
 
 def _target_triple(arch: str, os_name: str) -> str:
@@ -532,15 +685,52 @@ def _emit_object(module, optimize: int, triple: str) -> bytes:
         raise CliError(f"对象文件生成失败: {exc}") from exc
 
 
-def _link_executable(obj_file: Path, exe_file: Path):
+def _link_executable(obj_file: Path, exe_file: Path, libs: list[str] | None = None, build_dir: Path | None = None, compile_target: str | None = None):
+    libs = libs or []
+    build_dir = build_dir or obj_file.parent
+    link_inputs = [str(obj_file)]
+    generated_objects: list[Path] = []
+    for lib in libs:
+        path = Path(lib)
+        if _is_system_extern(lib):
+            link_inputs.append(f"-l{lib}")
+            continue
+        if path.suffix == ".c":
+            compiled = _compile_c_extern(path, build_dir, compile_target)
+            generated_objects.append(compiled)
+            link_inputs.append(str(compiled))
+            continue
+        if path.suffix == ".framework":
+            link_inputs.extend(["-framework", path.stem])
+            continue
+        if path.suffix == ".js":
+            continue
+        link_inputs.append(str(path))
     completed = subprocess.run(
-        ["cc", str(obj_file), "-o", str(exe_file)],
+        ["cc", *link_inputs, "-o", str(exe_file)],
         text=True,
         capture_output=True,
     )
     if completed.returncode != 0:
         detail = completed.stderr.strip() or completed.stdout.strip()
         raise CliError(f"链接失败: {detail}")
+
+
+def _compile_c_extern(source: Path, build_dir: Path, compile_target: str | None) -> Path:
+    if not source.exists():
+        raise CliError(f"extern C 源码不存在: {source}")
+    extern_dir = build_dir / ".extern"
+    extern_dir.mkdir(parents=True, exist_ok=True)
+    obj_name = re.sub(r"\W+", "_", str(source.resolve())) + ".o"
+    obj_file = extern_dir / obj_name
+    cmd = ["cc", "-c", str(source), "-o", str(obj_file)]
+    if compile_target in {"linux", "macos", "windows", "android", "ios"}:
+        cmd.insert(1, f"-DEZ_TARGET_{compile_target.upper()}=1")
+    completed = subprocess.run(cmd, text=True, capture_output=True)
+    if completed.returncode != 0:
+        detail = completed.stderr.strip() or completed.stdout.strip()
+        raise CliError(f"extern C 编译失败 {source}: {detail}")
+    return obj_file
 
 
 def _resolve_import(base_dir: Path, import_path: str, config: ProjectConfig) -> Path:
@@ -554,7 +744,103 @@ def _resolve_import(base_dir: Path, import_path: str, config: ProjectConfig) -> 
         std_candidate = (ROOT / "packages" / f"{import_path}.ez").resolve()
         if std_candidate.exists():
             return std_candidate
+    package_candidate = _resolve_package_import(import_path, config)
+    if package_candidate is not None:
+        return package_candidate
     return (config.root / path).resolve()
+
+
+def _resolve_package_import(import_path: str, config: ProjectConfig) -> Path | None:
+    """解析 from "pkg" / from "pkg/sub" 形式的依赖包入口。"""
+    if import_path.startswith(".") or import_path.endswith(".ez"):
+        return None
+    parts = import_path.split("/", 1)
+    package_name = parts[0]
+    rest = parts[1] if len(parts) > 1 else ""
+
+    roots = _dependency_roots(config, package_name)
+    for root in roots:
+        entry = _package_entry(root, package_name, rest)
+        if entry is not None:
+            return entry
+    return None
+
+
+def _dependency_roots(config: ProjectConfig, package_name: str) -> list[Path]:
+    roots: list[Path] = []
+    bundled_root = ROOT / "packages" / package_name
+    if bundled_root.exists():
+        roots.append(bundled_root)
+    dep_spec = config.deps.get(package_name)
+    if dep_spec:
+        if dep_spec == "@workspace":
+            for member in _expand_workspace_members(config):
+                if _workspace_member_name(member) == package_name or member.name == package_name:
+                    roots.append(member)
+        elif dep_spec.startswith(".") or dep_spec.startswith("/"):
+            roots.append(_resolve_path(config.root, dep_spec))
+        elif SEMVER_RE.match(dep_spec):
+            roots.append(config.root / ".ez" / "deps" / package_name / dep_spec)
+
+    installed_root = config.root / ".ez" / "deps" / package_name
+    if installed_root.exists():
+        if _package_entry(installed_root, package_name, "") is not None:
+            roots.append(installed_root)
+        else:
+            versions = [p for p in installed_root.iterdir() if p.is_dir()]
+            if len(versions) == 1:
+                roots.append(versions[0])
+    return sorted(dict.fromkeys(p.resolve() for p in roots))
+
+
+def _workspace_member_name(member: Path) -> str | None:
+    project_file = member / "project.toml"
+    if not project_file.exists() or tomllib is None:
+        return None
+    try:
+        with project_file.open("rb") as f:
+            data = tomllib.load(f)
+    except Exception:
+        return None
+    project = data.get("project")
+    if isinstance(project, dict) and isinstance(project.get("name"), str):
+        return project["name"]
+    return None
+
+
+def _package_entry(root: Path, package_name: str, rest: str) -> Path | None:
+    root = root.resolve()
+    if root.is_file():
+        return root if not rest else None
+    if not root.exists() or not root.is_dir():
+        return None
+    if rest:
+        sub = root / rest
+        candidates = [sub]
+        if sub.suffix != ".ez":
+            candidates.extend([sub.with_suffix(".ez"), sub / "index.ez", sub / f"{sub.name}.ez"])
+        for candidate in candidates:
+            if candidate.exists() and candidate.is_file():
+                return candidate.resolve()
+        return None
+
+    project_file = root / "project.toml"
+    if project_file.exists() and tomllib is not None:
+        try:
+            with project_file.open("rb") as f:
+                data = tomllib.load(f)
+            main_value = data.get("project", {}).get("main")
+            if isinstance(main_value, str):
+                candidate = _resolve_path(root, main_value)
+                if candidate.exists() and candidate.is_file():
+                    return candidate
+        except Exception:
+            pass
+
+    for candidate in [root / f"{package_name}.ez", root / "index.ez", root / "src" / "index.ez"]:
+        if candidate.exists() and candidate.is_file():
+            return candidate.resolve()
+    return None
 
 
 def _strip_imports(source: str) -> str:
@@ -578,6 +864,30 @@ def _collect_fmt_files(config: ProjectConfig, paths: list[str]) -> list[Path]:
         else:
             raise CliError(f"fmt 只支持 .ez 文件或目录: {root}")
     return sorted(dict.fromkeys(files))
+
+
+def _collect_test_files(config: ProjectConfig, paths: list[str]) -> list[Path]:
+    roots = [_resolve_path(Path.cwd(), p) for p in paths]
+    if not roots:
+        tests_dir = config.root / "tests"
+        roots = [tests_dir] if tests_dir.exists() else ([config.main] if config.main else [])
+    files: list[Path] = []
+    for root in roots:
+        if root is None:
+            continue
+        if root.is_dir():
+            files.extend(sorted(root.rglob("*.ez")))
+        elif root.suffix == ".ez":
+            files.append(root)
+        else:
+            raise CliError(f"test 只支持 .ez 文件或目录: {root}")
+    return sorted(dict.fromkeys(path.resolve() for path in files))
+
+
+def _count_test_symbols(source: str) -> int:
+    names = set(re.findall(r'\b(?:const|let)\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*\(', source))
+    names.update(re.findall(r'\bfn\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(', source))
+    return sum(1 for name in names if name.startswith("test") or name.endswith("_test"))
 
 
 
@@ -741,6 +1051,10 @@ def _select_run_output(config: ProjectConfig) -> OutputConfig:
         if output.os == native:
             return output
     return config.outputs[0]
+
+
+def _select_test_output(config: ProjectConfig) -> OutputConfig:
+    return _select_run_output(config)
 
 
 def _required_str(mapping: dict[str, Any], key: str, label: str) -> str:

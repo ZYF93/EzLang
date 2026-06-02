@@ -2,6 +2,8 @@
 
 `ez-web-ui` 提供面向 `emcc` 目标的 **底层 DOM 绑定**。包本身不做框架、不做 diff、不做渲染调度——这些由使用者自行实现。所有 API 均为对 Browser/Emscripten JS 侧的 FFI 绑定。
 
+> **当前实现状态**：仓库内已提供可编译链接的 ABI。`emcc` wrapper 已接入核心 DOM 操作；非 Web 原生目标返回零句柄、空字符串、空可选值、`false` 或执行 no-op，用于明确表示不可用，不伪装为成功。
+
 > **使用前提**：`project.toml` 中 `os = "emcc"`。
 
 ---
@@ -16,7 +18,7 @@ struct Node {
 
 // 事件对象
 struct Event {
-    type:    Str
+    eventType: Str
     targetId: I32
     data:    Blob?   // 序列化的原始事件数据，按需通过 getEventData 解析
 }

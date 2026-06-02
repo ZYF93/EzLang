@@ -2,6 +2,8 @@
 
 `ez-ios-ui` 提供面向 `ios` 目标的**原生 UIKit View 底层绑定**（基于 Objective-C runtime 桥接）。包本身不做框架和调度——这些由使用者自行实现。**View 树修改必须在主线程执行**，包提供主线程调度桥接。
 
+> **当前实现状态**：仓库内已提供可编译链接的 ABI 占位，真实 Objective-C/UIKit 桥接尚未接入。当前 native wrapper 返回零句柄、空字符串、空可选值、`false` 或执行 no-op，用于明确表示不可用；后续接入平台实现时保持这些公开签名。
+
 > **使用前提**：`project.toml` 中 `os = "ios"`，`sdk` 指向 Xcode SDK。
 
 ---

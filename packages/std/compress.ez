@@ -1,0 +1,23 @@
+// std/compress.ez - 压缩与解压缩标准库
+// 依赖: zlib/JS zlib 封装；流式接口等待 std/stream 落地后补充
+
+extern "@std/native/compress.c" for linux;
+extern "z" for linux;
+extern "@std/native/compress.c" for macos;
+extern "z" for macos;
+extern "@std/native/compress.c" for windows;
+extern "@std/native/compress.c" for android;
+extern "@std/native/compress.c" for ios;
+extern "@std/emcc/compress.js" for emcc;
+
+// === gzip ===
+export declare const compressGzip: (data: Blob) => Blob?;
+export declare const decompressGzip: (data: Blob) => Blob?;
+
+// === zlib ===
+export declare const compressZlib: (data: Blob) => Blob?;
+export declare const decompressZlib: (data: Blob) => Blob?;
+
+// === raw deflate ===
+export declare const compressDeflate: (data: Blob) => Blob?;
+export declare const decompressDeflate: (data: Blob) => Blob?;

@@ -19,10 +19,15 @@ class LLVMCodeGenerator(EzLangVisitor):
         self._method_this: ir.Value = None
         self.locals: dict[str, ir.AllocaInstr] = {}
         self.globals: dict[str, ir.GlobalVariable] = {}
+        self._ptr_unsigned: dict[int, bool] = {}
+        self._value_unsigned: dict[int, bool] = {}
+        self._struct_field_unsigned: dict[str, list[bool]] = {}
+        self._list_elem_unsigned: dict[int, bool] = {}
         self.loop_exit_blocks: list[ir.Block] = []
         self.loop_continue_blocks: list[ir.Block] = []
         self.catch_exit_blocks: list[ir.Block] = []
         self.catch_error_allocas: list[ir.AllocaInstr] = []
+        self.catch_result_allocas: list[ir.AllocaInstr] = []
         self.structs: dict[str, ir.IdentifiedStructType] = {}
         self.struct_fields: dict[str, list[str]] = {}
         self.struct_defaults: dict[str, dict[str, any]] = {}  # struct_name → {field_name: expression_ctx}
@@ -30,26 +35,41 @@ class LLVMCodeGenerator(EzLangVisitor):
         self.type_aliases: dict[str, ir.Type] = {}
         self.func_defaults: dict[str, dict[str, ir.Value]] = {}
         self.func_param_names: dict[str, list[str]] = {}
+        self.func_return_unsigned: dict[str, bool] = {}
         self.generic_templates: dict[str, tuple] = {}
         self._monomorphized: set[str] = set()
         self.extern_libs: list[tuple[str, Optional[str]]] = []  # (lib_path, target)
         self.active_extern_libs: list[str] = []
         self._extern_diagnostics: list[str] = []
         self._declare_names: list[str] = []
+        self._sret_functions: dict[str, ir.Type] = {}
         self._non_extern_decls_seen = 0
-        self._compiler_builtin_declares = {'copy', 'set', 'allocRaw'}
-        self._unimplemented_collection_declares = {
+        self._list_collection_builtins = {
             'listPush', 'listPop', 'listShift', 'listUnshift', 'listSort',
             'listFilter', 'listMap', 'listFind', 'listLen', 'listSlice',
+        }
+        self._dict_collection_builtins = {
             'dictKeys', 'dictValues', 'dictHas', 'dictDelete', 'dictLen',
         }
+        self._collection_builtin_declares = self._list_collection_builtins | self._dict_collection_builtins
+        self._compiler_builtin_declares = {'copy', 'set', 'allocRaw'} | self._collection_builtin_declares
+        self._unimplemented_collection_declares = set()
+        self._collection_mono_types: dict[str, tuple[str, list[ir.Type]]] = {}
         self._emcc_js_libs: list[str] = []
         self._emcc_binding_counter = 0
         self._supported_extern_exts = {".a", ".lib", ".so", ".dylib", ".dll", ".o", ".ll", ".bc", ".framework", ".js", ".c"}
+        self._void_intrinsic_result = object()
         self._str_counter: int = 0  # 字符串全局变量唯一 ID
         self._type_width_cache: dict[str, int] = {}
+        self._type_align_cache: dict[str, int] = {}
         self._zero_constant_cache: dict[str, ir.Constant] = {}
+        self._type_ids: dict[str, int] = {}
         self._flow_depth = 0
+        self._parallel_result_stack: list[ir.AllocaInstr] = []
+        self._parallel_exit_stack: list[ir.Block] = []
+        self._lock_policies: dict[str, int] = {}
+        self._uncaught_throw: ir.Function | None = None
+        self._curried_closures: dict[str, tuple[ir.Function, list[str]]] = {}
         self._declare_builtins()
 
     def _declare_builtins(self):
@@ -68,10 +88,17 @@ class LLVMCodeGenerator(EzLangVisitor):
         self._declare_arena()
 
         flow_hook_type = ir.FunctionType(void, [])
-        self._flow_enter = ir.Function(self.module, flow_hook_type, '__ezrt_flow_enter')
-        self._flow_exit = ir.Function(self.module, flow_hook_type, '__ezrt_flow_exit')
-        self._flow_sleep = ir.Function(self.module, ir.FunctionType(void, [i64]), '__ezrt_sleep')
-        self._flow_race = ir.Function(self.module, ir.FunctionType(i32, [i32, i32]), '__ezrt_race')
+        self._flow_enter = self._define_runtime_void_hook('__ezrt_flow_enter', flow_hook_type)
+        self._flow_exit = self._define_runtime_void_hook('__ezrt_flow_exit', flow_hook_type)
+        self._flow_sleep = self._define_runtime_void_hook('__ezrt_sleep', ir.FunctionType(void, [i64]))
+        self._flow_race = self._define_runtime_race_hook('__ezrt_race', ir.FunctionType(i32, [i32, i32]))
+        self._parallel_enter = self._define_runtime_void_hook('__ezrt_parallel_enter', flow_hook_type)
+        self._parallel_exit = self._define_runtime_void_hook('__ezrt_parallel_exit', flow_hook_type)
+        self._lock_register = self._define_runtime_void_hook('__ezrt_lock_register', ir.FunctionType(void, [i8_ptr, i32]))
+        self._lock_read_acquire = self._define_runtime_void_hook('__ezrt_lock_read_acquire', ir.FunctionType(void, [i8_ptr]))
+        self._lock_read_release = self._define_runtime_void_hook('__ezrt_lock_read_release', ir.FunctionType(void, [i8_ptr]))
+        self._lock_write_acquire = self._define_runtime_void_hook('__ezrt_lock_write_acquire', ir.FunctionType(void, [i8_ptr]))
+        self._lock_write_release = self._define_runtime_void_hook('__ezrt_lock_write_release', ir.FunctionType(void, [i8_ptr]))
 
         # 内置结构体: Error = { i32 code, i8* message }
         err_type = ir.global_context.get_identified_type('Error')
@@ -107,6 +134,54 @@ class LLVMCodeGenerator(EzLangVisitor):
             )
         self.structs['Dict'] = dict_type
         self.struct_fields['Dict'] = ['key_pages', 'value_pages', 'count', 'capacity', 'page_count']
+
+    def _define_runtime_void_hook(self, name: str, func_type: ir.FunctionType) -> ir.Function:
+        """定义最小运行时 hook，避免本机链接时遗留未定义符号。"""
+        func = ir.Function(self.module, func_type, name)
+        entry = func.append_basic_block('entry')
+        builder = ir.IRBuilder(entry)
+        builder.ret_void()
+        return func
+
+    def _define_runtime_race_hook(self, name: str, func_type: ir.FunctionType) -> ir.Function:
+        """当前同步 lowering 下的 race hook：返回任务参数作为占位结果。"""
+        func = ir.Function(self.module, func_type, name)
+        entry = func.append_basic_block('entry')
+        builder = ir.IRBuilder(entry)
+        builder.ret(func.args[0])
+        return func
+
+    def _get_or_declare_function(self, name: str, func_type: ir.FunctionType) -> ir.Function:
+        existing = self.module.globals.get(name)
+        if isinstance(existing, ir.Function):
+            return existing
+        return ir.Function(self.module, func_type, name)
+
+    def _define_uncaught_throw_hook(self) -> ir.Function:
+        """未捕获 throw 的最小终止路径。"""
+        void = ir.VoidType()
+        i8_ptr = ir.PointerType(ir.IntType(8))
+        i32 = ir.IntType(32)
+        func = ir.Function(self.module, ir.FunctionType(void, []), '__ezrt_uncaught_throw')
+        entry = func.append_basic_block('entry')
+        builder = ir.IRBuilder(entry)
+
+        puts_fn = self._get_or_declare_function('puts', ir.FunctionType(i32, [i8_ptr]))
+        exit_fn = self._get_or_declare_function('exit', ir.FunctionType(void, [i32]))
+        data = bytearray('uncaught EzLang throw\0', 'utf-8')
+        arr_type = ir.ArrayType(ir.IntType(8), len(data))
+        msg = ir.GlobalVariable(self.module, arr_type, '_ez_uncaught_throw_msg')
+        msg.initializer = ir.Constant(arr_type, data)
+        msg.global_constant = True
+        msg.linkage = 'internal'
+        msg_ptr = builder.gep(msg, [
+            ir.Constant(i32, 0),
+            ir.Constant(i32, 0),
+        ], inbounds=True)
+        builder.call(puts_fn, [msg_ptr])
+        builder.call(exit_fn, [ir.Constant(i32, 1)])
+        builder.unreachable()
+        return func
 
     def _declare_arena(self):
         """声明 Arena 内存管理基础设施：缓冲区 + 游标 + 分配函数"""
@@ -186,6 +261,73 @@ class LLVMCodeGenerator(EzLangVisitor):
             return self.builder.load(val)
         return val
 
+    def _type_ctx_is_unsigned(self, ctx) -> bool:
+        """判断语法类型是否为无符号整数类型。"""
+        if ctx is None:
+            return False
+        if isinstance(ctx, EzLangParser.ArrayTypeContext) or isinstance(ctx, EzLangParser.ListTypeContext):
+            return self._type_ctx_is_unsigned(ctx.type_())
+        if hasattr(ctx, 'baseType') and ctx.baseType() is not None:
+            bt = ctx.baseType()
+            return bt.U8() is not None or bt.U32() is not None or bt.U64() is not None
+        if hasattr(ctx, 'type_'):
+            inner = ctx.type_()
+            if inner is not None and not isinstance(inner, list):
+                return self._type_ctx_is_unsigned(inner)
+        return False
+
+    def _mark_unsigned(self, value: ir.Value | None, unsigned: bool) -> None:
+        if value is None:
+            return
+        if isinstance(value.type, ir.PointerType):
+            self._ptr_unsigned[id(value)] = unsigned
+        else:
+            self._value_unsigned[id(value)] = unsigned
+
+    def _is_unsigned_value(self, value: ir.Value | None) -> bool:
+        if value is None:
+            return False
+        if isinstance(value.type, ir.PointerType):
+            return self._ptr_unsigned.get(id(value), False)
+        return self._value_unsigned.get(id(value), False)
+
+    def _load_with_unsigned(self, ptr: ir.Value, name: str = "") -> ir.Value:
+        value = self.builder.load(ptr, name=name)
+        self._mark_unsigned(value, self._ptr_unsigned.get(id(ptr), False))
+        return value
+
+    def _coerce_preserve_unsigned(self, value: ir.Value, target_type: ir.Type) -> ir.Value:
+        unsigned = self._is_unsigned_value(value)
+        coerced = self._coerce_value(value, target_type) if value.type != target_type else value
+        self._mark_unsigned(coerced, unsigned)
+        return coerced
+
+    def _binary_result_unsigned(self, left: ir.Value, right: ir.Value) -> bool:
+        return self._is_unsigned_value(left) or self._is_unsigned_value(right)
+
+    def _list_type_is_unsigned(self, list_type: ir.Type) -> bool:
+        elem_type = None
+        if isinstance(list_type, ir.PointerType):
+            list_type = list_type.pointee
+        if self._is_list_type(list_type):
+            elem_type = list_type.elements[0].pointee.pointee
+        return isinstance(elem_type, ir.IntType) and self._list_elem_unsigned.get(id(list_type), False)
+
+    def _mark_list_elem_unsigned(self, list_value: ir.Value | ir.Type | None, unsigned: bool) -> None:
+        if list_value is None:
+            return
+        list_type = list_value
+        if isinstance(list_value, ir.Value):
+            list_type = list_value.type.pointee if isinstance(list_value.type, ir.PointerType) else list_value.type
+        if self._is_list_type(list_type):
+            self._list_elem_unsigned[id(list_type)] = unsigned
+
+    def _save_unsigned_state(self):
+        return dict(self._ptr_unsigned), dict(self._value_unsigned)
+
+    def _restore_unsigned_state(self, state) -> None:
+        self._ptr_unsigned, self._value_unsigned = state
+
     def _arena_allocate(self, llvm_type: ir.Type, name: str = "") -> ir.Value:
         """在 Arena 中分配内存，返回指向分配区域的指针"""
         if not hasattr(self, '_arena_alloc') or self.builder is None:
@@ -211,6 +353,14 @@ class LLVMCodeGenerator(EzLangVisitor):
             return ir.IntType(32)
 
         P = EzLangParser
+
+        # 指针类型 *T 当前 lowering 为裸指针。
+        if isinstance(ctx, P.PointerTypeContext):
+            return ir.PointerType(self._map_type(ctx.type_()))
+
+        # 匿名类型结构：动态键结构按 Dict ABI，普通结构使用字面结构。
+        if isinstance(ctx, P.TypeShapeTypeContext):
+            return self._map_type_shape(ctx.typeShape())
 
         # 可选类型: T? → {i1, T}
         if isinstance(ctx, P.OptionalTypeContext):
@@ -283,6 +433,23 @@ class LLVMCodeGenerator(EzLangVisitor):
                 return self._map_base_type(bt)
 
         return ir.IntType(32)
+
+    def _map_type_shape(self, shape_ctx) -> ir.Type:
+        if shape_ctx is None:
+            return ir.IntType(32)
+        members = list(shape_ctx.typeShapeMember())
+        dynamic_members = [member for member in members if member.LBRACK() is not None]
+        if dynamic_members and len(dynamic_members) == len(members):
+            return self.structs['Dict']
+        fields = []
+        for member in members:
+            if member.VAR_IDENTIFIER() is None:
+                continue
+            member_types = member.type_()
+            member_types = member_types if isinstance(member_types, list) else [member_types]
+            member_types = [t for t in member_types if t is not None]
+            fields.append(self._map_type(member_types[-1]) if member_types else ir.IntType(32))
+        return ir.LiteralStructType(fields) if fields else ir.IntType(32)
 
     def _map_base_type(self, bt) -> ir.Type:
         """基础类型映射"""
@@ -364,7 +531,7 @@ class LLVMCodeGenerator(EzLangVisitor):
         return gv
 
     def _type_width(self, t: ir.Type) -> int:
-        """获取 LLVM 类型的目标字节宽度（近似），并缓存递归结果。"""
+        """获取 LLVM 类型的目标字节宽度（近似 C ABI 对齐），并缓存递归结果。"""
         key = str(t)
         cached = self._type_width_cache.get(key)
         if cached is not None:
@@ -382,11 +549,57 @@ class LLVMCodeGenerator(EzLangVisitor):
         elif isinstance(t, ir.VectorType):
             width = t.count * self._type_width(t.element)
         elif isinstance(t, (ir.LiteralStructType, ir.IdentifiedStructType)):
-            width = max(sum(self._type_width(e) for e in t.elements), 1)
+            offset = 0
+            max_align = 1
+            for elem in t.elements:
+                align = self._type_align(elem)
+                max_align = max(max_align, align)
+                offset = self._align_to(offset, align)
+                offset += self._type_width(elem)
+            width = max(self._align_to(offset, max_align), 1)
         else:
             width = 4
         self._type_width_cache[key] = width
         return width
+
+    def _type_align(self, t: ir.Type) -> int:
+        """获取 LLVM 类型的近似 C ABI 对齐，当前按 64 位平台保守估算。"""
+        key = str(t)
+        cached = self._type_align_cache.get(key)
+        if cached is not None:
+            return cached
+        if isinstance(t, ir.IntType):
+            align = min(max(t.width // 8, 1), 8)
+        elif isinstance(t, ir.FloatType):
+            align = 4
+        elif isinstance(t, ir.DoubleType):
+            align = 8
+        elif isinstance(t, ir.PointerType):
+            align = 8
+        elif isinstance(t, ir.ArrayType):
+            align = self._type_align(t.element)
+        elif isinstance(t, ir.VectorType):
+            align = min(max(self._type_width(t), self._type_align(t.element)), 16)
+        elif isinstance(t, (ir.LiteralStructType, ir.IdentifiedStructType)):
+            align = max((self._type_align(e) for e in t.elements), default=1)
+        else:
+            align = 4
+        self._type_align_cache[key] = align
+        return align
+
+    @staticmethod
+    def _align_to(value: int, align: int) -> int:
+        if align <= 1:
+            return value
+        return (value + align - 1) // align * align
+
+    def _uses_c_sret(self, ret_type: ir.Type) -> bool:
+        """外部 C ABI: 大聚合返回值使用隐藏 sret 指针。"""
+        if not isinstance(ret_type, (ir.LiteralStructType, ir.IdentifiedStructType)):
+            return False
+        if self.compile_target == 'emcc':
+            return True
+        return self._type_width(ret_type) > 16
 
     def _zero_constant(self, t: ir.Type) -> ir.Constant:
         """为任意 LLVM 类型生成零值常量，并缓存纯常量构造。"""
@@ -485,6 +698,248 @@ class LLVMCodeGenerator(EzLangVisitor):
         return val
 
     # ==================== 辅助 ====================
+
+    def _qualified_name(self, ctx) -> str:
+        """读取支持点号命名空间的声明名。"""
+        qname = ctx.qualifiedVarName() if hasattr(ctx, 'qualifiedVarName') else None
+        if qname is None:
+            token = ctx.VAR_IDENTIFIER() if hasattr(ctx, 'VAR_IDENTIFIER') else None
+            return token.getText() if token is not None else ""
+        return qname.getText()
+
+    def _lock_policy_code(self, ctx) -> int:
+        prefix = ctx.lockPrefix() if hasattr(ctx, 'lockPrefix') else None
+        if prefix is None:
+            return 0
+        if prefix.RP() is not None:
+            return 1
+        if prefix.WP() is not None:
+            return 2
+        return 0
+
+    def _dict_key_text(self, field_ctx) -> str | None:
+        key_ctx = field_ctx.dictKey() if hasattr(field_ctx, 'dictKey') else None
+        if key_ctx is None:
+            token = field_ctx.VAR_IDENTIFIER() if hasattr(field_ctx, 'VAR_IDENTIFIER') else None
+            return token.getText() if token is not None else None
+        if key_ctx.VAR_IDENTIFIER() is not None:
+            return key_ctx.VAR_IDENTIFIER().getText()
+        if key_ctx.STRING_LITERAL() is not None:
+            return key_ctx.STRING_LITERAL().getText()[1:-1]
+        return None
+
+    def _dict_key_value(self, field_ctx) -> ir.Value:
+        key_ctx = field_ctx.dictKey() if hasattr(field_ctx, 'dictKey') else None
+        if key_ctx is not None and key_ctx.expression() is not None:
+            val = self._eval(key_ctx.expression())
+            if val is not None:
+                if isinstance(val, ir.AllocaInstr):
+                    val = self.builder.load(val)
+                if val.type == ir.PointerType(ir.IntType(8)):
+                    return val
+                tmp = self.builder.alloca(val.type, name="_dict_key_val")
+                self.builder.store(val, tmp)
+                return self.builder.bitcast(tmp, ir.PointerType(ir.IntType(8)))
+        text = self._dict_key_text(field_ctx) or ""
+        return self._make_global_string(text, prefix="_dict_key")
+
+    def _emit_lock_metadata(self, name: str, policy_code: int):
+        if policy_code == 0:
+            return None
+        self._lock_policies[name] = policy_code
+        meta_name = "__ez_lock_" + re.sub(r"\W+", "_", name)
+        if meta_name in self.module.globals:
+            return self.module.globals[meta_name]
+        meta = ir.GlobalVariable(self.module, ir.IntType(32), meta_name)
+        meta.initializer = ir.Constant(ir.IntType(32), policy_code)
+        meta.linkage = 'internal'
+        return meta
+
+    def _lock_name_ptr(self, name: str) -> ir.Value | None:
+        if self.builder is None or name not in self._lock_policies:
+            return None
+        return self._make_global_string(name, prefix="_lock_name")
+
+    def _emit_lock_access(self, name: str, mode: str, thunk):
+        name_ptr = self._lock_name_ptr(name)
+        if name_ptr is None:
+            return thunk()
+        if mode == "read":
+            acquire = self._lock_read_acquire
+            release = self._lock_read_release
+        else:
+            acquire = self._lock_write_acquire
+            release = self._lock_write_release
+        self.builder.call(acquire, [name_ptr])
+        value = thunk()
+        self.builder.call(release, [name_ptr])
+        return value
+
+    def _simple_lvalue_name(self, ctx) -> str | None:
+        """仅识别裸标识符左值；成员和索引左值由后续语义完善。"""
+        if ctx is None:
+            return None
+        text = ctx.getText() if hasattr(ctx, 'getText') else ''
+        if re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', text):
+            return text
+        return None
+
+    def _outer_postfix_ctx(self, ctx):
+        """返回表达式最外层的后缀表达式，用于判断真实左值形态。"""
+        if ctx is None:
+            return None
+        if isinstance(ctx, EzLangParser.PostfixExpressionContext):
+            return ctx
+        if hasattr(ctx, 'getChildCount'):
+            for i in range(ctx.getChildCount()):
+                result = self._outer_postfix_ctx(ctx.getChild(i))
+                if result is not None:
+                    return result
+        return None
+
+    def _member_lvalue_ptr(self, ctx) -> ir.Value | None:
+        """识别结构体字段左值，返回字段地址。"""
+        member_ctx = self._find_member_access_ctx(ctx)
+        if member_ctx is None:
+            return None
+        obj_ptr = self._eval(member_ctx.postfixExpression())
+        if obj_ptr is None or not hasattr(obj_ptr, 'type'):
+            return None
+        pointee = obj_ptr.type.pointee if hasattr(obj_ptr.type, 'pointee') else obj_ptr.type
+        if not isinstance(pointee, (ir.IdentifiedStructType, ir.LiteralStructType)):
+            return None
+
+        field_name = member_ctx.VAR_IDENTIFIER().getText()
+        field_index = None
+        if isinstance(pointee, ir.LiteralStructType) and len(pointee.elements) == 2 and pointee.elements[0] == ir.IntType(1):
+            optional_fields = {'ok': 0, 'value': 1}
+            field_index = optional_fields.get(field_name)
+        else:
+            struct_name = pointee.name if isinstance(pointee, ir.IdentifiedStructType) else None
+            field_names = self.struct_fields.get(struct_name, []) if struct_name else []
+            if field_name in field_names:
+                field_index = field_names.index(field_name)
+
+        if field_index is None:
+            return None
+        field_ptr = self.builder.gep(obj_ptr, [
+            ir.Constant(ir.IntType(32), 0),
+            ir.Constant(ir.IntType(32), field_index),
+        ], inbounds=True)
+        struct_name = pointee.name if isinstance(pointee, ir.IdentifiedStructType) else None
+        if struct_name is not None:
+            field_unsigned = self._struct_field_unsigned.get(struct_name, [])
+            self._mark_unsigned(field_ptr, field_unsigned[field_index] if field_index < len(field_unsigned) else False)
+        return field_ptr
+
+    def _index_lvalue_ptr(self, ctx) -> ir.Value | None:
+        """识别数组/List 索引左值，返回元素地址。"""
+        index_ctx = ctx if isinstance(ctx, EzLangParser.IndexContext) else self._outer_postfix_ctx(ctx)
+        if not isinstance(index_ctx, EzLangParser.IndexContext):
+            return None
+
+        obj_ptr = self._eval(index_ctx.postfixExpression())
+        if obj_ptr is None or not hasattr(obj_ptr, 'type'):
+            return None
+        index_val = self._eval(index_ctx.expression())
+        if index_val is None:
+            return None
+
+        if isinstance(obj_ptr.type, ir.PointerType) and self._is_list_type(obj_ptr.type.pointee):
+            elem_ptr = self._list_element_ptr(obj_ptr, index_val)
+            self._mark_unsigned(elem_ptr, self._list_type_is_unsigned(obj_ptr.type))
+            return elem_ptr
+
+        if isinstance(obj_ptr.type, ir.PointerType):
+            return self.builder.gep(obj_ptr, [
+                ir.Constant(ir.IntType(32), 0),
+                index_val,
+            ], inbounds=True)
+        return None
+
+    def _find_member_access_ctx(self, ctx):
+        if ctx is None:
+            return None
+        if isinstance(ctx, EzLangParser.MemberAccessContext):
+            return ctx
+        if hasattr(ctx, 'getChildCount'):
+            found = None
+            for i in range(ctx.getChildCount()):
+                child_found = self._find_member_access_ctx(ctx.getChild(i))
+                if child_found is not None:
+                    found = child_found
+            return found
+        return None
+
+    def _apply_assignment_operator(self, current: ir.Value, rhs: ir.Value, op_ctx) -> ir.Value:
+        if op_ctx is None or op_ctx.ASSIGN() is not None:
+            return rhs
+        rhs = self._coerce_preserve_unsigned(rhs, current.type) if rhs.type != current.type else rhs
+        unsigned = self._binary_result_unsigned(current, rhs)
+        if op_ctx.PLUS_ASSIGN() is not None:
+            result = self.builder.fadd(current, rhs, name="_assign_value") if self._is_float(current.type) else self.builder.add(current, rhs, name="_assign_value")
+            self._mark_unsigned(result, unsigned)
+            return result
+        if op_ctx.MINUS_ASSIGN() is not None:
+            result = self.builder.fsub(current, rhs, name="_assign_value") if self._is_float(current.type) else self.builder.sub(current, rhs, name="_assign_value")
+            self._mark_unsigned(result, unsigned)
+            return result
+        if op_ctx.STAR_ASSIGN() is not None:
+            result = self.builder.fmul(current, rhs, name="_assign_value") if self._is_float(current.type) else self.builder.mul(current, rhs, name="_assign_value")
+            self._mark_unsigned(result, unsigned)
+            return result
+        if op_ctx.SLASH_ASSIGN() is not None:
+            if self._is_float(current.type):
+                result = self.builder.fdiv(current, rhs, name="_assign_value")
+            else:
+                result = self.builder.udiv(current, rhs, name="_assign_value") if unsigned else self.builder.sdiv(current, rhs, name="_assign_value")
+            self._mark_unsigned(result, unsigned)
+            return result
+        if op_ctx.PERCENT_ASSIGN() is not None:
+            result = self.builder.urem(current, rhs, name="_assign_value") if unsigned else self.builder.srem(current, rhs, name="_assign_value")
+            self._mark_unsigned(result, unsigned)
+            return result
+        if op_ctx.AMPERSAND_ASSIGN() is not None:
+            return self.builder.and_(current, rhs, name="_assign_value")
+        if op_ctx.PIPE_ASSIGN() is not None:
+            return self.builder.or_(current, rhs, name="_assign_value")
+        if op_ctx.CARET_ASSIGN() is not None:
+            return self.builder.xor(current, rhs, name="_assign_value")
+        if op_ctx.SHL_ASSIGN() is not None:
+            result = self.builder.shl(current, rhs, name="_assign_value")
+            self._mark_unsigned(result, unsigned)
+            return result
+        if op_ctx.SHR_ASSIGN() is not None:
+            result = self.builder.lshr(current, rhs, name="_assign_value") if unsigned else self.builder.ashr(current, rhs, name="_assign_value")
+            self._mark_unsigned(result, unsigned)
+            return result
+        return rhs
+
+    def _type_id(self, type_name: str) -> int:
+        """为类型名分配稳定的 31-bit 正整数 ID。"""
+        if type_name in self._type_ids:
+            return self._type_ids[type_name]
+        value = 2166136261
+        for byte in type_name.encode("utf-8"):
+            value ^= byte
+            value = (value * 16777619) & 0xFFFFFFFF
+        value &= 0x7FFFFFFF
+        if value == 0:
+            value = 1
+        self._type_ids[type_name] = value
+        return value
+
+    def _typeof_name(self, ctx) -> str:
+        text = ctx.getText() if ctx is not None else "unknown"
+        if text in {"true", "false"}:
+            return "Bool"
+        if re.fullmatch(r'[-+]?\d+', text):
+            return "I32"
+        if re.fullmatch(r'[-+]?\d+\.\d+(?:[eE][-+]?\d+)?', text):
+            return "F64"
+        if text.startswith('"') and text.endswith('"'):
+            return "Str"
+        return text or "unknown"
 
     def visitChildren(self, ctx):
         """重写：根据 Context 类型自动分发到对应的 visit 方法"""
@@ -586,7 +1041,7 @@ class LLVMCodeGenerator(EzLangVisitor):
         return func
 
     def _init_global_variable(self, ctx: EzLangParser.VariableDeclContext):
-        name = ctx.VAR_IDENTIFIER().getText()
+        name = self._qualified_name(ctx)
         initializer = ctx.expression()
         if initializer is None or name not in self.globals:
             return None
@@ -599,11 +1054,15 @@ class LLVMCodeGenerator(EzLangVisitor):
         val = self._coerce_value(val, gv.type.pointee)
         if val.type != gv.type.pointee:
             return None
-        self.builder.store(val, gv)
+        self._emit_lock_access(name, "write", lambda: self.builder.store(val, gv))
         return None
 
     def _infer_global_initializer_type(self, initializer) -> ir.Type:
         text = initializer.getText()
+        if text.startswith('typeof'):
+            return ir.IntType(32)
+        if text.startswith('parallel'):
+            return self._infer_parallel_result_type(initializer)
         if text.startswith('"'):
             return ir.PointerType(ir.IntType(8))
         if text.startswith('{'):
@@ -619,7 +1078,56 @@ class LLVMCodeGenerator(EzLangVisitor):
         generic_args = self._expr_call_generic_args(initializer)
         if call_name is not None and generic_args:
             call_name = self._monomorphize(call_name, generic_args)
+        if call_name is not None:
+            list_builtin = self._list_builtin_base(call_name)
+            elem_type = generic_args[0] if generic_args else ir.IntType(32)
+            if list_builtin == 'listLen':
+                return ir.IntType(64)
+            if list_builtin in {'listPush', 'listUnshift', 'listSort'}:
+                return ir.VoidType()
+            if list_builtin in {'listPop', 'listShift'}:
+                return ir.LiteralStructType([ir.IntType(1), elem_type])
+            if list_builtin == 'listFind':
+                return ir.LiteralStructType([ir.IntType(1), elem_type])
+            if list_builtin in {'listSlice', 'listFilter'}:
+                return ir.LiteralStructType([
+                    ir.PointerType(ir.PointerType(elem_type)),
+                    ir.IntType(64),
+                    ir.IntType(64),
+                    ir.IntType(64),
+                ])
+            if list_builtin == 'listMap':
+                result_elem = generic_args[1] if len(generic_args) > 1 else ir.IntType(32)
+                return ir.LiteralStructType([
+                    ir.PointerType(ir.PointerType(result_elem)),
+                    ir.IntType(64),
+                    ir.IntType(64),
+                    ir.IntType(64),
+                ])
+            dict_builtin = self._dict_builtin_base(call_name)
+            key_type = generic_args[0] if generic_args else ir.PointerType(ir.IntType(8))
+            value_type = generic_args[1] if len(generic_args) > 1 else ir.PointerType(ir.IntType(8))
+            if dict_builtin == 'dictLen':
+                return ir.IntType(64)
+            if dict_builtin in {'dictHas', 'dictDelete'}:
+                return ir.IntType(1)
+            if dict_builtin == 'dictKeys':
+                return ir.LiteralStructType([
+                    ir.PointerType(ir.PointerType(key_type)),
+                    ir.IntType(64),
+                    ir.IntType(64),
+                    ir.IntType(64),
+                ])
+            if dict_builtin == 'dictValues':
+                return ir.LiteralStructType([
+                    ir.PointerType(ir.PointerType(value_type)),
+                    ir.IntType(64),
+                    ir.IntType(64),
+                    ir.IntType(64),
+                ])
         if call_name is not None and call_name in self.module.globals:
+            if call_name in self._sret_functions:
+                return self._sret_functions[call_name]
             callee = self.module.globals[call_name]
             func_type = callee.type.pointee if isinstance(callee.type, ir.PointerType) else None
             if isinstance(func_type, ir.FunctionType):
@@ -630,6 +1138,79 @@ class LLVMCodeGenerator(EzLangVisitor):
             return self.structs[struct_name]
 
         return ir.IntType(32)
+
+    def _infer_parallel_result_type(self, ctx) -> ir.Type:
+        """从 parallel 块中的首个 return 粗略推断结果类型。"""
+        if isinstance(ctx, EzLangParser.ParallelBlockExprContext):
+            return self._infer_block_return_type(ctx.parallelBlock().block())
+        if hasattr(ctx, 'parallelBlock') and ctx.parallelBlock() is not None:
+            return self._infer_block_return_type(ctx.parallelBlock().block())
+        if hasattr(ctx, 'getChildCount'):
+            for i in range(ctx.getChildCount()):
+                result = self._infer_parallel_result_type(ctx.getChild(i))
+                if not isinstance(result, ir.IntType) or result.width != 32:
+                    return result
+        return ir.IntType(32)
+
+    def _infer_block_return_type(self, block_ctx) -> ir.Type:
+        if block_ctx is None:
+            return ir.VoidType()
+        for stmt in block_ctx.statement():
+            ret = stmt.returnStatement()
+            if ret is not None and ret.expression() is not None:
+                return self._infer_global_initializer_type(ret.expression())
+        return ir.VoidType()
+
+    def _infer_function_literal_return_type(self, fn_lit) -> ir.Type:
+        if fn_lit is None:
+            return ir.VoidType()
+        if fn_lit.type_() is not None:
+            return self._map_type(fn_lit.type_())
+        if fn_lit.block() is not None:
+            return self._infer_block_return_type(fn_lit.block())
+        if fn_lit.expression() is not None:
+            expr_block = self._find_block_expr_ctx(fn_lit.expression())
+            if expr_block is not None:
+                return self._infer_block_return_type(expr_block)
+            return self._infer_global_initializer_type(fn_lit.expression())
+        return ir.VoidType()
+
+    def _find_block_expr_ctx(self, ctx):
+        if ctx is None:
+            return None
+        if isinstance(ctx, EzLangParser.BlockExprContext):
+            return ctx.block()
+        if hasattr(ctx, 'getChildCount'):
+            for i in range(ctx.getChildCount()):
+                result = self._find_block_expr_ctx(ctx.getChild(i))
+                if result is not None:
+                    return result
+        return None
+
+    def _infer_catch_result_type(self, block_ctx) -> ir.Type:
+        """从 catch 块中的首个 throw 表达式粗略推断捕获值类型。"""
+        if block_ctx is None:
+            return ir.VoidType()
+        for stmt in block_ctx.statement():
+            thrown = self._infer_throw_expression_type(stmt)
+            if thrown is not None:
+                return thrown
+        return ir.VoidType()
+
+    def _infer_throw_expression_type(self, ctx) -> ir.Type | None:
+        if ctx is None:
+            return None
+        throw_stmt = ctx.throwStatement() if hasattr(ctx, 'throwStatement') else None
+        if throw_stmt is not None and throw_stmt.expression() is not None:
+            return self._infer_global_initializer_type(throw_stmt.expression())
+        if isinstance(ctx, EzLangParser.ThrowStatementContext) and ctx.expression() is not None:
+            return self._infer_global_initializer_type(ctx.expression())
+        if hasattr(ctx, 'getChildCount'):
+            for i in range(ctx.getChildCount()):
+                result = self._infer_throw_expression_type(ctx.getChild(i))
+                if result is not None:
+                    return result
+        return None
 
     def _expr_call_name(self, ctx) -> str | None:
         if isinstance(ctx, EzLangParser.CallContext):
@@ -699,7 +1280,7 @@ class LLVMCodeGenerator(EzLangVisitor):
 
     def visitDeclareDecl(self, ctx: EzLangParser.DeclareDeclContext):
         """declare 外部函数/变量声明"""
-        name = ctx.VAR_IDENTIFIER().getText()
+        name = self._qualified_name(ctx)
         type_ctx = ctx.type_()
 
         if type_ctx is None:
@@ -731,6 +1312,7 @@ class LLVMCodeGenerator(EzLangVisitor):
         fn_type = type_ctx.functionType() if hasattr(type_ctx, 'functionType') else None
         if fn_type is not None:
             ret_type = self._map_type(fn_type.type_())
+            self.func_return_unsigned[name] = self._type_ctx_is_unsigned(fn_type.type_())
             param_types = []
             params = fn_type.paramTypeList()
             if params is not None:
@@ -739,8 +1321,14 @@ class LLVMCodeGenerator(EzLangVisitor):
                     if isinstance(pt, (ir.LiteralStructType, ir.IdentifiedStructType)):
                         pt = ir.PointerType(pt)
                     param_types.append(pt)
-            func_type = ir.FunctionType(ret_type, param_types)
+            uses_sret = self._uses_c_sret(ret_type)
+            abi_ret_type = ir.VoidType() if uses_sret else ret_type
+            abi_param_types = ([ir.PointerType(ret_type)] if uses_sret else []) + param_types
+            func_type = ir.FunctionType(abi_ret_type, abi_param_types)
             func = ir.Function(self.module, func_type, name)
+            if uses_sret:
+                func.args[0].add_attribute('sret')
+                self._sret_functions[name] = ret_type
             # 记录参数名供 visitCall 使用
             param_names = []
             if params is not None:
@@ -764,6 +1352,9 @@ class LLVMCodeGenerator(EzLangVisitor):
         if lib_path.startswith('@std/'):
             root = Path(__file__).resolve().parents[3]
             return str((root / 'packages' / 'std' / lib_path[len('@std/'):]).resolve())
+        if lib_path.startswith('@pkg/'):
+            root = Path(__file__).resolve().parents[3]
+            return str((root / 'packages' / lib_path[len('@pkg/'):]).resolve())
         return lib_path
 
     def visitExternDecl(self, ctx: EzLangParser.ExternDeclContext):
@@ -796,8 +1387,12 @@ class LLVMCodeGenerator(EzLangVisitor):
         ]
         source = None
         for d in base_dirs:
-            p = _os.path.join(d, path)
-            if _os.path.exists(p):
+            raw = _os.path.join(d, path)
+            candidates = [raw]
+            if not raw.endswith('.ez'):
+                candidates.extend([raw + '.ez', _os.path.join(raw, 'index.ez')])
+            p = next((candidate for candidate in candidates if _os.path.isfile(candidate)), None)
+            if p is not None:
                 with open(p) as f:
                     source = f.read()
                 break
@@ -854,10 +1449,12 @@ class LLVMCodeGenerator(EzLangVisitor):
 
     def visitVariableDecl(self, ctx: EzLangParser.VariableDeclContext):
         self._non_extern_decls_seen += 1
-        name = ctx.VAR_IDENTIFIER().getText()
+        name = self._qualified_name(ctx)
         type_ctx = ctx.type_()
         initializer = ctx.expression()
         decorators = [d.VAR_IDENTIFIER().getText() for d in ctx.decorator()]
+        lock_policy_code = self._lock_policy_code(ctx)
+        self._emit_lock_metadata(name, lock_policy_code)
 
         if self.builder is None:
             # 全局变量
@@ -872,19 +1469,26 @@ class LLVMCodeGenerator(EzLangVisitor):
             gv = ir.GlobalVariable(self.module, llvm_type, name)
             gv.initializer = self._zero_constant(llvm_type)
             self.globals[name] = gv
+            self._mark_unsigned(gv, self._type_ctx_is_unsigned(type_ctx))
+            if type_ctx is not None:
+                self._mark_list_elem_unsigned(gv, self._type_ctx_is_unsigned(type_ctx))
         else:
             # 局部变量
             if type_ctx is not None:
                 llvm_type = self._map_type(type_ctx)
                 alloca = self.builder.alloca(llvm_type, name=name)
                 self.locals[name] = alloca
+                self._mark_unsigned(alloca, self._type_ctx_is_unsigned(type_ctx))
+                self._mark_list_elem_unsigned(alloca, self._type_ctx_is_unsigned(type_ctx))
                 if initializer is not None:
                     val = self._eval_expr(initializer)
                     if val is not None:
                         if self._is_aggregate_ptr(val):
                             val = self.builder.load(val)
                         val = self._coerce_value(val, llvm_type)
-                        self.builder.store(val, alloca)
+                        self._emit_lock_access(name, "write", lambda: self.builder.store(val, alloca))
+                else:
+                    self._emit_lock_access(name, "write", lambda: self.builder.store(self._zero_constant(llvm_type), alloca))
             elif initializer is not None:
                 # 类型推断：先求值，根据结果确定类型
                 val = self._eval_expr(initializer)
@@ -893,14 +1497,18 @@ class LLVMCodeGenerator(EzLangVisitor):
                         # 结构体字面量返回指针，直接复用
                         val.name = name
                         self.locals[name] = val
+                        self._mark_list_elem_unsigned(val, self._list_type_is_unsigned(val.type))
                     else:
                         alloca = self.builder.alloca(val.type, name=name)
-                        self.builder.store(val, alloca)
+                        self._emit_lock_access(name, "write", lambda: self.builder.store(val, alloca))
                         self.locals[name] = alloca
+                        self._mark_unsigned(alloca, self._is_unsigned_value(val))
             else:
                 # 无类型无初值，默认 i32
                 alloca = self.builder.alloca(ir.IntType(32), name=name)
+                self._emit_lock_access(name, "write", lambda: self.builder.store(ir.Constant(ir.IntType(32), 0), alloca))
                 self.locals[name] = alloca
+                self._mark_unsigned(alloca, False)
 
     # ==================== 类型别名 ====================
 
@@ -916,6 +1524,7 @@ class LLVMCodeGenerator(EzLangVisitor):
 
             field_names = []
             alias_field_types = []
+            alias_field_unsigned = []
             for member in members:
                 if member.VAR_IDENTIFIER() is None:
                     continue
@@ -925,11 +1534,13 @@ class LLVMCodeGenerator(EzLangVisitor):
                 member_types = [t for t in member_types if t is not None]
                 field_type = self._map_type(member_types[-1]) if member_types else ir.IntType(32)
                 alias_field_types.append(field_type)
+                alias_field_unsigned.append(self._type_ctx_is_unsigned(member_types[-1]) if member_types else False)
             alias_struct = ir.global_context.get_identified_type(name)
             if not alias_struct.elements:
                 alias_struct.set_body(*alias_field_types)
             self.structs[name] = alias_struct
             self.struct_fields[name] = field_names
+            self._struct_field_unsigned[name] = alias_field_unsigned
             self.type_aliases[name] = alias_struct
             return None
 
@@ -947,6 +1558,7 @@ class LLVMCodeGenerator(EzLangVisitor):
         self.structs[name] = struct_type
         field_names = []
         field_types = []
+        field_unsigned = []
 
         defaults = {}
         for member_ctx in ctx.structMember():
@@ -957,6 +1569,7 @@ class LLVMCodeGenerator(EzLangVisitor):
                 ftype = self._map_type(field_ctx.type_())
                 field_names.append(fname)
                 field_types.append(ftype)
+                field_unsigned.append(self._type_ctx_is_unsigned(field_ctx.type_()))
                 # 收集默认值表达式（AST 上下文），实例化时求值
                 if field_ctx.expression() is not None:
                     defaults[fname] = field_ctx.expression()
@@ -973,28 +1586,54 @@ class LLVMCodeGenerator(EzLangVisitor):
                                 base_struct = self.structs[base_name]
                                 bf_idx = self.struct_fields[base_name].index(bf)
                                 field_types.append(base_struct.elements[bf_idx])
+                                base_unsigned = self._struct_field_unsigned.get(base_name, [])
+                                field_unsigned.append(base_unsigned[bf_idx] if bf_idx < len(base_unsigned) else False)
             # 方法: methodName = (this: Type, ...) => body
             method_ctx = member_ctx.structMethod()
             if method_ctx is not None:
                 mname = method_ctx.VAR_IDENTIFIER().getText()
                 fn_lit = method_ctx.functionLiteral()
+                sig = method_ctx.functionSignature()
+                if name not in self.struct_methods:
+                    self.struct_methods[name] = {}
+                self.struct_methods[name][mname] = f"{name}_{mname}"
                 if fn_lit is not None:
                     func_name = f"{name}_{mname}"
-                    if name not in self.struct_methods:
-                        self.struct_methods[name] = {}
-                    self.struct_methods[name][mname] = func_name
                     self._gen_method_func(func_name, fn_lit, name)
+                elif sig is not None:
+                    self._declare_method_signature(f"{name}_{mname}", sig)
 
         if not struct_type.elements:
             struct_type.set_body(*field_types)
         self.structs[name] = struct_type
         self.struct_fields[name] = field_names
+        self._struct_field_unsigned[name] = field_unsigned
         self.struct_defaults[name] = defaults
         return None
+
+    def _declare_method_signature(self, func_name: str, sig_ctx):
+        """结构体方法签名声明：只生成外部函数原型。"""
+        ret_type = self._map_type(sig_ctx.type_())
+        self.func_return_unsigned[func_name] = self._type_ctx_is_unsigned(sig_ctx.type_())
+        param_types = []
+        param_names = []
+        params = sig_ctx.paramList()
+        if params is not None:
+            for p in params.param():
+                param_types.append(self._map_type(p.type_()))
+                param_names.append(p.VAR_IDENTIFIER().getText())
+        if func_name in self.module.globals:
+            return self.module.globals[func_name]
+        func = ir.Function(self.module, ir.FunctionType(ret_type, param_types), func_name)
+        for i, pn in enumerate(param_names):
+            func.args[i].name = pn
+        self.func_param_names[func_name] = param_names
+        return func
 
     def _gen_method_func(self, func_name: str, fn_lit_ctx, struct_name: str):
         """生成结构体方法对应的 LLVM 函数"""
         ret_type = self._map_type(fn_lit_ctx.type_())
+        self.func_return_unsigned[func_name] = self._type_ctx_is_unsigned(fn_lit_ctx.type_())
         param_types = []
         param_names = []
         params = fn_lit_ctx.paramList()
@@ -1018,6 +1657,7 @@ class LLVMCodeGenerator(EzLangVisitor):
             prev_builder = self.builder
             prev_func = self.current_function
             prev_locals = self.locals
+            prev_unsigned = self._save_unsigned_state()
 
             self.builder = ir.IRBuilder(entry)
             self.current_function = func
@@ -1027,6 +1667,10 @@ class LLVMCodeGenerator(EzLangVisitor):
                 alloca = self.builder.alloca(param_types[i], name=pn)
                 self.builder.store(func.args[i], alloca)
                 self.locals[pn] = alloca
+                param_ctx = params.param()[i] if params is not None else None
+                if param_ctx is not None:
+                    self._mark_unsigned(alloca, self._type_ctx_is_unsigned(param_ctx.type_()))
+                    self._mark_list_elem_unsigned(alloca, self._type_ctx_is_unsigned(param_ctx.type_()))
 
             self._eval(body)
 
@@ -1039,6 +1683,7 @@ class LLVMCodeGenerator(EzLangVisitor):
             self.builder = prev_builder
             self.current_function = prev_func
             self.locals = prev_locals
+            self._restore_unsigned_state(prev_unsigned)
 
     # ==================== 函数声明 ====================
 
@@ -1064,6 +1709,7 @@ class LLVMCodeGenerator(EzLangVisitor):
     def _gen_func(self, name: str, fn_lit_ctx) -> ir.Function:
         """从函数字面量生成 LLVM 函数"""
         ret_type = self._map_type(fn_lit_ctx.type_())
+        self.func_return_unsigned[name] = self._type_ctx_is_unsigned(fn_lit_ctx.type_())
         param_types = []
         params = fn_lit_ctx.paramList()
         param_names = []
@@ -1091,8 +1737,11 @@ class LLVMCodeGenerator(EzLangVisitor):
         # 生成函数体
         block = func.append_basic_block(name="entry")
         old_builder = self.builder
+        old_func = self.current_function
         old_locals = self.locals
+        old_unsigned = self._save_unsigned_state()
         self.builder = ir.IRBuilder(block)
+        self.current_function = func
         self.locals = {}
 
         # 参数 alloca
@@ -1100,6 +1749,10 @@ class LLVMCodeGenerator(EzLangVisitor):
             alloca = self.builder.alloca(param_types[i], name=pn)
             self.builder.store(func.args[i], alloca)
             self.locals[pn] = alloca
+            param_ctx = params.param()[i] if params is not None else None
+            if param_ctx is not None:
+                self._mark_unsigned(alloca, self._type_ctx_is_unsigned(param_ctx.type_()))
+                self._mark_list_elem_unsigned(alloca, self._type_ctx_is_unsigned(param_ctx.type_()))
 
         # 函数体
         body = fn_lit_ctx.block() or fn_lit_ctx.expression()
@@ -1115,7 +1768,9 @@ class LLVMCodeGenerator(EzLangVisitor):
                 self.builder.ret_void()
 
         self.builder = old_builder
+        self.current_function = old_func
         self.locals = old_locals
+        self._restore_unsigned_state(old_unsigned)
         return func
 
     # ==================== 表达式求值 ====================
@@ -1291,14 +1946,14 @@ class LLVMCodeGenerator(EzLangVisitor):
             alloca = self.locals[name]
             if isinstance(alloca.type.pointee, (ir.IdentifiedStructType, ir.LiteralStructType, ir.ArrayType)):
                 return alloca
-            return self.builder.load(alloca, name=name)
+            return self._emit_lock_access(name, "read", lambda: self._load_with_unsigned(alloca, name=name))
         if name in self.module.globals and isinstance(self.module.globals[name], ir.Function):
             return self.module.globals[name]
         if name in self.globals:
             gv = self.globals[name]
             if isinstance(gv.type.pointee, (ir.IdentifiedStructType, ir.LiteralStructType, ir.ArrayType)):
                 return gv
-            return self.builder.load(gv, name=name)
+            return self._emit_lock_access(name, "read", lambda: self._load_with_unsigned(gv, name=name))
         return ir.Constant(ir.IntType(32), 0)
 
     def _monomorphize(self, base_name: str, type_args: list[ir.Type]) -> str:
@@ -1314,6 +1969,13 @@ class LLVMCodeGenerator(EzLangVisitor):
         self._monomorphized.add(mono_name)
         template = self.generic_templates[base_name]
         param_names, template_ctx = template[0], template[1]
+        if base_name in self._collection_builtin_declares:
+            self._collection_mono_types[mono_name] = (base_name, list(type_args))
+            self.func_param_names[mono_name] = [
+                p.VAR_IDENTIFIER().getText()
+                for p in (template_ctx.paramTypeList().paramType() if template_ctx.paramTypeList() is not None else [])
+            ]
+            return mono_name
         if len(template) > 2 and template[2] == 'unimplemented':
             self._extern_diagnostics.append(
                 f"标准库集合函数 '{base_name}' 尚未实现，不能生成外部符号 '{mono_name}'"
@@ -1341,10 +2003,17 @@ class LLVMCodeGenerator(EzLangVisitor):
                     orig_param_names.append(pname)
                     param_types.append(ptype)
 
-            func_type = ir.FunctionType(ret_type, param_types)
+            uses_sret = self._uses_c_sret(ret_type)
+            abi_ret_type = ir.VoidType() if uses_sret else ret_type
+            abi_param_types = ([ir.PointerType(ret_type)] if uses_sret else []) + param_types
+            func_type = ir.FunctionType(abi_ret_type, abi_param_types)
             func = ir.Function(self.module, func_type, mono_name)
+            if uses_sret:
+                func.args[0].add_attribute('sret')
+                self._sret_functions[mono_name] = ret_type
+            offset = 1 if uses_sret else 0
             for i, pn in enumerate(orig_param_names):
-                func.args[i].name = pn
+                func.args[i + offset].name = pn
             self.func_param_names[mono_name] = orig_param_names
             return mono_name
 
@@ -1376,6 +2045,7 @@ class LLVMCodeGenerator(EzLangVisitor):
             prev_builder = self.builder
             prev_func = self.current_function
             prev_locals = self.locals
+            prev_unsigned = self._save_unsigned_state()
 
             self.builder = ir.IRBuilder(entry)
             self.current_function = func
@@ -1397,6 +2067,7 @@ class LLVMCodeGenerator(EzLangVisitor):
             self.builder = prev_builder
             self.current_function = prev_func
             self.locals = prev_locals
+            self._restore_unsigned_state(prev_unsigned)
 
         return mono_name
 
@@ -1647,6 +2318,19 @@ class LLVMCodeGenerator(EzLangVisitor):
 
         struct_name = pointee.name if isinstance(pointee, ir.IdentifiedStructType) else None
 
+        if isinstance(pointee, ir.LiteralStructType) and len(pointee.elements) == 2 and pointee.elements[0] == ir.IntType(1):
+            optional_fields = {'ok': 0, 'value': 1}
+            if field_name in optional_fields:
+                idx = optional_fields[field_name]
+                gep = self.builder.gep(obj_ptr, [
+                    ir.Constant(ir.IntType(32), 0),
+                    ir.Constant(ir.IntType(32), idx)
+                ], inbounds=True)
+                field_type = pointee.elements[idx]
+                if isinstance(field_type, (ir.IdentifiedStructType, ir.LiteralStructType, ir.ArrayType)):
+                    return gep
+                return self._load_with_unsigned(gep, name=field_name)
+
         if struct_name and struct_name in self.struct_methods:
             methods = self.struct_methods[struct_name]
             if field_name in methods:
@@ -1663,7 +2347,12 @@ class LLVMCodeGenerator(EzLangVisitor):
                     ir.Constant(ir.IntType(32), 0),
                     ir.Constant(ir.IntType(32), idx)
                 ], inbounds=True)
-                value = self.builder.load(gep, name=field_name)
+                field_unsigned = self._struct_field_unsigned.get(struct_name, [])
+                self._mark_unsigned(gep, field_unsigned[idx] if idx < len(field_unsigned) else False)
+                field_type = pointee.elements[idx]
+                if isinstance(field_type, (ir.IdentifiedStructType, ir.LiteralStructType, ir.ArrayType)):
+                    return gep
+                value = self._load_with_unsigned(gep, name=field_name)
                 if isinstance(value.type, ir.PointerType) and isinstance(value.type.pointee, ir.FunctionType):
                     self._method_this = obj_ptr
                 return value
@@ -1680,12 +2369,14 @@ class LLVMCodeGenerator(EzLangVisitor):
             exprs = list(expr_list.expression())
 
         values = []
+        elem_unsigned = False
         for e in exprs:
             v = self._eval(e)
             if v is not None:
                 if isinstance(v, ir.AllocaInstr):
                     v = self.builder.load(v)
                 values.append(v)
+                elem_unsigned = elem_unsigned or self._is_unsigned_value(v)
 
         elem_type = values[0].type if values else ir.IntType(32)
         count = len(values)
@@ -1734,6 +2425,7 @@ class LLVMCodeGenerator(EzLangVisitor):
         self.builder.store(ir.Constant(i64, count), len_field)
         self.builder.store(ir.Constant(i64, page_count * page_size), cap_field)
         self.builder.store(ir.Constant(i64, page_count), page_count_field)
+        self._mark_list_elem_unsigned(alloca, elem_unsigned)
         return alloca
 
     def visitArrayLiteralExpr(self, ctx: EzLangParser.ArrayLiteralExprContext):
@@ -1748,7 +2440,7 @@ class LLVMCodeGenerator(EzLangVisitor):
         alloca = self._arena_allocate(dict_type, name="_tmp_dict")
         self.builder.store(self._zero_constant(dict_type), alloca)
         for f in fields:
-            key = self._make_global_string(f.VAR_IDENTIFIER().getText(), prefix="_dict_key")
+            key = self._dict_key_value(f)
             val = self._eval(f.expression())
             if isinstance(val, ir.AllocaInstr):
                 val = self.builder.load(val)
@@ -1789,8 +2481,10 @@ class LLVMCodeGenerator(EzLangVisitor):
     # ==================== typeof 表达式 ====================
 
     def visitTypeofExpr(self, ctx: EzLangParser.TypeofExprContext):
-        """typeof 表达式：编译时类型查询，运行时返回占位符"""
-        return ir.Constant(ir.IntType(32), 0)
+        """typeof 表达式：返回稳定类型 ID。"""
+        target = ctx.type_() if ctx.type_() is not None else ctx.expression()
+        type_name = self._typeof_name(target)
+        return ir.Constant(ir.IntType(32), self._type_id(type_name))
 
     def visitTypeofPrimaryExpr(self, ctx: EzLangParser.TypeofPrimaryExprContext):
         return self.visitTypeofExpr(ctx.typeofExpr())
@@ -1798,18 +2492,172 @@ class LLVMCodeGenerator(EzLangVisitor):
     # ==================== flow 并发块 ====================
 
     def visitFlowBlock(self, ctx: EzLangParser.FlowBlockContext):
-        """flow 块：插入运行时边界，当前仍保持同步块执行"""
+        """flow 块：保留运行时边界，并把块内 return 捕获为表达式结果。"""
         if self.builder is not None:
             self.builder.call(self._flow_enter, [])
+        result_type = self._infer_block_return_type(ctx.block())
+        result_alloca = None
+        exit_block = None
+        if self.builder is not None and not isinstance(result_type, ir.VoidType):
+            result_alloca = self.builder.alloca(result_type, name="_flow_result")
+            self.builder.store(self._zero_constant(result_type), result_alloca)
+            exit_block = self.builder.append_basic_block(name="flow_exit")
+            self._parallel_result_stack.append(result_alloca)
+            self._parallel_exit_stack.append(exit_block)
         self._flow_depth += 1
-        result = self._eval(ctx.block())
+        self._eval(ctx.block())
         self._flow_depth -= 1
+        if result_alloca is not None:
+            if self._parallel_result_stack and self._parallel_result_stack[-1] is result_alloca:
+                self._parallel_result_stack.pop()
+            if self._parallel_exit_stack and self._parallel_exit_stack[-1] is exit_block:
+                self._parallel_exit_stack.pop()
+            if self.builder is not None and not self.builder.block.is_terminated:
+                self.builder.branch(exit_block)
+            self.builder.position_at_start(exit_block)
         if self.builder is not None and not self.builder.block.is_terminated:
             self.builder.call(self._flow_exit, [])
-        return result
+        if result_alloca is not None:
+            return self.builder.load(result_alloca, name="flow_value")
+        return None
 
     def visitFlowBlockExpr(self, ctx: EzLangParser.FlowBlockExprContext):
         return self.visitFlowBlock(ctx.flowBlock())
+
+    # ==================== parallel 并发块 ====================
+
+    def visitParallelBlock(self, ctx: EzLangParser.ParallelBlockContext):
+        """parallel 块：先保留运行时 ABI 边界，当前按同步块 lowering。"""
+        if self.builder is not None:
+            self.builder.call(self._parallel_enter, [])
+        result_type = self._infer_block_return_type(ctx.block())
+        result_alloca = None
+        exit_block = None
+        if self.builder is not None and not isinstance(result_type, ir.VoidType):
+            result_alloca = self.builder.alloca(result_type, name="_parallel_result")
+            self.builder.store(self._zero_constant(result_type), result_alloca)
+            exit_block = self.builder.append_basic_block(name="parallel_exit")
+            self._parallel_result_stack.append(result_alloca)
+            self._parallel_exit_stack.append(exit_block)
+        self._eval(ctx.block())
+        if result_alloca is not None:
+            if self._parallel_result_stack and self._parallel_result_stack[-1] is result_alloca:
+                self._parallel_result_stack.pop()
+            if self._parallel_exit_stack and self._parallel_exit_stack[-1] is exit_block:
+                self._parallel_exit_stack.pop()
+            if self.builder is not None and not self.builder.block.is_terminated:
+                self.builder.branch(exit_block)
+            self.builder.position_at_start(exit_block)
+        if self.builder is not None and not self.builder.block.is_terminated:
+            self.builder.call(self._parallel_exit, [])
+        if result_alloca is not None:
+            return self.builder.load(result_alloca, name="parallel_value")
+        return None
+
+    def visitParallelBlockExpr(self, ctx: EzLangParser.ParallelBlockExprContext):
+        return self.visitParallelBlock(ctx.parallelBlock())
+
+    def _gen_race_call(self, args_ctx, provided: dict[str, ir.Value]):
+        """race hook：支持旧的 task 参数，也支持文档中的 pl 分支数组。"""
+        i32 = ir.IntType(32)
+        task_arg = provided.get('task')
+        timeout_arg = provided.get('timeout', ir.Constant(i32, 0))
+        pl_array = None
+
+        if task_arg is None:
+            branch_count = 0
+            if args_ctx is not None:
+                for named in args_ctx.namedArg():
+                    if named.VAR_IDENTIFIER() is None or named.expression() is None:
+                        continue
+                    if named.VAR_IDENTIFIER().getText() != 'pl':
+                        continue
+                    array_expr = named.expression().getText().strip()
+                    array_ctx = named.expression()
+                    if array_ctx is not None:
+                        array_literal = self._find_array_literal_ctx(array_ctx)
+                        if array_literal is not None and array_literal.expressionList() is not None:
+                            pl_array = array_literal
+                            branch_count = len(array_literal.expressionList().expression())
+                    if branch_count == 0 and array_expr.startswith('[') and array_expr.endswith(']'):
+                        branch_count = 1
+                    break
+            task_arg = ir.Constant(i32, branch_count)
+        elif task_arg.type != i32:
+            task_arg = self._coerce_value(task_arg, i32) if isinstance(task_arg.type, ir.IntType) else ir.Constant(i32, 0)
+
+        timeout_arg = self._coerce_value(timeout_arg, i32) if timeout_arg.type != i32 else timeout_arg
+        race_hook = self.builder.call(self._flow_race, [task_arg, timeout_arg])
+        if pl_array is None:
+            return race_hook
+
+        first_branch = self._first_function_literal_in_array(pl_array)
+        if first_branch is None:
+            return race_hook
+        params = first_branch.paramList()
+        if params is not None and params.param():
+            return race_hook
+
+        branch_type = self._infer_function_literal_return_type(first_branch)
+        result_type = i32 if isinstance(branch_type, ir.VoidType) else branch_type
+        result_alloca = self.builder.alloca(result_type, name="_race_result")
+        self.builder.store(self._zero_constant(result_type), result_alloca)
+        exit_block = self.builder.append_basic_block(name="race_exit")
+        self._parallel_result_stack.append(result_alloca)
+        self._parallel_exit_stack.append(exit_block)
+        expr_block = self._find_block_expr_ctx(first_branch.expression()) if first_branch.expression() is not None else None
+        if first_branch.block() is not None:
+            self._eval(first_branch.block())
+        elif expr_block is not None:
+            self._eval(expr_block)
+        elif first_branch.expression() is not None:
+            branch_value = self._eval(first_branch.expression())
+            if branch_value is not None and not isinstance(branch_type, ir.VoidType):
+                if self._is_aggregate_ptr(branch_value):
+                    branch_value = self.builder.load(branch_value)
+                branch_value = self._coerce_value(branch_value, branch_type)
+                self.builder.store(branch_value, result_alloca)
+        if self._parallel_result_stack and self._parallel_result_stack[-1] is result_alloca:
+            self._parallel_result_stack.pop()
+        if self._parallel_exit_stack and self._parallel_exit_stack[-1] is exit_block:
+            self._parallel_exit_stack.pop()
+        if self.builder is not None and not self.builder.block.is_terminated:
+            self.builder.branch(exit_block)
+        self.builder.position_at_start(exit_block)
+        if isinstance(branch_type, ir.VoidType):
+            return race_hook
+        return self.builder.load(result_alloca, name="race_value")
+
+    def _find_array_literal_ctx(self, ctx):
+        if ctx is None:
+            return None
+        if hasattr(ctx, 'arrayLiteral') and ctx.arrayLiteral() is not None:
+            return ctx.arrayLiteral()
+        if hasattr(ctx, 'getChildCount'):
+            for i in range(ctx.getChildCount()):
+                child = ctx.getChild(i)
+                result = self._find_array_literal_ctx(child)
+                if result is not None:
+                    return result
+        return None
+
+    def _first_function_literal_in_array(self, array_ctx):
+        expr_list = array_ctx.expressionList() if array_ctx is not None else None
+        if expr_list is None or not expr_list.expression():
+            return None
+        return self._find_function_literal_ctx(expr_list.expression()[0])
+
+    def _find_function_literal_ctx(self, ctx):
+        if ctx is None:
+            return None
+        if hasattr(ctx, 'functionLiteral') and ctx.functionLiteral() is not None:
+            return ctx.functionLiteral()
+        if hasattr(ctx, 'getChildCount'):
+            for i in range(ctx.getChildCount()):
+                result = self._find_function_literal_ctx(ctx.getChild(i))
+                if result is not None:
+                    return result
+        return None
 
     # ==================== SIMD 向量 ====================
 
@@ -1869,14 +2717,15 @@ class LLVMCodeGenerator(EzLangVisitor):
             page_slot = self.builder.gep(pages_ptr, [page_idx], inbounds=True)
             page_ptr = self.builder.load(page_slot, name='_arr_page')
             elem_ptr = self.builder.gep(page_ptr, [slot_idx], inbounds=True)
-            return self.builder.load(elem_ptr)
+            self._mark_unsigned(elem_ptr, self._list_type_is_unsigned(obj_ptr.type))
+            return self._load_with_unsigned(elem_ptr)
 
         # 兼容旧裸数组指针
         gep = self.builder.gep(obj_ptr, [
             ir.Constant(ir.IntType(32), 0),
             index_val
         ], inbounds=True)
-        return self.builder.load(gep)
+        return self._load_with_unsigned(gep)
 
     # 函数调用
     def visitCall(self, ctx: EzLangParser.CallContext):
@@ -1886,10 +2735,17 @@ class LLVMCodeGenerator(EzLangVisitor):
         # visitMemberAccess 返回 function 并设置 _method_this
         self._method_this = None
         func = self._eval(target_expr)
+        curried_target = None
+        curried_closure_value = None
+        if func is not None and isinstance(func, ir.Value) and hasattr(func, 'type'):
+            closure_type = func.type.pointee if isinstance(func.type, ir.PointerType) else None
+            curried_target = self._curried_closures.get(str(closure_type)) if closure_type is not None else None
+            if curried_target is not None:
+                curried_closure_value = func
 
         # 如果 _eval 没返回可调用对象，尝试从标识符查找（通过 primaryExpression 间接访问）
         name = None
-        if not self._is_callable_value(func):
+        if curried_target is None and not self._is_callable_value(func):
             # target_expr 可能是 PrimaryExprContext（包装了 primaryExpression）
             inner = target_expr
             if hasattr(target_expr, 'primaryExpression') and target_expr.primaryExpression():
@@ -1926,12 +2782,13 @@ class LLVMCodeGenerator(EzLangVisitor):
         is_unimplemented_collection = name and any(
             name == base or name.startswith(f'{base}_') for base in self._unimplemented_collection_declares
         )
+        is_compiler_builtin = name and any(
+            name == base or name.startswith(f'{base}_') for base in self._compiler_builtin_declares
+        )
 
-        if func is None or not self._is_callable_value(func):
+        if curried_target is None and (func is None or not self._is_callable_value(func)):
             # compiler builtin / 未实现集合函数不生成外部声明。
-            if name in self._compiler_builtin_declares or (
-                name and any(name == base or name.startswith(f'{base}_') for base in self._unimplemented_collection_declares)
-            ):
+            if is_compiler_builtin or is_unimplemented_collection:
                 func = None
             elif name:
                 args = ctx.namedArgList()
@@ -1944,8 +2801,15 @@ class LLVMCodeGenerator(EzLangVisitor):
         # 获取函数名，用于查参数元数据
         func_name = name if name else func.name if func is not None else ''
 
+        if curried_target is not None:
+            tramp_func, placeholder_names = curried_target
+            func = tramp_func
+            func_name = tramp_func.name
+            expected_names = list(placeholder_names)
+        else:
+            expected_names = self.func_param_names.get(func_name, [])
+
         # 获取函数期望的参数名列表和默认值
-        expected_names = self.func_param_names.get(func_name, [])
         defaults = self.func_defaults.get(func_name, {})
 
         # 解析调用时提供的具名参数，检测 ? 占位符（柯里化）
@@ -1956,6 +2820,8 @@ class LLVMCodeGenerator(EzLangVisitor):
             for a in args.namedArg():
                 if a.VAR_IDENTIFIER() is not None and a.expression() is not None:
                     pname = a.VAR_IDENTIFIER().getText()
+                    if self._flow_depth > 0 and func_name == 'race' and pname == 'pl':
+                        continue
                     # 检查表达式是否为 ? 占位符
                     if a.expression().getText().strip() == '?':
                         placeholder_params.append(pname)
@@ -1964,6 +2830,9 @@ class LLVMCodeGenerator(EzLangVisitor):
                         if val is not None:
                             provided[pname] = val
 
+        if self._flow_depth > 0 and func_name == 'race':
+            return self._gen_race_call(args, provided)
+
         # 如果存在 ? 占位符，生成柯里化闭包
         if placeholder_params:
             return self._gen_curried_call(func, func_name, expected_names, provided, placeholder_params)
@@ -1971,6 +2840,8 @@ class LLVMCodeGenerator(EzLangVisitor):
         # 按函数参数顺序构建实参列表（具名重排 + 默认值注入）
         call_args = []
         if expected_names:
+            if curried_target is not None and curried_closure_value is not None:
+                call_args.append(curried_closure_value)
             # 方法调用：首个参数是 this
             if self._method_this is not None:
                 call_args.append(self.builder.load(self._method_this) if isinstance(self._method_this, ir.AllocaInstr) else self._method_this)
@@ -2000,6 +2871,8 @@ class LLVMCodeGenerator(EzLangVisitor):
         # 检查是否为编译器内建函数
         intrinsic_result = self._try_gen_intrinsic_call(func_name, call_args)
         if intrinsic_result is not None:
+            if intrinsic_result is self._void_intrinsic_result:
+                return None
             return intrinsic_result
 
         if func is None:
@@ -2009,20 +2882,29 @@ class LLVMCodeGenerator(EzLangVisitor):
         if self._flow_depth > 0 and func_name == 'sleep' and call_args:
             sleep_arg = self._coerce_value(call_args[0], ir.IntType(64))
             return self.builder.call(self._flow_sleep, [sleep_arg])
-        if self._flow_depth > 0 and func_name == 'race' and len(call_args) >= 2:
-            task_arg = call_args[0]
-            if task_arg.type != ir.IntType(32):
-                task_arg = ir.Constant(ir.IntType(32), 0)
-            timeout_arg = self._coerce_value(call_args[1], ir.IntType(32))
-            return self.builder.call(self._flow_race, [task_arg, timeout_arg])
+        sret_type = self._sret_functions.get(func_name)
+        abi_arg_types = list(func_type.args) if func_type is not None else []
+        if sret_type is not None:
+            ret_slot = self._arena_allocate(sret_type, name=f"_{func_name}_ret")
+            call_args = [ret_slot] + call_args
 
         if func_type is not None:
             call_args = [
-                self._coerce_value(arg, func_type.args[i]) if i < len(func_type.args) else arg
+                self._coerce_value(arg, abi_arg_types[i]) if i < len(abi_arg_types) else arg
+                for i, arg in enumerate(call_args)
+            ]
+            call_args = [
+                self._load_if_aggregate_ptr(arg)
+                if i < len(abi_arg_types) and arg.type != abi_arg_types[i] and self._is_aggregate_ptr(arg)
+                else arg
                 for i, arg in enumerate(call_args)
             ]
 
-        return self.builder.call(func, call_args)
+        call = self.builder.call(func, call_args)
+        if sret_type is not None:
+            return ret_slot
+        self._mark_unsigned(call, self.func_return_unsigned.get(func_name, False))
+        return call
 
     def _call_return_type(self, ctx) -> ir.Type:
         """从调用表达式的类型上下文估算返回类型，用于错误恢复。"""
@@ -2100,7 +2982,829 @@ class LLVMCodeGenerator(EzLangVisitor):
         if name == 'dict_get' and len(call_args) >= 2:
             return self._gen_dict_get(call_args[0], call_args[1])
 
+        list_builtin = self._list_builtin_base(name)
+        if list_builtin == 'listLen' and len(call_args) >= 1:
+            return self._gen_list_len(call_args[0])
+        if list_builtin == 'listPush' and len(call_args) >= 2:
+            self._gen_list_push(call_args[0], call_args[1])
+            return self._void_intrinsic_result
+        if list_builtin == 'listPop' and len(call_args) >= 1:
+            return self._gen_list_pop(call_args[0])
+        if list_builtin == 'listShift' and len(call_args) >= 1:
+            return self._gen_list_shift(call_args[0])
+        if list_builtin == 'listUnshift' and len(call_args) >= 2:
+            self._gen_list_unshift(call_args[0], call_args[1])
+            return self._void_intrinsic_result
+        if list_builtin == 'listSlice' and len(call_args) >= 3:
+            return self._gen_list_slice(call_args[0], call_args[1], call_args[2])
+        if list_builtin == 'listFind' and len(call_args) >= 2:
+            return self._gen_list_find(call_args[0], call_args[1])
+        if list_builtin == 'listFilter' and len(call_args) >= 2:
+            return self._gen_list_filter(call_args[0], call_args[1])
+        if list_builtin == 'listMap' and len(call_args) >= 2:
+            return self._gen_list_map(name, call_args[0], call_args[1])
+        if list_builtin == 'listSort' and len(call_args) >= 2:
+            self._gen_list_sort(call_args[0], call_args[1])
+            return self._void_intrinsic_result
+
+        dict_builtin = self._dict_builtin_base(name)
+        if dict_builtin == 'dictLen' and len(call_args) >= 1:
+            return self._gen_dict_len(call_args[0])
+        if dict_builtin == 'dictHas' and len(call_args) >= 2:
+            return self._gen_dict_has(name, call_args[0], call_args[1])
+        if dict_builtin == 'dictDelete' and len(call_args) >= 2:
+            return self._gen_dict_delete(name, call_args[0], call_args[1])
+        if dict_builtin == 'dictKeys' and len(call_args) >= 1:
+            return self._gen_dict_keys(name, call_args[0])
+        if dict_builtin == 'dictValues' and len(call_args) >= 1:
+            return self._gen_dict_values(name, call_args[0])
+
         return None
+
+    def _list_builtin_base(self, name: str) -> str | None:
+        for base in self._list_collection_builtins:
+            if name == base or name.startswith(f'{base}_'):
+                return base
+        return None
+
+    def _dict_builtin_base(self, name: str) -> str | None:
+        for base in self._dict_collection_builtins:
+            if name == base or name.startswith(f'{base}_'):
+                return base
+        return None
+
+    def _collection_type_args(self, name: str) -> list[ir.Type]:
+        meta = self._collection_mono_types.get(name)
+        return list(meta[1]) if meta is not None else []
+
+    @staticmethod
+    def _is_list_type(t: ir.Type) -> bool:
+        return (
+            isinstance(t, ir.LiteralStructType)
+            and len(t.elements) == 4
+            and isinstance(t.elements[0], ir.PointerType)
+            and isinstance(t.elements[0].pointee, ir.PointerType)
+            and t.elements[1] == ir.IntType(64)
+            and t.elements[2] == ir.IntType(64)
+            and t.elements[3] == ir.IntType(64)
+        )
+
+    def _as_list_ptr(self, value: ir.Value) -> ir.Value | None:
+        if isinstance(value.type, ir.PointerType) and self._is_list_type(value.type.pointee):
+            return value
+        if self._is_list_type(value.type):
+            tmp = self.builder.alloca(value.type, name='_list_tmp')
+            self.builder.store(value, tmp)
+            return tmp
+        return None
+
+    def _list_elem_type(self, list_ptr: ir.Value) -> ir.Type:
+        pages_type = list_ptr.type.pointee.elements[0]
+        return pages_type.pointee.pointee
+
+    def _as_i64(self, value: ir.Value) -> ir.Value:
+        i64 = ir.IntType(64)
+        if value.type == i64:
+            return value
+        if isinstance(value.type, ir.IntType):
+            return self.builder.sext(value, i64) if value.type.width < 64 else self.builder.trunc(value, i64)
+        return ir.Constant(i64, 0)
+
+    def _list_field_ptr(self, list_ptr: ir.Value, index: int) -> ir.Value:
+        return self.builder.gep(list_ptr, [
+            ir.Constant(ir.IntType(32), 0),
+            ir.Constant(ir.IntType(32), index),
+        ], inbounds=True)
+
+    def _list_length(self, list_ptr: ir.Value) -> ir.Value:
+        return self.builder.load(self._list_field_ptr(list_ptr, 1), name='_list_len')
+
+    def _list_element_ptr(self, list_ptr: ir.Value, index: ir.Value) -> ir.Value:
+        i64 = ir.IntType(64)
+        index = self._as_i64(index)
+        pages = self.builder.load(self._list_field_ptr(list_ptr, 0), name='_list_pages')
+        page_idx = self.builder.udiv(index, ir.Constant(i64, 8), name='_list_page_idx')
+        slot_idx = self.builder.urem(index, ir.Constant(i64, 8), name='_list_slot_idx')
+        page_slot = self.builder.gep(pages, [page_idx], inbounds=True)
+        page = self.builder.load(page_slot, name='_list_page')
+        return self.builder.gep(page, [slot_idx], inbounds=True)
+
+    def _coerce_list_item(self, value: ir.Value, elem_type: ir.Type) -> ir.Value:
+        if self._is_aggregate_ptr(value) and value.type.pointee == elem_type:
+            value = self.builder.load(value)
+        if value.type != elem_type:
+            value = self._coerce_value(value, elem_type)
+        return value
+
+    def _optional_value(self, elem_type: ir.Type, ok: bool, value: ir.Value | None = None) -> ir.Value:
+        opt_type = ir.LiteralStructType([ir.IntType(1), elem_type])
+        if value is None:
+            value = self._zero_constant(elem_type)
+        else:
+            value = self._coerce_list_item(value, elem_type)
+        result = ir.Constant(opt_type, ir.Undefined)
+        result = self.builder.insert_value(result, ir.Constant(ir.IntType(1), int(ok)), 0)
+        return self.builder.insert_value(result, value, 1)
+
+    def _gen_list_len(self, list_value: ir.Value) -> ir.Value:
+        list_ptr = self._as_list_ptr(list_value)
+        if list_ptr is None:
+            return ir.Constant(ir.IntType(64), 0)
+        return self._list_length(list_ptr)
+
+    def _gen_list_push(self, list_value: ir.Value, item: ir.Value) -> None:
+        list_ptr = self._as_list_ptr(list_value)
+        if list_ptr is None:
+            return None
+        i64 = ir.IntType(64)
+        old_len = self._list_length(list_ptr)
+        new_len = self.builder.add(old_len, ir.Constant(i64, 1), name='_list_new_len')
+        self._list_ensure_capacity(list_ptr, new_len)
+        elem_type = self._list_elem_type(list_ptr)
+        elem_ptr = self._list_element_ptr(list_ptr, old_len)
+        self.builder.store(self._coerce_list_item(item, elem_type), elem_ptr)
+        self.builder.store(new_len, self._list_field_ptr(list_ptr, 1))
+        return None
+
+    def _gen_list_pop(self, list_value: ir.Value) -> ir.Value:
+        list_ptr = self._as_list_ptr(list_value)
+        if list_ptr is None:
+            return self._optional_value(ir.IntType(32), False)
+        i64 = ir.IntType(64)
+        elem_type = self._list_elem_type(list_ptr)
+        opt_type = ir.LiteralStructType([ir.IntType(1), elem_type])
+        result_ptr = self.builder.alloca(opt_type, name='_list_pop_result')
+        length = self._list_length(list_ptr)
+        is_empty = self.builder.icmp_unsigned('==', length, ir.Constant(i64, 0), name='_list_empty')
+        empty_block = self.builder.append_basic_block('list_pop_empty')
+        value_block = self.builder.append_basic_block('list_pop_value')
+        done_block = self.builder.append_basic_block('list_pop_done')
+        self.builder.cbranch(is_empty, empty_block, value_block)
+
+        self.builder.position_at_start(empty_block)
+        self.builder.store(self._optional_value(elem_type, False), result_ptr)
+        self.builder.branch(done_block)
+
+        self.builder.position_at_start(value_block)
+        new_len = self.builder.sub(length, ir.Constant(i64, 1), name='_list_new_len')
+        value = self.builder.load(self._list_element_ptr(list_ptr, new_len), name='_list_pop_value')
+        self.builder.store(new_len, self._list_field_ptr(list_ptr, 1))
+        self.builder.store(self._optional_value(elem_type, True, value), result_ptr)
+        self.builder.branch(done_block)
+
+        self.builder.position_at_start(done_block)
+        return self.builder.load(result_ptr, name='_list_pop_result_val')
+
+    def _gen_list_shift(self, list_value: ir.Value) -> ir.Value:
+        list_ptr = self._as_list_ptr(list_value)
+        if list_ptr is None:
+            return self._optional_value(ir.IntType(32), False)
+        i64 = ir.IntType(64)
+        elem_type = self._list_elem_type(list_ptr)
+        opt_type = ir.LiteralStructType([ir.IntType(1), elem_type])
+        result_ptr = self.builder.alloca(opt_type, name='_list_shift_result')
+        length = self._list_length(list_ptr)
+        is_empty = self.builder.icmp_unsigned('==', length, ir.Constant(i64, 0), name='_list_empty')
+        empty_block = self.builder.append_basic_block('list_shift_empty')
+        value_block = self.builder.append_basic_block('list_shift_value')
+        done_block = self.builder.append_basic_block('list_shift_done')
+        self.builder.cbranch(is_empty, empty_block, value_block)
+
+        self.builder.position_at_start(empty_block)
+        self.builder.store(self._optional_value(elem_type, False), result_ptr)
+        self.builder.branch(done_block)
+
+        self.builder.position_at_start(value_block)
+        first = self.builder.load(self._list_element_ptr(list_ptr, ir.Constant(i64, 0)), name='_list_shift_value')
+        index_ptr = self.builder.alloca(i64, name='_list_shift_i')
+        self.builder.store(ir.Constant(i64, 1), index_ptr)
+        loop_cond = self.builder.append_basic_block('list_shift_cond')
+        loop_body = self.builder.append_basic_block('list_shift_body')
+        loop_done = self.builder.append_basic_block('list_shift_loop_done')
+        self.builder.branch(loop_cond)
+
+        self.builder.position_at_start(loop_cond)
+        index = self.builder.load(index_ptr, name='_list_shift_i_val')
+        keep_moving = self.builder.icmp_unsigned('<', index, length, name='_list_shift_more')
+        self.builder.cbranch(keep_moving, loop_body, loop_done)
+
+        self.builder.position_at_start(loop_body)
+        prev_index = self.builder.sub(index, ir.Constant(i64, 1))
+        moved = self.builder.load(self._list_element_ptr(list_ptr, index), name='_list_shift_item')
+        self.builder.store(moved, self._list_element_ptr(list_ptr, prev_index))
+        self.builder.store(self.builder.add(index, ir.Constant(i64, 1)), index_ptr)
+        self.builder.branch(loop_cond)
+
+        self.builder.position_at_start(loop_done)
+        new_len = self.builder.sub(length, ir.Constant(i64, 1), name='_list_new_len')
+        self.builder.store(new_len, self._list_field_ptr(list_ptr, 1))
+        self.builder.store(self._optional_value(elem_type, True, first), result_ptr)
+        self.builder.branch(done_block)
+
+        self.builder.position_at_start(done_block)
+        return self.builder.load(result_ptr, name='_list_shift_result_val')
+
+    def _gen_list_unshift(self, list_value: ir.Value, item: ir.Value) -> None:
+        list_ptr = self._as_list_ptr(list_value)
+        if list_ptr is None:
+            return None
+        i64 = ir.IntType(64)
+        elem_type = self._list_elem_type(list_ptr)
+        old_len = self._list_length(list_ptr)
+        new_len = self.builder.add(old_len, ir.Constant(i64, 1), name='_list_new_len')
+        self._list_ensure_capacity(list_ptr, new_len)
+        index_ptr = self.builder.alloca(i64, name='_list_unshift_i')
+        self.builder.store(old_len, index_ptr)
+        loop_cond = self.builder.append_basic_block('list_unshift_cond')
+        loop_body = self.builder.append_basic_block('list_unshift_body')
+        loop_done = self.builder.append_basic_block('list_unshift_done')
+        self.builder.branch(loop_cond)
+
+        self.builder.position_at_start(loop_cond)
+        index = self.builder.load(index_ptr, name='_list_unshift_i_val')
+        keep_moving = self.builder.icmp_unsigned('>', index, ir.Constant(i64, 0), name='_list_unshift_more')
+        self.builder.cbranch(keep_moving, loop_body, loop_done)
+
+        self.builder.position_at_start(loop_body)
+        prev_index = self.builder.sub(index, ir.Constant(i64, 1))
+        moved = self.builder.load(self._list_element_ptr(list_ptr, prev_index), name='_list_unshift_item')
+        self.builder.store(moved, self._list_element_ptr(list_ptr, index))
+        self.builder.store(prev_index, index_ptr)
+        self.builder.branch(loop_cond)
+
+        self.builder.position_at_start(loop_done)
+        self.builder.store(self._coerce_list_item(item, elem_type), self._list_element_ptr(list_ptr, ir.Constant(i64, 0)))
+        self.builder.store(new_len, self._list_field_ptr(list_ptr, 1))
+        return None
+
+    def _gen_list_slice(self, list_value: ir.Value, start_value: ir.Value, end_value: ir.Value) -> ir.Value:
+        list_ptr = self._as_list_ptr(list_value)
+        if list_ptr is None:
+            return self._list_new(ir.IntType(32), ir.Constant(ir.IntType(64), 0))
+        i64 = ir.IntType(64)
+        zero = ir.Constant(i64, 0)
+        elem_type = self._list_elem_type(list_ptr)
+        length = self._list_length(list_ptr)
+        start = self._clamp_list_index(self._as_i64(start_value), length)
+        end = self._clamp_list_index(self._as_i64(end_value), length)
+        end_before_start = self.builder.icmp_unsigned('<', end, start, name='_list_slice_empty')
+        raw_len = self.builder.sub(end, start, name='_list_slice_raw_len')
+        slice_len = self.builder.select(end_before_start, zero, raw_len, name='_list_slice_len')
+        result = self._list_new(elem_type, slice_len)
+
+        index_ptr = self.builder.alloca(i64, name='_list_slice_i')
+        self.builder.store(zero, index_ptr)
+        loop_cond = self.builder.append_basic_block('list_slice_cond')
+        loop_body = self.builder.append_basic_block('list_slice_body')
+        loop_done = self.builder.append_basic_block('list_slice_done')
+        self.builder.branch(loop_cond)
+
+        self.builder.position_at_start(loop_cond)
+        index = self.builder.load(index_ptr, name='_list_slice_i_val')
+        keep_copying = self.builder.icmp_unsigned('<', index, slice_len, name='_list_slice_more')
+        self.builder.cbranch(keep_copying, loop_body, loop_done)
+
+        self.builder.position_at_start(loop_body)
+        src_index = self.builder.add(start, index, name='_list_slice_src_i')
+        item = self.builder.load(self._list_element_ptr(list_ptr, src_index), name='_list_slice_item')
+        self.builder.store(item, self._list_element_ptr(result, index))
+        self.builder.store(self.builder.add(index, ir.Constant(i64, 1)), index_ptr)
+        self.builder.branch(loop_cond)
+
+        self.builder.position_at_start(loop_done)
+        return result
+
+    def _call_list_function(self, func: ir.Value, args: list[ir.Value]) -> ir.Value | None:
+        if isinstance(func, ir.Function):
+            func_type = func.function_type
+            coerced = [self._coerce_value(arg, func_type.args[i]) if i < len(func_type.args) else arg for i, arg in enumerate(args)]
+            return self.builder.call(func, coerced)
+        if isinstance(func, ir.Value) and isinstance(func.type, ir.PointerType) and isinstance(func.type.pointee, ir.FunctionType):
+            func_type = func.type.pointee
+            coerced = [self._coerce_value(arg, func_type.args[i]) if i < len(func_type.args) else arg for i, arg in enumerate(args)]
+            return self.builder.call(func, coerced)
+        return None
+
+    def _gen_list_find(self, list_value: ir.Value, pred: ir.Value) -> ir.Value:
+        list_ptr = self._as_list_ptr(list_value)
+        if list_ptr is None:
+            return self._optional_value(ir.IntType(32), False)
+        i64 = ir.IntType(64)
+        elem_type = self._list_elem_type(list_ptr)
+        opt_type = ir.LiteralStructType([ir.IntType(1), elem_type])
+        result_ptr = self.builder.alloca(opt_type, name='_list_find_result')
+        self.builder.store(self._optional_value(elem_type, False), result_ptr)
+        length = self._list_length(list_ptr)
+        index_ptr = self.builder.alloca(i64, name='_list_find_i')
+        self.builder.store(ir.Constant(i64, 0), index_ptr)
+        loop_cond = self.builder.append_basic_block('list_find_cond')
+        loop_body = self.builder.append_basic_block('list_find_body')
+        found_block = self.builder.append_basic_block('list_find_found')
+        step_block = self.builder.append_basic_block('list_find_step')
+        done_block = self.builder.append_basic_block('list_find_done')
+        self.builder.branch(loop_cond)
+
+        self.builder.position_at_start(loop_cond)
+        index = self.builder.load(index_ptr, name='_list_find_i_val')
+        more = self.builder.icmp_unsigned('<', index, length, name='_list_find_more')
+        self.builder.cbranch(more, loop_body, done_block)
+
+        self.builder.position_at_start(loop_body)
+        item = self.builder.load(self._list_element_ptr(list_ptr, index), name='_list_find_item')
+        keep = self._call_list_function(pred, [item])
+        if keep is None or keep.type != ir.IntType(1):
+            keep = ir.Constant(ir.IntType(1), 0)
+        self.builder.cbranch(keep, found_block, step_block)
+
+        self.builder.position_at_start(found_block)
+        self.builder.store(self._optional_value(elem_type, True, item), result_ptr)
+        self.builder.branch(done_block)
+
+        self.builder.position_at_start(step_block)
+        self.builder.store(self.builder.add(index, ir.Constant(i64, 1)), index_ptr)
+        self.builder.branch(loop_cond)
+
+        self.builder.position_at_start(done_block)
+        return self.builder.load(result_ptr, name='_list_find_result_val')
+
+    def _gen_list_filter(self, list_value: ir.Value, pred: ir.Value) -> ir.Value:
+        list_ptr = self._as_list_ptr(list_value)
+        if list_ptr is None:
+            return self._list_new(ir.IntType(32), ir.Constant(ir.IntType(64), 0))
+        i64 = ir.IntType(64)
+        elem_type = self._list_elem_type(list_ptr)
+        length = self._list_length(list_ptr)
+        result = self._list_new(elem_type, ir.Constant(i64, 0))
+        index_ptr = self.builder.alloca(i64, name='_list_filter_i')
+        self.builder.store(ir.Constant(i64, 0), index_ptr)
+        loop_cond = self.builder.append_basic_block('list_filter_cond')
+        loop_body = self.builder.append_basic_block('list_filter_body')
+        keep_block = self.builder.append_basic_block('list_filter_keep')
+        step_block = self.builder.append_basic_block('list_filter_step')
+        done_block = self.builder.append_basic_block('list_filter_done')
+        self.builder.branch(loop_cond)
+
+        self.builder.position_at_start(loop_cond)
+        index = self.builder.load(index_ptr, name='_list_filter_i_val')
+        more = self.builder.icmp_unsigned('<', index, length, name='_list_filter_more')
+        self.builder.cbranch(more, loop_body, done_block)
+
+        self.builder.position_at_start(loop_body)
+        item = self.builder.load(self._list_element_ptr(list_ptr, index), name='_list_filter_item')
+        keep = self._call_list_function(pred, [item])
+        if keep is None or keep.type != ir.IntType(1):
+            keep = ir.Constant(ir.IntType(1), 0)
+        self.builder.cbranch(keep, keep_block, step_block)
+
+        self.builder.position_at_start(keep_block)
+        self._gen_list_push(result, item)
+        self.builder.branch(step_block)
+
+        self.builder.position_at_start(step_block)
+        self.builder.store(self.builder.add(index, ir.Constant(i64, 1)), index_ptr)
+        self.builder.branch(loop_cond)
+
+        self.builder.position_at_start(done_block)
+        return result
+
+    def _gen_list_map(self, name: str, list_value: ir.Value, func: ir.Value) -> ir.Value:
+        list_ptr = self._as_list_ptr(list_value)
+        type_args = self._collection_type_args(name)
+        result_elem_type = type_args[1] if len(type_args) > 1 else ir.IntType(32)
+        if list_ptr is None:
+            return self._list_new(result_elem_type, ir.Constant(ir.IntType(64), 0))
+        i64 = ir.IntType(64)
+        length = self._list_length(list_ptr)
+        result = self._list_new(result_elem_type, length)
+        index_ptr = self.builder.alloca(i64, name='_list_map_i')
+        self.builder.store(ir.Constant(i64, 0), index_ptr)
+        loop_cond = self.builder.append_basic_block('list_map_cond')
+        loop_body = self.builder.append_basic_block('list_map_body')
+        done_block = self.builder.append_basic_block('list_map_done')
+        self.builder.branch(loop_cond)
+
+        self.builder.position_at_start(loop_cond)
+        index = self.builder.load(index_ptr, name='_list_map_i_val')
+        more = self.builder.icmp_unsigned('<', index, length, name='_list_map_more')
+        self.builder.cbranch(more, loop_body, done_block)
+
+        self.builder.position_at_start(loop_body)
+        item = self.builder.load(self._list_element_ptr(list_ptr, index), name='_list_map_item')
+        mapped = self._call_list_function(func, [item])
+        if mapped is None:
+            mapped = self._zero_constant(result_elem_type)
+        mapped = self._coerce_list_item(mapped, result_elem_type)
+        self.builder.store(mapped, self._list_element_ptr(result, index))
+        self.builder.store(self.builder.add(index, ir.Constant(i64, 1)), index_ptr)
+        self.builder.branch(loop_cond)
+
+        self.builder.position_at_start(done_block)
+        return result
+
+    def _gen_list_sort(self, list_value: ir.Value, cmp_func: ir.Value) -> None:
+        list_ptr = self._as_list_ptr(list_value)
+        if list_ptr is None:
+            return None
+        i64 = ir.IntType(64)
+        length = self._list_length(list_ptr)
+        outer_ptr = self.builder.alloca(i64, name='_list_sort_i')
+        self.builder.store(ir.Constant(i64, 1), outer_ptr)
+        outer_cond = self.builder.append_basic_block('list_sort_outer_cond')
+        outer_body = self.builder.append_basic_block('list_sort_outer_body')
+        inner_cond = self.builder.append_basic_block('list_sort_inner_cond')
+        compare_block = self.builder.append_basic_block('list_sort_compare')
+        inner_body = self.builder.append_basic_block('list_sort_inner_body')
+        outer_step = self.builder.append_basic_block('list_sort_outer_step')
+        done_block = self.builder.append_basic_block('list_sort_done')
+        self.builder.branch(outer_cond)
+
+        self.builder.position_at_start(outer_cond)
+        outer = self.builder.load(outer_ptr, name='_list_sort_i_val')
+        more_outer = self.builder.icmp_unsigned('<', outer, length, name='_list_sort_more_outer')
+        self.builder.cbranch(more_outer, outer_body, done_block)
+
+        self.builder.position_at_start(outer_body)
+        inner_ptr = self.builder.alloca(i64, name='_list_sort_j')
+        self.builder.store(outer, inner_ptr)
+        self.builder.branch(inner_cond)
+
+        self.builder.position_at_start(inner_cond)
+        inner = self.builder.load(inner_ptr, name='_list_sort_j_val')
+        has_prev = self.builder.icmp_unsigned('>', inner, ir.Constant(i64, 0), name='_list_sort_has_prev')
+        self.builder.cbranch(has_prev, compare_block, outer_step)
+
+        self.builder.position_at_start(compare_block)
+        prev_index = self.builder.sub(inner, ir.Constant(i64, 1), name='_list_sort_prev_i')
+        cur_val = self.builder.load(self._list_element_ptr(list_ptr, inner), name='_list_sort_cur')
+        prev_val = self.builder.load(self._list_element_ptr(list_ptr, prev_index), name='_list_sort_prev')
+        cmp_result = self._call_list_function(cmp_func, [prev_val, cur_val])
+        if cmp_result is None:
+            cmp_result = ir.Constant(ir.IntType(32), 0)
+        if cmp_result.type != ir.IntType(32):
+            cmp_result = self._coerce_value(cmp_result, ir.IntType(32))
+        should_swap_cmp = self.builder.icmp_signed('>', cmp_result, ir.Constant(ir.IntType(32), 0), name='_list_sort_should_swap_cmp')
+        self.builder.cbranch(should_swap_cmp, inner_body, outer_step)
+
+        self.builder.position_at_start(inner_body)
+        cur_ptr = self._list_element_ptr(list_ptr, inner)
+        prev_ptr = self._list_element_ptr(list_ptr, prev_index)
+        tmp = self.builder.load(cur_ptr, name='_list_sort_tmp')
+        self.builder.store(self.builder.load(prev_ptr), cur_ptr)
+        self.builder.store(tmp, prev_ptr)
+        self.builder.store(prev_index, inner_ptr)
+        self.builder.branch(inner_cond)
+
+        self.builder.position_at_start(outer_step)
+        self.builder.store(self.builder.add(outer, ir.Constant(i64, 1)), outer_ptr)
+        self.builder.branch(outer_cond)
+
+        self.builder.position_at_start(done_block)
+        return None
+
+    def _clamp_list_index(self, value: ir.Value, length: ir.Value) -> ir.Value:
+        i64 = ir.IntType(64)
+        zero = ir.Constant(i64, 0)
+        is_negative = self.builder.icmp_signed('<', value, zero)
+        non_negative = self.builder.select(is_negative, zero, value)
+        too_large = self.builder.icmp_unsigned('>', non_negative, length)
+        return self.builder.select(too_large, length, non_negative)
+
+    def _list_new(self, elem_type: ir.Type, length: ir.Value) -> ir.Value:
+        i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
+        page_ptr_type = ir.PointerType(elem_type)
+        pages_type = ir.PointerType(page_ptr_type)
+        list_type = ir.LiteralStructType([pages_type, i64, i64, i64])
+        list_ptr = self._arena_allocate(list_type, name='_tmp_list')
+        self.builder.store(self._zero_constant(list_type), list_ptr)
+
+        page_count = self.builder.udiv(self.builder.add(length, ir.Constant(i64, 7)), ir.Constant(i64, 8), name='_list_page_count_raw')
+        no_pages = self.builder.icmp_unsigned('==', page_count, ir.Constant(i64, 0))
+        page_count = self.builder.select(no_pages, ir.Constant(i64, 1), page_count, name='_list_page_count')
+        page_table_bytes = self.builder.mul(page_count, ir.Constant(i64, 8), name='_list_page_table_bytes')
+        page_table_raw = self.builder.call(self._arena_alloc, [page_table_bytes, ir.Constant(i64, 8)])
+        pages = self.builder.bitcast(page_table_raw, pages_type, name='_list_new_pages')
+
+        index_ptr = self.builder.alloca(i64, name='_list_new_i')
+        self.builder.store(ir.Constant(i64, 0), index_ptr)
+        loop_cond = self.builder.append_basic_block('list_new_cond')
+        loop_body = self.builder.append_basic_block('list_new_body')
+        loop_done = self.builder.append_basic_block('list_new_done')
+        self.builder.branch(loop_cond)
+
+        self.builder.position_at_start(loop_cond)
+        index = self.builder.load(index_ptr, name='_list_new_i_val')
+        more = self.builder.icmp_unsigned('<', index, page_count, name='_list_new_more')
+        self.builder.cbranch(more, loop_body, loop_done)
+
+        self.builder.position_at_start(loop_body)
+        page_bytes = ir.Constant(i64, max(self._type_width(elem_type), 1) * 8)
+        page_raw = self.builder.call(self._arena_alloc, [page_bytes, ir.Constant(i64, 8)])
+        page = self.builder.bitcast(page_raw, page_ptr_type, name='_list_new_page')
+        page_slot = self.builder.gep(pages, [index], inbounds=True)
+        self.builder.store(page, page_slot)
+        self.builder.store(self.builder.add(index, ir.Constant(i64, 1)), index_ptr)
+        self.builder.branch(loop_cond)
+
+        self.builder.position_at_start(loop_done)
+        self.builder.store(pages, self._list_field_ptr(list_ptr, 0))
+        self.builder.store(length, self._list_field_ptr(list_ptr, 1))
+        self.builder.store(self.builder.mul(page_count, ir.Constant(i64, 8)), self._list_field_ptr(list_ptr, 2))
+        self.builder.store(page_count, self._list_field_ptr(list_ptr, 3))
+        return list_ptr
+
+    def _list_ensure_capacity(self, list_ptr: ir.Value, required_len: ir.Value) -> None:
+        i64 = ir.IntType(64)
+        elem_type = self._list_elem_type(list_ptr)
+        page_ptr_type = ir.PointerType(elem_type)
+        pages_type = ir.PointerType(page_ptr_type)
+        capacity = self.builder.load(self._list_field_ptr(list_ptr, 2), name='_list_capacity')
+        page_count = self.builder.load(self._list_field_ptr(list_ptr, 3), name='_list_page_count')
+        has_capacity = self.builder.icmp_unsigned('>=', capacity, required_len, name='_list_has_capacity')
+        grow_block = self.builder.append_basic_block('list_grow')
+        done_block = self.builder.append_basic_block('list_grow_done')
+        self.builder.cbranch(has_capacity, done_block, grow_block)
+
+        self.builder.position_at_start(grow_block)
+        new_page_count = self.builder.add(page_count, ir.Constant(i64, 1), name='_list_new_page_count')
+        page_table_bytes = self.builder.mul(new_page_count, ir.Constant(i64, 8), name='_list_page_table_bytes')
+        page_table_raw = self.builder.call(self._arena_alloc, [page_table_bytes, ir.Constant(i64, 8)])
+        new_pages = self.builder.bitcast(page_table_raw, pages_type, name='_list_grown_pages')
+        old_pages = self.builder.load(self._list_field_ptr(list_ptr, 0), name='_list_old_pages')
+        index_ptr = self.builder.alloca(i64, name='_list_copy_page_i')
+        self.builder.store(ir.Constant(i64, 0), index_ptr)
+        copy_cond = self.builder.append_basic_block('list_page_copy_cond')
+        copy_body = self.builder.append_basic_block('list_page_copy_body')
+        copy_done = self.builder.append_basic_block('list_page_copy_done')
+        self.builder.branch(copy_cond)
+
+        self.builder.position_at_start(copy_cond)
+        index = self.builder.load(index_ptr, name='_list_copy_page_i_val')
+        more = self.builder.icmp_unsigned('<', index, page_count, name='_list_copy_more')
+        self.builder.cbranch(more, copy_body, copy_done)
+
+        self.builder.position_at_start(copy_body)
+        old_slot = self.builder.gep(old_pages, [index], inbounds=True)
+        new_slot = self.builder.gep(new_pages, [index], inbounds=True)
+        self.builder.store(self.builder.load(old_slot), new_slot)
+        self.builder.store(self.builder.add(index, ir.Constant(i64, 1)), index_ptr)
+        self.builder.branch(copy_cond)
+
+        self.builder.position_at_start(copy_done)
+        page_bytes = ir.Constant(i64, max(self._type_width(elem_type), 1) * 8)
+        page_raw = self.builder.call(self._arena_alloc, [page_bytes, ir.Constant(i64, 8)])
+        new_page = self.builder.bitcast(page_raw, page_ptr_type, name='_list_new_page')
+        new_page_slot = self.builder.gep(new_pages, [page_count], inbounds=True)
+        self.builder.store(new_page, new_page_slot)
+        self.builder.store(new_pages, self._list_field_ptr(list_ptr, 0))
+        self.builder.store(new_page_count, self._list_field_ptr(list_ptr, 3))
+        self.builder.store(self.builder.mul(new_page_count, ir.Constant(i64, 8)), self._list_field_ptr(list_ptr, 2))
+        self.builder.branch(done_block)
+
+        self.builder.position_at_start(done_block)
+        return None
+
+    def _as_dict_ptr(self, value: ir.Value) -> ir.Value | None:
+        dict_type = self.structs['Dict']
+        if isinstance(value.type, ir.PointerType) and value.type.pointee == dict_type:
+            return value
+        if value.type == dict_type:
+            tmp = self.builder.alloca(dict_type, name='_dict_tmp')
+            self.builder.store(value, tmp)
+            return tmp
+        return None
+
+    def _dict_count_ptr(self, dict_ptr: ir.Value) -> ir.Value:
+        return self.builder.gep(dict_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 2)], inbounds=True)
+
+    def _dict_count(self, dict_ptr: ir.Value) -> ir.Value:
+        return self.builder.load(self._dict_count_ptr(dict_ptr), name='_dict_count')
+
+    def _dict_slot_ptr(self, dict_ptr: ir.Value, page_field: int, index: ir.Value) -> ir.Value:
+        i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
+        if index.type != i32:
+            index32 = self.builder.trunc(index, i32) if isinstance(index.type, ir.IntType) and index.type.width > 32 else self.builder.zext(index, i32)
+        else:
+            index32 = index
+        pages_ptr = self.builder.gep(dict_ptr, [ir.Constant(i32, 0), ir.Constant(i32, page_field)], inbounds=True)
+        pages = self.builder.load(pages_ptr, name='_dict_pages')
+        page_idx = self.builder.udiv(index32, ir.Constant(i32, 8), name='_dict_page_idx')
+        slot_idx32 = self.builder.urem(index32, ir.Constant(i32, 8), name='_dict_slot_idx32')
+        slot_idx = self.builder.zext(slot_idx32, i64)
+        page_slot = self.builder.gep(pages, [page_idx], inbounds=True)
+        page = self.builder.load(page_slot, name='_dict_page')
+        return self.builder.gep(page, [slot_idx], inbounds=True)
+
+    def _dict_key_slot_ptr(self, dict_ptr: ir.Value, index: ir.Value) -> ir.Value:
+        return self._dict_slot_ptr(dict_ptr, 0, index)
+
+    def _dict_value_slot_ptr(self, dict_ptr: ir.Value, index: ir.Value) -> ir.Value:
+        return self._dict_slot_ptr(dict_ptr, 1, index)
+
+    def _dict_to_i8_ptr(self, value: ir.Value) -> ir.Value:
+        i8_ptr = ir.PointerType(ir.IntType(8))
+        if value.type == i8_ptr:
+            return value
+        if self._is_aggregate_ptr(value):
+            return self.builder.bitcast(value, i8_ptr)
+        tmp = self.builder.alloca(value.type, name='_dict_item_ptr')
+        self.builder.store(value, tmp)
+        return self.builder.bitcast(tmp, i8_ptr)
+
+    def _dict_from_i8_ptr(self, raw: ir.Value, value_type: ir.Type) -> ir.Value:
+        i8_ptr = ir.PointerType(ir.IntType(8))
+        if value_type == i8_ptr:
+            return raw
+        ptr = self.builder.bitcast(raw, ir.PointerType(value_type), name='_dict_typed_ptr')
+        return self.builder.load(ptr, name='_dict_typed_value')
+
+    def _gen_c_string_equal(self, left: ir.Value, right: ir.Value) -> ir.Value:
+        i1 = ir.IntType(1)
+        i8 = ir.IntType(8)
+        i64 = ir.IntType(64)
+        i8_ptr = ir.PointerType(i8)
+        left = left if left.type == i8_ptr else self._dict_to_i8_ptr(left)
+        right = right if right.type == i8_ptr else self._dict_to_i8_ptr(right)
+        same_ptr = self.builder.icmp_unsigned('==', left, right, name='_dict_key_same_ptr')
+        result_ptr = self.builder.alloca(i1, name='_dict_key_eq_result')
+        self.builder.store(ir.Constant(i1, 1), result_ptr)
+        index_ptr = self.builder.alloca(i64, name='_dict_key_eq_i')
+        self.builder.store(ir.Constant(i64, 0), index_ptr)
+        scan_cond = self.builder.append_basic_block('dict_key_eq_cond')
+        scan_body = self.builder.append_basic_block('dict_key_eq_body')
+        mismatch_block = self.builder.append_basic_block('dict_key_eq_mismatch')
+        step_block = self.builder.append_basic_block('dict_key_eq_step')
+        done_block = self.builder.append_basic_block('dict_key_eq_done')
+        self.builder.cbranch(same_ptr, done_block, scan_cond)
+
+        self.builder.position_at_start(scan_cond)
+        index = self.builder.load(index_ptr, name='_dict_key_eq_i_val')
+        left_ch = self.builder.load(self.builder.gep(left, [index], inbounds=True), name='_dict_key_left_ch')
+        right_ch = self.builder.load(self.builder.gep(right, [index], inbounds=True), name='_dict_key_right_ch')
+        chars_equal = self.builder.icmp_unsigned('==', left_ch, right_ch, name='_dict_key_chars_equal')
+        self.builder.cbranch(chars_equal, scan_body, mismatch_block)
+
+        self.builder.position_at_start(scan_body)
+        at_end = self.builder.icmp_unsigned('==', left_ch, ir.Constant(i8, 0), name='_dict_key_at_end')
+        self.builder.cbranch(at_end, done_block, step_block)
+
+        self.builder.position_at_start(step_block)
+        self.builder.store(self.builder.add(index, ir.Constant(i64, 1)), index_ptr)
+        self.builder.branch(scan_cond)
+
+        self.builder.position_at_start(mismatch_block)
+        self.builder.store(ir.Constant(i1, 0), result_ptr)
+        self.builder.branch(done_block)
+
+        self.builder.position_at_start(done_block)
+        return self.builder.load(result_ptr, name='_dict_key_eq')
+
+    def _gen_dict_find_index(self, dict_ptr: ir.Value, key: ir.Value, key_type: ir.Type) -> tuple[ir.Value, ir.Value]:
+        i1 = ir.IntType(1)
+        i32 = ir.IntType(32)
+        found_ptr = self.builder.alloca(i1, name='_dict_found')
+        index_result_ptr = self.builder.alloca(i32, name='_dict_found_index')
+        scan_ptr = self.builder.alloca(i32, name='_dict_find_i')
+        self.builder.store(ir.Constant(i1, 0), found_ptr)
+        self.builder.store(ir.Constant(i32, 0), index_result_ptr)
+        self.builder.store(ir.Constant(i32, 0), scan_ptr)
+        count = self._dict_count(dict_ptr)
+        cond_block = self.builder.append_basic_block('dict_find_cond')
+        body_block = self.builder.append_basic_block('dict_find_body')
+        found_block = self.builder.append_basic_block('dict_find_found')
+        step_block = self.builder.append_basic_block('dict_find_step')
+        done_block = self.builder.append_basic_block('dict_find_done')
+        self.builder.branch(cond_block)
+
+        self.builder.position_at_start(cond_block)
+        index = self.builder.load(scan_ptr, name='_dict_find_i_val')
+        more = self.builder.icmp_unsigned('<', index, count, name='_dict_find_more')
+        self.builder.cbranch(more, body_block, done_block)
+
+        self.builder.position_at_start(body_block)
+        stored_raw = self.builder.load(self._dict_key_slot_ptr(dict_ptr, index), name='_dict_find_key')
+        if key_type == ir.PointerType(ir.IntType(8)):
+            matches = self._gen_c_string_equal(stored_raw, key)
+        else:
+            stored = self._dict_from_i8_ptr(stored_raw, key_type)
+            wanted = self._coerce_list_item(key, key_type)
+            if isinstance(key_type, ir.IntType):
+                matches = self.builder.icmp_signed('==', stored, wanted, name='_dict_key_match')
+            elif key_type == ir.FloatType() or key_type == ir.DoubleType():
+                matches = self.builder.fcmp_ordered('==', stored, wanted, name='_dict_key_match')
+            else:
+                stored_ptr = self.builder.bitcast(stored_raw, ir.PointerType(ir.IntType(8)))
+                wanted_ptr = self._dict_to_i8_ptr(wanted)
+                matches = self.builder.icmp_unsigned('==', stored_ptr, wanted_ptr, name='_dict_key_match')
+        self.builder.cbranch(matches, found_block, step_block)
+
+        self.builder.position_at_start(found_block)
+        self.builder.store(ir.Constant(i1, 1), found_ptr)
+        self.builder.store(index, index_result_ptr)
+        self.builder.branch(done_block)
+
+        self.builder.position_at_start(step_block)
+        self.builder.store(self.builder.add(index, ir.Constant(i32, 1)), scan_ptr)
+        self.builder.branch(cond_block)
+
+        self.builder.position_at_start(done_block)
+        return self.builder.load(found_ptr, name='_dict_found_val'), self.builder.load(index_result_ptr, name='_dict_found_index_val')
+
+    def _gen_dict_len(self, dict_value: ir.Value) -> ir.Value:
+        dict_ptr = self._as_dict_ptr(dict_value)
+        if dict_ptr is None:
+            return ir.Constant(ir.IntType(64), 0)
+        return self.builder.zext(self._dict_count(dict_ptr), ir.IntType(64))
+
+    def _gen_dict_has(self, name: str, dict_value: ir.Value, key: ir.Value) -> ir.Value:
+        dict_ptr = self._as_dict_ptr(dict_value)
+        if dict_ptr is None:
+            return ir.Constant(ir.IntType(1), 0)
+        type_args = self._collection_type_args(name)
+        key_type = type_args[0] if type_args else ir.PointerType(ir.IntType(8))
+        found, _ = self._gen_dict_find_index(dict_ptr, key, key_type)
+        return found
+
+    def _gen_dict_delete(self, name: str, dict_value: ir.Value, key: ir.Value) -> ir.Value:
+        dict_ptr = self._as_dict_ptr(dict_value)
+        if dict_ptr is None:
+            return ir.Constant(ir.IntType(1), 0)
+        i32 = ir.IntType(32)
+        type_args = self._collection_type_args(name)
+        key_type = type_args[0] if type_args else ir.PointerType(ir.IntType(8))
+        found, found_index = self._gen_dict_find_index(dict_ptr, key, key_type)
+        count = self._dict_count(dict_ptr)
+        shift_start = self.builder.append_basic_block('dict_delete_shift_start')
+        shift_cond = self.builder.append_basic_block('dict_delete_shift_cond')
+        shift_body = self.builder.append_basic_block('dict_delete_shift_body')
+        done_block = self.builder.append_basic_block('dict_delete_done')
+        self.builder.cbranch(found, shift_start, done_block)
+
+        self.builder.position_at_start(shift_start)
+        index_ptr = self.builder.alloca(i32, name='_dict_delete_i')
+        self.builder.store(found_index, index_ptr)
+        self.builder.branch(shift_cond)
+
+        self.builder.position_at_start(shift_cond)
+        index = self.builder.load(index_ptr, name='_dict_delete_i_val')
+        next_index = self.builder.add(index, ir.Constant(i32, 1), name='_dict_delete_next_i')
+        more = self.builder.icmp_unsigned('<', next_index, count, name='_dict_delete_more')
+        self.builder.cbranch(more, shift_body, done_block)
+
+        self.builder.position_at_start(shift_body)
+        self.builder.store(self.builder.load(self._dict_key_slot_ptr(dict_ptr, next_index)), self._dict_key_slot_ptr(dict_ptr, index))
+        self.builder.store(self.builder.load(self._dict_value_slot_ptr(dict_ptr, next_index)), self._dict_value_slot_ptr(dict_ptr, index))
+        self.builder.store(next_index, index_ptr)
+        self.builder.branch(shift_cond)
+
+        self.builder.position_at_start(done_block)
+        new_count = self.builder.sub(count, ir.Constant(i32, 1), name='_dict_delete_new_count')
+        count_to_store = self.builder.select(found, new_count, count, name='_dict_delete_count')
+        self.builder.store(count_to_store, self._dict_count_ptr(dict_ptr))
+        return found
+
+    def _gen_dict_keys(self, name: str, dict_value: ir.Value) -> ir.Value:
+        type_args = self._collection_type_args(name)
+        key_type = type_args[0] if type_args else ir.PointerType(ir.IntType(8))
+        return self._gen_dict_list_from_slots(dict_value, 0, key_type)
+
+    def _gen_dict_values(self, name: str, dict_value: ir.Value) -> ir.Value:
+        type_args = self._collection_type_args(name)
+        value_type = type_args[1] if len(type_args) > 1 else ir.PointerType(ir.IntType(8))
+        return self._gen_dict_list_from_slots(dict_value, 1, value_type)
+
+    def _gen_dict_list_from_slots(self, dict_value: ir.Value, field_index: int, elem_type: ir.Type) -> ir.Value:
+        dict_ptr = self._as_dict_ptr(dict_value)
+        if dict_ptr is None:
+            return self._list_new(elem_type, ir.Constant(ir.IntType(64), 0))
+        i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
+        count32 = self._dict_count(dict_ptr)
+        count = self.builder.zext(count32, i64)
+        result = self._list_new(elem_type, count)
+        index_ptr = self.builder.alloca(i32, name='_dict_list_i')
+        self.builder.store(ir.Constant(i32, 0), index_ptr)
+        loop_cond = self.builder.append_basic_block('dict_list_cond')
+        loop_body = self.builder.append_basic_block('dict_list_body')
+        loop_done = self.builder.append_basic_block('dict_list_done')
+        self.builder.branch(loop_cond)
+
+        self.builder.position_at_start(loop_cond)
+        index = self.builder.load(index_ptr, name='_dict_list_i_val')
+        more = self.builder.icmp_unsigned('<', index, count32, name='_dict_list_more')
+        self.builder.cbranch(more, loop_body, loop_done)
+
+        self.builder.position_at_start(loop_body)
+        slot_ptr = self._dict_key_slot_ptr(dict_ptr, index) if field_index == 0 else self._dict_value_slot_ptr(dict_ptr, index)
+        raw = self.builder.load(slot_ptr, name='_dict_list_raw')
+        value = self._dict_from_i8_ptr(raw, elem_type)
+        self.builder.store(value, self._list_element_ptr(result, self.builder.zext(index, i64)))
+        self.builder.store(self.builder.add(index, ir.Constant(i32, 1)), index_ptr)
+        self.builder.branch(loop_cond)
+
+        self.builder.position_at_start(loop_done)
+        return result
 
     def _gen_dict_set(self, dict_ptr: ir.Value, key: ir.Value, value: ir.Value) -> ir.Value:
         """dict_set(dict, key, value): 向分页存储追加元素，容量不足时分配新页"""
@@ -2293,6 +3997,8 @@ class LLVMCodeGenerator(EzLangVisitor):
         ret_type = func_type.return_type
         tramp_func_type = ir.FunctionType(ret_type, tramp_param_types)
         tramp_func = ir.Function(self.module, tramp_func_type, name=tramp_name)
+        self.func_param_names[tramp_name] = ['__closure'] + list(placeholder_params)
+        self._curried_closures[str(closure_type)] = (tramp_func, list(placeholder_params))
 
         # 保存当前 builder 状态，进入跳板函数体
         old_builder = self.builder
@@ -2353,16 +4059,13 @@ class LLVMCodeGenerator(EzLangVisitor):
         for i in range(1, len(ctx.multiplicativeExpression())):
             right = self._eval(ctx.multiplicativeExpression(i))
             if left is None or right is None: continue
-            # 通过遍历子节点找操作符
-            is_sub = False
-            for j in range(ctx.getChildCount()):
-                if ctx.getChild(j).getText() == '-':
-                    is_sub = True
-                    break
+            op = ctx.getChild((i * 2) - 1).getText()
+            unsigned = self._binary_result_unsigned(left, right)
             if self._is_float(left.type):
-                left = self.builder.fsub(left, right) if is_sub else self.builder.fadd(left, right)
+                left = self.builder.fsub(left, right) if op == '-' else self.builder.fadd(left, right)
             else:
-                left = self.builder.sub(left, right) if is_sub else self.builder.add(left, right)
+                left = self.builder.sub(left, right) if op == '-' else self.builder.add(left, right)
+            self._mark_unsigned(left, unsigned)
         return left
 
     def visitMultiplicativeExpression(self, ctx: EzLangParser.MultiplicativeExpressionContext):
@@ -2370,19 +4073,16 @@ class LLVMCodeGenerator(EzLangVisitor):
         for i in range(1, len(ctx.unaryExpression())):
             right = self._eval(ctx.unaryExpression(i))
             if left is None or right is None: continue
-            op = '*'
-            for j in range(ctx.getChildCount()):
-                t = ctx.getChild(j).getText()
-                if t in ('*', '/', '%'):
-                    op = t
-                    break
+            op = ctx.getChild((i * 2) - 1).getText()
+            unsigned = self._binary_result_unsigned(left, right)
             if self._is_float(left.type):
                 if op == '*': left = self.builder.fmul(left, right)
                 elif op == '/': left = self.builder.fdiv(left, right)
             else:
                 if op == '*': left = self.builder.mul(left, right)
-                elif op == '/': left = self.builder.sdiv(left, right)
-                elif op == '%': left = self.builder.srem(left, right)
+                elif op == '/': left = self.builder.udiv(left, right) if unsigned else self.builder.sdiv(left, right)
+                elif op == '%': left = self.builder.urem(left, right) if unsigned else self.builder.srem(left, right)
+            self._mark_unsigned(left, unsigned)
         return left
 
     def visitEqualityExpression(self, ctx: EzLangParser.EqualityExpressionContext):
@@ -2426,15 +4126,13 @@ class LLVMCodeGenerator(EzLangVisitor):
         for i in range(1, len(ctx.additiveExpression())):
             right = self._eval(ctx.additiveExpression(i))
             if left is None or right is None: continue
-            op = 'shl'
-            for j in range(ctx.getChildCount()):
-                t = ctx.getChild(j).getText()
-                if t == '<<': op = 'shl'; break
-                elif t == '>>': op = 'ashr'; break
-            if op == 'shl':
+            op = ctx.getChild((i * 2) - 1).getText()
+            unsigned = self._is_unsigned_value(left)
+            if op == '<<':
                 left = self.builder.shl(left, right)
             else:
-                left = self.builder.ashr(left, right)
+                left = self.builder.lshr(left, right) if unsigned else self.builder.ashr(left, right)
+            self._mark_unsigned(left, unsigned)
         return left
 
     def visitBitAndExpression(self, ctx: EzLangParser.BitAndExpressionContext):
@@ -2633,24 +4331,46 @@ class LLVMCodeGenerator(EzLangVisitor):
             return self._eval(ctx.pipelineExpression())
 
         left = ctx.pipelineExpression()
-        name = None
-        if hasattr(left, 'identifierExpr') and left.identifierExpr():
-            id_token = left.identifierExpr().VAR_IDENTIFIER() or left.identifierExpr().TYPE_IDENTIFIER()
-            name = id_token.getText()
+        op_ctx = ctx.assignmentOperator()
+        name = self._simple_lvalue_name(left)
+
+        lvalue_ptr = None
+        outer = self._outer_postfix_ctx(left)
+        if isinstance(outer, EzLangParser.IndexContext):
+            lvalue_ptr = self._index_lvalue_ptr(outer)
+        elif isinstance(outer, EzLangParser.MemberAccessContext):
+            lvalue_ptr = self._member_lvalue_ptr(outer)
 
         val = None
         if ctx.assignmentExpression():
             val = self._eval(ctx.assignmentExpression())
 
-        if name and val:
+        if lvalue_ptr is not None and val is not None:
+            store_val = val
+            if isinstance(store_val, ir.AllocaInstr):
+                store_val = self.builder.load(store_val)
+            current = self._load_with_unsigned(lvalue_ptr, name="_assign_current")
+            store_val = self._apply_assignment_operator(current, store_val, op_ctx)
+            if store_val.type != lvalue_ptr.type.pointee:
+                store_val = self._coerce_preserve_unsigned(store_val, lvalue_ptr.type.pointee)
+            self.builder.store(store_val, lvalue_ptr)
+            return store_val
+
+        if name and val is not None:
             # 如果值是 alloca（结构体字面量），需要 load
             store_val = val
             if isinstance(val, ir.AllocaInstr):
                 store_val = self.builder.load(val)
             if name in self.locals:
-                self.builder.store(store_val, self.locals[name])
+                target = self.locals[name]
+                current = self._load_with_unsigned(target, name="_assign_current")
+                store_val = self._apply_assignment_operator(current, store_val, op_ctx)
+                self._emit_lock_access(name, "write", lambda: self.builder.store(store_val, target))
             elif name in self.globals:
-                self.builder.store(store_val, self.globals[name])
+                target = self.globals[name]
+                current = self._load_with_unsigned(target, name="_assign_current")
+                store_val = self._apply_assignment_operator(current, store_val, op_ctx)
+                self._emit_lock_access(name, "write", lambda: self.builder.store(store_val, target))
 
         return val
 
@@ -2662,12 +4382,27 @@ class LLVMCodeGenerator(EzLangVisitor):
         return None
 
     def visitReturnStatement(self, ctx: EzLangParser.ReturnStatementContext):
+        if self._parallel_result_stack:
+            if ctx.expression():
+                val = self._eval(ctx.expression())
+                result_alloca = self._parallel_result_stack[-1]
+                if val is not None:
+                    if self._is_aggregate_ptr(val):
+                        val = self.builder.load(val)
+                    val = self._coerce_value(val, result_alloca.type.pointee)
+                    self.builder.store(val, result_alloca)
+            self.builder.branch(self._parallel_exit_stack[-1])
+            return None
         if ctx.expression():
             val = self._eval(ctx.expression())
             if val is not None:
                 # 聚合类型指针需要 load 后才能 ret（alloca 和 arena 都是指针）
                 if self._is_aggregate_ptr(val):
                     val = self.builder.load(val)
+                if self.current_function is not None:
+                    expected = self.current_function.function_type.return_type
+                    if not isinstance(expected, ir.VoidType) and val.type != expected:
+                        val = self._coerce_value(val, expected)
                 self.builder.ret(val)
             else:
                 self.builder.ret_void()
@@ -2841,10 +4576,18 @@ class LLVMCodeGenerator(EzLangVisitor):
         null_ptr = ir.Constant(ir.PointerType(ir.IntType(8)), None)
         self.builder.store(null_ptr, error_alloca)
 
+        result_type = self._infer_catch_result_type(ctx.block())
+        result_alloca = None
+        if not isinstance(result_type, ir.VoidType):
+            result_alloca = self.builder.alloca(result_type, name="_catch_result")
+            self.builder.store(self._zero_constant(result_type), result_alloca)
+
         catch_exit_bb = self.builder.append_basic_block(name="catch_exit")
 
         self.catch_exit_blocks.append(catch_exit_bb)
         self.catch_error_allocas.append(error_alloca)
+        if result_alloca is not None:
+            self.catch_result_allocas.append(result_alloca)
 
         # 执行 catch 体内的代码
         if ctx.block() is not None:
@@ -2852,12 +4595,16 @@ class LLVMCodeGenerator(EzLangVisitor):
 
         self.catch_exit_blocks.pop()
         self.catch_error_allocas.pop()
+        if result_alloca is not None:
+            self.catch_result_allocas.pop()
 
         # 跳转到出口
         if not self.builder.block.is_terminated:
             self.builder.branch(catch_exit_bb)
 
         self.builder.position_at_start(catch_exit_bb)
+        if result_alloca is not None:
+            return self.builder.load(result_alloca, name="catch_value")
         return None
 
     def visitCatchBlockExpr(self, ctx: EzLangParser.CatchBlockExprContext):
@@ -2865,6 +4612,14 @@ class LLVMCodeGenerator(EzLangVisitor):
 
     def visitThrowStatement(self, ctx: EzLangParser.ThrowStatementContext):
         """throw expr → 存储错误标记并跳转到 catch_exit"""
+        thrown_value = self._eval(ctx.expression()) if ctx.expression() is not None else None
+        if self.catch_result_allocas and thrown_value is not None:
+            result_alloca = self.catch_result_allocas[-1]
+            if self._is_aggregate_ptr(thrown_value):
+                thrown_value = self.builder.load(thrown_value)
+            thrown_value = self._coerce_value(thrown_value, result_alloca.type.pointee)
+            self.builder.store(thrown_value, result_alloca)
+
         if self.catch_error_allocas:
             # 存储非空标记（i8 1 转为指针）表示发生了异常
             sentinel = ir.Constant(ir.IntType(64), 1).inttoptr(
@@ -2873,6 +4628,11 @@ class LLVMCodeGenerator(EzLangVisitor):
 
         if self.catch_exit_blocks:
             self.builder.branch(self.catch_exit_blocks[-1])
+        else:
+            if self._uncaught_throw is None:
+                self._uncaught_throw = self._define_uncaught_throw_hook()
+            self.builder.call(self._uncaught_throw, [])
+            self.builder.unreachable()
         return None
 
     # ==================== 类 if 表达式 ====================

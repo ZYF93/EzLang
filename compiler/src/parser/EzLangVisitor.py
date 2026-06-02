@@ -1,4 +1,4 @@
-# Generated from /Users/beicaizhishen/Desktop/EzLang/grammar/EzLang.g4 by ANTLR 4.13.2
+# Generated from EzLang.g4 by ANTLR 4.13.2
 from antlr4 import *
 if "." in __name__:
     from .EzLangParser import EzLangParser
@@ -21,6 +21,21 @@ class EzLangVisitor(ParseTreeVisitor):
 
     # Visit a parse tree produced by EzLangParser#variableDecl.
     def visitVariableDecl(self, ctx:EzLangParser.VariableDeclContext):
+        return self.visitChildren(ctx)
+
+
+    # Visit a parse tree produced by EzLangParser#lockPrefix.
+    def visitLockPrefix(self, ctx:EzLangParser.LockPrefixContext):
+        return self.visitChildren(ctx)
+
+
+    # Visit a parse tree produced by EzLangParser#qualifiedVarName.
+    def visitQualifiedVarName(self, ctx:EzLangParser.QualifiedVarNameContext):
+        return self.visitChildren(ctx)
+
+
+    # Visit a parse tree produced by EzLangParser#decorator.
+    def visitDecorator(self, ctx:EzLangParser.DecoratorContext):
         return self.visitChildren(ctx)
 
 
@@ -89,6 +104,11 @@ class EzLangVisitor(ParseTreeVisitor):
         return self.visitChildren(ctx)
 
 
+    # Visit a parse tree produced by EzLangParser#importName.
+    def visitImportName(self, ctx:EzLangParser.ImportNameContext):
+        return self.visitChildren(ctx)
+
+
     # Visit a parse tree produced by EzLangParser#exportDecl.
     def visitExportDecl(self, ctx:EzLangParser.ExportDeclContext):
         return self.visitChildren(ctx)
@@ -119,8 +139,8 @@ class EzLangVisitor(ParseTreeVisitor):
         return self.visitChildren(ctx)
 
 
-    # Visit a parse tree produced by EzLangParser#functionTypeRef.
-    def visitFunctionTypeRef(self, ctx:EzLangParser.FunctionTypeRefContext):
+    # Visit a parse tree produced by EzLangParser#pointerType.
+    def visitPointerType(self, ctx:EzLangParser.PointerTypeContext):
         return self.visitChildren(ctx)
 
 
@@ -129,8 +149,23 @@ class EzLangVisitor(ParseTreeVisitor):
         return self.visitChildren(ctx)
 
 
+    # Visit a parse tree produced by EzLangParser#listType.
+    def visitListType(self, ctx:EzLangParser.ListTypeContext):
+        return self.visitChildren(ctx)
+
+
+    # Visit a parse tree produced by EzLangParser#functionTypeRef.
+    def visitFunctionTypeRef(self, ctx:EzLangParser.FunctionTypeRefContext):
+        return self.visitChildren(ctx)
+
+
     # Visit a parse tree produced by EzLangParser#genericFunctionType.
     def visitGenericFunctionType(self, ctx:EzLangParser.GenericFunctionTypeContext):
+        return self.visitChildren(ctx)
+
+
+    # Visit a parse tree produced by EzLangParser#typeShapeType.
+    def visitTypeShapeType(self, ctx:EzLangParser.TypeShapeTypeContext):
         return self.visitChildren(ctx)
 
 
@@ -149,8 +184,8 @@ class EzLangVisitor(ParseTreeVisitor):
         return self.visitChildren(ctx)
 
 
-    # Visit a parse tree produced by EzLangParser#listType.
-    def visitListType(self, ctx:EzLangParser.ListTypeContext):
+    # Visit a parse tree produced by EzLangParser#genericParamFunctionType.
+    def visitGenericParamFunctionType(self, ctx:EzLangParser.GenericParamFunctionTypeContext):
         return self.visitChildren(ctx)
 
 
@@ -319,6 +354,11 @@ class EzLangVisitor(ParseTreeVisitor):
         return self.visitChildren(ctx)
 
 
+    # Visit a parse tree produced by EzLangParser#structLiteralExpr.
+    def visitStructLiteralExpr(self, ctx:EzLangParser.StructLiteralExprContext):
+        return self.visitChildren(ctx)
+
+
     # Visit a parse tree produced by EzLangParser#identifierExpr.
     def visitIdentifierExpr(self, ctx:EzLangParser.IdentifierExprContext):
         return self.visitChildren(ctx)
@@ -344,11 +384,6 @@ class EzLangVisitor(ParseTreeVisitor):
         return self.visitChildren(ctx)
 
 
-    # Visit a parse tree produced by EzLangParser#structLiteralExpr.
-    def visitStructLiteralExpr(self, ctx:EzLangParser.StructLiteralExprContext):
-        return self.visitChildren(ctx)
-
-
     # Visit a parse tree produced by EzLangParser#arrayLiteralExpr.
     def visitArrayLiteralExpr(self, ctx:EzLangParser.ArrayLiteralExprContext):
         return self.visitChildren(ctx)
@@ -366,6 +401,11 @@ class EzLangVisitor(ParseTreeVisitor):
 
     # Visit a parse tree produced by EzLangParser#flowBlockExpr.
     def visitFlowBlockExpr(self, ctx:EzLangParser.FlowBlockExprContext):
+        return self.visitChildren(ctx)
+
+
+    # Visit a parse tree produced by EzLangParser#parallelBlockExpr.
+    def visitParallelBlockExpr(self, ctx:EzLangParser.ParallelBlockExprContext):
         return self.visitChildren(ctx)
 
 
@@ -391,6 +431,11 @@ class EzLangVisitor(ParseTreeVisitor):
 
     # Visit a parse tree produced by EzLangParser#typeofPrimaryExpr.
     def visitTypeofPrimaryExpr(self, ctx:EzLangParser.TypeofPrimaryExprContext):
+        return self.visitChildren(ctx)
+
+
+    # Visit a parse tree produced by EzLangParser#markupExpr.
+    def visitMarkupExpr(self, ctx:EzLangParser.MarkupExprContext):
         return self.visitChildren(ctx)
 
 
@@ -449,6 +494,11 @@ class EzLangVisitor(ParseTreeVisitor):
         return self.visitChildren(ctx)
 
 
+    # Visit a parse tree produced by EzLangParser#dictKey.
+    def visitDictKey(self, ctx:EzLangParser.DictKeyContext):
+        return self.visitChildren(ctx)
+
+
     # Visit a parse tree produced by EzLangParser#arrayLiteral.
     def visitArrayLiteral(self, ctx:EzLangParser.ArrayLiteralContext):
         return self.visitChildren(ctx)
@@ -464,8 +514,28 @@ class EzLangVisitor(ParseTreeVisitor):
         return self.visitChildren(ctx)
 
 
+    # Visit a parse tree produced by EzLangParser#markupLiteral.
+    def visitMarkupLiteral(self, ctx:EzLangParser.MarkupLiteralContext):
+        return self.visitChildren(ctx)
+
+
+    # Visit a parse tree produced by EzLangParser#markupAttr.
+    def visitMarkupAttr(self, ctx:EzLangParser.MarkupAttrContext):
+        return self.visitChildren(ctx)
+
+
+    # Visit a parse tree produced by EzLangParser#markupChild.
+    def visitMarkupChild(self, ctx:EzLangParser.MarkupChildContext):
+        return self.visitChildren(ctx)
+
+
     # Visit a parse tree produced by EzLangParser#functionLiteral.
     def visitFunctionLiteral(self, ctx:EzLangParser.FunctionLiteralContext):
+        return self.visitChildren(ctx)
+
+
+    # Visit a parse tree produced by EzLangParser#functionSignature.
+    def visitFunctionSignature(self, ctx:EzLangParser.FunctionSignatureContext):
         return self.visitChildren(ctx)
 
 
@@ -486,6 +556,11 @@ class EzLangVisitor(ParseTreeVisitor):
 
     # Visit a parse tree produced by EzLangParser#flowBlock.
     def visitFlowBlock(self, ctx:EzLangParser.FlowBlockContext):
+        return self.visitChildren(ctx)
+
+
+    # Visit a parse tree produced by EzLangParser#parallelBlock.
+    def visitParallelBlock(self, ctx:EzLangParser.ParallelBlockContext):
         return self.visitChildren(ctx)
 
 

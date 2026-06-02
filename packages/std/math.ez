@@ -1,0 +1,48 @@
+// std/math.ez - 数学与数值工具标准库
+// 依赖: EzLang 标准库封装层（C/JS）
+
+extern "@std/native/math.c" for linux;
+extern "m" for linux;
+extern "@std/native/math.c" for macos;
+extern "@std/native/math.c" for windows;
+extern "@std/native/math.c" for android;
+extern "@std/native/math.c" for ios;
+extern "@std/emcc/math.js" for emcc;
+
+// === 数学常量 ===
+export const mathPI: F64 = 3.141592653589793;
+export const mathE: F64 = 2.718281828459045;
+
+// === 整型工具 ===
+export declare const mathAbsI32: (value: I32) => I32;
+export declare const mathAbsI64: (value: I64) => I64;
+export declare const mathMinI32: (a: I32, b: I32) => I32;
+export declare const mathMaxI32: (a: I32, b: I32) => I32;
+export declare const mathClampI32: (value: I32, minValue: I32, maxValue: I32) => I32;
+export declare const mathGcdI64: (a: I64, b: I64) => I64;
+export declare const mathLcmI64: (a: I64, b: I64) => I64;
+
+// === 浮点运算 ===
+export declare const mathSqrt: (value: F64) => F64;
+export declare const mathPow: (base: F64, exp: F64) => F64;
+export declare const mathSin: (value: F64) => F64;
+export declare const mathCos: (value: F64) => F64;
+export declare const mathTan: (value: F64) => F64;
+export declare const mathLog: (value: F64) => F64;
+export declare const mathExp: (value: F64) => F64;
+export declare const mathFloor: (value: F64) => F64;
+export declare const mathCeil: (value: F64) => F64;
+export declare const mathRound: (value: F64) => F64;
+export declare const mathIsNaN: (value: F64) => Bool;
+export declare const mathIsInf: (value: F64) => Bool;
+
+// === 溢出安全整型运算 ===
+export declare const mathAddI64Checked: (a: I64, b: I64) => I64?;
+export declare const mathSubI64Checked: (a: I64, b: I64) => I64?;
+export declare const mathMulI64Checked: (a: I64, b: I64) => I64?;
+export declare const mathDivI64Checked: (a: I64, b: I64) => I64?;
+
+// === 数值转换 ===
+export declare const mathF64ToI32: (value: F64) => I32?;
+export declare const mathF64ToI64: (value: F64) => I64?;
+export declare const mathI64ToF64: (value: I64) => F64;

@@ -14,7 +14,7 @@ let a = 1; // 语句由 ; 分隔，表达式可以直接作为语句使用
 ### 语义说明与规范
 * **区分大小写**。
 * 标识符、关键字、类型名不允许包含空白字符。
-* **关键字**：`let`, `const`, `static`, `struct`, `type`, `declare`, `loop`, `break`, `continue`, `import`, `export`, `from`, `match`, `catch`, `throw`, `flow`,  `typeof`
+* **关键字**：`let`, `const`, `static`, `struct`, `type`, `declare`, `loop`, `break`, `continue`, `import`, `export`, `from`, `match`, `catch`, `throw`, `flow`, `parallel`, `rp`, `wp`, `typeof`, `return`, `in`, `for`, `as`, `extern`
 * **命名规范**：类型名应以大写字母开头（如 `User`, `Result`），变量名应以小写字母开头（如 `user`, `count`）。
 
 ### LLVM 映射
@@ -193,6 +193,9 @@ struct Blob {
 ### 语法
 ```ez
 let count: I32 = 10
+rp let cache: User[] = []  // 读优先锁
+wp let queue: I32[] = []   // 写优先锁
+let ordered: I32 = 0       // 默认顺序锁
 const max: I32 = 100
 static config: Str = "release"
 let copy = count
@@ -200,6 +203,9 @@ let copy = count
 
 ### 语义说明与规范
 * `let`：可变局部变量；`const`：只读局部变量。两者均存储在当前 Arena 空间。
+* `rp let variable = ...`：声明读优先变量锁。有读请求时优先读取；写请求等待当前读取完成。写请求兜底等待时间为 1ms，超过 1ms 后，该写请求排到后续读请求之前，避免写长期饥饿。
+* `wp let variable = ...`：声明写优先变量锁。有写请求时优先写入；读请求可以饥饿。
+* 顺序锁：不加 `rp` / `wp` 前缀的普通变量默认使用顺序锁，按照读写请求到达顺序依次读写。
 * `static`：全局静态变量，生命周期贯穿程序。
 * **值语义**：赋值默认是值语义，`a = b` 会进行全量拷贝。函数参数默认按值传递（除 `this` 使用引用语义外）。
 * **Arena 内存模型**：
@@ -212,6 +218,7 @@ let copy = count
 * 局部变量映射为 `alloca` 或 Arena 内存地址。拷贝使用 `llvm.memcpy`。
 * `static` 变量映射为全局常量或全局可变区。
 * Arena 使用单一底层缓冲区和游标管理，作用域结束仅需移动游标，无需逐个析构对象。
+* 变量锁当前会在语义阶段记录 `rp`/`wp` 策略，并在 LLVM IR 中为直接变量读写生成 `__ezrt_lock_read_*` / `__ezrt_lock_write_*` hook；这些 hook 目前是可链接 ABI 占位，完整跨任务读优先、写优先与顺序锁调度仍是后续目标。
 * Arena 分配器会根据类型的 `alignof` 自动内存对齐，确保 SIMD 和大结构体符合目标架构要求。
 
 ---
@@ -263,28 +270,33 @@ const ret = flow {
         ],
         timeout = 3000
     )
+    const p = parallel {
+        const c = fetchC()
+        return c * 2
+    }
     const err = catch {
         fetch()
     }
     (typeof err & Error == Error) ? print(msg = err.message)
-    return a + b + ret2
+    return a + b + ret2 + p
 }
 ```
 
 ### 语义说明与规范
 * **flow**：`flow { ... }` 为并发调度作用域。flow 不改变程序的顺序语义。flow 内代码在语义上严格按源码顺序执行，但 runtime 可对无依赖阻塞操作进行调度优化，且调度不得改变可观察行为。
-* **阻塞操作**：flow 外部如 `fetch()` 为同步阻塞。flow 内部如 `fetch()` 允许挂起当前执行点并调度其它可运行逻辑。
-* **自动依赖等待**：读取未完成阻塞结果时，runtime 自动等待依赖。
+* **当前实现**：编译器会记录 flow/parallel/suspend point 元数据，并在 LLVM IR 中生成可链接的 `__ezrt_flow_*`、`__ezrt_parallel_*`、`__ezrt_sleep`、`__ezrt_race` hook。当前 codegen 保持同步 lowering；`flow` / `parallel` 块内的 `return` 会被捕获为表达式结果，不会提前退出外层函数。
+* **阻塞操作**：flow 外部如 `fetch()` 为同步阻塞。flow 内部的阻塞调用当前保留稳定 hook ABI，真实挂起调度由后续运行时状态机接入。
+* **parallel 块**：`const ret = parallel { code... return... }` 当前按同步块执行，并以 `return` 的值作为整个 `parallel` 表达式的值。真实线程创建、等待唤醒、异常跨任务传播和 join 语义是后续运行时实现目标。
+* **自动依赖等待**：读取未完成阻塞结果时，目标 runtime 会自动等待依赖；当前同步 lowering 下不会产生未完成结果。
 * **flow 返回**：flow 返回前必须保证所有前序语义操作完成，且所有副作用已提交。
-* **race 函数**：并发运行所有分支，返回首个完成值，自动取消其它分支；`timeout` 超时则取消所有任务并 `throw Error(code = errTimeout, ...)`；`timeout` 不填默认永不超时。
+* **race 函数**：目标语义为并发运行所有分支，返回首个完成值并自动取消其它分支；当前支持 `race(pl = [...], timeout = ...)` 语法进入语义分析并 lowering 到 `__ezrt_race` hook。当前 codegen 会把 `pl` 作为分支数量元数据传给 hook，并同步执行第一个零参数函数字面量分支作为表达式结果；不会并发执行其它分支，也不会执行取消、超时返回或跨任务异常传播。
 * **cancel**：取消不会立即终止同步代码。取消仅中断 IO、sleep、timer、wait 等 suspend source。底层 suspend source 被取消时，`throw Error(code = errCancel, message = "操作已取消")` 并沿同步调用栈传播；可在 `catch {}` 中通过 `err.code == errCancel` 判断并特殊处理。
 * **非阻塞同步代码**：普通同步 CPU 代码不会被中断。
 * **副作用一致性**：runtime 不允许改变副作用顺序、锁语义、可观察行为。
 
 ### LLVM 映射
-* **flow**：lowering 为状态机与调度点。
-* **suspend source**：映射为 epoll、io_uring、kqueue、timerfd 等平台等待机制。
-* **cancel**：取消底层等待源。
+* **当前**：lowering 为同步执行块 + 可链接 runtime hook + flow/parallel 返回值槽。
+* **目标**：后续可将 hook 替换为状态机、平台等待源（epoll、io_uring、kqueue、timerfd 等）、线程/任务创建、结果存储、等待唤醒、异常传播与 join。
 
 ---
 
@@ -329,8 +341,8 @@ const err = catch {
 * **match**：从上到下依次求值，匹配后继续下一条，除非显式 `break`。
 * **continue**：跳过当前 match 的后续分支，继续执行下一条。
 * **break**：退出当前 `loop` 或 `match`。
-* **throw**：抛出异常，会沿同步调用栈传播，直到被 `catch` 捕获或到达程序的顶层，导致程序终止。
-* **catch**：用于捕获 `throw` 抛出的异常值。
+* **throw**：当前在最近的 `catch {}` 块内写入抛出的异常值，并跳转到该 `catch` 出口；没有活动 `catch` 时会输出未捕获异常诊断并以退出码 1 终止。
+* **catch**：当前返回块内 `throw expr` 的异常值；没有 `throw` 时返回 `Void`。跨函数传播与携带完整异常对象的统一诊断链路是后续目标。
 
 ### LLVM 映射
 * 循环映射为 `br` 与 `phi` 节点结构。
@@ -364,7 +376,7 @@ let masked = (v1 < v2) ? v1 : v2
 ### 语义说明与规范
 * **算术与位运算**：支持 `+`, `-`, `*`, `/`, `%` 及 `&`, `|`, `^`, `<<`, `>>`。整数除法向下取整。浮点运算遵循 IEEE 754。无符号类型右移填充零，有符号类型算术右移。移位右操作数必须为无符号类型。
 * **逻辑与比较运算**：支持 `&&`, `||`, `!` 与 `==`, `!=`, `<`, `>`, `<=`, `>=`。逻辑运算支持短路求值。不支持结构体/联合类型直接比较（除非实现相关方法）。
-* **复合赋值**：如 `+=`, `<<=` 等价于展开运算，但左操作数只求值一次。
+* **复合赋值**：如 `+=`, `<<=` 等价于展开运算。当前实现对裸变量和结构体字段左值生成加载、运算、存储序列，并避免重复求值字段所属对象；索引左值的完整单次求值规则仍需后续补齐。
 * **优先级**：`!` > `*`, `/`, `%` > `+`, `-` > `<<`, `>>` > `&` > `^` > `|` > 比较 > `&&` > `||`。位运算 `&` 优先级高于比较运算 `==` 但低于移位。建议显式加括号以避免歧义。
 * **SIMD 语义**：`Vec<Type>[N]` 操作逐元素并行执行。向量长度必须匹配。标量与向量混合运算时，标量自动广播成等长向量后再计算。
 
@@ -463,7 +475,7 @@ let isError = typeof err & Error == Error
 
 ### 语义说明与规范
 * **元编程与装饰器**：`@Dec` 将变量包装为 `Meta<T>`。`Meta<T>` 包含 `value`, `getter`, `setter`, `type`, `name`，访问时通过函数指针调用拦截逻辑。
-* **标记语法**：XML 风格标记语法被自动翻译编译为普通函数调用与结构体构造表达式。
+* **标记语法**：XML 风格标记语法当前会校验属性与子表达式，并 lowering 为标签名字符串，便于保留语法入口和 IR 可生成性；翻译为普通函数调用与结构体构造表达式是后续目标。
 * **管道与插值**：管道 `->` 配合 `%` 占位符重写为命名参数调用（如 `a -> fn(x = %)` 重写为 `fn(x = a)`）；字符串插值编译为最小内存复制拼接逻辑。
 * **类型安全机制**：
   * `Type! expr`：无检查的类型断言，适用于强制拆包或位级重解释。
@@ -471,6 +483,6 @@ let isError = typeof err & Error == Error
 
 ### LLVM 映射
 * 装饰器生成 `Meta<T>` 结构体，按值传递，拦截逻辑表现为 `call` 指令调用 `getter`/`setter`。
-* 标记语法、管道语法在编译前端翻译展开；字符串插值生成相应的内存复制拼接逻辑。
+* 标记语法当前生成标签名字符串；目标 lowering 是在编译前端翻译展开为普通函数调用与结构体构造表达式。管道语法在编译前端翻译展开；字符串插值生成相应的内存复制拼接逻辑。
 * `Type! expr` 映射为位级重解释（`bitcast`）或 `load` 操作。
 * `typeof` 映射为通过结构体内部隐含的 TypeID 进行数值比较。

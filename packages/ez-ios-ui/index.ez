@@ -1,0 +1,125 @@
+// ez-ios-ui - iOS UIKit 绑定包
+// 当前提供可编译链接的 ABI 占位；真实 Objective-C/UIKit 桥接后续接入。
+
+extern "@pkg/ez-ios-ui/native/ios_ui.c" for linux;
+extern "@pkg/ez-ios-ui/native/ios_ui.c" for macos;
+extern "@pkg/ez-ios-ui/native/ios_ui.c" for windows;
+extern "@pkg/ez-ios-ui/native/ios_ui.c" for android;
+extern "@pkg/ez-ios-ui/native/ios_ui.c" for ios;
+extern "@pkg/ez-ios-ui/native/ios_ui.c" for emcc;
+
+export struct Node { id: I32; };
+
+export struct TouchEvent {
+    phase: Str;
+    x: F32;
+    y: F32;
+};
+
+export struct TextChangedEvent {
+    text: Str;
+    range: I32;
+};
+
+export struct Color {
+    r: F32;
+    g: F32;
+    b: F32;
+    a: F32;
+};
+
+export struct Rect {
+    x: F32;
+    y: F32;
+    width: F32;
+    height: F32;
+};
+
+export struct Insets {
+    top: F32;
+    left: F32;
+    bottom: F32;
+    right: F32;
+};
+
+export type ActionHandler = () => Void;
+export type TouchHandler = (e: TouchEvent) => Void;
+export type TextChangeHandler = (e: TextChangedEvent) => Void;
+export type ValueChangeHandler = (value: F32) => Void;
+
+export const contentMode.scaleToFill: I32 = 0;
+export const contentMode.scaleAspectFit: I32 = 1;
+export const contentMode.scaleAspectFill: I32 = 2;
+export const contentMode.center: I32 = 4;
+
+export const controlEvent.touchUpInside: I32 = 0x40;
+export const controlEvent.valueChanged: I32 = 0x1000;
+export const controlEvent.editingChanged: I32 = 0x100;
+
+export const permission.camera: Str = "camera";
+export const permission.photoLibrary: Str = "photoLibrary";
+export const permission.microphone: Str = "microphone";
+export const permission.location: Str = "location";
+export const permission.locationAlways: Str = "locationAlways";
+export const permission.notifications: Str = "notifications";
+export const permission.contacts: Str = "contacts";
+export const permission.faceID: Str = "faceID";
+export const permission.calendar: Str = "calendar";
+
+export declare const createView: () => Node;
+export declare const createStackView: (axis: Str) => Node;
+export declare const createScrollView: () => Node;
+export declare const createLabel: () => Node;
+export declare const createTextField: () => Node;
+export declare const createTextView: () => Node;
+export declare const createButton: () => Node;
+export declare const createSwitch: () => Node;
+export declare const createSlider: () => Node;
+export declare const createImageView: () => Node;
+export declare const destroyNode: (node: Node) => Void;
+
+export declare const addSubview: (parent: Node, child: Node) => Void;
+export declare const insertSubviewAt: (parent: Node, child: Node, index: I32) => Void;
+export declare const removeFromSuperview: (node: Node) => Void;
+export declare const getSubviewAt: (parent: Node, index: I32) => Node?;
+export declare const getSubviewCount: (parent: Node) => I32;
+export declare const getSuperview: (node: Node) => Node?;
+export declare const getRootView: () => Node;
+
+export declare const setFrame: (node: Node, rect: Rect) => Void;
+export declare const getFrame: (node: Node) => Rect;
+export declare const pinToEdges: (node: Node, insets: Insets) => Void;
+export declare const centerInParent: (node: Node) => Void;
+export declare const setWidth: (node: Node, width: F32) => Void;
+export declare const setHeight: (node: Node, height: F32) => Void;
+
+export declare const setText: (node: Node, text: Str) => Void;
+export declare const getText: (node: Node) => Str;
+export declare const setTextColor: (node: Node, color: Color) => Void;
+export declare const setBackgroundColor: (node: Node, color: Color) => Void;
+export declare const setAlpha: (node: Node, alpha: F32) => Void;
+export declare const setHidden: (node: Node, hidden: Bool) => Void;
+export declare const setContentMode: (node: Node, mode: I32) => Void;
+
+export declare const addTarget: (node: Node, event: I32, handler: ActionHandler) => Void;
+export declare const removeTarget: (node: Node, event: I32) => Void;
+export declare const setOnTextChanged: (node: Node, handler: TextChangeHandler) => Void;
+export declare const addTapGesture: (node: Node, taps: I32, handler: ActionHandler) => Void;
+export declare const removeTapGesture: (node: Node) => Void;
+
+export declare const runOnMainThread: (work: () => Void) => Void;
+export declare const postToMain: (work: () => Void) => Void;
+export declare const postDelayed: (work: () => Void, ms: F64) => I64;
+export declare const cancelDelayed: (token: I64) => Void;
+export declare const scheduleFrame: (work: () => Void) => I64;
+export declare const cancelFrame: (token: I64) => Void;
+export declare const isMainThread: () => Bool;
+
+export declare const getScreenWidth: () => F32;
+export declare const getScreenHeight: () => F32;
+export declare const getScreenScale: () => F32;
+export declare const getSafeAreaInsets: () => Insets;
+export declare const getStatusBarHeight: () => F32;
+
+export declare const requestPermission: (perm: Str) => Bool;
+export declare const queryPermission: (perm: Str) => Str;
