@@ -110,7 +110,7 @@ declare const setInnerHTML:      (node: Node, html: Str) => Void
 
 ```ez
 // 注册 / 注销事件监听（capture 阶段可选）
-declare const addEventListener:      (node: Node, event: Str, handler: EventHandler, capture: Bool? = false) => Void
+declare const addEventListener:      (node: Node, event: Str, handler: EventHandler, capture: Bool?) => Void
 declare const removeEventListener:   (node: Node, event: Str, handler: EventHandler) => Void
 
 // 事件委托（在 parent 上监听冒泡，通过 selector 过滤）
@@ -204,21 +204,21 @@ from "ez-web-ui" import {
 
 // 用户自定义 VNode
 struct VNode {
-    tag:      Str
-    props:    { [key: Str]: Str }
-    children: VNode[]
-    dom:      Node?      // 对应真实 DOM 节点
+    tag:      Str;
+    props:    { [key: Str]: Str };
+    children: VNode[];
+    dom:      Node?;      // 对应真实 DOM 节点
 }
 
 // 创建真实 DOM（mount 阶段）
-const createDom = (vnode: VNode) => Node => {
-    const dom = createElement(tag = vnode.tag)
-    setStyles(node = dom, styles = vnode.props)
+const createDom = (vnode: VNode): Node => {
+    const dom = createElement(tag = vnode.tag);
+    setStyles(node = dom, styles = vnode.props);
     loop child in vnode.children {
-        appendChild(parent = dom, child = createDom(vnode = child))
+        appendChild(parent = dom, child = createDom(vnode = child));
     }
-    return dom
-}
+    return dom;
+};
 
 // diff 与 patch 由用户自行实现...
 ```

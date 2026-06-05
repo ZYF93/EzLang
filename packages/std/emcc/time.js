@@ -7,7 +7,16 @@ mergeInto(LibraryManager.library, {
     return BigInt(Date.now());
   },
   sleep: function (ms) {
-    // WebAssembly 主线程无法同步 sleep；语言层 flow 负责挂起调度。
+    var delay = Number(ms);
+    if (!Number.isFinite(delay) || delay <= 0) return;
+    if (typeof SharedArrayBuffer !== 'undefined' && typeof Atomics !== 'undefined') {
+      var flag = new Int32Array(new SharedArrayBuffer(4));
+      Atomics.wait(flag, 0, 0, delay);
+      return;
+    }
+    // 浏览器主线程没有可移植同步 sleep 原语，短时忙等用于保持 ABI 语义。
+    var end = Date.now() + delay;
+    while (Date.now() < end) {}
   },
   getYear: function (datePtr) {
     return new Date(Number(HEAP64[datePtr >> 3])).getUTCFullYear();

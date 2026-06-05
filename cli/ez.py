@@ -102,6 +102,7 @@ class ProjectConfig:
     extern_search_paths: dict[str, list[Path]] = field(default_factory=dict)
     workspace_members: list[str] = field(default_factory=list)
     plugins: list[PluginConfig] = field(default_factory=list)
+    log_compile_min_level: int | None = None
     warnings: list[str] = field(default_factory=list)
 
 
@@ -183,21 +184,35 @@ def cmd_build(args) -> int:
     for output in config.outputs:
         context = _plugin_context(config, output, source_plan)
         _run_plugin_hook(plugins, "before_build", context)
-        module, libs = _compile_project(config, output.os, source_plan)
+        module, libs = _compile_project(config, output.os, source_plan, target_arch=output.arch)
         output.dir.mkdir(parents=True, exist_ok=True)
         _apply_target_triple(module, output.triple)
         out_file = output.dir / f"{config.name}.ll"
         out_file.write_text(str(module), encoding="utf-8")
         print(f"built {output.os}/{output.arch} {out_file}")
         obj_file = None
+        exe_file = None
+        sdk_artifact = None
         if _can_emit_object(output):
             obj_file = output.dir / f"{config.name}.o"
             obj_file.write_bytes(_emit_object(module, config.optimize, output.triple))
             print(f"object: {obj_file}")
+            if _can_emit_native_object(output) and _module_defines_main(module):
+                exe_file = output.dir / config.name
+                _link_executable(obj_file, exe_file, libs, output.dir, output.os)
+                print(f"executable: {exe_file}")
+            elif output.sdk is not None and output.os in {"android", "ios", "emcc"}:
+                sdk_artifact = _link_sdk_artifact(obj_file, output, libs, output.dir, config.name)
+                print(f"sdk artifact: {sdk_artifact}")
+                ui_bridge = _emit_mobile_ui_bridge(output, libs, output.dir, config.name, sdk_artifact)
+                if ui_bridge is not None:
+                    print(f"ui bridge: {ui_bridge}")
         context.update(
             {
                 "ir": str(out_file),
                 "object": str(obj_file) if obj_file is not None else None,
+                "executable": str(exe_file) if exe_file is not None else None,
+                "sdk_artifact": str(sdk_artifact) if sdk_artifact is not None else None,
                 "extern_libs": [str(lib[0] if isinstance(lib, tuple) else lib) for lib in libs],
             }
         )
@@ -218,7 +233,7 @@ def cmd_run(args) -> int:
         print(f"error: ez run only supports native target {_native_os()}/{_native_arch()}, got {output.os}/{output.arch}", file=sys.stderr)
         return 1
     source_plan = discover_sources(config)
-    module, libs = _compile_project(config, output.os, source_plan)
+    module, libs = _compile_project(config, output.os, source_plan, target_arch=output.arch)
     _apply_target_triple(module, output.triple)
     output.dir.mkdir(parents=True, exist_ok=True)
     obj_file = output.dir / f"{config.name}.o"
@@ -241,8 +256,16 @@ def cmd_test(args) -> int:
     failed = 0
     for test_file in test_files:
         try:
+            test_source = test_file.read_text(encoding="utf-8")
+            test_locations = _test_registration_locations(test_source)
             source_plan = _discover_sources_from(config, test_file)
-            module, libs = _compile_source_plan(config, output.os, source_plan, test_file.parent)
+            module, libs = _compile_source_plan(
+                config,
+                output.os,
+                source_plan,
+                test_file.parent,
+                target_arch=output.arch,
+            )
             test_count = max(_count_test_symbols(test_file.read_text(encoding="utf-8")), 1)
             ran = False
             if _can_emit_native_object(output) and 'define i32 @"main"' in str(module):
@@ -253,10 +276,13 @@ def cmd_test(args) -> int:
                 exe_file = test_dir / test_file.stem
                 obj_file.write_bytes(_emit_object(module, config.optimize, output.triple))
                 _link_executable(obj_file, exe_file, libs, test_dir, output.os)
-                completed = subprocess.run([str(exe_file)])
+                completed = subprocess.run([str(exe_file)], text=True, capture_output=True)
                 ran = True
                 if completed.returncode != 0:
-                    raise CliError(f"运行失败，退出码 {completed.returncode}")
+                    detail = completed.stderr.strip() or completed.stdout.strip()
+                    detail = _annotate_test_failure_detail(detail, test_file, test_locations, config.root)
+                    suffix = f": {detail}" if detail else ""
+                    raise CliError(f"运行失败，退出码 {completed.returncode}{suffix}")
             passed += test_count
             suffix = "run" if ran else "compile"
             print(f"ok {test_file.relative_to(config.root) if test_file.is_relative_to(config.root) else test_file} ({test_count} tests, {suffix})")
@@ -358,6 +384,7 @@ def load_project(path: str | Path, *, require_main: bool) -> ProjectConfig:
             raise CliError(f"入口文件不存在: {main}")
     outputs = _parse_outputs(data.get("output"), root)
     extern_search_paths = _parse_extern_config(data.get("extern"), root)
+    log_compile_min_level = _parse_log_config(data.get("log"))
     return ProjectConfig(
         path=project_path,
         root=root,
@@ -372,8 +399,23 @@ def load_project(path: str | Path, *, require_main: bool) -> ProjectConfig:
         extern_search_paths=extern_search_paths,
         workspace_members=list(data.get("workspace", {}).get("members", [])),
         plugins=_parse_plugins(data.get("plugins", [])),
+        log_compile_min_level=log_compile_min_level,
         warnings=outputs[1],
     )
+
+
+def _parse_log_config(raw_log) -> int | None:
+    if raw_log is None:
+        return None
+    if not isinstance(raw_log, dict):
+        raise CliError("[log] 必须是表")
+    value = raw_log.get("compile_min_level")
+    if value is None:
+        return None
+    level = int(value)
+    if level < 0 or level > 4:
+        raise CliError("log.compile_min_level 必须在 0..4 之间")
+    return level
 
 
 def _parse_plugins(raw_plugins) -> list[PluginConfig]:
@@ -482,14 +524,21 @@ def _discover_sources_from(config: ProjectConfig, entry: Path) -> list[Path]:
     return ordered
 
 
-def _compile_source_plan(config: ProjectConfig, compile_target: str, source_plan: list[Path], base_dir: Path):
+def _compile_source_plan(config: ProjectConfig, compile_target: str, source_plan: list[Path], base_dir: Path,
+                         target_arch: str | None = None):
     source = "\n".join(_strip_imports(path.read_text(encoding="utf-8")) for path in source_plan)
     analyzer = analyze(source, base_dir=base_dir, compile_target=compile_target)
     if analyzer.symbols.has_errors():
         resolved_errors = _resolve_extern_errors(analyzer.symbols.errors, config, compile_target, base_dir)
         if resolved_errors:
             raise CliError("语义错误: " + "; ".join(resolved_errors))
-    module, errors, libs = compile_source(source, module_name=config.name, compile_target=compile_target)
+    module, errors, libs = compile_source(
+        source,
+        module_name=config.name,
+        compile_target=compile_target,
+        target_arch=target_arch,
+        log_compile_min_level=config.log_compile_min_level,
+    )
     errors = _resolve_extern_errors(errors, config, compile_target, base_dir)
     if errors:
         raise CliError("编译错误: " + "; ".join(errors))
@@ -585,10 +634,11 @@ def _run_plugin_hook(plugins: list[LoadedPlugin], hook_name: str, context: dict[
 
 
 
-def _compile_project(config: ProjectConfig, compile_target: str, source_plan: list[Path] | None = None):
+def _compile_project(config: ProjectConfig, compile_target: str, source_plan: list[Path] | None = None,
+                     target_arch: str | None = None):
     source_plan = source_plan or discover_sources(config)
     base_dir = config.main.parent if config.main is not None else config.root
-    return _compile_source_plan(config, compile_target, source_plan, base_dir)
+    return _compile_source_plan(config, compile_target, source_plan, base_dir, target_arch=target_arch)
 
 
 def _can_emit_native_object(output: OutputConfig) -> bool:
@@ -597,6 +647,10 @@ def _can_emit_native_object(output: OutputConfig) -> bool:
 
 def _can_emit_object(output: OutputConfig) -> bool:
     return llvm is not None and output.triple != ""
+
+
+def _module_defines_main(module) -> bool:
+    return 'define i32 @"main"' in str(module)
 
 
 def _extern_search_roots(config: ProjectConfig, compile_target: str, base_dir: Path) -> list[Path]:
@@ -716,14 +770,229 @@ def _link_executable(obj_file: Path, exe_file: Path, libs: list[str] | None = No
         raise CliError(f"链接失败: {detail}")
 
 
-def _compile_c_extern(source: Path, build_dir: Path, compile_target: str | None) -> Path:
+def _link_sdk_artifact(obj_file: Path, output: OutputConfig, libs: list[str], build_dir: Path, name: str) -> Path:
+    if output.sdk is None:
+        raise CliError(f"{output.os} 目标需要 output.sdk 才能执行 SDK 链接")
+    if output.os == "emcc":
+        artifact = build_dir / f"{name}.js"
+        cmd = [str(_sdk_tool(output.sdk, ["emcc", "upstream/emscripten/emcc"])), str(obj_file), "-o", str(artifact)]
+        for lib in libs:
+            path = Path(lib)
+            if path.suffix == ".js":
+                cmd.extend(["--js-library", str(path)])
+            elif _is_system_extern(lib):
+                cmd.append(f"-l{lib}")
+            else:
+                cmd.append(str(path))
+        _run_sdk_command(cmd, "emcc SDK 链接失败")
+        return artifact
+
+    if output.os == "android":
+        artifact = build_dir / f"lib{name}.so"
+        clang = _sdk_tool(output.sdk, [
+            f"toolchains/llvm/prebuilt/{_ndk_host_tag()}/bin/{output.triple}21-clang",
+            f"toolchains/llvm/prebuilt/{_ndk_host_tag()}/bin/clang",
+            "bin/clang",
+            "clang",
+        ])
+        link_inputs = _sdk_native_link_inputs(libs, build_dir, output.os, clang)
+        if _uses_mobile_ui("android", libs):
+            entry = _write_android_jni_entry(build_dir)
+            link_inputs.append(str(_compile_c_extern(entry, build_dir, output.os, cc=str(clang))))
+        _run_sdk_command([str(clang), "-shared", str(obj_file), *link_inputs, "-o", str(artifact)], "Android SDK 链接失败")
+        return artifact
+
+    if output.os == "ios":
+        artifact = build_dir / f"lib{name}.dylib"
+        clang = _sdk_tool(output.sdk, ["usr/bin/clang", "Toolchains/XcodeDefault.xctoolchain/usr/bin/clang", "bin/clang", "clang"])
+        link_inputs = _sdk_native_link_inputs(libs, build_dir, output.os, clang)
+        _run_sdk_command([str(clang), "-dynamiclib", str(obj_file), *link_inputs, "-o", str(artifact)], "iOS SDK 链接失败")
+        return artifact
+
+    raise CliError(f"{output.os} 目标暂不支持 SDK 链接")
+
+
+def _emit_mobile_ui_bridge(output: OutputConfig, libs: list[str], build_dir: Path, name: str, artifact: Path) -> Path | None:
+    """为移动 UI 包生成宿主桥接模板，供平台工程直接接入动态库。"""
+    if _uses_mobile_ui("android", libs) and output.os == "android":
+        return _emit_android_ui_bridge(build_dir, name, artifact)
+    if _uses_mobile_ui("ios", libs) and output.os == "ios":
+        return _emit_ios_ui_bridge(build_dir, name, artifact)
+    return None
+
+
+def _uses_mobile_ui(os_name: str, libs: list[str]) -> bool:
+    marker = "ez-android-ui" if os_name == "android" else "ez-ios-ui"
+    return marker in "\n".join(str(lib) for lib in libs)
+
+
+def _write_android_jni_entry(build_dir: Path) -> Path:
+    source = build_dir / ".ez" / "android_jni_entry.c"
+    source.parent.mkdir(parents=True, exist_ok=True)
+    source.write_text(
+        '// EzLang Android 宿主入口：把 Kotlin Activity 的 native main 转发到 EzLang main。\n'
+        '#include <jni.h>\n\n'
+        'extern int main(void);\n\n'
+        'JNIEXPORT jint JNICALL Java_dev_ezlang_EzLangActivity_main(JNIEnv *env, jclass cls) {\n'
+        '    (void)env;\n'
+        '    (void)cls;\n'
+        '    return (jint)main();\n'
+        '}\n',
+        encoding="utf-8",
+    )
+    return source
+
+
+def _emit_android_ui_bridge(build_dir: Path, name: str, artifact: Path) -> Path:
+    bridge_dir = build_dir / "ez-android-ui-bridge"
+    src_dir = bridge_dir / "app" / "src" / "main" / "java" / "dev" / "ezlang"
+    src_dir.mkdir(parents=True, exist_ok=True)
+    jni_dir = bridge_dir / "app" / "src" / "main" / "jniLibs" / "arm64-v8a"
+    jni_dir.mkdir(parents=True, exist_ok=True)
+    if artifact.exists():
+        shutil.copy2(artifact, jni_dir / artifact.name)
+    manifest = bridge_dir / "app" / "src" / "main" / "AndroidManifest.xml"
+    manifest.parent.mkdir(parents=True, exist_ok=True)
+    manifest.write_text(
+        '<manifest xmlns:android="http://schemas.android.com/apk/res/android">\n'
+        '  <application android:theme="@style/AppTheme" android:label="EzLang">\n'
+        '    <activity android:name=".EzLangActivity" android:exported="true">\n'
+        '      <intent-filter>\n'
+        '        <action android:name="android.intent.action.MAIN" />\n'
+        '        <category android:name="android.intent.category.LAUNCHER" />\n'
+        '      </intent-filter>\n'
+        '    </activity>\n'
+        '  </application>\n'
+        '</manifest>\n',
+        encoding="utf-8",
+    )
+    (src_dir / "EzLangActivity.kt").write_text(
+        'package dev.ezlang\n\n'
+        'import android.app.Activity\n'
+        'import android.os.Bundle\n'
+        'import android.widget.FrameLayout\n\n'
+        'class EzLangActivity : Activity() {\n'
+        '    companion object {\n'
+        f'        init {{ System.loadLibrary("{artifact.stem.removeprefix("lib")}") }}\n'
+        '        @JvmStatic external fun main(): Int\n'
+        '    }\n\n'
+        '    override fun onCreate(savedInstanceState: Bundle?) {\n'
+        '        super.onCreate(savedInstanceState)\n'
+        '        setContentView(FrameLayout(this))\n'
+        '        main()\n'
+        '    }\n'
+        '}\n',
+        encoding="utf-8",
+    )
+    (bridge_dir / "CMakeLists.txt").write_text(
+        'cmake_minimum_required(VERSION 3.22)\n'
+        f'project({name}_android_bridge)\n'
+        '# EzLang 产物由 CLI 生成在同级 dist 目录；Android 工程可把 lib 复制到 jniLibs。\n',
+        encoding="utf-8",
+    )
+    (bridge_dir / "README.md").write_text(
+        f'# EzLang Android UI Bridge\n\n动态库: `{artifact.name}`\n\n'
+        '把 `app/src/main` 合并到 Android 工程，确保动态库位于 `jniLibs/<abi>/`。\n',
+        encoding="utf-8",
+    )
+    return bridge_dir
+
+
+def _emit_ios_ui_bridge(build_dir: Path, name: str, artifact: Path) -> Path:
+    bridge_dir = build_dir / "ez-ios-ui-bridge"
+    sources = bridge_dir / "Sources" / "EzLangBridge"
+    sources.mkdir(parents=True, exist_ok=True)
+    libs_dir = bridge_dir / "Libraries"
+    libs_dir.mkdir(parents=True, exist_ok=True)
+    if artifact.exists():
+        shutil.copy2(artifact, libs_dir / artifact.name)
+    (sources / "EzLangViewController.swift").write_text(
+        'import UIKit\n\n'
+        '@_silgen_name("main") private func ezlangMain() -> Int32\n\n'
+        'public final class EzLangViewController: UIViewController {\n'
+        '    public override func viewDidLoad() {\n'
+        '        super.viewDidLoad()\n'
+        '        view.backgroundColor = .systemBackground\n'
+        '        _ = ezlangMain()\n'
+        '    }\n'
+        '}\n',
+        encoding="utf-8",
+    )
+    (bridge_dir / "Package.swift").write_text(
+        '// swift-tools-version: 5.9\n'
+        'import PackageDescription\n\n'
+        f'let package = Package(name: "{name}IOSBridge", products: [\n'
+        '    .library(name: "EzLangBridge", targets: ["EzLangBridge"])\n'
+        '], targets: [\n'
+        '    .target(name: "EzLangBridge")\n'
+        '])\n',
+        encoding="utf-8",
+    )
+    (bridge_dir / "Info.plist").write_text(
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
+        '<plist version="1.0"><dict><key>UILaunchStoryboardName</key><string>LaunchScreen</string></dict></plist>\n',
+        encoding="utf-8",
+    )
+    (bridge_dir / "README.md").write_text(
+        f'# EzLang iOS UI Bridge\n\n动态库: `{artifact.name}`\n\n'
+        '把 `Sources/EzLangBridge` 加入 Xcode 工程，并把动态库加入 Link Binary With Libraries。\n',
+        encoding="utf-8",
+    )
+    return bridge_dir
+
+
+def _sdk_native_link_inputs(libs: list[str], build_dir: Path, compile_target: str, clang: Path) -> list[str]:
+    inputs: list[str] = []
+    for lib in libs:
+        path = Path(lib)
+        if _is_system_extern(lib):
+            inputs.append(f"-l{lib}")
+        elif path.suffix == ".c":
+            inputs.append(str(_compile_c_extern(path, build_dir, compile_target, cc=str(clang))))
+        elif path.suffix == ".framework":
+            inputs.extend(["-framework", path.stem])
+        elif path.suffix == ".js":
+            continue
+        else:
+            inputs.append(str(path))
+    return inputs
+
+
+def _sdk_tool(sdk: Path, candidates: list[str]) -> Path:
+    for candidate in candidates:
+        path = (sdk / candidate).resolve()
+        if path.exists() and path.is_file():
+            return path
+    joined = ", ".join(candidates)
+    raise CliError(f"output.sdk 缺少工具: {joined}")
+
+
+def _ndk_host_tag() -> str:
+    if sys.platform == "darwin":
+        return "darwin-x86_64"
+    if sys.platform.startswith("linux"):
+        return "linux-x86_64"
+    if sys.platform.startswith("win"):
+        return "windows-x86_64"
+    return "linux-x86_64"
+
+
+def _run_sdk_command(cmd: list[str], label: str):
+    completed = subprocess.run(cmd, text=True, capture_output=True)
+    if completed.returncode != 0:
+        detail = completed.stderr.strip() or completed.stdout.strip()
+        raise CliError(f"{label}: {detail}")
+
+
+def _compile_c_extern(source: Path, build_dir: Path, compile_target: str | None, cc: str = "cc") -> Path:
     if not source.exists():
         raise CliError(f"extern C 源码不存在: {source}")
     extern_dir = build_dir / ".extern"
     extern_dir.mkdir(parents=True, exist_ok=True)
     obj_name = re.sub(r"\W+", "_", str(source.resolve())) + ".o"
     obj_file = extern_dir / obj_name
-    cmd = ["cc", "-c", str(source), "-o", str(obj_file)]
+    cmd = [cc, "-c", str(source), "-o", str(obj_file)]
     if compile_target in {"linux", "macos", "windows", "android", "ios"}:
         cmd.insert(1, f"-DEZ_TARGET_{compile_target.upper()}=1")
     completed = subprocess.run(cmd, text=True, capture_output=True)
@@ -888,6 +1157,33 @@ def _count_test_symbols(source: str) -> int:
     names = set(re.findall(r'\b(?:const|let)\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*\(', source))
     names.update(re.findall(r'\bfn\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(', source))
     return sum(1 for name in names if name.startswith("test") or name.endswith("_test"))
+
+
+def _test_registration_locations(source: str) -> dict[str, int]:
+    locations: dict[str, int] = {}
+    register_re = re.compile(r'\btestRegister\s*\([^)]*\bname\s*=\s*"([^"]+)"')
+    param_re = re.compile(r'\btestRegisterParam\s*\([^)]*\bname\s*=\s*"([^"]+)"[^)]*\bparam\s*=\s*"([^"]+)"')
+    for line_no, line in enumerate(source.splitlines(), start=1):
+        for match in register_re.finditer(line):
+            locations.setdefault(match.group(1), line_no)
+        for match in param_re.finditer(line):
+            locations.setdefault(f"{match.group(1)}[{match.group(2)}]", line_no)
+    return locations
+
+
+def _annotate_test_failure_detail(detail: str, test_file: Path, locations: dict[str, int], root: Path) -> str:
+    if not detail or not locations:
+        return detail
+    display = test_file.relative_to(root) if test_file.is_relative_to(root) else test_file
+
+    def repl(match: re.Match) -> str:
+        name = match.group(1)
+        line = locations.get(name)
+        if line is None:
+            return match.group(0)
+        return f"test failed: {display}:{line} {name}:"
+
+    return re.sub(r'test failed:\s+([^:\n]+):', repl, detail, count=1)
 
 
 

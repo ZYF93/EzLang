@@ -7,7 +7,7 @@
 导入：
 
 ```ez
-from "std/mem" import { copy, set, allocRaw };
+from "std/mem" import { copy, set, allocRaw, errCancel, errTimeout, errUnsupported, errIO, errNotFound, errPermission };
 ```
 
 API：
@@ -15,8 +15,14 @@ API：
 - `copy(dst: Blob, src: Blob, count: I64) -> Void`
 - `set(dst: Blob, value: U8, count: I64) -> Void`
 - `allocRaw(size: I64) -> Blob`
+- `errCancel: I32 = 1`
+- `errTimeout: I32 = 2`
+- `errUnsupported: I32 = 3`
+- `errIO: I32 = 4`
+- `errNotFound: I32 = 5`
+- `errPermission: I32 = 6`
 
-这些函数是 compiler builtin，会 lowering 到 LLVM intrinsic 或 Arena 分配器。
+这些函数是 compiler builtin，会 lowering 到 LLVM intrinsic 或 Arena 分配器。错误码使用正值区间；业务错误码由应用自行分配。
 
 ## std/test
 
@@ -25,19 +31,31 @@ API：
 - `testNotEqualI64(actual: I64, expected: I64, msg: Str) -> Void`
 - `testEqualStr(actual: Str, expected: Str, msg: Str) -> Void`
 - `testSkip(msg: Str) -> Void`
+- `testThrows(body: () -> Void, expectedCode: I32, msg: Str) -> Void`
 - `testRegister(name: Str) -> Void`
+- `testRegisterParam(name: Str, param: Str) -> Void`
+- `testCount() -> I32`
+- `testName(index: I32) -> Str`
 - `testPassed() -> I32`
 - `testFailed() -> I32`
 - `testSkipped() -> I32`
 - `testReset() -> Void`
 
-`ez test` 默认扫描项目 `tests/` 目录下的 `.ez` 文件，执行带 `main` 的本机测试文件；没有 `main` 的测试文件会做编译检查。测试函数名以 `test` 开头或 `_test` 结尾时计入 CLI 摘要。
+`testThrows` 调用传入函数并断言其抛出的 `Error.code` 等于 `expectedCode`；无异常时捕获到零值 `Error`，断言会失败。`testRegisterParam` 将参数化用例登记为 `name[param]`，`testCount` / `testName` 可按注册顺序检索用例名。
+
+`ez test` 默认扫描项目 `tests/` 目录下的 `.ez` 文件，执行带 `main` 的本机测试文件；没有 `main` 的测试文件会做编译检查。测试函数名以 `test` 开头或 `_test` 结尾时计入 CLI 摘要。运行失败时，CLI 会输出测试文件路径、退出码，并把 `testRegister` / `testRegisterParam` 登记的用例名映射回源码行号，适合持续集成环境收集诊断。
 
 ## std/stream
 
 - `Stream { handle: I64, kind: I32 }`
 - `streamKindMemory: I32`
+- `streamKindFileRead: I32`
+- `streamKindFileWrite: I32`
+- `streamKindTcp: I32`
 - `streamFromBlob(data: Blob) -> Stream?`
+- `streamFromTcpHandle(handle: I64) -> Stream`
+- `streamOpenFileRead(path: Str) -> Stream?`
+- `streamOpenFileWrite(path: Str) -> Stream?`
 - `streamRead(stream: Stream, maxBytes: I64) -> Blob?`
 - `streamWrite(stream: Stream, data: Blob) -> I64`
 - `streamToBlob(stream: Stream) -> Blob?`
@@ -45,7 +63,7 @@ API：
 - `streamFlush(stream: Stream) -> Bool`
 - `streamClose(stream: Stream) -> Bool`
 
-当前先提供内存/Blob 流，作为文件、网络、进程管道和压缩流后续接入的稳定 ABI。`streamCopy` 从源流当前游标开始复制到目标流，返回复制字节数；失败返回 `-1`。
+当前提供内存/Blob 流、文件读写流与 TCP 连接流，作为进程管道和压缩流后续接入的稳定 ABI。`streamCopy` 从源流当前游标开始复制到目标流，返回复制字节数；失败返回 `-1`。
 
 ## std/io
 
@@ -84,6 +102,8 @@ API：
 - `platform() -> Str`
 - `arch() -> Str`
 
+平台说明：emcc 目标在 Node 风格运行时读取 `Module.arguments` / `process.env` / `process.pid`；浏览器缺少对应能力时按签名返回空列表、空可选值、`false` 或 `-1`。
+
 ## std/path
 
 - `pathSeparator() -> Str`
@@ -115,6 +135,7 @@ API：
 - `strCharAt(s: Str, index: I64) -> Str?`
 - `strToBytes(s: Str) -> Blob`
 - `strFromBytes(data: Blob) -> Str?`
+- `strEqual(a: Str, b: Str) -> Bool`
 - `strContains(s: Str, needle: Str) -> Bool`
 - `strStartsWith(s: Str, prefix: Str) -> Bool`
 - `strEndsWith(s: Str, suffix: Str) -> Bool`
@@ -248,7 +269,7 @@ API：
 平台说明：
 
 - `std/process` 只用于外部程序调用，不暴露线程、线程池、互斥锁、条件变量等底层并发接口。
-- Linux/macOS native 目标实现子进程调用；Windows、Android、iOS、WebAssembly 当前返回空可选值或 `false`。
+- Linux/macOS/Windows native 目标实现子进程调用；Android、iOS、WebAssembly 当前返回空可选值或 `false`。
 - `Command.env` 使用 `KEY=VALUE` 字符串数组表示环境覆盖；`ProcessResult.ok` 表示退出码是否为 `0`。
 - `flow` 调度状态机完成前，进程等待仍是同步阻塞调用。
 
@@ -279,6 +300,7 @@ API：
 平台说明：
 
 - `std/uri` 只做词法解析和百分号编解码，不访问网络。
+- `uriQueryGet/Set` 操作不带前导 `?` 的裸 query；传入的 `key`/`value` 是未编码文本，接口会按 query 规则解码匹配、编码写回。
 - 查询参数接口使用裸 query 字符串，不包含前导 `?`。
 - 非法百分号转义会让解码函数返回空可选值。
 
@@ -309,6 +331,7 @@ API：
 - `logTargetStderr: I32`
 - `logTargetStdout: I32`
 - `logTargetConsole: I32`
+- `logTargetFile: I32`
 
 类型：
 
@@ -319,6 +342,7 @@ API：
 - `logDefaultConfig() -> LogConfig`
 - `logConfigure(config: LogConfig) -> Void`
 - `logSetLevel(level: I32) -> Void`
+- `logSetFile(path: Str) -> Bool`
 - `logWrite(level: I32, msg: Str) -> Void`
 - `logWriteFields(level: I32, msg: Str, fields: Str[]) -> Void`
 - `logWriteAt(level: I32, msg: Str, file: Str, line: I32, column: I32, fields: Str[]) -> Void`
@@ -328,11 +352,15 @@ API：
 - `logWarnMsg(msg: Str) -> Void`
 - `logErrorMsg(msg: Str) -> Void`
 
+原生平台支持 stderr/stdout/file 目标；Android/iOS 非文件目标同时写入系统日志入口；emcc 输出到 console，`logSetFile` 返回 `false`。
+
 平台说明：
 
 - 原生平台当前输出到 stdout/stderr；WebAssembly 输出到 console。
 - `fields` 使用偶数位 `key, value` 字符串数组，末尾孤立 key 会被忽略。
-- 当前实现运行时级别过滤；编译期过滤等待编译器配置传递能力完善。
+- 运行时级别由 `LogConfig.minLevel` 或 `logSetLevel` 控制。
+- 项目配置 `[log].compile_min_level` 可启用编译期级别过滤，范围为 `0..4`。
+- 编译期过滤只删除静态可判定且低于阈值的标准日志调用；动态 `level` 参数继续走运行时过滤。
 
 ## std/regex
 
@@ -393,6 +421,10 @@ API：
 
 ## std/time
 
+类型：
+
+- `Duration { ms: I64 }`
+
 - `now() -> Date`
 - `timestamp() -> I64`
 - `sleep(ms: I64) -> Void`
@@ -402,9 +434,11 @@ API：
 - `getHour(this: Date) -> I32`
 - `getMinute(this: Date) -> I32`
 - `getSecond(this: Date) -> I32`
-- `add(...) -> Void`
-- `sub(...) -> Void`
+- `add(this: Date, year: I32?, month: I32?, day: I32?, hour: I32?, minute: I32?, second: I32?) -> Void`
+- `sub(this: Date, year: I32?, month: I32?, day: I32?, hour: I32?, minute: I32?, second: I32?) -> Void`
 - `format(this: Date, fmt: Str) -> Str`
+
+`format` 支持 `YYYY`、`MM`、`DD`、`HH`、`SS` 命名占位符，以及 `%Y`、`%m`、`%d`、`%H`、`%M`、`%S`。分钟使用 `%M`，月份使用 `MM` 或 `%m`。
 
 ## std/net/http
 
@@ -420,6 +454,8 @@ API：
 - `RouteHandler`
 - `HttpServer`
 
+原生桌面平台支持明文 `http://` 客户端请求；HTTPS、Android/iOS、emcc 同步 fetch 返回空可选值。HTTP 服务端当前明确不支持，`createServer` 返回 `handle = 0`，`HttpServer.on/start/stop` 为空操作。
+
 ## std/net/tcp
 
 - `tcpConnect(host: Str, port: I32) -> TcpConn?`
@@ -434,12 +470,16 @@ API：
 - `udpRecv(socket: UdpSocket, maxBytes: I64) -> Blob?`
 - `udpClose(socket: UdpSocket) -> Bool`
 
+原生目标提供阻塞式 TCP/UDP socket 基础能力；TCP 连接句柄可通过 `std/stream.streamFromTcpHandle` 交给通用读写和拷贝函数。emcc 当前明确不支持 TCP/UDP，返回空可选值、`-1` 或 `false`。当前接口不提供超时、TLS 或异步 flow 挂起。
+
 ## std/net/ws
 
 - `wsConnect(url: Str) -> WsConn?`
 - `wsSend(conn: WsConn, data: Blob) -> I64`
 - `wsRecv(conn: WsConn, maxBytes: I64) -> Blob?`
 - `wsClose(conn: WsConn) -> Bool`
+
+原生目标仅支持 `ws://` 握手和基础单帧消息收发；`wss://`、分片帧、ping/pong 自动处理和 emcc 同步 WebSocket 明确不支持，失败时返回空可选值或 `-1`。
 
 ## std/fmt
 
@@ -461,10 +501,26 @@ API：
 
 `std/collections` 的公开接口由编译器内建 lowering 实现，不需要外部运行时链接。
 
+- `listPush<T>(list: List<T>, item: T) -> Void`
+- `listPop<T>(list: List<T>) -> T?`
+- `listShift<T>(list: List<T>) -> T?`
+- `listUnshift<T>(list: List<T>, item: T) -> Void`
+- `listSort<T>(list: List<T>, cmp: (a: T, b: T) -> I32) -> Void`
+- `listFilter<T>(list: List<T>, pred: (item: T) -> Bool) -> List<T>`
+- `listMap<T, U>(list: List<T>, f: (item: T) -> U) -> List<U>`
+- `listFind<T>(list: List<T>, pred: (item: T) -> Bool) -> T?`
+- `listLen<T>(list: List<T>) -> I64`
+- `listSlice<T>(list: List<T>, start: I64, end: I64) -> List<T>`
+- `dictKeys<K, V>(dict: Dict<K, V>) -> K[]`
+- `dictValues<K, V>(dict: Dict<K, V>) -> V[]`
+- `dictHas<K, V>(dict: Dict<K, V>, key: K) -> Bool`
+- `dictDelete<K, V>(dict: Dict<K, V>, key: K) -> Bool`
+- `dictLen<K, V>(dict: Dict<K, V>) -> I64`
+
 `List<T>` 支持 `listLen`、`listPush`、`listPop`、`listShift`、`listUnshift`、`listSlice`、`listSort`、`listFilter`、`listMap`、`listFind`。当前数组/List ABI 使用分页布局 `{ pages, length, capacity, page_count }`，`push/unshift/filter` 会按需扩页。
 
 `Dict<K, V>` 支持 `dictKeys`、`dictValues`、`dictHas`、`dictDelete`、`dictLen`。当前字典实现基于现有分页键值存储做线性扫描；`Str` 键按 C 字符串内容比较，标量键按值比较。后续哈希表布局落地后可替换为更高效实现。
 
 ## std/net
 
-`std/net/http`、`std/net/tcp`、`std/net/ws` 的接口声明和 ABI 已可编译链接。原生目标当前支持明文 `http://` 客户端请求、阻塞式 TCP/UDP 基础收发，以及 `ws://` WebSocket 握手和单帧消息收发。HTTPS、HTTP 服务端、WebSocket `wss://`、分片帧、超时配置和异步 flow 挂起仍待后续运行时接入；不支持的入口返回空可选值、失败值或零句柄。
+`std/net/http`、`std/net/tcp`、`std/net/ws` 的接口声明和 ABI 已可编译链接。原生目标当前支持明文 `http://` 客户端请求、基础字符串请求/响应头、阻塞式 TCP/UDP 基础收发，以及 `ws://` WebSocket 握手和单帧消息收发。HTTPS、HTTP 服务端、WebSocket `wss://`、分片帧、超时配置和异步 flow 挂起仍待后续运行时接入；不支持的入口返回空可选值、失败值或零句柄。

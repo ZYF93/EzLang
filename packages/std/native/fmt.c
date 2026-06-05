@@ -200,13 +200,28 @@ static int ez_b64_value(char ch) {
     return -1;
 }
 
+static bool ez_b64_is_valid_input(const char *s, size_t len, size_t *padding) {
+    if (len % 4 != 0) return false;
+    *padding = 0;
+    if (len > 0 && s[len - 1] == '=') (*padding)++;
+    if (len > 1 && s[len - 2] == '=') (*padding)++;
+    if (*padding > 2) return false;
+    for (size_t i = 0; i < len; ++i) {
+        bool is_padding = s[i] == '=';
+        if (is_padding) {
+            if (i < len - *padding) return false;
+        } else if (ez_b64_value(s[i]) < 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
 OptBlob b64Decode(const char *s) {
     if (!s) return (OptBlob){false, {0}};
     size_t in_len = strlen(s);
-    if (in_len % 4 != 0) return (OptBlob){false, {0}};
     size_t padding = 0;
-    if (in_len > 0 && s[in_len - 1] == '=') padding++;
-    if (in_len > 1 && s[in_len - 2] == '=') padding++;
+    if (!ez_b64_is_valid_input(s, in_len, &padding)) return (OptBlob){false, {0}};
     size_t out_len = (in_len / 4) * 3 - padding;
     uint8_t *out = (uint8_t *)malloc(out_len ? out_len : 1);
     if (!out) return (OptBlob){false, {0}};
@@ -317,6 +332,49 @@ Blob msgpackEncode_I64(int64_t value) {
     return (Blob){out, 9};
 }
 
+Blob msgpackEncode_F64(double value) {
+    uint8_t *out = (uint8_t *)malloc(9);
+    if (!out) return (Blob){0};
+    uint64_t bits = 0;
+    memcpy(&bits, &value, sizeof(bits));
+    out[0] = 0xCB;
+    for (int i = 0; i < 8; ++i) out[i + 1] = (uint8_t)(bits >> (56 - i * 8));
+    return (Blob){out, 9};
+}
+
+Blob msgpackEncode_I1(bool value) {
+    uint8_t *out = (uint8_t *)malloc(1);
+    if (!out) return (Blob){0};
+    out[0] = value ? 0xC3 : 0xC2;
+    return (Blob){out, 1};
+}
+
+Blob msgpackEncode_Str(const char *value) {
+    if (!value) value = "";
+    size_t len = strlen(value);
+    size_t header_len = len <= 31 ? 1 : len <= 0xFF ? 2 : len <= 0xFFFF ? 3 : 5;
+    uint8_t *out = (uint8_t *)malloc(header_len + len);
+    if (!out) return (Blob){0};
+    if (len <= 31) {
+        out[0] = (uint8_t)(0xA0 | len);
+    } else if (len <= 0xFF) {
+        out[0] = 0xD9;
+        out[1] = (uint8_t)len;
+    } else if (len <= 0xFFFF) {
+        out[0] = 0xDA;
+        out[1] = (uint8_t)(len >> 8);
+        out[2] = (uint8_t)len;
+    } else {
+        out[0] = 0xDB;
+        out[1] = (uint8_t)(len >> 24);
+        out[2] = (uint8_t)(len >> 16);
+        out[3] = (uint8_t)(len >> 8);
+        out[4] = (uint8_t)len;
+    }
+    memcpy(out + header_len, value, len);
+    return (Blob){out, (int64_t)(header_len + len)};
+}
+
 int32_t msgpackDecode_I32(const Blob *data) {
     if (data && data->size == 5 && data->data && data->data[0] == 0xD2) {
         uint32_t value = ((uint32_t)data->data[1] << 24) | ((uint32_t)data->data[2] << 16) | ((uint32_t)data->data[3] << 8) | data->data[4];
@@ -332,6 +390,47 @@ int64_t msgpackDecode_I64(const Blob *data) {
         return (int64_t)value;
     }
     return 0;
+}
+
+double msgpackDecode_F64(const Blob *data) {
+    if (data && data->size == 9 && data->data && data->data[0] == 0xCB) {
+        uint64_t bits = 0;
+        for (int i = 0; i < 8; ++i) bits = (bits << 8) | data->data[i + 1];
+        double value = 0.0;
+        memcpy(&value, &bits, sizeof(value));
+        return value;
+    }
+    return 0.0;
+}
+
+bool msgpackDecode_I1(const Blob *data) {
+    if (!data || data->size != 1 || !data->data) return false;
+    return data->data[0] == 0xC3;
+}
+
+const char *msgpackDecode_Str(const Blob *data) {
+    if (!data || data->size <= 0 || !data->data) return ez_strdup_safe("");
+    const uint8_t *bytes = data->data;
+    size_t size = (size_t)data->size;
+    size_t header_len = 0;
+    size_t len = 0;
+    if ((bytes[0] & 0xE0) == 0xA0) {
+        header_len = 1;
+        len = bytes[0] & 0x1F;
+    } else if (bytes[0] == 0xD9 && size >= 2) {
+        header_len = 2;
+        len = bytes[1];
+    } else if (bytes[0] == 0xDA && size >= 3) {
+        header_len = 3;
+        len = ((size_t)bytes[1] << 8) | bytes[2];
+    } else if (bytes[0] == 0xDB && size >= 5) {
+        header_len = 5;
+        len = ((size_t)bytes[1] << 24) | ((size_t)bytes[2] << 16) | ((size_t)bytes[3] << 8) | bytes[4];
+    } else {
+        return ez_strdup_safe("");
+    }
+    if (header_len + len > size) return ez_strdup_safe("");
+    return ez_strdup_range((const char *)(bytes + header_len), len);
 }
 
 static bool ez_is_unreserved(unsigned char ch) {

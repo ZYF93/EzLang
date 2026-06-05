@@ -94,6 +94,26 @@ static bool ez_path_is_abs_raw(const char *path) {
     return ez_is_windows_drive(path) && ez_is_sep(path[2]);
 }
 
+static bool ez_component_boundary(const char *path, size_t index) {
+    return !path || path[index] == '\0' || ez_is_sep(path[index]);
+}
+
+static size_t ez_component_count(const char *path) {
+    size_t count = 0;
+    bool in_component = false;
+    for (const char *p = path; p && *p; ++p) {
+        if (ez_is_sep(*p)) {
+            if (in_component) {
+                count++;
+                in_component = false;
+            }
+        } else {
+            in_component = true;
+        }
+    }
+    return in_component ? count + 1 : count;
+}
+
 static char *ez_append_part(char *out, size_t *len, size_t *cap, const char *part, size_t part_len, char sep) {
     if (*len + part_len + 2 > *cap) {
         while (*len + part_len + 2 > *cap) *cap *= 2;
@@ -334,13 +354,13 @@ const char *pathRelative(const char *from, const char *to) {
            (from_norm[common] == to_norm[common] || (ez_is_sep(from_norm[common]) && ez_is_sep(to_norm[common])))) {
         common++;
     }
-    while (common > from_root && !ez_is_sep(from_norm[common - 1])) common--;
-
-    size_t up_count = 0;
-    for (const char *p = from_norm + common; *p; ++p) {
-        if (ez_is_sep(*p)) up_count++;
+    if (!ez_component_boundary(from_norm, common) || !ez_component_boundary(to_norm, common)) {
+        while (common > from_root && !ez_is_sep(from_norm[common - 1])) common--;
     }
-    if (from_norm[common] != '\0') up_count++;
+
+    const char *from_tail = from_norm + common;
+    while (ez_is_sep(*from_tail)) from_tail++;
+    size_t up_count = ez_component_count(from_tail);
 
     const char *tail = to_norm + common;
     while (ez_is_sep(*tail)) tail++;
@@ -439,6 +459,10 @@ OptStr pathFromFileUrl(const char *url) {
     size_t len = 0;
     for (size_t i = 0; src[i]; ++i) {
         if (src[i] == '%') {
+            if (!src[i + 1] || !src[i + 2]) {
+                free(out);
+                return (OptStr){false, NULL};
+            }
             int hi = ez_hex_value(src[i + 1]);
             int lo = ez_hex_value(src[i + 2]);
             if (hi < 0 || lo < 0) {

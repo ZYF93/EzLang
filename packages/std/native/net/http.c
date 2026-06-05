@@ -1,5 +1,6 @@
 // EzLang std/net/http 原生封装层
-// 当前实现明文 HTTP/1.0 客户端；HTTPS、服务端与完整 headers 映射后续补齐。
+// 当前实现明文 HTTP/1.0 客户端；HTTPS 与完整网络运行时后续补齐。
+// HTTP 服务端明确不支持：createServer 返回 handle = 0。
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -53,6 +54,8 @@ typedef struct {
     int64_t handle;
 } HttpServer;
 
+enum { EZ_HTTP_SERVER_UNSUPPORTED_HANDLE = 0 };
+
 typedef struct {
     bool ok;
     HttpResponse value;
@@ -74,6 +77,94 @@ static char *ez_strdup_range(const char *src, size_t len) {
 
 static Dict ez_empty_headers(void) {
     return (Dict){0};
+}
+
+static char *ez_trim_dup(const char *src, size_t len) {
+    while (len > 0 && (*src == ' ' || *src == '\t')) {
+        src++;
+        len--;
+    }
+    while (len > 0 && (src[len - 1] == ' ' || src[len - 1] == '\t' || src[len - 1] == '\r')) len--;
+    return ez_strdup_range(src, len);
+}
+
+static Dict ez_make_headers(char **keys, char **values, size_t count) {
+    if (count == 0) return ez_empty_headers();
+    size_t page_count = (count + 7) / 8;
+    char ***key_pages = (char ***)calloc(page_count, sizeof(char **));
+    char ***value_pages = (char ***)calloc(page_count, sizeof(char **));
+    if (!key_pages || !value_pages) return ez_empty_headers();
+    for (size_t page = 0; page < page_count; ++page) {
+        key_pages[page] = (char **)calloc(8, sizeof(char *));
+        value_pages[page] = (char **)calloc(8, sizeof(char *));
+        if (!key_pages[page] || !value_pages[page]) continue;
+        for (size_t slot = 0; slot < 8; ++slot) {
+            size_t index = page * 8 + slot;
+            if (index >= count) break;
+            key_pages[page][slot] = keys[index];
+            value_pages[page][slot] = values[index];
+        }
+    }
+    return (Dict){key_pages, value_pages, (int32_t)count, (int32_t)(page_count * 8), (int32_t)page_count};
+}
+
+static const char *ez_dict_key_at(const Dict *dict, int32_t index) {
+    if (!dict || index < 0 || index >= dict->count || !dict->key_pages) return NULL;
+    int32_t page = index / 8;
+    int32_t slot = index % 8;
+    if (page >= dict->page_count || !dict->key_pages[page]) return NULL;
+    return dict->key_pages[page][slot];
+}
+
+static const char *ez_dict_value_at(const Dict *dict, int32_t index) {
+    if (!dict || index < 0 || index >= dict->count || !dict->value_pages) return NULL;
+    int32_t page = index / 8;
+    int32_t slot = index % 8;
+    if (page >= dict->page_count || !dict->value_pages[page]) return NULL;
+    return dict->value_pages[page][slot];
+}
+
+static char ez_ascii_lower(char ch) {
+    return (ch >= 'A' && ch <= 'Z') ? (char)(ch - 'A' + 'a') : ch;
+}
+
+static bool ez_ascii_ieq(const char *left, const char *right) {
+    if (!left || !right) return false;
+    while (*left && *right) {
+        if (ez_ascii_lower(*left) != ez_ascii_lower(*right)) return false;
+        left++;
+        right++;
+    }
+    return *left == '\0' && *right == '\0';
+}
+
+static bool ez_skip_request_header(const char *key) {
+    return ez_ascii_ieq(key, "Host") || ez_ascii_ieq(key, "Connection") || ez_ascii_ieq(key, "Content-Length");
+}
+
+static size_t ez_request_headers_len(const Dict *headers) {
+    if (!headers || headers->count <= 0) return 0;
+    size_t total = 0;
+    for (int32_t i = 0; i < headers->count; ++i) {
+        const char *key = ez_dict_key_at(headers, i);
+        const char *value = ez_dict_value_at(headers, i);
+        if (!key || key[0] == '\0' || ez_skip_request_header(key)) continue;
+        total += strlen(key) + 2 + strlen(value ? value : "") + 2;
+    }
+    return total;
+}
+
+static size_t ez_append_request_headers(char *request, size_t offset, size_t capacity, const Dict *headers) {
+    if (!headers || headers->count <= 0) return offset;
+    for (int32_t i = 0; i < headers->count; ++i) {
+        const char *key = ez_dict_key_at(headers, i);
+        const char *value = ez_dict_value_at(headers, i);
+        if (!key || key[0] == '\0' || ez_skip_request_header(key)) continue;
+        int written = snprintf(request + offset, capacity - offset, "%s: %s\r\n", key, value ? value : "");
+        if (written < 0) return offset;
+        offset += (size_t)written;
+    }
+    return offset;
 }
 
 static OptHttpResponse ez_http_none(void) {
@@ -190,6 +281,50 @@ static Blob ez_response_body(uint8_t *response, size_t response_len) {
     return (Blob){body, (int64_t)body_len};
 }
 
+static Dict ez_response_headers(const uint8_t *response, size_t response_len) {
+    if (!response || response_len == 0) return ez_empty_headers();
+    const char *start = (const char *)response;
+    const char *end = start + response_len;
+    const char *line_end = memchr(start, '\n', (size_t)(end - start));
+    if (!line_end) return ez_empty_headers();
+    const char *line_start = line_end + 1;
+
+    char **keys = NULL;
+    char **values = NULL;
+    size_t count = 0;
+    size_t capacity = 0;
+    while (line_start < end) {
+        line_end = memchr(line_start, '\n', (size_t)(end - line_start));
+        if (!line_end) break;
+        size_t line_len = (size_t)(line_end - line_start);
+        while (line_len > 0 && line_start[line_len - 1] == '\r') line_len--;
+        if (line_len == 0) break;
+
+        const char *colon = memchr(line_start, ':', line_len);
+        if (colon && colon != line_start) {
+            if (count == capacity) {
+                size_t next_capacity = capacity ? capacity * 2 : 8;
+                char **next_keys = (char **)realloc(keys, next_capacity * sizeof(char *));
+                if (!next_keys) break;
+                keys = next_keys;
+                char **next_values = (char **)realloc(values, next_capacity * sizeof(char *));
+                if (!next_values) break;
+                values = next_values;
+                capacity = next_capacity;
+            }
+            keys[count] = ez_trim_dup(line_start, (size_t)(colon - line_start));
+            values[count] = ez_trim_dup(colon + 1, line_len - (size_t)(colon + 1 - line_start));
+            if (keys[count] && values[count]) count++;
+        }
+        line_start = line_end + 1;
+    }
+
+    Dict result = ez_make_headers(keys, values, count);
+    free(keys);
+    free(values);
+    return result;
+}
+
 static int32_t ez_response_status(const uint8_t *response, size_t response_len) {
     if (!response || response_len < 12) return 0;
     const char *text = (const char *)response;
@@ -198,7 +333,7 @@ static int32_t ez_response_status(const uint8_t *response, size_t response_len) 
     return (int32_t)strtol(space + 1, NULL, 10);
 }
 
-static OptHttpResponse ez_http_fetch(const char *method, const char *url, const Blob *body) {
+static OptHttpResponse ez_http_fetch(const char *method, const char *url, const Dict *headers, const Blob *body) {
     EzUrlParts parts = {0};
     if (!ez_parse_http_url(url, &parts)) return ez_http_none();
     ez_socket_t sock = ez_http_connect(parts.host, parts.port);
@@ -208,21 +343,32 @@ static OptHttpResponse ez_http_fetch(const char *method, const char *url, const 
     }
 
     const char *verb = method && method[0] ? method : "GET";
-    int body_size = body && body->data && body->size > 0 ? (int)body->size : 0;
+    int64_t body_size = body && body->data && body->size > 0 ? body->size : 0;
+    size_t headers_len = ez_request_headers_len(headers);
     int req_len = snprintf(NULL, 0,
-        "%s %s HTTP/1.0\r\nHost: %s\r\nConnection: close\r\nContent-Length: %d\r\n\r\n",
-        verb, parts.path, parts.host, body_size);
-    char *request = (char *)malloc((size_t)req_len + 1);
+        "%s %s HTTP/1.0\r\nHost: %s\r\nConnection: close\r\nContent-Length: %lld\r\n",
+        verb, parts.path, parts.host, (long long)body_size);
+    if (req_len < 0) {
+        ez_close_socket(sock);
+        ez_url_parts_free(&parts);
+        return ez_http_none();
+    }
+    size_t request_size = (size_t)req_len + headers_len + 2;
+    char *request = (char *)malloc(request_size + 1);
     if (!request) {
         ez_close_socket(sock);
         ez_url_parts_free(&parts);
         return ez_http_none();
     }
-    snprintf(request, (size_t)req_len + 1,
-        "%s %s HTTP/1.0\r\nHost: %s\r\nConnection: close\r\nContent-Length: %d\r\n\r\n",
-        verb, parts.path, parts.host, body_size);
+    size_t offset = (size_t)snprintf(request, request_size + 1,
+        "%s %s HTTP/1.0\r\nHost: %s\r\nConnection: close\r\nContent-Length: %lld\r\n",
+        verb, parts.path, parts.host, (long long)body_size);
+    offset = ez_append_request_headers(request, offset, request_size + 1, headers);
+    memcpy(request + offset, "\r\n", 2);
+    offset += 2;
+    request[offset] = '\0';
 
-    bool ok = ez_send_all(sock, request, (size_t)req_len);
+    bool ok = ez_send_all(sock, request, offset);
     if (ok && body_size > 0) ok = ez_send_all(sock, (const char *)body->data, (size_t)body_size);
     free(request);
     ez_url_parts_free(&parts);
@@ -260,25 +406,36 @@ static OptHttpResponse ez_http_fetch(const char *method, const char *url, const 
     }
 
     int32_t status = ez_response_status(response, response_len);
+    if (status == 0) {
+        free(response);
+        return ez_http_none();
+    }
+    Dict response_headers = ez_response_headers(response, response_len);
     Blob response_body = ez_response_body(response, response_len);
     free(response);
-    if (status == 0) return ez_http_none();
 
-    HttpResponse value = {status, ez_empty_headers(), response_body};
+    HttpResponse value = {status, response_headers, response_body};
     return (OptHttpResponse){true, value};
 }
 
 OptHttpResponse fetch(const char *url) {
-    return ez_http_fetch("GET", url, NULL);
+    return ez_http_fetch("GET", url, NULL, NULL);
 }
 
 OptHttpResponse fetchEx(const HttpRequest *req) {
     if (!req) return ez_http_none();
-    return ez_http_fetch(req->method, req->url, &req->body);
+    return ez_http_fetch(req->method, req->url, &req->headers, &req->body);
 }
 
 HttpServer createServer(const char *host, int32_t port) {
     (void)host;
     (void)port;
-    return (HttpServer){0};
+    return (HttpServer){EZ_HTTP_SERVER_UNSUPPORTED_HANDLE};
+}
+
+const char *HttpResponse_text(const HttpResponse *value) {
+    if (!value) return ez_strdup_range("", 0);
+    int64_t size = value->body.size;
+    if (size <= 0 || !value->body.data) return ez_strdup_range("", 0);
+    return ez_strdup_range((const char *)value->body.data, (size_t)size);
 }

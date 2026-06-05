@@ -1,4 +1,5 @@
 // EzLang std/net/tcp Emscripten JS 封装层
+// WebAssembly 目标不支持原生 TCP/UDP 套接字；所有接口明确返回不可用结果。
 mergeInto(LibraryManager.library, {
   tcpConnect: function (ret, host, port) {
     HEAPU8[ret] = 0;

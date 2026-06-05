@@ -179,6 +179,12 @@ OptStr strFromBytes(const Blob *data) {
     return (OptStr){true, ez_strdup_range((const char *)data->data, (size_t)data->size)};
 }
 
+bool strEqual(const char *a, const char *b) {
+    if (!a) a = "";
+    if (!b) b = "";
+    return strcmp(a, b) == 0;
+}
+
 bool strContains(const char *s, const char *needle) {
     if (!s) s = "";
     if (!needle) needle = "";

@@ -1,11 +1,12 @@
 // operators.ez - 验证运算符
 let a = 10 + 5 * 2;
 let b = (a > 10) && (a < 30);
-let c = 100 >> 2;
+let shift: U32 = 2;
+let c = 100 >> shift;
 let e = 0b1010 & 0b1100;
 let f = 0b1010 | 0b0101;
 let g = 0b1010 ^ 0b1100;
-let h = 1 << 3;
+let h = 1 << shift;
 let i = (a == 20) || false;
 let d = 0;
 d += 10;

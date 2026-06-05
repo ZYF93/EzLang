@@ -1,5 +1,6 @@
 // EzLang std/log Emscripten JS 封装层
 (function () {
+  var TARGET_FILE = 3;
   var config = { minLevel: 2, target: 2, includeTimestamp: 1, includeLocation: 1 };
   var PTR = typeof POINTER_SIZE !== 'undefined' ? POINTER_SIZE : 4;
 
@@ -67,13 +68,20 @@
     logSetLevel: function (level) {
       config.minLevel = level | 0;
     },
+    logSetFile: function (path) {
+      // WebAssembly 同步日志不支持本地文件目标。
+      return 0;
+    },
     logWrite: function (level, msg) {
+      if (config.target === TARGET_FILE) config.target = 2;
       write(level | 0, msg, 0, 0, 0, 0);
     },
     logWriteFields: function (level, msg, fields) {
+      if (config.target === TARGET_FILE) config.target = 2;
       write(level | 0, msg, 0, 0, 0, fields);
     },
     logWriteAt: function (level, msg, file, line, column, fields) {
+      if (config.target === TARGET_FILE) config.target = 2;
       write(level | 0, msg, file, line, column, fields);
     },
     logTraceMsg: function (msg) { write(0, msg, 0, 0, 0, 0); },

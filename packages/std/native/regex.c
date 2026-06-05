@@ -19,7 +19,7 @@ typedef struct {
 typedef struct {
     const char *pattern;
     int32_t flags;
-    bool ok;
+    int8_t ok;
 } Regex;
 
 typedef struct {
@@ -71,9 +71,13 @@ static int ez_regex_cflags(int32_t flags) {
 #endif
 }
 
+static bool ez_regex_is_global(const Regex *regex) {
+    return regex && (regex->flags & 4) != 0;
+}
+
 #if !defined(_WIN32)
 static bool ez_compile(const Regex *regex, regex_t *compiled) {
-    if (!regex || !regex->ok || !regex->pattern) return false;
+    if (!regex || !regex->pattern) return false;
     return regcomp(compiled, regex->pattern, ez_regex_cflags(regex->flags)) == 0;
 }
 #endif
@@ -91,7 +95,15 @@ Regex regexCompile(const char *pattern, int32_t flags) {
 }
 
 bool regexIsValid(const Regex *regex) {
-    return regex && regex->ok;
+#if defined(_WIN32)
+    (void)regex;
+    return false;
+#else
+    regex_t compiled;
+    if (!ez_compile(regex, &compiled)) return false;
+    regfree(&compiled);
+    return true;
+#endif
 }
 
 bool regexTest(const Regex *regex, const char *input) {
@@ -198,6 +210,7 @@ StrList regexFindAll(const Regex *regex, const char *input) {
 const char *regexReplace(const Regex *regex, const char *input, const char *replacement) {
     if (!input) input = "";
     if (!replacement) replacement = "";
+#if defined(_WIN32)
     OptRegexMatch found = ez_find_impl(regex, input);
     if (!found.ok) return ez_strdup_safe(input);
     size_t input_len = strlen(input);
@@ -209,6 +222,72 @@ const char *regexReplace(const Regex *regex, const char *input, const char *repl
     memcpy(out + found.value.start, replacement, repl_len);
     strcpy(out + found.value.start + repl_len, input + found.value.end);
     return out;
+#else
+    regex_t compiled;
+    if (!ez_compile(regex, &compiled)) return ez_strdup_safe(input);
+
+    size_t input_len = strlen(input);
+    size_t repl_len = strlen(replacement);
+    size_t cap = input_len + repl_len + 1;
+    char *out = (char *)malloc(cap);
+    if (!out) {
+        regfree(&compiled);
+        return NULL;
+    }
+
+    const char *cursor = input;
+    size_t out_len = 0;
+    bool replaced = false;
+    bool replace_all = ez_regex_is_global(regex);
+    while (*cursor) {
+        regmatch_t match;
+        if (regexec(&compiled, cursor, 1, &match, 0) != 0 || match.rm_so < 0) break;
+
+        size_t prefix_len = (size_t)match.rm_so;
+        size_t need = out_len + prefix_len + repl_len + strlen(cursor + match.rm_eo) + 1;
+        if (need > cap) {
+            while (need > cap) cap *= 2;
+            char *next = (char *)realloc(out, cap);
+            if (!next) {
+                free(out);
+                regfree(&compiled);
+                return NULL;
+            }
+            out = next;
+        }
+        memcpy(out + out_len, cursor, prefix_len);
+        out_len += prefix_len;
+        memcpy(out + out_len, replacement, repl_len);
+        out_len += repl_len;
+        replaced = true;
+
+        size_t advance = match.rm_eo > 0 ? (size_t)match.rm_eo : (size_t)match.rm_so + 1;
+        if (!replace_all) {
+            cursor += match.rm_eo;
+            break;
+        }
+        cursor += advance;
+    }
+
+    if (!replaced) {
+        free(out);
+        regfree(&compiled);
+        return ez_strdup_safe(input);
+    }
+    size_t tail_len = strlen(cursor);
+    if (out_len + tail_len + 1 > cap) {
+        char *next = (char *)realloc(out, out_len + tail_len + 1);
+        if (!next) {
+            free(out);
+            regfree(&compiled);
+            return NULL;
+        }
+        out = next;
+    }
+    memcpy(out + out_len, cursor, tail_len + 1);
+    regfree(&compiled);
+    return out;
+#endif
 }
 
 StrList regexSplit(const Regex *regex, const char *input) {

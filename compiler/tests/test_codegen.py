@@ -13,6 +13,22 @@ from llvmlite import ir, binding
 from codegen.llvm_codegen import compile_source
 
 
+def assert_optional_return_bridge(ir_text: str, name: str, value_type: str, arch: str):
+    """断言 native 小可选返回按目标架构桥接，并还原为 Ez 内部布局。"""
+    internal_type = f"{{i1, {value_type}}}"
+    if value_type == "i32":
+        assert f'declare i64 @"{name}"' in ir_text
+    elif arch == "aarch64":
+        assert f'declare [2 x i64] @"{name}"' in ir_text
+    elif arch == "x86_64":
+        assert f'declare {{i8, {value_type}}} @"{name}"' in ir_text
+    else:
+        assert f'declare {internal_type} @"{name}"' in ir_text
+        return
+    assert f'%"_{name}_abi_ret" = alloca {internal_type}' in ir_text
+    assert f'%"_{name}_ret" = load {internal_type}' in ir_text
+
+
 class TestCodegen:
 
     def test_empty_source(self):
@@ -37,6 +53,23 @@ class TestCodegen:
         assert module is not None
         gv = module.get_global('y')
         assert gv is not None
+
+    def test_variable_decl_without_initializer_zero_initializes(self):
+        """无初始化器的显式类型变量应写入类型零值。"""
+        source = '''
+        const main = (): I32 => {
+            let count: I32;
+            let arr: I32[]?;
+            return arr.ok ? 1 : count;
+        };
+        '''
+        module, errors, _ = compile_source(source)
+        assert module is not None
+        assert len(errors) == 0, f'编译错误: {errors}'
+        ir_text = str(module)
+        binding.parse_assembly(ir_text).verify()
+        assert 'store i32 0, i32* %"count"' in ir_text
+        assert 'store {i1, {i32**, i64, i64, i64}} {i1 0' in ir_text
 
     def test_simple_function(self):
         """简单函数代码生成"""
@@ -152,11 +185,12 @@ class TestCodegen:
         """位运算符 & | ^ << >>"""
         source = '''
 	const test_bitwise = () => {
+	    let shift: U32 = 2;
 	    let a: I32 = 0b1010 & 0b1100;
 	    let b: I32 = 0b1010 | 0b0101;
 	    let c: I32 = 0b1010 ^ 0b1100;
-	    let d: I32 = 1 << 3;
-	    let e: I32 = 100 >> 2;
+	    let d: I32 = 1 << shift;
+	    let e: I32 = 100 >> shift;
 	    return a;
 	};
 	'''
@@ -262,6 +296,25 @@ class TestCodegen:
         func = module.get_global('test_if_block')
         assert func is not None
 
+    def test_if_like_statement_without_else_skips_false_branch(self):
+        """无 else 条件块为假时不应执行 then 块。"""
+        source = '''
+        const test_if_statement = (): I32 => {
+            (false) ? {
+                return 2;
+            };
+            return 0;
+        };
+        '''
+        module, errors, _ = compile_source(source)
+        assert module is not None
+        assert len(errors) == 0, f'编译错误: {errors}'
+        ir_text = str(module)
+        binding.parse_assembly(ir_text).verify()
+        assert 'br i1 0, label %"if_then"' in ir_text
+        assert 'ret i32 2' in ir_text
+        assert 'ret i32 0' in ir_text
+
     def test_struct_decl(self):
         """结构体声明"""
         source = '''
@@ -293,6 +346,24 @@ class TestCodegen:
         func = module.get_global('run')
         assert func is not None
 
+    def test_struct_duck_type_alias_rebuilds_layout_by_fields(self):
+        """结构体赋给同字段形状别名时应按字段名重组布局。"""
+        source = '''
+        type PointShape = { x: I32; y: I32; };
+        struct Point { x: I32; y: I32; };
+        const run = (): I32 => {
+            const p: PointShape = Point(x = 10, y = 20);
+            return p.x + p.y;
+        };
+        '''
+        module, errors, _ = compile_source(source)
+        assert module is not None
+        assert len(errors) == 0, f'编译错误: {errors}'
+        ir_text = str(module)
+        binding.parse_assembly(ir_text).verify()
+        assert '%"PointShape" = type {i32, i32}' in ir_text
+        assert 'insertvalue %"PointShape"' in ir_text
+
     def test_array_literal(self):
         """数组字面量 [1, 2, 3]"""
         source = '''
@@ -307,23 +378,87 @@ class TestCodegen:
         assert func is not None
 
     def test_markup_literal_codegen(self):
-        """标记字面量生成字符串表示"""
+        """无同名工厂函数的标记字面量应返回编译错误。"""
         source = '''
 	const test_markup = () => {
-	    let ui = <text color="blue">
-	        "Welcome"
-	        <div id=1 />
-	        {1 + 2}
-	    </text>;
+	    let ui = <text color="blue" />;
 	    return 0;
 	};
 	'''
         module, errors, _ = compile_source(source)
         assert module is not None
+        assert any("同名工厂函数 'text'" in e for e in errors), f'应有缺少工厂函数错误: {errors}'
+        ir_text = str(module)
+        assert 'c"text\\00"' not in ir_text
+
+    def test_markup_literal_lowers_to_factory_call(self):
+        """存在同名工厂函数时，标记字面量 lower 为普通函数调用。"""
+        source = '''
+        const text = (color: Str, children: Str[]): I32 => {
+            return 7;
+        };
+
+        const test_markup_factory = () => {
+            let ui = <text color="blue">"Welcome"</text>;
+            return ui;
+        };
+        '''
+        module, errors, _ = compile_source(source)
+        assert module is not None
         assert len(errors) == 0, f'编译错误: {errors}'
         ir_text = str(module)
-        assert '_markup_' in ir_text
-        assert 'text' in ir_text
+        binding.parse_assembly(ir_text).verify()
+        assert 'call i32 @"text"' in ir_text
+        assert '_markup_children' in ir_text
+        assert '_markup_attr' in ir_text
+
+    def test_markup_literal_codegen_reports_attr_type_mismatch(self):
+        """直接 codegen 路径也应报告标记属性类型不匹配。"""
+        source = '''
+        const text = (color: I32): I32 => {
+            return color;
+        };
+
+        const test_markup_attr = () => {
+            let ui = <text color="blue" />;
+            return ui;
+        };
+        '''
+        module, errors, _ = compile_source(source)
+        assert module is not None
+        assert any("参数 'color' 类型不匹配" in e for e in errors), errors
+
+    def test_markup_literal_codegen_reports_children_type_mismatch(self):
+        """直接 codegen 路径也应报告 children 类型不匹配。"""
+        source = '''
+        const text = (children: I32[]): I32 => {
+            return 1;
+        };
+
+        const test_markup_children = () => {
+            let ui = <text>"Welcome"</text>;
+            return ui;
+        };
+        '''
+        module, errors, _ = compile_source(source)
+        assert module is not None
+        assert any("参数 'children' 类型不匹配" in e for e in errors), errors
+
+    def test_markup_literal_codegen_reports_children_without_parameter(self):
+        """直接 codegen 路径也应报告未知 children 参数。"""
+        source = '''
+        const text = (): I32 => {
+            return 1;
+        };
+
+        const test_markup_children = () => {
+            let ui = <text>"Welcome"</text>;
+            return ui;
+        };
+        '''
+        module, errors, _ = compile_source(source)
+        assert module is not None
+        assert any("未知参数 'children'" in e for e in errors), errors
 
     def test_array_index(self):
         """数组索引访问 arr[0]"""
@@ -443,6 +578,62 @@ class TestCodegen:
         assert 'unreachable' in ir_text
         assert 'ret i32 0' not in ir_text
 
+    def test_throw_propagates_across_function_call_ir(self):
+        """函数内 throw 应通过异常槽传播到调用点的 catch。"""
+        source = '''
+        const fail = (): Void => {
+            throw Error(code = 17, message = "nested");
+        };
+        const run = (body: () => Void): I32 => {
+            const err = catch { body(); };
+            return err.code;
+        };
+        '''
+        module, errors, _ = compile_source(source)
+        assert module is not None
+        assert len(errors) == 0, f'编译错误: {errors}'
+        ir_text = str(module)
+        assert '@"__ezrt_throw_active" = internal global i1 0' in ir_text
+        assert '@"__ezrt_throw_value" = internal global %"Error"' in ir_text
+        assert 'br i1 %"_throw_active", label %"call_throw", label %"call_continue"' in ir_text
+        assert 'br label %"catch_exit"' in ir_text
+        assert 'load %"Error", %"Error"* @"__ezrt_throw_value"' in ir_text
+
+    def test_throw_propagates_through_flow_parallel_and_race_ir(self):
+        """当前同步 lowering 下 flow/parallel/race 内 throw 也应交给外层 catch。"""
+        source = '''
+        const run = (): I32 => {
+            const flowErr = catch {
+                const value = flow {
+                    throw Error(code = 31, message = "flow");
+                    return 1;
+                };
+            };
+            const parallelErr = catch {
+                const value = parallel {
+                    throw Error(code = 32, message = "parallel");
+                    return 1;
+                };
+            };
+            const raceErr = catch {
+                const value = flow {
+                    return race(pl = [() => { throw Error(code = 33, message = "race"); return 1; }, () => { return 2; }], timeout = 10);
+                };
+            };
+            return flowErr.code + parallelErr.code + raceErr.code;
+        };
+        '''
+        module, errors, _ = compile_source(source)
+        assert module is not None
+        assert len(errors) == 0, f'编译错误: {errors}'
+        ir_text = str(module)
+        assert 'call void @"__ezrt_flow_enter"()' in ir_text
+        assert 'call void @"__ezrt_parallel_enter"()' in ir_text
+        assert 'call i32 @"__ezrt_race"(i32 2, i32 10)' in ir_text
+        assert 'store %"Error"' in ir_text
+        assert 'store i1 1, i1* @"__ezrt_throw_active"' in ir_text
+        assert 'load %"Error", %"Error"* @"__ezrt_throw_value"' in ir_text
+
     def test_default_params(self):
         """函数默认参数"""
         source = '''
@@ -524,6 +715,19 @@ class TestCodegen:
         assert gv is not None
         ir_text = str(module)
         assert '{i32, i8*}' in ir_text
+
+    def test_union_return_uses_variant_tag(self):
+        """函数返回联合类型时，应按返回类型声明顺序写入 tag。"""
+        source = '''
+        const make = (): I32 | Str => {
+            return "ez";
+        };
+        '''
+        module, errors, _ = compile_source(source)
+        assert module is not None
+        assert len(errors) == 0, f'编译错误: {errors}'
+        ir_text = str(module)
+        assert 'insertvalue {i32, i8*} undef, i32 1, 0' in ir_text
 
     def test_optional_unwrap(self):
         """可选拆包 expr? 提取值"""
@@ -695,6 +899,40 @@ class TestCodegen:
         func = module.get_global('run')
         assert func is not None
 
+    def test_simd_vector_scalar_broadcast(self):
+        """SIMD 向量与标量混合运算时应广播标量。"""
+        source = '''
+        const run = (): Vec<I32>[4] => {
+            let a = Vec[1, 2, 3, 4];
+            return a + 2;
+        };
+        '''
+        module, errors, _ = compile_source(source)
+        assert module is not None
+        assert len(errors) == 0, f'编译错误: {errors}'
+        ir_text = str(module)
+        binding.parse_assembly(ir_text).verify()
+        assert 'add <4 x i32>' in ir_text
+        assert ir_text.count('insertelement <4 x i32>') >= 4
+
+    def test_simd_vector_comparison_mask(self):
+        """SIMD 向量比较应生成向量 mask。"""
+        source = '''
+        const run = () => {
+            let a = Vec[1, 2, 3, 4];
+            let b = Vec[2, 2, 2, 2];
+            let mask = a < b;
+            return 0;
+        };
+        '''
+        module, errors, _ = compile_source(source)
+        assert module is not None
+        assert len(errors) == 0, f'编译错误: {errors}'
+        ir_text = str(module)
+        binding.parse_assembly(ir_text).verify()
+        assert 'icmp slt <4 x i32>' in ir_text
+        assert '<4 x i1>' in ir_text
+
     def test_struct_value_copy(self):
         """结构体值语义拷贝（let p2 = p1; 拷贝全部字段）"""
         source = '''
@@ -809,6 +1047,83 @@ class TestCodegen:
         func = module.get_global('run')
         assert func is not None
 
+    def test_generic_function_infers_type_args_from_named_arguments(self):
+        """泛型函数调用可从命名实参推导类型参数。"""
+        source = '''
+        const id<T> = (x: T): T => {
+            return x;
+        };
+
+        const run = () => {
+            let n = id(x = 42);
+            let s = id(x = "ez");
+            return n;
+        };
+        '''
+        module, errors, _ = compile_source(source)
+        assert module is not None
+        assert len(errors) == 0, f'编译错误: {errors}'
+        assert module.get_global('id_I32') is not None
+        assert module.get_global('id_Str') is not None
+
+    def test_generic_struct_explicit_args_monomorphize_layout(self):
+        """显式泛型结构体实参应生成具体字段布局。"""
+        source = '''
+        struct Pair<T, U> { first: T; second: U; };
+        const run = (): I32 => {
+            const p = Pair<I32, Str>(first = 42, second = "ez");
+            return p.first;
+        };
+        '''
+        module, errors, _ = compile_source(source)
+        assert module is not None
+        assert len(errors) == 0, f'编译错误: {errors}'
+        ir_text = str(module)
+        binding.parse_assembly(ir_text).verify()
+        assert '%"Pair_I32_Str" = type {i32, i8*}' in ir_text
+        assert '@"run"' in ir_text
+
+    def test_generic_struct_infers_type_args_from_constructor_fields(self):
+        """泛型结构体构造可从字段值推导具体布局。"""
+        source = '''
+        struct Pair<T, U> { first: T; second: U; };
+        const run = (): I32 => {
+            const p = Pair(first = 42, second = "ez");
+            return p.first;
+        };
+        '''
+        module, errors, _ = compile_source(source)
+        assert module is not None
+        assert len(errors) == 0, f'编译错误: {errors}'
+        ir_text = str(module)
+        binding.parse_assembly(ir_text).verify()
+        assert '%"Pair_I32_Str" = type {i32, i8*}' in ir_text
+        assert 'getelementptr inbounds %"Pair_I32_Str"' in ir_text
+
+    def test_generic_struct_method_monomorphizes_for_concrete_struct(self):
+        """泛型结构体方法应随具体结构体类型单态化。"""
+        source = '''
+        struct Pair<T, U> {
+            first: T;
+            second: U;
+            swap = (this: Pair<T, U>): Pair<U, T> => {
+                return Pair<U, T>(first = this.second, second = this.first);
+            };
+        };
+        const run = (): I32 => {
+            const p = Pair(first = 42, second = "ez");
+            const swapped = p.swap();
+            return swapped.second;
+        };
+        '''
+        module, errors, _ = compile_source(source)
+        assert module is not None
+        assert len(errors) == 0, f'编译错误: {errors}'
+        ir_text = str(module)
+        binding.parse_assembly(ir_text).verify()
+        assert 'define %"Pair_Str_I32" @"Pair_I32_Str_swap"' in ir_text
+        assert 'call %"Pair_Str_I32" @"Pair_I32_Str_swap"' in ir_text
+
     def test_dict_literal(self):
         """字典字面量 { key: Type = value }"""
         source = '''
@@ -903,7 +1218,8 @@ class TestCodegen:
         ir_text = str(module)
         assert '@"__ezrt_race"' in ir_text
         assert 'call i32 @"__ezrt_race"(i32 2, i32 10)' in ir_text
-        assert 'store i32 1, i32* %"_race_result"' in ir_text
+        assert 'define i32 @"__ez_race_branch_' in ir_text
+        assert 'call i32 @"__ezrt_race_i32"' in ir_text
         assert 'call i32 @"race"' not in ir_text
 
     def test_typeof_expr(self):
@@ -936,6 +1252,22 @@ class TestCodegen:
         ir_text = str(module)
         assert 'ret i32 0' not in ir_text
         assert 'ret i32' in ir_text
+
+    def test_typeof_struct_value_supports_bitmask_comparison(self):
+        """typeof err & Error == Error 应按 TypeID 位与比较生成 IR。"""
+        source = '''
+        const run = (): Bool => {
+            const err = Error(code = 1, message = "x");
+            return typeof err & Error == Error;
+        };
+        '''
+        module, errors, _ = compile_source(source)
+        assert module is not None
+        assert len(errors) == 0, f'编译错误: {errors}'
+        ir_text = str(module)
+        assert 'and i32' in ir_text
+        assert 'icmp' in ir_text
+        assert 'ret i1 0' not in ir_text
 
     def test_comprehensive_module(self):
         """综合测试：结构体、方法、可选类型、泛型、管道、字典"""
@@ -1024,6 +1356,9 @@ class TestCodegen:
         ir_text = str(module)
         # 应包含 llvm.memcpy 调用，且不保留 copy 外部符号
         assert 'llvm.memcpy' in ir_text, f'未找到 llvm.memcpy 调用:\n{ir_text}'
+        assert 'getelementptr inbounds %"Blob", %"Blob"* %"dst.1", i32 0, i32 0' in ir_text
+        assert 'getelementptr inbounds %"Blob", %"Blob"* %"src.1", i32 0, i32 0' in ir_text
+        assert 'bitcast %"Blob"' not in ir_text
         assert '@"copy"' not in ir_text
 
     def test_stdlib_mem_set(self):
@@ -1041,7 +1376,27 @@ class TestCodegen:
         ir_text = str(module)
         # 应包含 llvm.memset 调用，且不保留 set 外部符号
         assert 'llvm.memset' in ir_text, f'未找到 llvm.memset 调用:\n{ir_text}'
+        assert 'getelementptr inbounds %"Blob", %"Blob"* %"dst.1", i32 0, i32 0' in ir_text
+        assert 'bitcast %"Blob"' not in ir_text
         assert '@"set"' not in ir_text
+
+    def test_stdlib_mem_set_alloc_raw_uses_blob_data(self):
+        """allocRaw 返回的 Blob 值传给 set 时，应写入 Blob.data 指向的字节。"""
+        source = '''
+        from "./std/mem.ez" import { allocRaw, set };
+
+        const do_set = (): Void => {
+            const buf = allocRaw(size = 1);
+            return set(dst = buf, value = 255, count = 1);
+        };
+        '''
+        module, errors, _ = compile_source(source)
+        assert module is not None
+        assert len(errors) == 0, f'编译错误: {errors}'
+        ir_text = str(module)
+        assert 'getelementptr inbounds %"Blob", %"Blob"* %"buf", i32 0, i32 0' in ir_text
+        assert 'llvm.memset' in ir_text
+        assert 'bitcast %"Blob"' not in ir_text
 
     def test_member_assignment_and_compound_assignment(self):
         """结构体字段赋值和复合赋值应写回字段。"""
@@ -1086,12 +1441,13 @@ class TestCodegen:
         """U* 整数除法、取余、右移应使用无符号 LLVM 指令。"""
         source = '''
         const calc = (a: U32, b: U32): U32 => {
+            let shift: U32 = 1;
             let x: U32 = a / b;
             let y: U32 = a % b;
-            let z: U32 = a >> 1;
+            let z: U32 = a >> shift;
             x /= b;
             y %= b;
-            z >>= 1;
+            z >>= shift;
             return x + y + z;
         };
         '''
@@ -1107,6 +1463,41 @@ class TestCodegen:
         assert 'srem i32' not in ir_text
         assert 'ashr i32' not in ir_text
         assert 'store i32 %"_assign_value"' in ir_text
+
+    def test_unsigned_bitwise_results_keep_logical_shift(self):
+        """U* 位运算表达式结果继续按无符号值生成逻辑右移。"""
+        source = '''
+        const calc = (a: U32, b: U32, shift: U32): U32 => {
+            let x: U32 = (a & b) >> shift;
+            let y: U32 = (a | b) >> shift;
+            let z: U32 = (a ^ b) >> shift;
+            x &= b;
+            x >>= shift;
+            return x + y + z;
+        };
+        '''
+        module, errors, _ = compile_source(source)
+        assert module is not None
+        assert len(errors) == 0, f'编译错误: {errors}'
+        ir_text = str(module)
+        binding.parse_assembly(ir_text).verify()
+        assert ir_text.count('lshr i32') >= 4
+        assert 'ashr i32' not in ir_text
+
+    def test_unsigned_relational_ops_use_unsigned_icmp(self):
+        """U* 关系比较应使用无符号 icmp。"""
+        source = '''
+        const less = (a: U32, b: U32): Bool => {
+            return a < b;
+        };
+        '''
+        module, errors, _ = compile_source(source)
+        assert module is not None
+        assert len(errors) == 0, f'编译错误: {errors}'
+        ir_text = str(module)
+        binding.parse_assembly(ir_text).verify()
+        assert 'icmp ult i32' in ir_text
+        assert 'icmp slt i32' not in ir_text
 
     def test_stdlib_mem_error_codes(self):
         """std/mem 错误码常量"""
@@ -1151,7 +1542,7 @@ class TestCodegen:
             return;
         };
         '''
-        module, errors, libs = compile_source(source, compile_target='linux')
+        module, errors, libs = compile_source(source, compile_target='linux', target_arch='x86_64')
         assert module is not None
         assert len(errors) == 0, f'编译错误: {errors}'
         assert str(STD_ROOT / 'native' / 'io.c') in libs
@@ -1184,7 +1575,7 @@ class TestCodegen:
             return os_name;
         };
         '''
-        module, errors, libs = compile_source(source, compile_target='linux')
+        module, errors, libs = compile_source(source, compile_target='linux', target_arch='x86_64')
         assert module is not None
         assert len(errors) == 0, f'编译错误: {errors}'
         assert libs == [str(STD_ROOT / 'native' / 'os.c')]
@@ -1222,7 +1613,7 @@ class TestCodegen:
             return ok;
         };
         '''
-        module, errors, libs = compile_source(source, compile_target='linux')
+        module, errors, libs = compile_source(source, compile_target='linux', target_arch='x86_64')
         assert module is not None
         assert len(errors) == 0, f'编译错误: {errors}'
         assert libs == [str(STD_ROOT / 'native' / 'fs.c')]
@@ -1267,7 +1658,7 @@ class TestCodegen:
             return 0;
         };
         '''
-        module, errors, libs = compile_source(source, compile_target='linux')
+        module, errors, libs = compile_source(source, compile_target='linux', target_arch='x86_64')
         assert module is not None
         assert len(errors) == 0, f'编译错误: {errors}'
         assert libs == [str(STD_ROOT / 'native' / 'path.c')]
@@ -1322,7 +1713,7 @@ class TestCodegen:
             return 0;
         };
         '''
-        module, errors, libs = compile_source(source, compile_target='linux')
+        module, errors, libs = compile_source(source, compile_target='linux', target_arch='x86_64')
         assert module is not None
         assert len(errors) == 0, f'编译错误: {errors}'
         assert libs == [str(STD_ROOT / 'native' / 'str.c')]
@@ -1386,7 +1777,7 @@ class TestCodegen:
             return abs32;
         };
         '''
-        module, errors, libs = compile_source(source, compile_target='linux')
+        module, errors, libs = compile_source(source, compile_target='linux', target_arch='x86_64')
         assert module is not None
         assert len(errors) == 0, f'编译错误: {errors}'
         assert libs == [str(STD_ROOT / 'native' / 'math.c'), 'm']
@@ -1397,8 +1788,16 @@ class TestCodegen:
                      'mathMulI64Checked', 'mathDivI64Checked', 'mathF64ToI32', 'mathF64ToI64', 'mathI64ToF64']:
             assert module.get_global(name) is not None
         ir_text = str(module)
-        assert 'declare {i1, i64} @"mathAddI64Checked"' in ir_text
-        assert 'declare {i1, i32} @"mathF64ToI32"' in ir_text
+        assert_optional_return_bridge(ir_text, 'mathAddI64Checked', 'i64', 'x86_64')
+        assert_optional_return_bridge(ir_text, 'mathF64ToI32', 'i32', 'x86_64')
+        assert_optional_return_bridge(ir_text, 'mathF64ToI64', 'i64', 'x86_64')
+
+        aarch64_module, aarch64_errors, _ = compile_source(source, compile_target='linux', target_arch='aarch64')
+        assert aarch64_module is not None
+        assert len(aarch64_errors) == 0, f'编译错误: {aarch64_errors}'
+        aarch64_ir = str(aarch64_module)
+        assert_optional_return_bridge(aarch64_ir, 'mathAddI64Checked', 'i64', 'aarch64')
+        assert_optional_return_bridge(aarch64_ir, 'mathF64ToI64', 'i64', 'aarch64')
 
     def test_stdlib_math_target_filter(self):
         """std/math extern 应按目标过滤"""
@@ -1431,7 +1830,7 @@ class TestCodegen:
             return 0;
         };
         '''
-        module, errors, libs = compile_source(source, compile_target='linux')
+        module, errors, libs = compile_source(source, compile_target='linux', target_arch='x86_64')
         assert module is not None
         assert len(errors) == 0, f'编译错误: {errors}'
         assert libs == [str(STD_ROOT / 'native' / 'random.c')]
@@ -1445,7 +1844,12 @@ class TestCodegen:
         assert 'declare i64 @"randomNextU64"' in ir_text
         assert 'declare %"Blob" @"randomShuffleBytes"' in ir_text
         assert 'declare void @"randomSecureBytes"({i1, %"Blob"}* sret({i1, %"Blob"})' in ir_text
-        assert 'declare {i1, i64} @"randomSecureU64"' in ir_text
+        assert_optional_return_bridge(ir_text, 'randomSecureU64', 'i64', 'x86_64')
+
+        aarch64_module, aarch64_errors, _ = compile_source(source, compile_target='linux', target_arch='aarch64')
+        assert aarch64_module is not None
+        assert len(aarch64_errors) == 0, f'编译错误: {aarch64_errors}'
+        assert_optional_return_bridge(str(aarch64_module), 'randomSecureU64', 'i64', 'aarch64')
 
     def test_stdlib_random_target_filter(self):
         """std/random extern 应按目标过滤"""
@@ -1577,7 +1981,7 @@ class TestCodegen:
             return 0;
         };
         '''
-        module, errors, libs = compile_source(source, compile_target='linux')
+        module, errors, libs = compile_source(source, compile_target='linux', target_arch='x86_64')
         assert module is not None
         assert len(errors) == 0, f'编译错误: {errors}'
         assert libs == [str(STD_ROOT / 'native' / 'process.c')]
@@ -1591,16 +1995,23 @@ class TestCodegen:
         assert 'declare void @"processSpawn"({i1, %"Process"}* sret({i1, %"Process"})' in ir_text
         assert 'declare void @"processWait"({i1, %"ProcessResult"}* sret({i1, %"ProcessResult"})' in ir_text
         assert 'declare i1 @"processTerminate"(%"Process"*' in ir_text
-        assert 'declare {i1, i8*} @"processCurrentPath"' in ir_text
+        assert_optional_return_bridge(ir_text, 'processCurrentPath', 'i8*', 'x86_64')
+
+        aarch64_module, aarch64_errors, _ = compile_source(source, compile_target='linux', target_arch='aarch64')
+        assert aarch64_module is not None
+        assert len(aarch64_errors) == 0, f'编译错误: {aarch64_errors}'
+        assert_optional_return_bridge(str(aarch64_module), 'processCurrentPath', 'i8*', 'aarch64')
 
     def test_stdlib_process_target_filter(self):
         """std/process extern 应覆盖桌面、移动端与 emcc 目标"""
         source = 'from "./std/process.ez" import { processCurrentPath };'
         _, _, linux_libs = compile_source(source, compile_target='linux')
+        _, _, windows_libs = compile_source(source, compile_target='windows')
         _, _, android_libs = compile_source(source, compile_target='android')
         _, _, ios_libs = compile_source(source, compile_target='ios')
         _, _, emcc_libs = compile_source(source, compile_target='emcc')
         assert linux_libs == [str(STD_ROOT / 'native' / 'process.c')]
+        assert windows_libs == [str(STD_ROOT / 'native' / 'process.c')]
         assert android_libs == [str(STD_ROOT / 'native' / 'process.c')]
         assert ios_libs == [str(STD_ROOT / 'native' / 'process.c')]
         assert emcc_libs == [str(STD_ROOT / 'emcc' / 'process.js')]
@@ -1637,7 +2048,7 @@ class TestCodegen:
             return 0;
         };
         '''
-        module, errors, libs = compile_source(source, compile_target='linux')
+        module, errors, libs = compile_source(source, compile_target='linux', target_arch='x86_64')
         assert module is not None
         assert len(errors) == 0, f'编译错误: {errors}'
         assert libs == [str(STD_ROOT / 'native' / 'uri.c')]
@@ -1649,8 +2060,16 @@ class TestCodegen:
         assert '%"UriParts" = type' in ir_text
         assert 'declare void @"uriParse"({i1, %"UriParts"}* sret({i1, %"UriParts"})' in ir_text
         assert 'declare i8* @"uriBuild"(%"UriParts"*' in ir_text
-        assert 'declare {i1, i8*} @"uriScheme"' in ir_text
-        assert 'declare {i1, i32} @"uriPort"' in ir_text
+        assert_optional_return_bridge(ir_text, 'uriScheme', 'i8*', 'x86_64')
+        assert_optional_return_bridge(ir_text, 'uriHost', 'i8*', 'x86_64')
+        assert_optional_return_bridge(ir_text, 'uriPort', 'i32', 'x86_64')
+
+        aarch64_module, aarch64_errors, _ = compile_source(source, compile_target='linux', target_arch='aarch64')
+        assert aarch64_module is not None
+        assert len(aarch64_errors) == 0, f'编译错误: {aarch64_errors}'
+        aarch64_ir = str(aarch64_module)
+        assert_optional_return_bridge(aarch64_ir, 'uriScheme', 'i8*', 'aarch64')
+        assert_optional_return_bridge(aarch64_ir, 'uriHost', 'i8*', 'aarch64')
 
     def test_stdlib_uri_target_filter(self):
         """std/uri extern 应按目标过滤"""
@@ -1679,7 +2098,7 @@ class TestCodegen:
             return 0;
         };
         '''
-        module, errors, libs = compile_source(source, compile_target='linux')
+        module, errors, libs = compile_source(source, compile_target='linux', target_arch='x86_64')
         assert module is not None
         assert len(errors) == 0, f'编译错误: {errors}'
         assert libs == [str(STD_ROOT / 'native' / 'debug.c')]
@@ -1689,7 +2108,12 @@ class TestCodegen:
         assert 'declare void @"debugPrint"' in ir_text
         assert 'declare i8* @"debugLocation"' in ir_text
         assert 'declare i8* @"debugHex"(%"Blob"*' in ir_text
-        assert 'declare {i1, i8*} @"debugStack"' in ir_text
+        assert_optional_return_bridge(ir_text, 'debugStack', 'i8*', 'x86_64')
+
+        aarch64_module, aarch64_errors, _ = compile_source(source, compile_target='linux', target_arch='aarch64')
+        assert aarch64_module is not None
+        assert len(aarch64_errors) == 0, f'编译错误: {aarch64_errors}'
+        assert_optional_return_bridge(str(aarch64_module), 'debugStack', 'i8*', 'aarch64')
 
     def test_stdlib_debug_target_filter(self):
         """std/debug extern 应按目标过滤"""
@@ -1705,8 +2129,8 @@ class TestCodegen:
         """std/log 结构化日志库导入"""
         source = '''
         from "./std/log.ez" import {
-            logTrace, logDebug, logInfo, logWarn, logError, logTargetStderr, LogConfig,
-            logDefaultConfig, logConfigure, logSetLevel, logWrite, logWriteFields, logWriteAt,
+            logTrace, logDebug, logInfo, logWarn, logError, logTargetStderr, logTargetFile, LogConfig,
+            logDefaultConfig, logConfigure, logSetLevel, logSetFile, logWrite, logWriteFields, logWriteAt,
             logInfoMsg, logWarnMsg, logErrorMsg
         };
 
@@ -1714,6 +2138,8 @@ class TestCodegen:
             const cfg = logDefaultConfig();
             logConfigure(config = LogConfig(minLevel = logDebug, target = logTargetStderr, includeTimestamp = true, includeLocation = true));
             logSetLevel(level = logTrace);
+            const file_ok = logSetFile(path = "build.log");
+            logConfigure(config = LogConfig(minLevel = logDebug, target = logTargetFile, includeTimestamp = true, includeLocation = true));
             logWrite(level = logInfo, msg = "hello");
             logWriteFields(level = logWarn, msg = "warn", fields = ["key", "value"]);
             logWriteAt(level = logError, msg = "err", file = "main.ez", line = 1, column = 2, fields = ["code", "1"]);
@@ -1723,17 +2149,18 @@ class TestCodegen:
             return 0;
         };
         '''
-        module, errors, libs = compile_source(source, compile_target='linux')
+        module, errors, libs = compile_source(source, compile_target='linux', target_arch='x86_64')
         assert module is not None
         assert len(errors) == 0, f'编译错误: {errors}'
         assert libs == [str(STD_ROOT / 'native' / 'log.c')]
-        for name in ['logDefaultConfig', 'logConfigure', 'logSetLevel', 'logWrite', 'logWriteFields',
+        for name in ['logDefaultConfig', 'logConfigure', 'logSetLevel', 'logSetFile', 'logWrite', 'logWriteFields',
                      'logWriteAt', 'logInfoMsg', 'logWarnMsg', 'logErrorMsg']:
             assert module.get_global(name) is not None
         ir_text = str(module)
         assert '%"LogConfig" = type' in ir_text
         assert 'declare %"LogConfig" @"logDefaultConfig"' in ir_text
         assert 'declare void @"logConfigure"(%"LogConfig"*' in ir_text
+        assert 'declare i1 @"logSetFile"' in ir_text
         assert 'declare void @"logWriteFields"(i32' in ir_text
 
     def test_stdlib_log_target_filter(self):
@@ -1745,6 +2172,43 @@ class TestCodegen:
         assert linux_libs == [str(STD_ROOT / 'native' / 'log.c')]
         assert android_libs == [str(STD_ROOT / 'native' / 'log.c')]
         assert emcc_libs == [str(STD_ROOT / 'emcc' / 'log.js')]
+
+    def test_stdlib_log_compile_min_level_drops_static_low_level_calls(self):
+        """std/log 编译期级别过滤应删除静态低级别调用。"""
+        source = '''
+        from "./std/log.ez" import {
+            logTrace, logWarn, logError, logDebugMsg, logInfoMsg, logWarnMsg, logWrite
+        };
+
+        const check_log = (): I32 => {
+            logDebugMsg(msg = "drop-debug");
+            logInfoMsg(msg = "drop-info");
+            logWarnMsg(msg = "keep-warn");
+            logWrite(level = logTrace, msg = "drop-write");
+            logWrite(level = logError, msg = "keep-write");
+            logWrite(level = logWarn, msg = "keep-warn-write");
+            return 0;
+        };
+        '''
+        module, errors, _ = compile_source(
+            source,
+            compile_target='linux',
+            target_arch='x86_64',
+            log_compile_min_level=3,
+        )
+
+        assert module is not None
+        assert len(errors) == 0, f'编译错误: {errors}'
+        ir_text = str(module)
+        assert 'drop-debug' not in ir_text
+        assert 'drop-info' not in ir_text
+        assert 'drop-write' not in ir_text
+        assert 'keep-warn' in ir_text
+        assert 'keep-write' in ir_text
+        assert 'keep-warn-write' in ir_text
+        assert 'call void @"logDebugMsg"' not in ir_text
+        assert 'call void @"logInfoMsg"' not in ir_text
+        assert ir_text.count('call void @"logWrite"') == 2
 
     def test_stdlib_regex_import(self):
         """std/regex 轻量正则库导入"""
@@ -1872,17 +2336,26 @@ class TestCodegen:
         source = '''
         from "./std/test.ez" import {
             testAssert, testEqualI64, testNotEqualI64, testEqualStr,
-            testSkip, testRegister, testPassed, testFailed, testSkipped, testReset
+            testSkip, testThrows, testRegister, testRegisterParam, testCount, testName,
+            testPassed, testFailed, testSkipped, testReset
+        };
+
+        const fail = (): Void => {
+            throw Error(code = 7, message = "boom");
         };
 
         const check_test = (): I32 => {
             testReset();
             testRegister(name = "check_test");
+            testRegisterParam(name = "case", param = "1");
             testAssert(condition = true, msg = "truth");
             testEqualI64(actual = 42, expected = 42, msg = "i64");
             testNotEqualI64(actual = 1, expected = 2, msg = "neq");
             testEqualStr(actual = "ez", expected = "ez", msg = "str");
+            testThrows(body = fail, expectedCode = 7, msg = "throws");
             testSkip(msg = "later");
+            const count = testCount();
+            const name = testName(index = 1);
             const passed = testPassed();
             const failed = testFailed();
             const skipped = testSkipped();
@@ -1893,8 +2366,9 @@ class TestCodegen:
         assert module is not None
         assert len(errors) == 0, f'编译错误: {errors}'
         assert libs == [str(STD_ROOT / 'native' / 'test.c')]
-        for name in ['testAssert', 'testEqualI64', 'testNotEqualI64', 'testEqualStr', 'testSkip', 'testRegister', 'testPassed', 'testFailed', 'testSkipped', 'testReset']:
+        for name in ['testAssert', 'testEqualI64', 'testNotEqualI64', 'testEqualStr', 'testSkip', 'testRegister', 'testRegisterParam', 'testCount', 'testName', 'testPassed', 'testFailed', 'testSkipped', 'testReset']:
             assert module.get_global(name) is not None
+        assert module.get_global('testThrows') is not None
 
     def test_stdlib_test_target_filter(self):
         """std/test extern 应按目标过滤"""
@@ -1907,17 +2381,21 @@ class TestCodegen:
         assert emcc_libs == [str(STD_ROOT / 'emcc' / 'test.js')]
 
     def test_stdlib_stream_import(self):
-        """std/stream 内存流导入"""
+        """std/stream 流 ABI 导入"""
         source = '''
         from "./std/stream.ez" import {
-            streamKindMemory, Stream, streamFromBlob, streamRead, streamWrite,
-            streamToBlob, streamCopy, streamFlush, streamClose
+            streamKindMemory, streamKindFileRead, streamKindFileWrite, streamKindTcp, Stream,
+            streamFromBlob, streamFromTcpHandle, streamOpenFileRead, streamOpenFileWrite,
+            streamRead, streamWrite, streamToBlob, streamCopy, streamFlush, streamClose
         };
 
         const check_stream = (): I64 => {
             const data = Blob(data = "hello", size = 5);
             const src = streamFromBlob(data = data);
+            const tcp = streamFromTcpHandle(handle = 0);
             const dst = streamFromBlob(data = Blob(data = "", size = 0));
+            const input = streamOpenFileRead(path = "input.bin");
+            const output = streamOpenFileWrite(path = "output.bin");
             const first = streamRead(stream = src.value, maxBytes = 2);
             const written = streamWrite(stream = dst.value, data = first.value);
             const copied = streamCopy(dst = dst.value, src = src.value, bufferSize = 4);
@@ -1934,6 +2412,9 @@ class TestCodegen:
         ir_text = str(module)
         assert '%"Stream" = type {i64, i32}' in ir_text
         assert 'declare void @"streamFromBlob"({i1, %"Stream"}* sret({i1, %"Stream"})' in ir_text
+        assert 'declare %"Stream" @"streamFromTcpHandle"(i64' in ir_text
+        assert 'declare void @"streamOpenFileRead"({i1, %"Stream"}* sret({i1, %"Stream"})' in ir_text
+        assert 'declare void @"streamOpenFileWrite"({i1, %"Stream"}* sret({i1, %"Stream"})' in ir_text
         assert 'declare void @"streamRead"({i1, %"Blob"}* sret({i1, %"Blob"})' in ir_text
         for name in ['streamWrite', 'streamToBlob', 'streamCopy', 'streamFlush', 'streamClose']:
             assert module.get_global(name) is not None
@@ -2022,30 +2503,64 @@ class TestCodegen:
             return i;
         };
         '''
-        module, errors, libs = compile_source(source, compile_target='linux')
+        module, errors, libs = compile_source(source, compile_target='linux', target_arch='x86_64')
         assert module is not None
         assert len(errors) == 0, f'编译错误: {errors}'
         assert libs == [str(STD_ROOT / 'native' / 'fmt.c')]
         for name in ['parseInt', 'parseI64', 'parseF64', 'format', 'b64Encode', 'b64Decode', 'urlEncode', 'urlDecode']:
             assert module.get_global(name) is not None
+        ir_text = str(module)
+        assert_optional_return_bridge(ir_text, 'parseInt', 'i32', 'x86_64')
+        assert_optional_return_bridge(ir_text, 'parseI64', 'i64', 'x86_64')
+        assert_optional_return_bridge(ir_text, 'parseF64', 'double', 'x86_64')
+        assert_optional_return_bridge(ir_text, 'urlDecode', 'i8*', 'x86_64')
+
+        aarch64_module, aarch64_errors, _ = compile_source(source, compile_target='linux', target_arch='aarch64')
+        assert aarch64_module is not None
+        assert len(aarch64_errors) == 0, f'编译错误: {aarch64_errors}'
+        aarch64_ir = str(aarch64_module)
+        assert_optional_return_bridge(aarch64_ir, 'parseI64', 'i64', 'aarch64')
+        assert_optional_return_bridge(aarch64_ir, 'parseF64', 'double', 'aarch64')
+        assert_optional_return_bridge(aarch64_ir, 'urlDecode', 'i8*', 'aarch64')
 
     def test_stdlib_fmt_generic_import(self):
         """std/fmt 泛型编码声明可导入"""
         source = '''
         from "./std/fmt.ez" import { toString, jsonStringify, jsonParse, msgpackEncode, msgpackDecode };
+
+        const check_msgpack = (): Str => {
+            const b = msgpackDecode<Bool>(data = msgpackEncode<Bool>(data = true));
+            const s = msgpackDecode<Str>(data = msgpackEncode<Str>(data = "EzLang"));
+            const f = msgpackDecode<F64>(data = msgpackEncode<F64>(data = 3.0));
+            return s;
+        };
         '''
         module, errors, _ = compile_source(source)
         assert module is not None
         assert len(errors) == 0, f'编译错误: {errors}'
+        for name in ['msgpackEncode_I1', 'msgpackDecode_I1', 'msgpackEncode_Str', 'msgpackDecode_Str', 'msgpackEncode_F64', 'msgpackDecode_F64']:
+            assert module.get_global(name) is not None
+
+    def test_stdlib_fmt_emcc_to_string_f32_declares_wrapper(self):
+        """emcc 平台的 toString<F32> 应有对应 JS 封装符号。"""
+        source = '''
+        from "./std/fmt.ez" import { toString };
+        let text = toString<F32>(value = 3.5);
+        '''
+        module, errors, libs = compile_source(source, compile_target='emcc')
+        assert module is not None
+        assert len(errors) == 0, f'编译错误: {errors}'
+        assert libs == [str(STD_ROOT / 'emcc' / 'fmt.js')]
+        assert module.get_global('toString_F32') is not None
 
     def test_stdlib_net_http_import(self):
         """std/net/http 导入"""
         source = '''
         from "./std/net/http.ez" import { Headers, HttpRequest, HttpResponse, fetch, fetchEx };
 
-        const call_http = (): HttpResponse? => {
+        const call_http = (): Str => {
             const resp = fetch(url = "https://example.com");
-            return resp;
+            return resp.ok ? resp.value.text() : "";
         };
         '''
         module, errors, libs = compile_source(source, compile_target='linux')
@@ -2054,10 +2569,12 @@ class TestCodegen:
         assert libs == [str(STD_ROOT / 'native' / 'net' / 'http.c')]
         assert module.get_global('fetch') is not None
         assert module.get_global('fetchEx') is not None
+        assert module.get_global('HttpResponse_text') is not None
         ir_text = str(module)
         assert 'HttpRequest' in ir_text
         assert 'HttpResponse' in ir_text
         assert 'sret({i1, %"HttpResponse"})' in ir_text
+        assert 'call i8* @"HttpResponse_text"' in ir_text
 
     def test_stdlib_net_http_target_filter(self):
         """std/net/http extern 应按目标过滤"""
@@ -2138,6 +2655,30 @@ class TestCodegen:
         assert 'TcpListener' in ir_text
         assert 'UdpSocket' in ir_text
         assert 'sret({i1, %"Blob"})' in ir_text
+
+    def test_stdlib_net_tcp_stream_uses_std_stream_abi(self):
+        """TCP 连接可交给 std/stream 通用函数。"""
+        source = '''
+        from "./std/stream.ez" import { Stream, streamFromTcpHandle, streamRead, streamWrite, streamClose };
+        from "./std/net/tcp.ez" import { TcpConn };
+
+        const use_tcp_stream = (conn: TcpConn): I64 => {
+            const stream = streamFromTcpHandle(handle = conn.handle);
+            const written = streamWrite(stream = stream, data = Blob(data = "ping", size = 4));
+            const chunk = streamRead(stream = stream, maxBytes = 4);
+            const closed = streamClose(stream = stream);
+            return written;
+        };
+        '''
+        module, errors, libs = compile_source(source, compile_target='linux')
+        assert module is not None
+        assert len(errors) == 0, f'编译错误: {errors}'
+        assert libs == [str(STD_ROOT / 'native' / 'stream.c'), str(STD_ROOT / 'native' / 'net' / 'tcp.c')]
+        ir_text = str(module)
+        binding.parse_assembly(ir_text).verify()
+        assert '%"Stream" = type {i64, i32}' in ir_text
+        assert module.get_global('streamFromTcpHandle') is not None
+        assert module.get_global('streamRead') is not None
 
     def test_stdlib_net_tcp_udp_target_filter(self):
         """std/net TCP/UDP extern 应按目标过滤"""
@@ -2295,10 +2836,24 @@ class TestCodegen:
         assert module is not None
         ir_text = str(module)
         assert '__arena_buffer' in ir_text
+        assert '__arena_capacity' in ir_text
         assert '__arena_cursor' in ir_text
         assert '__arena_alloc' in ir_text
         assert '__arena_save' in ir_text
         assert '__arena_restore' in ir_text
+
+    def test_arena_uses_thread_local_expandable_storage(self):
+        """Arena 状态应是线程本地的，并在容量不足时通过 realloc 扩容。"""
+        module, errors, _ = compile_source('let x: I32 = 42;')
+        assert module is not None
+        assert len(errors) == 0, f'编译错误: {errors}'
+        ir_text = str(module)
+        assert '@"__arena_buffer" = internal thread_local global i8* null' in ir_text
+        assert '@"__arena_capacity" = internal thread_local global i64 0' in ir_text
+        assert '@"__arena_cursor" = internal thread_local global i64 0' in ir_text
+        assert 'declare i8* @"realloc"(i8* %".1", i64 %".2")' in ir_text
+        assert 'call i8* @"realloc"' in ir_text
+        assert 'call void @"llvm.trap"()' in ir_text
 
     def test_arena_alloc_is_function(self):
         """__arena_alloc 应为 LLVM 函数"""
@@ -2327,6 +2882,30 @@ class TestCodegen:
         ir_text = str(module)
         assert 'call i64 @"__arena_save"()' in ir_text
         assert 'call void @"__arena_restore"' in ir_text
+
+    def test_arena_restore_before_early_return_ir(self):
+        """块内提前 return 前应恢复当前 Arena 游标。"""
+        source = '''
+        struct Data { val: I32; };
+        const run = (): I32 => {
+            {
+                let d = Data(val = 1);
+                return d.val;
+            }
+            return 0;
+        };
+        '''
+        module, errors, _ = compile_source(source)
+        assert module is not None
+        assert len(errors) == 0, f'编译错误: {errors}'
+        ir_text = str(module)
+        binding.parse_assembly(ir_text).verify()
+        run_ir = ir_text[ir_text.find('define i32 @"run"'):]
+        restore_idx = run_ir.find('call void @"__arena_restore"')
+        ret_idx = run_ir.find('ret i32')
+        assert restore_idx != -1
+        assert ret_idx != -1
+        assert restore_idx < ret_idx
 
     def test_arena_return_aggregate_by_value_ir(self):
         """返回 Arena 聚合值前应 load 成值语义返回"""
@@ -2566,6 +3145,57 @@ class TestCodegen:
         module, errors, _ = compile_source(source)
         assert module is not None
         assert len(errors) == 0, f'编译错误: {errors}'
+
+    def test_dict_index_lookup_uses_requested_key(self):
+        """Dict 索引读取应生成按 key 扫描逻辑。"""
+        source = '''
+        const test = (): Str => {
+            let d = { name = "EzLang", lang = "ez" };
+            return d["lang"];
+        };
+        '''
+        module, errors, _ = compile_source(source)
+        assert module is not None
+        assert len(errors) == 0, f'编译错误: {errors}'
+        ir_text = str(module)
+        binding.parse_assembly(ir_text).verify()
+        assert 'dict_find_cond' in ir_text
+        assert 'dict_lookup_value_val' in ir_text
+
+    def test_dict_index_assignment_upserts_key(self):
+        """Dict 索引赋值应更新已有 key，缺失时插入新 key。"""
+        source = '''
+        const test = (): Str => {
+            let d = { name = "old" };
+            d["name"] = "new";
+            d["lang"] = "EzLang";
+            return d["lang"];
+        };
+        '''
+        module, errors, _ = compile_source(source)
+        assert module is not None
+        assert len(errors) == 0, f'编译错误: {errors}'
+        ir_text = str(module)
+        binding.parse_assembly(ir_text).verify()
+        assert 'dict_upsert_update' in ir_text
+        assert 'dict_upsert_insert' in ir_text
+
+    def test_dynamic_dict_shape_annotation_keeps_codegen_key_type(self):
+        """动态键类型结构注解应传给 Dict 索引 codegen。"""
+        source = '''
+        const test = (): Str => {
+            let d: { [key: I32]: Str } = { [1] = "one" };
+            d[2] = "two";
+            return d[2];
+        };
+        '''
+        module, errors, _ = compile_source(source)
+        assert module is not None
+        assert len(errors) == 0, f'编译错误: {errors}'
+        ir_text = str(module)
+        binding.parse_assembly(ir_text).verify()
+        assert 'dict_find_cond' in ir_text
+        assert 'dict_upsert_insert' in ir_text
 
     def test_p0_documented_syntax_codegen(self):
         """P0 文档语法应能生成 IR 或明确占位 ABI"""

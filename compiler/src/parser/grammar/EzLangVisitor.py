@@ -269,6 +269,16 @@ class EzLangVisitor(ParseTreeVisitor):
         return self.visitChildren(ctx)
 
 
+    # Visit a parse tree produced by EzLangParser#equalityExpression.
+    def visitEqualityExpression(self, ctx:EzLangParser.EqualityExpressionContext):
+        return self.visitChildren(ctx)
+
+
+    # Visit a parse tree produced by EzLangParser#relationalExpression.
+    def visitRelationalExpression(self, ctx:EzLangParser.RelationalExpressionContext):
+        return self.visitChildren(ctx)
+
+
     # Visit a parse tree produced by EzLangParser#bitOrExpression.
     def visitBitOrExpression(self, ctx:EzLangParser.BitOrExpressionContext):
         return self.visitChildren(ctx)
@@ -281,16 +291,6 @@ class EzLangVisitor(ParseTreeVisitor):
 
     # Visit a parse tree produced by EzLangParser#bitAndExpression.
     def visitBitAndExpression(self, ctx:EzLangParser.BitAndExpressionContext):
-        return self.visitChildren(ctx)
-
-
-    # Visit a parse tree produced by EzLangParser#equalityExpression.
-    def visitEqualityExpression(self, ctx:EzLangParser.EqualityExpressionContext):
-        return self.visitChildren(ctx)
-
-
-    # Visit a parse tree produced by EzLangParser#relationalExpression.
-    def visitRelationalExpression(self, ctx:EzLangParser.RelationalExpressionContext):
         return self.visitChildren(ctx)
 
 
@@ -364,6 +364,11 @@ class EzLangVisitor(ParseTreeVisitor):
         return self.visitChildren(ctx)
 
 
+    # Visit a parse tree produced by EzLangParser#ifLikePrimaryExpr.
+    def visitIfLikePrimaryExpr(self, ctx:EzLangParser.IfLikePrimaryExprContext):
+        return self.visitChildren(ctx)
+
+
     # Visit a parse tree produced by EzLangParser#parenExpr.
     def visitParenExpr(self, ctx:EzLangParser.ParenExprContext):
         return self.visitChildren(ctx)
@@ -421,11 +426,6 @@ class EzLangVisitor(ParseTreeVisitor):
 
     # Visit a parse tree produced by EzLangParser#loopPrimaryExpr.
     def visitLoopPrimaryExpr(self, ctx:EzLangParser.LoopPrimaryExprContext):
-        return self.visitChildren(ctx)
-
-
-    # Visit a parse tree produced by EzLangParser#ifLikePrimaryExpr.
-    def visitIfLikePrimaryExpr(self, ctx:EzLangParser.IfLikePrimaryExprContext):
         return self.visitChildren(ctx)
 
 

@@ -20,6 +20,7 @@ export struct UdpSocket {
     handle: I64;
 };
 
+// 原生目标提供阻塞式 TCP/UDP socket；emcc 明确不支持并返回空可选值或失败值。
 export declare const tcpConnect: (host: Str, port: I32) => TcpConn?;
 export declare const tcpListen: (host: Str, port: I32) => TcpListener?;
 export declare const tcpAccept: (listener: TcpListener) => TcpConn?;

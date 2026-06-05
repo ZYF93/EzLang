@@ -13,20 +13,110 @@ from cli import ez
 
 
 def test_e2e_stdlib_documents_exported_declares():
-    """标准库文档应覆盖源码导出的公开 declare 函数。"""
+    """标准库 API 文档应覆盖源码导出的公开符号。"""
     documents = {
         "docs/stdlib-api.md": (ROOT / "docs" / "stdlib-api.md").read_text(encoding="utf-8"),
         "docs/stdlib.md": (ROOT / "docs" / "stdlib.md").read_text(encoding="utf-8"),
     }
-    missing = []
+
+    def compact(signature: str) -> str:
+        return re.sub(r"\s+", "", signature.replace("=>", "->"))
+
+    api_entries = set()
+    for line in documents["docs/stdlib-api.md"].splitlines():
+        match = re.match(r"\s*-\s+`([^`]+)`\s*$", line)
+        if match and "(" in match.group(1) and "->" in match.group(1):
+            api_entries.add(compact(match.group(1)))
+    missing_names = []
+    missing_signatures = []
     for source in sorted((ROOT / "packages" / "std").glob("**/*.ez")):
         text = source.read_text(encoding="utf-8")
-        for match in re.finditer(r"export\s+declare\s+const\s+([A-Za-z_][A-Za-z0-9_]*)", text):
+        for match in re.finditer(r"export\s+struct\s+([A-Z][A-Za-z0-9_]*)\s*\{", text):
             name = match.group(1)
             for doc_name, docs in documents.items():
                 if name not in docs:
-                    missing.append(f"{doc_name} 缺少 {source.relative_to(ROOT)}:{name}")
-    assert not missing, "标准库文档缺少公开接口: " + ", ".join(missing)
+                    missing_names.append(f"{doc_name} 缺少 {source.relative_to(ROOT)}:{name}")
+        for match in re.finditer(r"export\s+(?:const|let)\s+([A-Za-z_][A-Za-z0-9_]*)\s*:", text):
+            name = match.group(1)
+            for doc_name, docs in documents.items():
+                if name not in docs:
+                    missing_names.append(f"{doc_name} 缺少 {source.relative_to(ROOT)}:{name}")
+        for match in re.finditer(r"export\s+declare\s+const\s+([A-Za-z_][A-Za-z0-9_]*)\s*:\s*([^;]+);", text):
+            name = match.group(1)
+            source_sig = match.group(2).strip()
+            if source_sig.startswith("<"):
+                expected = f"{name}{source_sig}".replace("=>", "->")
+            else:
+                expected = f"{name}{source_sig}".replace("=>", "->")
+            for doc_name, docs in documents.items():
+                if name not in docs:
+                    missing_names.append(f"{doc_name} 缺少 {source.relative_to(ROOT)}:{name}")
+            if compact(expected) not in api_entries:
+                missing_signatures.append(f"docs/stdlib-api.md 缺少 {source.relative_to(ROOT)}:{expected}")
+    assert not missing_names, "标准库文档缺少公开接口: " + ", ".join(missing_names)
+    assert not missing_signatures, "标准库 API 文档缺少公开签名: " + ", ".join(missing_signatures)
+
+
+def test_e2e_stdlib_does_not_expose_low_level_concurrency_primitives():
+    """标准库不能公开线程、锁、原子、通道等底层并发接口。"""
+    forbidden = re.compile(r"\b(thread|mutex|rwlock|atomic|channel|condvar|condition)\b", re.I)
+    allowed_names = {"platformHasThreads"}
+    for source in sorted((ROOT / "packages" / "std").glob("**/*.ez")):
+        text = source.read_text(encoding="utf-8")
+        assert not forbidden.search(source.stem), f"标准库不应公开底层并发模块: {source.relative_to(ROOT)}"
+        for match in re.finditer(r"export\s+(?:declare\s+const|const|struct)\s+([A-Za-z_][A-Za-z0-9_]*)", text):
+            name = match.group(1)
+            if name in allowed_names:
+                continue
+            assert not forbidden.search(name), f"标准库不应公开底层并发接口: {source.relative_to(ROOT)}:{name}"
+
+
+def test_e2e_stdlib_time_format_tokens_are_documented():
+    """std/time format 的跨平台格式占位符应写入两份标准库文档。"""
+    for doc_path in [ROOT / "docs" / "stdlib-api.md", ROOT / "docs" / "stdlib.md"]:
+        text = doc_path.read_text(encoding="utf-8")
+        for token in ["YYYY", "MM", "DD", "HH", "SS", "%Y", "%m", "%d", "%H", "%M", "%S"]:
+            assert token in text, f"{doc_path.relative_to(ROOT)} 缺少 time format token {token}"
+        assert "分钟使用 `%M`" in text
+
+
+def test_e2e_stdlib_mem_names_and_error_codes_are_documented():
+    """std/mem 应统一使用 set 名称和正值错误码。"""
+    mem_source = (ROOT / "packages" / "std" / "mem.ez").read_text(encoding="utf-8")
+    docs = [
+        (ROOT / "docs" / "stdlib.md").read_text(encoding="utf-8"),
+        (ROOT / "docs" / "stdlib-api.md").read_text(encoding="utf-8"),
+    ]
+
+    assert "export declare const set" in mem_source
+    assert "export declare const memset" not in mem_source
+    for text in docs:
+        assert "set(dst: Blob" in text or "declare const set:" in text
+        assert "memset(dst" not in text
+        for name, value in [
+            ("errCancel", 1),
+            ("errTimeout", 2),
+            ("errUnsupported", 3),
+            ("errIO", 4),
+            ("errNotFound", 5),
+            ("errPermission", 6),
+        ]:
+            assert re.search(rf"{name}[^\n=]*=\s*{value}\b", mem_source)
+            assert re.search(rf"{name}[^\n=]*=\s*{value}\b", text)
+
+
+def test_e2e_stdlib_capability_matrix_covers_modules():
+    """标准库能力矩阵应覆盖每个公开模块。"""
+    docs = (ROOT / "docs" / "stdlib.md").read_text(encoding="utf-8")
+    assert "## 标准库能力矩阵" in docs
+    modules = []
+    for source in sorted((ROOT / "packages" / "std").glob("**/*.ez")):
+        rel = source.relative_to(ROOT / "packages" / "std").with_suffix("")
+        modules.append("std/" + rel.as_posix())
+    missing = [module for module in modules if f"`{module}`" not in docs]
+    assert not missing, "标准库能力矩阵缺少模块: " + ", ".join(missing)
+    for phrase in ["能力类型说明", "内存规则", "错误规则", "Flow 规则"]:
+        assert phrase in docs
 
 
 def write_project(tmp_path: Path, source: Path):
@@ -51,6 +141,21 @@ dir = "dist/native"
         encoding="utf-8",
     )
     return project_toml
+
+
+def assert_native_optional_return(ir_text: str, name: str, value_type: str):
+    """断言 native 小可选返回值按当前架构桥接，并还原为 Ez 内部布局。"""
+    internal_type = f"{{i1, {value_type}}}"
+    if value_type == "i32":
+        assert f'declare i64 @"{name}"' in ir_text
+    elif ez._native_arch() == "aarch64":
+        assert f'declare [2 x i64] @"{name}"' in ir_text
+    elif ez._native_arch() == "x86_64":
+        assert f'declare {{i8, {value_type}}} @"{name}"' in ir_text
+    else:
+        assert f'declare {internal_type} @"{name}"' in ir_text
+        return
+    assert f'%"_{name}_abi_ret" = alloca {internal_type}' in ir_text
 
 
 def test_e2e_hello_builds_and_runs(tmp_path):
@@ -94,7 +199,19 @@ def test_e2e_std_io_imports_and_builds(tmp_path):
     assert 'declare void @"print"' in ir_text
     assert 'declare void @"println"' in ir_text
     assert 'declare void @"error"' in ir_text
-    assert 'declare {i1, i8*} @"readLine"' in ir_text
+    assert_native_optional_return(ir_text, "readLine", "i8*")
+
+
+def test_e2e_native_io_wrapper_uses_mobile_logs_and_empty_mobile_stdin():
+    io_c = (ROOT / "packages" / "std" / "native" / "io.c").read_text(encoding="utf-8")
+    assert "__android_log_write" in io_c
+    assert "ANDROID_LOG_INFO" in io_c
+    assert "ANDROID_LOG_ERROR" in io_c
+    assert "os_log_with_type" in io_c
+    assert "OS_LOG_TYPE_INFO" in io_c
+    assert "OS_LOG_TYPE_ERROR" in io_c
+    assert "#if defined(__ANDROID__) || (defined(__APPLE__) && TARGET_OS_IPHONE)" in io_c
+    assert "return (OptStr){false, NULL};" in io_c
 
 
 def test_e2e_std_fs_imports_and_builds(tmp_path):
@@ -141,7 +258,7 @@ def test_e2e_std_path_imports_and_builds(tmp_path):
     assert 'declare i8* @"pathNormalize"' in ir_text
     assert 'declare i1 @"pathIsAbs"' in ir_text
     assert 'declare void @"pathParse"(%"PathParts"* sret(%"PathParts")' in ir_text
-    assert 'declare {i1, i8*} @"pathFromFileUrl"' in ir_text
+    assert_native_optional_return(ir_text, "pathFromFileUrl", "i8*")
 
 
 def test_e2e_std_str_imports_and_builds(tmp_path):
@@ -177,7 +294,7 @@ def test_e2e_std_str_imports_and_builds(tmp_path):
     ir_text = ir_file.read_text(encoding="utf-8")
     assert 'declare i64 @"strByteLen"' in ir_text
     assert 'declare i8* @"strSliceChars"' in ir_text
-    assert 'declare {i1, i8*} @"strCharAt"' in ir_text
+    assert_native_optional_return(ir_text, "strCharAt", "i8*")
     assert 'declare %"Blob" @"strToBytes"' in ir_text
     assert 'declare void @"strSplit"({i8***, i64, i64, i64}* sret({i8***, i64, i64, i64})' in ir_text
 
@@ -222,8 +339,10 @@ def test_e2e_std_math_imports_and_builds(tmp_path):
     assert 'declare i32 @"mathAbsI32"' in ir_text
     assert 'declare double @"mathSqrt"' in ir_text
     assert 'declare i1 @"mathIsNaN"' in ir_text
-    assert 'declare {i1, i64} @"mathAddI64Checked"' in ir_text
-    assert 'declare {i1, i32} @"mathF64ToI32"' in ir_text
+    assert_native_optional_return(ir_text, "mathAddI64Checked", "i64")
+    assert 'declare i64 @"mathF64ToI32"' in ir_text
+    assert '%"_mathF64ToI32_abi_ret" = alloca {i1, i32}' in ir_text
+    assert_native_optional_return(ir_text, "mathF64ToI64", "i64")
 
 
 def test_e2e_std_random_imports_and_builds(tmp_path):
@@ -251,7 +370,24 @@ def test_e2e_std_random_imports_and_builds(tmp_path):
     assert 'declare i32 @"randomNextU32"' in ir_text
     assert 'declare %"Blob" @"randomShuffleBytes"' in ir_text
     assert 'declare void @"randomSecureBytes"({i1, %"Blob"}* sret({i1, %"Blob"})' in ir_text
-    assert 'declare {i1, i64} @"randomSecureU64"' in ir_text
+    assert_native_optional_return(ir_text, "randomSecureU64", "i64")
+
+
+def test_e2e_random_wrappers_use_secure_entropy_without_prng_fallback():
+    native = (ROOT / "packages" / "std" / "native" / "random.c").read_text(encoding="utf-8")
+    emcc = (ROOT / "packages" / "std" / "emcc" / "random.js").read_text(encoding="utf-8")
+
+    for marker in ["CryptGenRandom", "arc4random_buf", "getrandom", 'open("/dev/urandom"', "return (OptBlob){false"]:
+        assert marker in native
+    secure_read = native[native.index("static bool ez_random_read_system"):native.index("OptBlob randomSecureBytes")]
+    assert "ez_random_next" not in secure_read
+    assert "ez_random_mix_seed" not in secure_read
+
+    for marker in ["cryptoObj.getRandomValues", "require('crypto')", "randomBytes", "return null"]:
+        assert marker in emcc
+    secure_bytes = emcc[emcc.index("function secureBytes"):emcc.index("mergeInto(LibraryManager.library")]
+    assert "next(" not in secure_bytes
+    assert "mixSeed" not in secure_bytes
 
 
 def test_e2e_std_hash_imports_and_builds(tmp_path):
@@ -311,6 +447,17 @@ def test_e2e_std_platform_imports_and_builds(tmp_path):
     assert 'declare i1 @"platformHasSubprocess"' in ir_text
 
 
+def test_e2e_platform_wrappers_probe_native_and_emcc_capabilities():
+    native = (ROOT / "packages" / "std" / "native" / "platform.c").read_text(encoding="utf-8")
+    emcc = (ROOT / "packages" / "std" / "emcc" / "platform.js").read_text(encoding="utf-8")
+    for marker in ["GetSystemInfo", "GlobalMemoryStatusEx", "sysconf(_SC_PAGESIZE)", "sysconf(_SC_NPROCESSORS_ONLN)", "sysctlbyname(\"hw.memsize\""]:
+        assert marker in native
+    assert "TARGET_OS_IPHONE" in native
+    assert "return false;" in native[native.index("bool platformHasSubprocess"):]
+    for marker in ["stringToNewUTF8('emcc')", "stringToNewUTF8('wasm32')", "return 65536n", "SharedArrayBuffer", "typeof FS", "typeof fetch", "getRandomValues", "typeof document", "return 0;"]:
+        assert marker in emcc
+
+
 def test_e2e_std_process_imports_and_builds(tmp_path):
     source = tmp_path / "std_process.ez"
     source.write_text(
@@ -335,7 +482,20 @@ def test_e2e_std_process_imports_and_builds(tmp_path):
     assert '%"ProcessResult" = type' in ir_text
     assert 'declare void @"processExec"({i1, %"ProcessResult"}* sret({i1, %"ProcessResult"})' in ir_text
     assert 'declare void @"processSpawn"({i1, %"Process"}* sret({i1, %"Process"})' in ir_text
-    assert 'declare {i1, i8*} @"processCurrentPath"' in ir_text
+    assert_native_optional_return(ir_text, "processCurrentPath", "i8*")
+
+
+def test_e2e_process_wrappers_cover_windows_and_unsupported_targets():
+    native = (ROOT / "packages" / "std" / "native" / "process.c").read_text(encoding="utf-8")
+    emcc = (ROOT / "packages" / "std" / "emcc" / "process.js").read_text(encoding="utf-8")
+    for marker in ["CreateProcessW", "WaitForSingleObject", "TerminateProcess", "GetModuleFileNameW"]:
+        assert marker in native
+    assert "#if !defined(_WIN32) && !defined(__ANDROID__) && !(defined(__APPLE__) && TARGET_OS_IPHONE)" in native
+    assert "return (OptProcessResult){false, {0}};" in native
+    assert "return (OptProcess){false, {0}};" in native
+    assert "writeOptProcessResult(ret, false)" in emcc
+    assert "writeOptProcess(ret, false)" in emcc
+    assert "writeOptStr(ret, null)" in emcc
 
 
 def test_e2e_std_uri_imports_and_builds(tmp_path):
@@ -368,8 +528,22 @@ def test_e2e_std_uri_imports_and_builds(tmp_path):
     assert '%"UriParts" = type' in ir_text
     assert 'declare void @"uriParse"({i1, %"UriParts"}* sret({i1, %"UriParts"})' in ir_text
     assert 'declare i8* @"uriNormalize"' in ir_text
-    assert 'declare {i1, i8*} @"uriHost"' in ir_text
-    assert 'declare {i1, i32} @"uriPort"' in ir_text
+    assert_native_optional_return(ir_text, "uriHost", "i8*")
+    assert 'declare i64 @"uriPort"' in ir_text
+    assert '%"_uriPort_abi_ret" = alloca {i1, i32}' in ir_text
+
+
+def test_e2e_uri_wrappers_cover_parsing_percent_encoding_and_query_ops():
+    native = (ROOT / "packages" / "std" / "native" / "uri.c").read_text(encoding="utf-8")
+    emcc = (ROOT / "packages" / "std" / "emcc" / "uri.js").read_text(encoding="utf-8")
+    for marker in ["ez_scheme_valid", "ez_percent_encode", "ez_percent_decode", "ez_normalize_path", "uriQueryGet", "uriQuerySet"]:
+        assert marker in native
+    assert "query_mode && ch == ' '" in native
+    assert "ez_query_key_matches" in native
+    for marker in ["validScheme", "percentEncodeString", "percentDecodeString", "normalizePath", "queryKeyMatches", "querySet"]:
+        assert marker in emcc
+    assert "queryMode && ch === '+'" in emcc
+    assert "entries.push(encodedKey + '=' + encodedValue)" in emcc
 
 
 def test_e2e_std_debug_imports_and_builds(tmp_path):
@@ -392,16 +566,28 @@ def test_e2e_std_debug_imports_and_builds(tmp_path):
     assert 'declare void @"debugPrint"' in ir_text
     assert 'declare void @"debugAssert"' in ir_text
     assert 'declare i8* @"debugRuntimeInfo"' in ir_text
-    assert 'declare {i1, i8*} @"debugStack"' in ir_text
+    assert_native_optional_return(ir_text, "debugStack", "i8*")
+
+
+def test_e2e_debug_wrappers_cover_crash_hex_and_stack_paths():
+    native = (ROOT / "packages" / "std" / "native" / "debug.c").read_text(encoding="utf-8")
+    emcc = (ROOT / "packages" / "std" / "emcc" / "debug.js").read_text(encoding="utf-8")
+    for marker in ["abort();", "backtrace(frames", "backtrace_symbols", "ezlang native/windows", "ezlang native/linux"]:
+        assert marker in native
+    assert 'static const char hex[] = "0123456789abcdef"' in native
+    for marker in ["console.error", "throw new Error", "new Error().stack", "padStart(2, '0')", "ezlang emcc/wasm32"]:
+        assert marker in emcc
 
 
 def test_e2e_std_log_imports_and_builds(tmp_path):
     source = tmp_path / "std_log.ez"
     source.write_text(
-        'from "std/log" import { logTrace, logDebug, logInfo, logWarn, logError, logTargetStderr, LogConfig, logDefaultConfig, logConfigure, logSetLevel, logWrite, logWriteFields, logWriteAt, logInfoMsg, logWarnMsg, logErrorMsg };\n\n'
+        'from "std/log" import { logTrace, logDebug, logInfo, logWarn, logError, logTargetStderr, logTargetFile, LogConfig, logDefaultConfig, logConfigure, logSetLevel, logSetFile, logWrite, logWriteFields, logWriteAt, logInfoMsg, logWarnMsg, logErrorMsg };\n\n'
         'let cfg = logDefaultConfig();\n'
         'logConfigure(config = LogConfig(minLevel = logDebug, target = logTargetStderr, includeTimestamp = true, includeLocation = true));\n'
         'logSetLevel(level = logTrace);\n'
+        'let fileOk = logSetFile(path = "build.log");\n'
+        'logConfigure(config = LogConfig(minLevel = logTrace, target = logTargetFile, includeTimestamp = false, includeLocation = true));\n'
         'logWrite(level = logInfo, msg = "hello");\n'
         'logWriteFields(level = logWarn, msg = "warn", fields = ["key", "value"]);\n'
         'logWriteAt(level = logError, msg = "err", file = "main.ez", line = 1, column = 2, fields = ["code", "1"]);\n'
@@ -419,6 +605,60 @@ def test_e2e_std_log_imports_and_builds(tmp_path):
     assert 'declare %"LogConfig" @"logDefaultConfig"' in ir_text
     assert 'declare void @"logWrite"' in ir_text
     assert 'declare void @"logWriteAt"' in ir_text
+    assert 'declare i1 @"logSetFile"' in ir_text
+
+
+def test_e2e_std_test_supports_exceptions_parameters_and_diagnostics(tmp_path):
+    source = tmp_path / "std_test.ez"
+    source.write_text(
+        'from "std/test" import { testReset, testRegister, testRegisterParam, testCount, testName, testThrows, testEqualStr, testPassed };\n\n'
+        'const fail = (): Void => { throw Error(code = 4, message = "boom"); };\n'
+        'const check = (): I32 => {\n'
+        '    testReset();\n'
+        '    testRegister(name = "check");\n'
+        '    testRegisterParam(name = "table", param = "4");\n'
+        '    testThrows(body = fail, expectedCode = 4, msg = "throws");\n'
+        '    testEqualStr(actual = testName(index = 1), expected = "table[4]", msg = "param name");\n'
+        '    return testPassed() + testCount();\n'
+        '};\n',
+        encoding="utf-8",
+    )
+    project_toml = write_project(tmp_path, source)
+
+    assert ez.main(["build", "--project", str(project_toml)]) == 0
+    ir_text = (tmp_path / "dist" / "native" / "e2e.ll").read_text(encoding="utf-8")
+    for marker in [
+        'define void @"testThrows"',
+        'declare void @"testRegisterParam"',
+        'declare i32 @"testCount"',
+        'declare i8* @"testName"',
+        '@"__ezrt_throw_active" = internal global i1 0',
+    ]:
+        assert marker in ir_text
+
+    native = (ROOT / "packages" / "std" / "native" / "test.c").read_text(encoding="utf-8")
+    emcc = (ROOT / "packages" / "std" / "emcc" / "test.js").read_text(encoding="utf-8")
+    for marker in ["remember_test_name", "testRegisterParam", "testName", "g_current_test"]:
+        assert marker in native
+    for marker in ["var tests = []", "testRegisterParam", "testName", "currentTest"]:
+        assert marker in emcc
+
+
+def test_e2e_log_wrappers_cover_file_target_mobile_logs_and_emcc_console():
+    """std/log 应覆盖文件目标、移动端系统日志与 emcc console 边界。"""
+    native = (ROOT / "packages" / "std" / "native" / "log.c").read_text(encoding="utf-8")
+    emcc = (ROOT / "packages" / "std" / "emcc" / "log.js").read_text(encoding="utf-8")
+    docs = (ROOT / "docs" / "stdlib.md").read_text(encoding="utf-8")
+
+    for marker in ["EZ_LOG_TARGET_FILE", "fopen(path, \"a\")", "logSetFile", "fflush(out)"]:
+        assert marker in native
+    assert "__android_log_write" in native
+    assert "os_log_with_type" in native
+    assert "WebAssembly 同步日志不支持本地文件目标" in emcc
+    assert "return 0;" in emcc_js_function_body(emcc, "logSetFile")
+    assert "console.error" in emcc and "console.warn" in emcc and "console.log" in emcc
+    assert "原生平台支持 stderr/stdout/file" in docs
+    assert "移动端非文件目标同步写系统日志" in docs
 
 
 def test_e2e_std_regex_imports_and_builds(tmp_path):
@@ -503,7 +743,7 @@ def test_e2e_std_os_imports_and_builds(tmp_path):
     ir_file = tmp_path / "dist" / "native" / "e2e.ll"
     ir_text = ir_file.read_text(encoding="utf-8")
     assert 'declare void @"args"({i8***, i64, i64, i64}* sret({i8***, i64, i64, i64})' in ir_text
-    assert 'declare {i1, i8*} @"env"' in ir_text
+    assert_native_optional_return(ir_text, "env", "i8*")
     assert 'declare i1 @"setEnv"' in ir_text
     assert 'declare i8* @"cwd"' in ir_text
     assert 'declare void @"exit"' in ir_text
@@ -530,6 +770,15 @@ def test_e2e_std_time_imports_and_builds(tmp_path):
     assert 'declare i32 @"getHour"' in ir_text
     assert 'declare void @"add"' in ir_text
     assert 'declare i8* @"format"' in ir_text
+
+
+def test_e2e_time_wrappers_use_millisecond_clock_sleep_and_utc_fields():
+    native = (ROOT / "packages" / "std" / "native" / "time.c").read_text(encoding="utf-8")
+    emcc = (ROOT / "packages" / "std" / "emcc" / "time.js").read_text(encoding="utf-8")
+    for marker in ["/ 10000ULL", "gettimeofday", "nanosleep", "gmtime_r", "timegm", "ez_format_percent_token"]:
+        assert marker in native
+    for marker in ["Date.now()", "Atomics.wait", "while (Date.now() < end)", "getUTCFullYear", "setUTCFullYear", ".replace(/%Y|YYYY/g"]:
+        assert marker in emcc
 
 
 def test_e2e_std_net_http_client_imports_and_builds(tmp_path):
@@ -567,6 +816,89 @@ def test_e2e_std_net_http_server_imports_and_builds(tmp_path):
     assert 'start' in ir_text
     assert 'stop' in ir_text
 
+
+def test_e2e_std_net_http_marks_server_unsupported_and_client_supported():
+    """HTTP 客户端有实现；服务端接口必须明确标记为不支持。"""
+    native = (ROOT / "packages" / "std" / "native" / "net" / "http.c").read_text(encoding="utf-8")
+    emcc = (ROOT / "packages" / "std" / "emcc" / "net" / "http.js").read_text(encoding="utf-8")
+    interface = (ROOT / "packages" / "std" / "net" / "http.ez").read_text(encoding="utf-8")
+    docs = (ROOT / "docs" / "stdlib.md").read_text(encoding="utf-8")
+
+    assert "ez_http_fetch" in native
+    assert "getaddrinfo" in native
+    assert "send(sock" in native
+    assert "recv(sock" in native
+    assert "HTTP_SERVER_UNSUPPORTED_HANDLE" in emcc
+    assert "EZ_HTTP_SERVER_UNSUPPORTED_HANDLE" in native
+    assert "`createServer` 返回 `handle = 0`" in docs
+    assert "HTTP 服务端当前明确不支持" in interface
+    assert "return (HttpServer){0};" not in native
+    assert "return 0n;" not in emcc
+
+
+def test_e2e_std_net_tcp_udp_ws_support_boundaries_are_explicit():
+    """TCP/UDP/WebSocket 应明确区分原生支持范围和不支持入口。"""
+    tcp_native = (ROOT / "packages" / "std" / "native" / "net" / "tcp.c").read_text(encoding="utf-8")
+    ws_native = (ROOT / "packages" / "std" / "native" / "net" / "ws.c").read_text(encoding="utf-8")
+    tcp_emcc = (ROOT / "packages" / "std" / "emcc" / "net" / "tcp.js").read_text(encoding="utf-8")
+    ws_emcc = (ROOT / "packages" / "std" / "emcc" / "net" / "ws.js").read_text(encoding="utf-8")
+    tcp_interface = (ROOT / "packages" / "std" / "net" / "tcp.ez").read_text(encoding="utf-8")
+    ws_interface = (ROOT / "packages" / "std" / "net" / "ws.ez").read_text(encoding="utf-8")
+    api_docs = (ROOT / "docs" / "stdlib-api.md").read_text(encoding="utf-8")
+
+    for marker in ["socket(", "connect(", "bind(", "listen(", "accept(", "recv(", "send(", "sendto(", "recvfrom("]:
+        assert marker in tcp_native
+    for marker in ["ws://", "Sec-WebSocket-Key", "0x82", "opcode", "0x8"]:
+        assert marker in ws_native
+    assert 'const char *prefix = "ws://";' in ws_native
+    assert 'const char *prefix = "wss://";' not in ws_native
+
+    for marker in ["HEAPU8[ret] = 0;", "return -1;", "return 0;"]:
+        assert marker in tcp_emcc
+        assert marker in ws_emcc
+    assert "emcc 明确不支持" in tcp_interface
+    assert "wss://、分片帧和 emcc" in ws_interface
+    assert "emcc 当前明确不支持 TCP/UDP" in api_docs
+    assert "`wss://`、分片帧" in api_docs
+
+
+def test_e2e_cli_build_links_externs_and_records_emcc_js_libraries():
+    """工具链应把 extern 接入构建链接流程，并保留 emcc JS library 输入。"""
+    cli = (ROOT / "cli" / "ez.py").read_text(encoding="utf-8")
+    docs = (ROOT / "docs" / "toolchain.md").read_text(encoding="utf-8")
+
+    for marker in ["_link_executable(obj_file, exe_file, libs", "_compile_c_extern", "-framework", "-l{lib}"]:
+        assert marker in cli
+    assert "_module_defines_main(module)" in cli
+    assert 'if path.suffix == ".js":\n            continue' in cli
+    assert "_link_sdk_artifact" in cli
+    assert "--js-library" in cli
+    assert "lib{name}.so" in cli
+    assert "lib{name}.dylib" in cli
+    assert '"extern_libs"' in cli
+    assert '"executable"' in cli
+    assert '"sdk_artifact"' in cli
+    assert "本机可执行目标会生成 LLVM IR、对象文件和同名可执行文件" in docs
+    assert "`extern \"*.js\" for emcc`" in docs
+    assert "SDK 链接产物" in docs
+
+
+def test_e2e_toolchain_docs_match_cli_defaults_and_targets():
+    """工具链文档应与 CLI 默认配置、支持架构和支持系统保持一致。"""
+    docs = (ROOT / "docs" / "toolchain.md").read_text(encoding="utf-8")
+    cli = (ROOT / "cli" / "ez.py").read_text(encoding="utf-8")
+
+    assert 'project.get("optimize", 2)' in cli
+    assert "优化等级，0–3，默认值为 2" in docs
+    for arch in ["x86_64", "aarch64", "arm", "wasm32", "riscv64"]:
+        assert f'"{arch}"' in cli
+        assert f'`"{arch}"`' in docs
+    for os_name in ["windows", "macos", "linux", "android", "ios", "emcc", "freestanding"]:
+        assert f'"{os_name}"' in cli
+        assert f'`"{os_name}"`' in docs
+    for marker in ["LLVM IR、对象文件和同名可执行文件", "SDK 链接产物", "未配置 `output.sdk` 时仍保留 IR/对象文件输出"]:
+        assert marker in docs
+
 def test_e2e_std_collections_basic_list_builds(tmp_path):
     source = tmp_path / "std_collections.ez"
     source.write_text(
@@ -580,6 +912,81 @@ def test_e2e_std_collections_basic_list_builds(tmp_path):
     assert 'list_grow' in ir_text
     assert 'list_slice_cond' in ir_text
     assert 'listLen_I32' not in ir_text
+
+
+def test_e2e_array_list_layout_is_paged_across_docs_codegen_and_wrappers(tmp_path):
+    """数组/List ABI 应在文档、代码生成和平台封装中统一为分页布局。"""
+    for doc_path in [ROOT / "docs" / "doc.md", ROOT / "docs" / "stdlib.md", ROOT / "docs" / "stdlib-api.md"]:
+        text = doc_path.read_text(encoding="utf-8")
+        assert "分页" in text, f"{doc_path.relative_to(ROOT)} 未写明分页数组 ABI"
+        for field in ["pages", "length", "capacity", "page_count"]:
+            assert field in text, f"{doc_path.relative_to(ROOT)} 未写明数组 ABI 字段 {field}"
+
+    source = tmp_path / "list_layout.ez"
+    source.write_text(
+        'from "std/collections" import { listLen, listPush };\n\n'
+        'let nums: List<I32> = [1, 2, 3, 4, 5, 6, 7, 8, 9];\n'
+        'listPush<I32>(list = nums, item = 10);\n'
+        'let n: I64 = listLen<I32>(list = nums);\n',
+        encoding="utf-8",
+    )
+    project_toml = write_project(tmp_path, source)
+
+    assert ez.main(["build", "--project", str(project_toml)]) == 0
+    ir_text = (tmp_path / "dist" / "native" / "e2e.ll").read_text(encoding="utf-8")
+    assert "{i32**, i64, i64, i64}" in ir_text
+    assert "_tmp_arr_pages" in ir_text
+    assert "_tmp_arr_page" in ir_text
+    assert "list_grow" in ir_text
+    assert "listLen_I32" not in ir_text
+
+    for wrapper_path in [
+        ROOT / "packages" / "std" / "native" / "str.c",
+        ROOT / "packages" / "std" / "native" / "fs.c",
+        ROOT / "packages" / "std" / "native" / "os.c",
+        ROOT / "packages" / "std" / "emcc" / "str.js",
+    ]:
+        wrapper = wrapper_path.read_text(encoding="utf-8")
+        assert "page_count" in wrapper or "pageCount" in wrapper, f"{wrapper_path.relative_to(ROOT)} 未使用分页列表布局"
+
+
+def test_e2e_operator_semantics_match_docs_and_codegen(tmp_path):
+    """文档要求的核心运算符语义应有对应代码生成形态。"""
+    docs = (ROOT / "docs" / "doc.md").read_text(encoding="utf-8")
+    for marker in ["无符号类型的除法", "逻辑运算支持短路求值", "标量自动广播", "向量比较生成同宽布尔 mask", "避免重复求值"]:
+        assert marker in docs
+
+    source = tmp_path / "operators.ez"
+    source.write_text(
+        'const calc = (a: U32, b: U32, shift: U32): U32 => {\n'
+        '    let masked: U32 = (a & b) >> shift;\n'
+        '    masked /= b;\n'
+        '    masked %= b;\n'
+        '    masked >>= shift;\n'
+        '    return masked;\n'
+        '};\n\n'
+        'const logic = (a: Bool, b: Bool): Bool => {\n'
+        '    return (a && b) || (!a && !b);\n'
+        '};\n\n'
+        'const simd = (): Vec<Bool>[4] => {\n'
+        '    let v = Vec[1, 2, 3, 4];\n'
+        '    return (v + 2) < Vec[4, 4, 4, 4];\n'
+        '};\n',
+        encoding="utf-8",
+    )
+    project_toml = write_project(tmp_path, source)
+
+    assert ez.main(["build", "--project", str(project_toml)]) == 0
+    ir_text = (tmp_path / "dist" / "native" / "e2e.ll").read_text(encoding="utf-8")
+    assert "udiv i32" in ir_text
+    assert "urem i32" in ir_text
+    assert ir_text.count("lshr i32") >= 2
+    assert "ashr i32" not in ir_text
+    assert "br i1" in ir_text
+    assert re.search(r"phi\s+i1", ir_text)
+    assert "insertelement <4 x i32>" in ir_text
+    assert "icmp slt <4 x i32>" in ir_text
+    assert "<4 x i1>" in ir_text
 
 
 def test_e2e_std_collections_higher_order_and_dict_build(tmp_path):
@@ -613,12 +1020,28 @@ def test_e2e_std_fmt_imports_and_builds(tmp_path):
     ir_file = tmp_path / "dist" / "native" / "e2e.ll"
     ir_text = ir_file.read_text(encoding="utf-8")
     assert 'declare i8* @"toString_I32"' in ir_text
-    assert 'declare {i1, i32} @"parseInt"' in ir_text
+    assert 'declare i64 @"parseInt"' in ir_text
+    assert '%"_parseInt_abi_ret" = alloca {i1, i32}' in ir_text
+    assert_native_optional_return(ir_text, "parseI64", "i64")
+    assert_native_optional_return(ir_text, "parseF64", "double")
     assert 'declare i8* @"format"' in ir_text
     assert 'declare i8* @"b64Encode"' in ir_text
     assert 'declare i8* @"jsonStringify_I32"' in ir_text
     assert 'declare i32 @"jsonParse_I32"' in ir_text
     assert 'declare i8* @"urlEncode"' in ir_text
+    assert_native_optional_return(ir_text, "urlDecode", "i8*")
+
+
+def test_e2e_fmt_wrappers_implement_parse_format_encoding_json_and_msgpack():
+    native = (ROOT / "packages" / "std" / "native" / "fmt.c").read_text(encoding="utf-8")
+    emcc = (ROOT / "packages" / "std" / "emcc" / "fmt.js").read_text(encoding="utf-8")
+    for marker in ["strtol", "strtoll", "strtod", "ez_b64_is_valid_input", "jsonStringify_Str", "jsonParse_Str", "msgpackEncode_I64", "msgpackDecode_Str", "urlEncode", "urlDecode"]:
+        assert marker in native
+    assert "ez_list_get(args, arg_index++)" in native
+    assert "EZ_B64" in native
+    for marker in ["Number.parseInt", "BigInt(text)", "isStrictBase64", "JSON.stringify", "JSON.parse", "msgpackEncode_I64", "msgpackDecode_Str", "encodeURIComponent", "decodeURIComponent"]:
+        assert marker in emcc
+    assert "listGet(argsPtr, index++)" in emcc
 
 
 def test_e2e_flow_example_builds_with_runtime_hooks(tmp_path):
@@ -699,6 +1122,9 @@ def test_e2e_native_target_runs(tmp_path):
 
 def test_e2e_emcc_fs_wrapper_uses_memfs_and_idbfs():
     fs_js = (ROOT / "packages" / "std" / "emcc" / "fs.js").read_text(encoding="utf-8")
+    assert "function pathValue" in fs_js
+    assert "text.length === 0 ? null : text" in fs_js
+    assert "if (target === null)" in fs_js
     assert "FS.writeFile" in fs_js
     assert "FS.readFile" in fs_js
     assert "FS.mkdirTree" in fs_js
@@ -707,6 +1133,168 @@ def test_e2e_emcc_fs_wrapper_uses_memfs_and_idbfs():
     assert "readFile: function (ret, path)" in fs_js
     assert "listDir: function (ret, path)" in fs_js
     assert "stat: function (ret, path)" in fs_js
+
+
+def test_e2e_native_fs_wrapper_covers_windows_and_mobile_branches():
+    fs_c = (ROOT / "packages" / "std" / "native" / "fs.c").read_text(encoding="utf-8")
+
+    for marker in [
+        "#include <TargetConditionals.h>",
+        "defined(__APPLE__) && TARGET_OS_IPHONE",
+        "FindFirstFileA",
+        "FindNextFileA",
+        "DeleteFileA",
+        "recursive ? ez_fs_remove_tree(real_path)",
+        "_access(real_path, 0)",
+        "_fullpath(NULL, real_path, 0)",
+        "struct _stat64",
+        "_stat64(real_path, &st)",
+        "static bool ez_fs_valid_path",
+        "if (!ez_fs_valid_path(path)) return NULL;",
+        "if (!real_path) return ez_fs_copy_str(\"\");",
+    ]:
+        assert marker in fs_c
+    assert "return (StrList){pages, (int64_t)count, page_count * 8, page_count}" in fs_c
+    assert "(void)path;\n    return (StrList){0};" not in fs_c
+    assert "strdup(" not in fs_c
+
+
+def test_e2e_path_wrappers_cover_platform_path_edges():
+    native_path = (ROOT / "packages" / "std" / "native" / "path.c").read_text(encoding="utf-8")
+    emcc_path = (ROOT / "packages" / "std" / "emcc" / "path.js").read_text(encoding="utf-8")
+
+    for marker in [
+        "ez_is_windows_drive",
+        "ez_root_len",
+        "ez_path_is_abs_raw",
+        "ez_normalize_raw",
+        "pathToFileUrl",
+        "pathFromFileUrl",
+    ]:
+        assert marker in native_path
+    for marker in [
+        "/^[A-Za-z]:[\\\\/]/",
+        "/^[\\\\/]{2}/",
+        "return stringToNewUTF8('/');",
+        "encodeURIComponent",
+        "decodeURIComponent",
+        "writePathParts",
+    ]:
+        assert marker in emcc_path
+
+
+def test_e2e_str_wrappers_validate_utf8_bytes():
+    native_str = (ROOT / "packages" / "std" / "native" / "str.c").read_text(encoding="utf-8")
+    emcc_str = (ROOT / "packages" / "std" / "emcc" / "str.js").read_text(encoding="utf-8")
+
+    for marker in [
+        "ez_utf8_validate_len",
+        "if (width < 0 || i + (size_t)width > len) return false;",
+        "if (ch == 0xED && b1 >= 0xA0) return false;",
+        "if (ch == 0xF4 && b1 > 0x8F) return false;",
+    ]:
+        assert marker in native_str
+    for marker in [
+        "function validUtf8Bytes",
+        "else return false;",
+        "if (width === 3 && ch === 0xed && bytes[i + 1] >= 0xa0) return false;",
+        "if (width === 4 && ch === 0xf4 && bytes[i + 1] > 0x8f) return false;",
+        "HEAPU8[ret] = 0;",
+    ]:
+        assert marker in emcc_str
+
+
+def test_e2e_math_wrappers_cover_checked_edges_and_emcc_bigint():
+    native_math = (ROOT / "packages" / "std" / "native" / "math.c").read_text(encoding="utf-8")
+    emcc_math = (ROOT / "packages" / "std" / "emcc" / "math.js").read_text(encoding="utf-8")
+
+    for marker in [
+        "value == INT32_MIN ? INT32_MAX",
+        "value == INT64_MIN ? INT64_MAX",
+        "__builtin_add_overflow",
+        "__builtin_mul_overflow",
+        "b == 0 || (a == INT64_MIN && b == -1)",
+        "!isfinite(value)",
+    ]:
+        assert marker in native_math
+    for marker in [
+        "var I64_MIN = -(1n << 63n);",
+        "var I64_MAX = (1n << 63n) - 1n;",
+        "function checkedI64",
+        "a === I64_MIN && b === -1n",
+        "Number.isFinite(value)",
+        "BigInt(Math.trunc(value))",
+    ]:
+        assert marker in emcc_math
+
+
+def test_e2e_emcc_fmt_wrapper_covers_f32_and_strict_f64_parse():
+    fmt_js = (ROOT / "packages" / "std" / "emcc" / "fmt.js").read_text(encoding="utf-8")
+    assert "toString_F32: function" in fmt_js
+    assert "Number.parseFloat" not in fmt_js
+    assert "Number(text)" in fmt_js
+    for name in ["msgpackEncode_I1", "msgpackDecode_I1", "msgpackEncode_Str", "msgpackDecode_Str", "msgpackEncode_F64", "msgpackDecode_F64"]:
+        assert name in fmt_js
+
+
+def test_e2e_emcc_time_wrapper_covers_named_and_percent_format_tokens():
+    time_js = (ROOT / "packages" / "std" / "emcc" / "time.js").read_text(encoding="utf-8")
+    for token in ["%Y|YYYY", "%m|MM", "%d|DD", "%H|HH", "%M", "%S|SS"]:
+        assert token in time_js
+
+
+def test_e2e_emcc_os_args_use_runtime_arguments():
+    os_js = (ROOT / "packages" / "std" / "emcc" / "os.js").read_text(encoding="utf-8")
+    assert "function writeStrList" in os_js
+    assert "Module.arguments" in os_js
+    assert "arguments_" in os_js
+    assert "writeStrList(ret, runtimeArgs())" in os_js
+    assert "function nodeProcess" in os_js
+    assert "proc.env" in os_js
+    assert "proc.pid" in os_js
+    assert "return proc && proc.pid ? proc.pid | 0 : -1;" in emcc_js_function_body(os_js, "pid")
+
+
+def test_e2e_emcc_io_readline_returns_empty_optional():
+    """WebAssembly 目标不支持同步 stdin 时，readLine 应显式返回空可选值。"""
+    io_js = (ROOT / "packages" / "std" / "emcc" / "io.js").read_text(encoding="utf-8")
+    body = emcc_js_function_body(io_js, "readLine")
+    assert "HEAPU8[ret] = 0;" in body
+    assert "setValue(ret + 8, 0, '*');" in body
+
+
+def test_e2e_emcc_stub_wrappers_are_marked_unsupported():
+    """公开 wrapper 只有失败占位时，必须写明平台不支持。"""
+    cases = {
+        "packages/std/emcc/io.js": ["readLine"],
+        "packages/std/emcc/net/http.js": ["fetch", "fetchEx", "createServer"],
+        "packages/std/emcc/net/tcp.js": [
+            "tcpConnect", "tcpListen", "tcpAccept", "tcpRead", "tcpWrite", "tcpClose",
+            "tcpListenerClose", "udpBind", "udpSend", "udpRecv", "udpClose",
+        ],
+        "packages/std/emcc/net/ws.js": ["wsConnect", "wsSend", "wsRecv", "wsClose"],
+        "packages/std/emcc/process.js": [
+            "processExec", "processSpawn", "processWait", "processTerminate", "processCurrentPath",
+        ],
+    }
+    unsupported_marker = re.compile(r"不支持|不可用|unsupported|unavailable", re.I)
+    failure_markers = [
+        "HEAPU8[ret] = 0;",
+        "writeOptProcessResult(ret, false)",
+        "writeOptProcess(ret, false)",
+        "writeOptStr(ret, null)",
+        "return -1;",
+        "return 0;",
+        "return 0n;",
+        "HTTP_SERVER_UNSUPPORTED_HANDLE",
+    ]
+
+    for rel_path, names in cases.items():
+        text = (ROOT / rel_path).read_text(encoding="utf-8")
+        assert unsupported_marker.search(text), f"{rel_path} 的占位 wrapper 缺少不支持说明"
+        for name in names:
+            body = emcc_js_function_body(text, name)
+            assert any(marker in body for marker in failure_markers), f"{rel_path}:{name} 未显式失败"
 
 
 def test_e2e_emcc_optional_and_struct_returns_use_sret(tmp_path):
@@ -756,10 +1344,37 @@ def test_e2e_emcc_net_wrappers_use_optional_sret():
     ws_js = (ROOT / "packages" / "std" / "emcc" / "net" / "ws.js").read_text(encoding="utf-8")
     assert "fetch: function (ret, url)" in http_js
     assert "fetchEx: function (ret, req)" in http_js
+    assert "HttpResponse_text: function" in http_js
     assert "tcpConnect: function (ret, host, port)" in tcp_js
     assert "tcpListen: function (ret, host, port)" in tcp_js
     assert "udpBind: function (ret, host, port)" in tcp_js
     assert "wsConnect: function (ret, url)" in ws_js
+
+
+def emcc_js_function_body(text: str, name: str) -> str:
+    pattern = rf"{name}: function \([^)]*\) \{{(?P<body>.*?)\n\s*\}},"
+    match = re.search(pattern, text, re.S)
+    assert match, f"找不到 emcc JS wrapper 函数 {name}"
+    return match.group("body")
+
+
+def test_e2e_emcc_tcp_udp_ws_wrappers_fail_explicitly():
+    """emcc 暂不支持 TCP/UDP/WS 时应显式返回失败值，不能伪装成功。"""
+    tcp_js = (ROOT / "packages" / "std" / "emcc" / "net" / "tcp.js").read_text(encoding="utf-8")
+    ws_js = (ROOT / "packages" / "std" / "emcc" / "net" / "ws.js").read_text(encoding="utf-8")
+
+    for name in ["tcpConnect", "tcpListen", "tcpAccept", "tcpRead", "udpBind", "udpRecv"]:
+        assert "HEAPU8[ret] = 0;" in emcc_js_function_body(tcp_js, name)
+    assert "HEAPU8[ret] = 0;" in emcc_js_function_body(ws_js, "wsConnect")
+    assert "HEAPU8[ret] = 0;" in emcc_js_function_body(ws_js, "wsRecv")
+
+    for name in ["tcpWrite", "udpSend"]:
+        assert "return -1;" in emcc_js_function_body(tcp_js, name)
+    assert "return -1;" in emcc_js_function_body(ws_js, "wsSend")
+
+    for name in ["tcpClose", "tcpListenerClose", "udpClose"]:
+        assert "return 0;" in emcc_js_function_body(tcp_js, name)
+    assert "return 0;" in emcc_js_function_body(ws_js, "wsClose")
 
 
 def test_e2e_public_emcc_wrappers_do_not_use_legacy_null_stubs():
@@ -776,13 +1391,13 @@ def test_e2e_public_emcc_wrappers_do_not_use_legacy_null_stubs():
         "platform.js": ["platformOS", "platformHasSubprocess"],
         "uri.js": ["uriParse", "uriDecodeQuery", "uriQuerySet"],
         "debug.js": ["debugPrint", "debugStack"],
-        "log.js": ["logDefaultConfig", "logWriteAt"],
+        "log.js": ["logDefaultConfig", "logSetFile", "logWriteAt"],
         "regex.js": ["regexCompile", "regexFind"],
         "crypto.js": ["cryptoSha256", "cryptoHmacSha256"],
         "compress.js": ["compressGzip", "decompressDeflate"],
         "process.js": ["processExec", "processCurrentPath"],
         "stream.js": ["streamFromBlob", "streamRead", "streamCopy"],
-        "test.js": ["testAssert", "testEqualI64", "testPassed"],
+        "test.js": ["testAssert", "testEqualI64", "testRegisterParam", "testName", "testPassed"],
         "net/http.js": ["fetch", "fetchEx"],
         "net/tcp.js": ["tcpConnect", "tcpListen", "udpBind"],
         "net/ws.js": ["wsConnect"],
@@ -858,6 +1473,35 @@ def test_e2e_ui_packages_import_by_package_name_and_build(tmp_path, capsys):
             assert str(ROOT / "packages" / expected) in out, name
 
 
+def test_e2e_web_ui_emcc_wrapper_covers_dom_contract():
+    """ez-web-ui emcc 绑定应覆盖 DOM 节点、事件、帧调度和批量属性接口。"""
+    text = (ROOT / "packages" / "ez-web-ui" / "emcc" / "web_ui.js").read_text(encoding="utf-8")
+    for name in [
+        "createElement", "appendChild", "getChildren", "setAttributes", "setStyles",
+        "addEventListener", "removeEventListener", "delegateEvent", "scheduleFrame",
+        "scheduleMicrotask", "requestPermission", "getBodyNode",
+    ]:
+        assert f"{name}: function (" in text
+    for marker in ["function readNodeId", "function readDict", "function writeNodeList", "function callEvent"]:
+        assert marker in text
+    assert "dynCall_vi" in text or "wasmTable" in text
+
+
+def test_e2e_mobile_ui_native_wrappers_keep_minimal_state():
+    """移动 UI 原生层至少应维护可测试的节点、文本和层级状态。"""
+    checks = {
+        "ez-android-ui/native/android_ui.c": ["createTextView", "createButton", "addView", "getChildCount", "runOnMainThread"],
+        "ez-ios-ui/native/ios_ui.c": ["createLabel", "createButton", "addSubview", "getSubviewCount", "runOnMainThread"],
+    }
+    for relative, names in checks.items():
+        text = (ROOT / "packages" / relative).read_text(encoding="utf-8")
+        assert "ABI 占位封装" not in text
+        assert "return no_node();" not in text
+        assert "static UiNode" in text
+        for name in names:
+            assert f"{name}(" in text
+
+
 def test_e2e_std_platform_externs_cover_mobile_and_emcc(tmp_path, capsys):
     std_root = ROOT / "packages" / "std"
     cases = [
@@ -880,7 +1524,7 @@ def test_e2e_std_platform_externs_cover_mobile_and_emcc(tmp_path, capsys):
         ("compress", 'from "std/compress" import { compressGzip };\nlet data = Blob(data = "hello", size = 5);\nlet compressed = compressGzip(data = data);\n', ["native/compress.c", "emcc/compress.js"]),
         ("process", 'from "std/process" import { processCurrentPath };\nlet path = processCurrentPath();\n', ["native/process.c", "emcc/process.js"]),
         ("stream", 'from "std/stream" import { streamFromBlob };\nlet s = streamFromBlob(data = Blob(data = "", size = 0));\n', ["native/stream.c", "emcc/stream.js"]),
-        ("test", 'from "std/test" import { testAssert };\ntestAssert(condition = true, msg = "ok");\n', ["native/test.c", "emcc/test.js"]),
+        ("test", 'from "std/test" import { testAssert, testRegisterParam, testName };\ntestRegisterParam(name = "case", param = "1");\ntestAssert(condition = testName(index = 0) == "case[1]", msg = "ok");\n', ["native/test.c", "emcc/test.js"]),
     ]
 
     for name, source, expected_libs in cases:

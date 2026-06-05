@@ -12,6 +12,8 @@ EzLang 提供了开箱即用的命令行工具链（CLI），并采用 `project.
 ### `ez build`
 读取 `project.toml`，执行项目的编译与构建。该命令会根据配置中的 `[[output]]` 节点执行交叉编译，生成对应架构和操作系统的产物，并输出到指定的 `dir` 目录中。同时也会根据 `[[plugins]]` 配置项加载编译器前端或后端插件。
 
+本机可执行目标会生成 LLVM IR、对象文件和同名可执行文件；链接阶段会编译 `extern "*.c"` 源码，链接对象文件、静态库、动态库、framework 与系统库。配置 `output.sdk` 后，`emcc` 目标会调用 Emscripten `emcc` 并把 `extern "*.js" for emcc` 作为 `--js-library` 传入；Android/iOS 目标会调用 SDK 内的 `clang` 编译 C extern 并链接平台动态库。未配置 `output.sdk` 时仍保留 IR/对象文件输出，便于外部构建系统接手。
+
 ### `ez run`
 构建并立即执行当前项目（仅适用于本地可执行产物）。不适用于 `emcc` / `android` / `ios` 目标。
 
@@ -36,6 +38,10 @@ EzLang 提供了开箱即用的命令行工具链（CLI），并采用 `project.
 * `public` (布尔值)：是否将该包对外公开。为 `true` 时，配合 `ez release` 可发布到远端。
 * `registry` (字符串)：包管理远端服务的具体地址（如 `"https://www.xxx.com"`），指定本包发布的目标中心仓库或拉取依赖的源。
 * `optimize` (数字)：优化等级，0–3，默认值为 2。
+
+### `[log]`
+标准日志模块的编译期配置。
+* `compile_min_level` (数字，可选)：编译期最低日志级别，范围 0–4，对应 `logTrace` 到 `logError`。低于该级别且级别可静态确定的 `std/log` 标准日志调用会在代码生成前删除；动态 `level` 参数仍由运行时过滤。
 
 ### `[extern]`
 全局外部库配置，为所有模块提供默认的 extern 搜索路径。
@@ -84,7 +90,7 @@ search_paths = ["C:/Program Files/MyLib/lib"]
 
 * `dir` (字符串)：对应目标的编译产物存放路径（如 `"./dist/linux"`）。
 
-* `sdk` (字符串，可选)：平台 SDK 路径。`android` 目标需要指定 NDK 路径，`ios` 目标需要指定 Xcode SDK 路径。
+* `sdk` (字符串，可选)：平台 SDK 路径。`android` 目标指定 NDK 根目录，`ios` 目标指定 Xcode/SDK 根目录，`emcc` 目标指定 Emscripten SDK 或包含 `emcc` 的目录。
 
   ```toml
   [[output]]
@@ -120,6 +126,9 @@ description = "A cross-platform EzLang application"
 main        = "./src/index.ez"
 public      = false
 optimize    = 2
+
+[log]
+compile_min_level = 2
 
 [workspace]
 members = ["./packages/**"]
@@ -161,6 +170,7 @@ sdk  = "/Applications/Xcode.app"
 arch = "wasm32"
 os   = "emcc"
 dir  = "./dist/web"
+sdk  = "/opt/emsdk"
 
 [[plugins]]
 name = "backend"
@@ -185,3 +195,13 @@ core-lib = "@workspace"
 | `freestanding`                | 无系统依赖，但 `std` 不可用，只可使用 `std/mem` 的底层原语 |
 
 > **移动端 UI**：`android` / `ios` 目标本身只编译系统级逻辑。如需 UI，分别引入 `ez-android-ui` 和 `ez-ios-ui` 依赖包，并通过各自包的配置完成界面构建。
+
+### SDK 链接产物
+
+| 目标       | SDK 工具查找                                                    | 产物                         |
+| ---------- | --------------------------------------------------------------- | ---------------------------- |
+| `emcc`    | `emcc` 或 `upstream/emscripten/emcc`                            | `<name>.js`，同时由 emcc 生成 wasm |
+| `android` | `toolchains/llvm/prebuilt/<host>/bin/<triple>21-clang` 或 `clang` | `lib<name>.so`               |
+| `ios`     | `usr/bin/clang`、`Toolchains/XcodeDefault.xctoolchain/usr/bin/clang` 或 `clang` | `lib<name>.dylib`            |
+
+SDK 链接失败时，CLI 会输出缺失工具、C extern 编译失败或链接失败的具体诊断。`extern "*.js"` 只参与 `emcc` SDK 链接；native 链接阶段会忽略 JS library 输入。

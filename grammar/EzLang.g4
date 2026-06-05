@@ -271,7 +271,13 @@ orExpression:
     andExpression (OR andExpression)*;
 
 andExpression:
-    bitOrExpression (AND bitOrExpression)*;
+    equalityExpression (AND equalityExpression)*;
+
+equalityExpression:
+    relationalExpression ((EQ | NE) relationalExpression)*;
+
+relationalExpression:
+    bitOrExpression ((LANGLE | RANGLE | LE | GE) bitOrExpression)*;
 
 bitOrExpression:
     bitXorExpression (PIPE bitXorExpression)*;
@@ -280,13 +286,7 @@ bitXorExpression:
     bitAndExpression (CARET bitAndExpression)*;
 
 bitAndExpression:
-    equalityExpression (AMPERSAND equalityExpression)*;
-
-equalityExpression:
-    relationalExpression ((EQ | NE) relationalExpression)*;
-
-relationalExpression:
-    shiftExpression ((LANGLE | RANGLE | LE | GE) shiftExpression)*;
+    shiftExpression (AMPERSAND shiftExpression)*;
 
 shiftExpression:
     additiveExpression ((SHL | SHR) additiveExpression)*;
@@ -318,6 +318,7 @@ primaryExpression:
     literal                                                             # literalExpr
     | structLiteral                                                      # structLiteralExpr
     | (VAR_IDENTIFIER | TYPE_IDENTIFIER) genericArgs?                           # identifierExpr
+    | ifLikeExpr                                                         # ifLikePrimaryExpr
     | '(' expression ')'                                                 # parenExpr
     | QUESTION                                                           # placeholderExpr
     | dictLiteral                                                        # dictExpr
@@ -330,12 +331,11 @@ primaryExpression:
     | matchBlock                                                         # matchBlockExpr
     | catchBlock                                                         # catchBlockExpr
     | loopExpr                                                           # loopPrimaryExpr
-    | ifLikeExpr                                                         # ifLikePrimaryExpr
     | typeofExpr                                                         # typeofPrimaryExpr
     | markupLiteral                                                      # markupExpr;
 
 typeofExpr:
-    TYPEOF (expression | type_);
+    TYPEOF (type_ | unaryExpression);
 
 // 字面量
 literal:
@@ -443,7 +443,7 @@ catchBlock:
 
 // 类 if 表达式
 ifLikeExpr:
-    '(' expression ')' QUESTION (expression | block) (COLON (expression | block))?;
+    '(' expression ')' QUESTION block (COLON (expression | block))?;
 
 // 循环表达式
 loopExpr:

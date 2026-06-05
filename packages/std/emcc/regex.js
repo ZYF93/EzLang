@@ -107,7 +107,8 @@
       writeStrList(ret, items);
     },
     regexReplace: function (regexPtr, inputPtr, replacementPtr) {
-      var re = compile(readRegex(regexPtr), false);
+      var regex = readRegex(regexPtr);
+      var re = compile(regex, (regex.flags & 4) !== 0);
       var input = text(inputPtr);
       return stringToNewUTF8(re ? input.replace(re, text(replacementPtr)) : input);
     },

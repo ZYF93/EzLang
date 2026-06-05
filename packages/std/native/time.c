@@ -143,13 +143,105 @@ void sub(Date *value, const OptI32 *year, const OptI32 *month, const OptI32 *day
     ez_time_shift(value, year, month, day, hour, minute, second, -1);
 }
 
+static void ez_append_padded(char *out, size_t out_size, size_t *used, int value, int width) {
+    if (*used >= out_size) return;
+    int written = snprintf(out + *used, out_size - *used, "%0*d", width, value);
+    if (written < 0) return;
+    *used += (size_t)written;
+    if (*used >= out_size) {
+        out[out_size - 1] = '\0';
+        *used = out_size - 1;
+    }
+}
+
+static void ez_append_text(char *out, size_t out_size, size_t *used, const char *text, size_t len) {
+    if (*used >= out_size) return;
+    size_t remaining = out_size - *used - 1;
+    if (len > remaining) len = remaining;
+    memcpy(out + *used, text, len);
+    *used += len;
+    out[*used] = '\0';
+}
+
+static const char *ez_format_named_token(char *out, size_t out_size, size_t *used,
+                                         const char *cursor, const struct tm *tm_value) {
+    if (strncmp(cursor, "YYYY", 4) == 0) {
+        ez_append_padded(out, out_size, used, tm_value->tm_year + 1900, 4);
+        return cursor + 4;
+    }
+    if (strncmp(cursor, "MM", 2) == 0) {
+        ez_append_padded(out, out_size, used, tm_value->tm_mon + 1, 2);
+        return cursor + 2;
+    }
+    if (strncmp(cursor, "DD", 2) == 0) {
+        ez_append_padded(out, out_size, used, tm_value->tm_mday, 2);
+        return cursor + 2;
+    }
+    if (strncmp(cursor, "HH", 2) == 0) {
+        ez_append_padded(out, out_size, used, tm_value->tm_hour, 2);
+        return cursor + 2;
+    }
+    if (strncmp(cursor, "SS", 2) == 0) {
+        ez_append_padded(out, out_size, used, tm_value->tm_sec, 2);
+        return cursor + 2;
+    }
+    ez_append_text(out, out_size, used, cursor, 1);
+    return cursor + 1;
+}
+
+static const char *ez_format_percent_token(char *out, size_t out_size, size_t *used,
+                                           const char *cursor, const struct tm *tm_value) {
+    char buffer[16];
+    if (cursor[0] != '%' || cursor[1] == '\0') {
+        ez_append_text(out, out_size, used, cursor, 1);
+        return cursor + 1;
+    }
+    switch (cursor[1]) {
+        case 'Y':
+            ez_append_padded(out, out_size, used, tm_value->tm_year + 1900, 4);
+            break;
+        case 'm':
+            ez_append_padded(out, out_size, used, tm_value->tm_mon + 1, 2);
+            break;
+        case 'd':
+            ez_append_padded(out, out_size, used, tm_value->tm_mday, 2);
+            break;
+        case 'H':
+            ez_append_padded(out, out_size, used, tm_value->tm_hour, 2);
+            break;
+        case 'M':
+            ez_append_padded(out, out_size, used, tm_value->tm_min, 2);
+            break;
+        case 'S':
+            ez_append_padded(out, out_size, used, tm_value->tm_sec, 2);
+            break;
+        case '%':
+            ez_append_text(out, out_size, used, "%", 1);
+            break;
+        default:
+            buffer[0] = '%';
+            buffer[1] = cursor[1];
+            buffer[2] = '\0';
+            ez_append_text(out, out_size, used, buffer, 2);
+            break;
+    }
+    return cursor + 2;
+}
+
 const char *format(const Date *value, const char *fmt) {
     struct tm tm_value = ez_time_tm(value);
     const char *pattern = fmt ? fmt : "%Y-%m-%dT%H:%M:%SZ";
     char *result = (char *)malloc(128);
     if (!result) return NULL;
-    if (strftime(result, 128, pattern, &tm_value) == 0) {
-        result[0] = '\0';
+    size_t used = 0;
+    result[0] = '\0';
+    const char *cursor = pattern;
+    while (*cursor != '\0' && used < 127) {
+        if (*cursor == '%') {
+            cursor = ez_format_percent_token(result, 128, &used, cursor, &tm_value);
+        } else {
+            cursor = ez_format_named_token(result, 128, &used, cursor, &tm_value);
+        }
     }
     return result;
 }

@@ -2,6 +2,7 @@
 
 import sys
 import os
+import re
 from pathlib import Path
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
@@ -53,6 +54,14 @@ def all_example_files():
     """获取所有示例文件路径"""
     examples_dir = Path(__file__).parent.parent.parent / 'examples'
     return sorted(examples_dir.glob('*.ez'))
+
+
+def markdown_ez_blocks(filepath: Path):
+    """提取 Markdown 中标记为 ez 的代码块。"""
+    text = filepath.read_text(encoding='utf-8')
+    for index, match in enumerate(re.finditer(r'```ez\n(.*?)\n```', text, re.S), 1):
+        line = text[:match.start()].count('\n') + 1
+        yield index, line, match.group(1)
 
 
 class TestParser:
@@ -175,8 +184,29 @@ class TestParser:
         ''')
         assert len(errors) == 0, f'解析错误: {errors}'
 
+    def test_variable_decl_without_initializer_parses(self):
+        """显式类型变量允许省略初始化器。"""
+        _, errors = parse_source('''
+        let count: I32;
+        let arr: I32[]?;
+        let ptr: *I8;
+        ''')
+        assert len(errors) == 0, f'解析错误: {errors}'
+
     def test_all_examples(self):
         """测试所有示例文件可解析"""
         for ez_file in all_example_files():
             tree, errors = parse_file(str(ez_file))
             assert len(errors) == 0, f'{ez_file.name}: {errors}'
+
+    def test_documentation_ez_blocks_parse(self):
+        """文档中的 EzLang 代码块应保持可解析。"""
+        docs = sorted((Path(__file__).parent.parent.parent / 'docs').glob('*.md'))
+        checked = 0
+        for doc in docs:
+            for index, line, source in markdown_ez_blocks(doc):
+                checked += 1
+                _, errors = parse_source(source)
+                rel = doc.relative_to(Path(__file__).parent.parent.parent)
+                assert len(errors) == 0, f'{rel} 代码块 {index}（起始行 {line}）解析错误: {errors}'
+        assert checked > 0

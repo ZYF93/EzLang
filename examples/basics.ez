@@ -37,8 +37,9 @@ x /= 4;
 x %= 7;
 
 // 位运算赋值
+let shift: U32 = 1;
 x &= 0xF0;
 x |= 0x0F;
 x ^= 0xFF;
-x <<= 2;
-x >>= 1;
+x <<= shift;
+x >>= shift;

@@ -22,8 +22,10 @@ Flow 并发相关 hook：
 - `__ezrt_flow_exit()`：离开 flow 块。
 - `__ezrt_sleep(ms)`：flow 内 sleep suspend point。
 - `__ezrt_race(task, timeout)`：race 调度入口。
+- `__ezrt_race_i32(branches, count, timeout, timed_out)`：并发运行零捕获 `() => I32` 分支并返回首个完成值。
+- `__ezrt_task_start_i32(branch)` / `__ezrt_task_join_i32(handle)`：flow 内 `parallel { ... return I32 }` 的后台任务启动与依赖读取等待。
 
-当前 codegen 保持这些 hook 的 ABI 稳定。具体平台可替换为 epoll、kqueue、IOCP、WASI 或浏览器事件循环。
+当前 codegen 保持这些 hook 的 ABI 稳定。原生目标通过 `packages/std/native/runtime.c` 提供 `race` 和 `parallel` 的最小任务运行时；其它阻塞 I/O 后续可替换为 epoll、kqueue、IOCP、WASI 或浏览器事件循环。
 
 ## 阻塞调用与 suspend point
 

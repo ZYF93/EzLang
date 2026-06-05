@@ -2,12 +2,42 @@
 
 import sys
 import os
+import re
 from pathlib import Path
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 
 from semantic.analyzer import SemanticAnalyzer, analyze
 from semantic.symbols import SymbolKind
+
+
+ROOT = Path(__file__).parent.parent.parent
+
+
+def markdown_ez_blocks(filepath: Path):
+    """提取 Markdown 中标记为 ez 的代码块。"""
+    text = filepath.read_text(encoding='utf-8')
+    for index, match in enumerate(re.finditer(r'```ez\n(.*?)\n```', text, re.S), 1):
+        line = text[:match.start()].count('\n') + 1
+        yield index, line, match.group(1)
+
+
+DOC_SEMANTIC_SKIP = {
+    ('docs/doc.md', 2): '泛型、符号和局部推导的语义展示，依赖后续完整泛型推导能力',
+    ('docs/doc.md', 3): '结构体/内置类型声明展示，包含无函数上下文的示例方法体',
+    ('docs/doc.md', 6): 'flow/race 调度展示，依赖示例外部 fetch 函数',
+    ('docs/doc.md', 7): '控制流展示，依赖示例外部 print 函数',
+    ('docs/doc.md', 9): 'extern 路径和跨平台库声明展示，依赖示例外部库文件',
+    ('docs/doc.md', 10): '装饰器和标记语法展示，依赖示例外部 print 与 UI 工厂函数',
+    ('docs/ez-android-ui.md', 12): 'Android UI 包架构示例，依赖未接入的 ez-android-ui 包实现',
+    ('docs/ez-ios-ui.md', 13): 'iOS UI 包架构示例，依赖未接入的 ez-ios-ui 包实现',
+    ('docs/ez-web-ui.md', 12): 'Web UI 框架骨架示例，依赖未接入的 ez-web-ui 包实现',
+    ('docs/stdlib.md', 1): 'extern 搜索路径展示，依赖示例外部库文件',
+    ('docs/stdlib.md', 24): 'HTTP flow 使用示例，依赖示例外部网络接口上下文',
+    ('docs/stdlib.md', 26): 'HTTP 服务端使用示例，依赖前置 HTTP 类型和服务端上下文',
+    ('docs/tutorial.md', 6): '教程片段依赖 std/io 导入解析，由 CLI 集成测试覆盖',
+    ('docs/tutorial.md', 7): '教程片段依赖 std/time 导入解析，由 CLI 集成测试覆盖',
+}
 
 
 def analyze_file(filepath: str) -> SemanticAnalyzer:
@@ -40,6 +70,17 @@ class TestSemantic:
         global_val = anal.symbols.resolve('global_val')
         assert global_val is not None
         assert global_val.kind == SymbolKind.STATIC
+
+    def test_variable_decl_without_initializer_keeps_annotated_type(self):
+        """无初始化器变量应使用显式标注类型。"""
+        anal = analyze('let count: I32; let arr: I32[]?; let ptr: *I8;')
+        assert not anal.symbols.has_errors(), f'语义错误: {anal.symbols.errors}'
+        count = anal.symbols.resolve('count')
+        arr = anal.symbols.resolve('arr')
+        ptr = anal.symbols.resolve('ptr')
+        assert count is not None and count.type.name == 'I32'
+        assert arr is not None and arr.type.kind.name == 'OPTIONAL'
+        assert ptr is not None and ptr.type.kind.name == 'POINTER'
 
     def test_basics(self):
         """基础语法语义检查"""
@@ -169,17 +210,97 @@ class TestSemantic:
         assert mismatch.symbols.has_errors()
         assert any('不匹配' in e for e in mismatch.symbols.errors)
 
+    def test_typeof_struct_type_id_comparison(self):
+        """typeof 结构体值可与类型名 TypeID 做位运算判断。"""
+        anal = analyze('''
+        const main = (): I32 => {
+            const err = Error(code = 1, message = "x");
+            const ok = typeof err & Error == Error;
+            return ok ? 0 : 1;
+        };
+        ''')
+        assert not anal.symbols.has_errors(), f'错误: {anal.symbols.errors}'
+
     def test_binary_op_same_types(self):
         """同类型运算不应报类型错误"""
         anal = analyze('let x = 1 + 2; let y = 3.0 + 4.0;')
         type_errors = [e for e in anal.symbols.errors if '二元运算' in e or '不匹配' in e]
         assert len(type_errors) == 0
 
+    def test_shift_rhs_requires_unsigned_integer(self):
+        """移位右操作数必须显式为无符号整数。"""
+        ok = analyze('let shift: U32 = 1; let x = 1 << shift;')
+        assert not ok.symbols.has_errors(), f'不应有语义错误: {ok.symbols.errors}'
+
+        bad = analyze('let x = 1 << 1;')
+        assert any('移位右操作数' in e for e in bad.symbols.errors), f'应有移位类型错误: {bad.symbols.errors}'
+
     def test_comparison_returns_bool(self):
         """比较运算返回 Bool"""
         anal = analyze('let x = 1 == 2;')
         sym = anal.symbols.resolve('x')
         assert sym.type.name == 'Bool'
+
+    def test_simd_vector_scalar_binary_ops(self):
+        """SIMD 向量支持同类标量广播运算。"""
+        anal = analyze('''
+        let a = Vec[1, 2, 3, 4];
+        let b = a + 2;
+        ''')
+        assert not anal.symbols.has_errors(), f'不应有语义错误: {anal.symbols.errors}'
+        sym = anal.symbols.resolve('b')
+        assert sym is not None
+        assert sym.type is not None
+        assert sym.type.kind.name == 'VEC'
+        assert sym.type.element_type.name == 'I32'
+        assert sym.type.vec_size == 4
+
+    def test_simd_vector_scalar_type_mismatch(self):
+        """SIMD 向量广播只允许同类数值标量。"""
+        anal = analyze('''
+        let a = Vec[1, 2, 3, 4];
+        let b = a + 2.0;
+        ''')
+        assert any('SIMD 向量与标量类型不匹配' in e for e in anal.symbols.errors), anal.symbols.errors
+
+    def test_simd_vector_comparison_returns_mask(self):
+        """SIMD 向量比较返回同宽 Bool mask。"""
+        anal = analyze('''
+        let a = Vec[1, 2, 3, 4];
+        let b = Vec[2, 2, 2, 2];
+        let mask = a < b;
+        ''')
+        assert not anal.symbols.has_errors(), f'不应有语义错误: {anal.symbols.errors}'
+        sym = anal.symbols.resolve('mask')
+        assert sym is not None
+        assert sym.type is not None
+        assert sym.type.kind.name == 'VEC'
+        assert sym.type.element_type.name == 'Bool'
+        assert sym.type.vec_size == 4
+
+    def test_simd_vector_length_mismatch(self):
+        """SIMD 向量二元运算要求长度一致。"""
+        anal = analyze('''
+        let a = Vec[1, 2, 3, 4];
+        let b = Vec[1, 2];
+        let c = a + b;
+        ''')
+        assert any('SIMD 向量长度不匹配' in e for e in anal.symbols.errors), anal.symbols.errors
+
+    def test_simd_shift_rhs_requires_unsigned_integer(self):
+        """SIMD 移位右操作数同样必须是无符号整数。"""
+        ok = analyze('''
+        let a = Vec[1, 2, 3, 4];
+        let shift: U32 = 1;
+        let b = a << shift;
+        ''')
+        assert not ok.symbols.has_errors(), f'不应有语义错误: {ok.symbols.errors}'
+
+        bad = analyze('''
+        let a = Vec[1, 2, 3, 4];
+        let b = a << 1;
+        ''')
+        assert any('移位右操作数' in e for e in bad.symbols.errors), bad.symbols.errors
 
     def test_logical_returns_bool(self):
         """逻辑运算返回 Bool"""
@@ -295,19 +416,76 @@ class TestSemantic:
         anal = analyze('const greeting = "Hello {{missingName}}";')
         assert any('missingName' in e for e in anal.symbols.errors), f'应有未定义变量错误: {anal.symbols.errors}'
 
-    def test_markup_literal_semantic(self):
-        """标记字面量应翻译为字符串类型并分析表达式子节点"""
+    def test_markup_literal_requires_factory(self):
+        """标记字面量必须存在同名工厂函数。"""
+        anal = analyze('let ui = <text color="blue" />;')
+        assert any("同名工厂函数 'text'" in e for e in anal.symbols.errors), anal.symbols.errors
+        ui = anal.symbols.resolve('ui')
+        assert ui is not None
+        assert ui.type.name == 'unknown'
+
+    def test_markup_literal_lowers_to_factory_type(self):
+        """存在同名工厂函数时，标记字面量返回工厂函数的返回类型。"""
         anal = analyze('''
-        let ui = <text color="blue">
-            "Welcome"
-            <div id=1 />
-            {1 + 2}
-        </text>;
+        const text = (color: Str, children: Str[]): I32 => {
+            return 1;
+        };
+        let ui = <text color="blue">"Welcome"</text>;
         ''')
         assert not anal.symbols.has_errors(), f'不应有语义错误: {anal.symbols.errors}'
         ui = anal.symbols.resolve('ui')
         assert ui is not None
-        assert ui.type.name == 'Str'
+        assert ui.type.name == 'I32'
+
+    def test_markup_literal_factory_parameter_check(self):
+        """标记工厂函数参数应参与语义校验。"""
+        anal = analyze('''
+        const text = (color: Str, children: Str[]): I32 => {
+            return 1;
+        };
+        let ui = <text tone="blue">"Welcome"</text>;
+        ''')
+        assert any("未知参数 'tone'" in e for e in anal.symbols.errors), anal.symbols.errors
+
+    def test_markup_literal_checks_attr_type(self):
+        """标记属性类型应匹配同名工厂函数参数。"""
+        anal = analyze('''
+        const text = (color: I32): I32 => {
+            return color;
+        };
+        let ui = <text color="blue" />;
+        ''')
+        assert any("参数 'color' 类型不匹配" in e for e in anal.symbols.errors), anal.symbols.errors
+
+    def test_markup_literal_checks_children_type(self):
+        """标记 children 类型应匹配同名工厂函数参数。"""
+        anal = analyze('''
+        const text = (children: I32[]): I32 => {
+            return 1;
+        };
+        let ui = <text>"Welcome"</text>;
+        ''')
+        assert any("参数 'children' 类型不匹配" in e for e in anal.symbols.errors), anal.symbols.errors
+
+    def test_markup_literal_rejects_mixed_children_type(self):
+        """标记子节点数组元素类型不一致时应报错。"""
+        anal = analyze('''
+        const text = (children: Str[]): I32 => {
+            return 1;
+        };
+        let ui = <text>"Welcome"{1 + 2}</text>;
+        ''')
+        assert any('标记子节点类型不一致' in e for e in anal.symbols.errors), anal.symbols.errors
+
+    def test_markup_literal_rejects_children_without_parameter(self):
+        """工厂函数未声明 children 参数时，标记子节点应报未知参数。"""
+        anal = analyze('''
+        const text = (): I32 => {
+            return 1;
+        };
+        let ui = <text>"Welcome"</text>;
+        ''')
+        assert any("未知参数 'children'" in e for e in anal.symbols.errors), anal.symbols.errors
 
     def test_markup_literal_checks_child_expression(self):
         """标记字面量应检查表达式子节点"""
@@ -377,6 +555,35 @@ class TestSemantic:
         assert d.type.name == 'Dict'
         assert d.type.key_type.name == 'Str'
         assert d.type.value_type.name == 'Str'
+
+    def test_dict_literal_expression_key_infers_key_type(self):
+        """字典表达式键应按表达式类型推导 key 类型。"""
+        anal = analyze('let d = { [1] = "one" };')
+        d = anal.symbols.resolve('d')
+        assert d is not None
+        assert d.type.name == 'Dict'
+        assert d.type.key_type.name == 'I32'
+        assert d.type.value_type.name == 'Str'
+
+    def test_dict_index_returns_value_type(self):
+        """Dict 索引应按键查询并返回值类型，而不是按数组索引处理。"""
+        anal = analyze('let d = { name = "EzLang", lang = "ez" }; let lang = d["lang"];')
+        assert not anal.symbols.warnings, f'不应有索引警告: {anal.symbols.warnings}'
+        lang = anal.symbols.resolve('lang')
+        assert lang is not None
+        assert lang.type is not None
+        assert lang.type.name == 'Str'
+
+    def test_dict_index_checks_key_type(self):
+        """Dict 索引 key 类型应参与语义校验。"""
+        anal = analyze('let d = { name = "EzLang" }; let bad = d[1];')
+        assert any('字典键类型不匹配' in e for e in anal.symbols.errors), anal.symbols.errors
+
+    def test_dynamic_dict_shape_annotation_checks_key_type(self):
+        """{ [key: K]: V } 注解应按动态键类型校验索引。"""
+        anal = analyze('let d: { [key: I32]: Str } = { [1] = "one" }; let bad = d["one"];')
+        assert not any('变量初始化类型不匹配' in e for e in anal.symbols.errors), anal.symbols.errors
+        assert any('字典键类型不匹配' in e for e in anal.symbols.errors), anal.symbols.errors
 
     def test_return_outside_function(self):
         """return 在函数外应报错"""
@@ -449,6 +656,99 @@ class TestSemantic:
         ''')
         errors = [e for e in anal.symbols.errors if '期望' in e]
         assert len(errors) > 0, f'应检测到泛型参数数量不匹配: {anal.symbols.errors}'
+
+    def test_generic_struct_explicit_args_instantiate_fields(self):
+        """显式泛型结构体实参应替换字段类型。"""
+        anal = analyze('''
+        struct Pair<T, U> { first: T; second: U; };
+        const main = (): I32 => {
+            const p = Pair<I32, Str>(first = 42, second = "hello");
+            return p.first;
+        };
+        ''')
+        assert not anal.symbols.errors, f'不应产生语义错误: {anal.symbols.errors}'
+
+        wrong = analyze('''
+        struct Pair<T, U> { first: T; second: U; };
+        const main = (): I32 => {
+            const p = Pair<I32, Str>(first = 42, second = 7);
+            return p.first;
+        };
+        ''')
+        errors = [e for e in wrong.symbols.errors if '字段初始化类型' in e and '不匹配' in e]
+        assert errors, f'应按显式类型参数检查字段类型: {wrong.symbols.errors}'
+
+    def test_generic_struct_infers_type_args_from_fields(self):
+        """泛型结构体构造应从字段初始化值推导类型参数。"""
+        anal = analyze('''
+        struct Pair<T, U> { first: T; second: U; };
+        const main = (): I32 => {
+            const p = Pair(first = 42, second = "hello");
+            return p.first;
+        };
+        ''')
+        assert not anal.symbols.errors, f'不应产生语义错误: {anal.symbols.errors}'
+
+        wrong = analyze('''
+        struct Pair<T, U> { first: T; second: U; };
+        const main = (): I32 => {
+            const p = Pair(first = 42, second = "hello");
+            let s: Str = p.first;
+            return 0;
+        };
+        ''')
+        errors = [e for e in wrong.symbols.errors if '变量初始化类型' in e and '不匹配' in e]
+        assert errors, f'应把 p.first 推导为 I32: {wrong.symbols.errors}'
+
+    def test_generic_struct_method_return_type_is_instantiated(self):
+        """泛型结构体方法返回类型应随接收者具体类型实例化。"""
+        anal = analyze('''
+        struct Pair<T, U> {
+            first: T;
+            second: U;
+            swap = (this: Pair<T, U>): Pair<U, T> => {
+                return Pair<U, T>(first = this.second, second = this.first);
+            };
+        };
+        const main = (): I32 => {
+            const p = Pair(first = 42, second = "hello");
+            const swapped = p.swap();
+            let s: Str = swapped.first;
+            let n: I32 = swapped.second;
+            return n;
+        };
+        ''')
+        assert not anal.symbols.errors, f'不应产生语义错误: {anal.symbols.errors}'
+        assert not anal.symbols.warnings, f'不应产生语义警告: {anal.symbols.warnings}'
+
+    def test_optional_member_access_returns_optional_field_type(self):
+        """opt?.field 应返回字段类型的可选值。"""
+        anal = analyze('''
+        struct Box { value: I32; };
+        const main = (): I32 => {
+            let box: Box?;
+            const value = box?.value;
+            return value.ok ? value.value : 0;
+        };
+        ''')
+        assert not anal.symbols.errors, f'不应产生语义错误: {anal.symbols.errors}'
+        assert not anal.symbols.warnings, f'不应产生语义警告: {anal.symbols.warnings}'
+
+    def test_optional_method_call_returns_optional_result_type(self):
+        """opt?.method() 应返回方法返回值类型的可选值。"""
+        anal = analyze('''
+        struct TextBox {
+            value: I32;
+            text = (this: TextBox): Str => { return "box"; };
+        };
+        const main = (): I32 => {
+            let box: TextBox?;
+            const text = box?.text();
+            return text.ok ? 1 : 0;
+        };
+        ''')
+        assert not anal.symbols.errors, f'不应产生语义错误: {anal.symbols.errors}'
+        assert not anal.symbols.warnings, f'不应产生语义警告: {anal.symbols.warnings}'
 
     def test_struct_init_wrong_field(self):
         """结构体构造使用不存在的字段应警告"""
@@ -699,3 +999,20 @@ class TestSemantic:
         assert anal.symbols.resolve('ptr').type.kind.name == 'POINTER'
         assert len(anal.parallel_blocks) == 1
         assert any(p['name'] == 'parallel' for p in anal.suspend_points)
+
+    def test_documentation_ez_blocks_semantic_or_marked_demo(self):
+        """文档 Ez 代码块应通过语义分析，或显式标为演示片段。"""
+        seen: set[tuple[str, int]] = set()
+        for doc in sorted((ROOT / 'docs').glob('*.md')):
+            rel = doc.relative_to(ROOT).as_posix()
+            for index, line, source in markdown_ez_blocks(doc):
+                key = (rel, index)
+                if key in DOC_SEMANTIC_SKIP:
+                    seen.add(key)
+                    continue
+                anal = analyze(source)
+                assert not anal.symbols.has_errors(), (
+                    f'{rel} 代码块 {index}（起始行 {line}）语义错误: {anal.symbols.errors}'
+                )
+        missing = set(DOC_SEMANTIC_SKIP) - seen
+        assert not missing, f'文档语义跳过清单指向了不存在的代码块: {sorted(missing)}'

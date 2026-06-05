@@ -12,6 +12,7 @@ export struct WsConn {
     handle: I64;
 };
 
+// 原生目标仅支持 ws:// 握手和基础单帧消息；wss://、分片帧和 emcc 同步 WebSocket 明确不支持。
 export declare const wsConnect: (url: Str) => WsConn?;
 export declare const wsSend: (conn: WsConn, data: Blob) => I64;
 export declare const wsRecv: (conn: WsConn, maxBytes: I64) => Blob?;

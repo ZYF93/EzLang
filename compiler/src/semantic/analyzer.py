@@ -3,6 +3,7 @@
 import os
 import re
 from pathlib import Path
+from typing import Optional
 
 from parser.EzLangParser import EzLangParser
 from parser.EzLangVisitor import EzLangVisitor
@@ -22,6 +23,9 @@ class SemanticAnalyzer(EzLangVisitor):
         self.current_function_return: Optional[Type] = None  # 当前函数声明的返回类型
         self.in_function = False  # 是否在函数内部
         self.generic_templates: dict[str, tuple] = {}  # name → (param_names, template_ctx)
+        self.struct_generic_params: dict[str, list[str]] = {}
+        self.struct_method_types: dict[str, dict[str, Type]] = {}
+        self._current_generic_names: set[str] = set()
         self.flow_depth = 0
         self.parallel_depth = 0
         self.flow_blocks: list[dict] = []
@@ -198,7 +202,12 @@ class SemanticAnalyzer(EzLangVisitor):
                 # 查找是否为已定义的结构体/别名或内置对象类型，直接返回完整类型信息
                 resolved = self.symbols.resolve(name)
                 if resolved and resolved.kind in (SymbolKind.STRUCT, SymbolKind.TYPE_ALIAS):
-                    return resolved.type
+                    resolved_type = resolved.type
+                    if resolved.kind == SymbolKind.STRUCT and generic_args is not None:
+                        args = [self._get_type_from_ctx(t) for t in generic_args.type_()]
+                        if None not in args:
+                            return self._instantiate_struct_type(resolved_type, args)
+                    return resolved_type
                 builtin = builtin_type(name)
                 if builtin is not None:
                     return builtin
@@ -253,7 +262,11 @@ class SemanticAnalyzer(EzLangVisitor):
     def _infer_literal_type(self, ctx) -> Optional[Type]:
         """从字面量推导类型"""
         if ctx.INTEGER_LITERAL() is not None:
-            return Type(name="I32", kind=TypeKind.BASIC)
+            try:
+                value = int(ctx.INTEGER_LITERAL().getText(), 0)
+            except ValueError:
+                return Type(name="I32", kind=TypeKind.BASIC)
+            return Type(name="I32" if -(2 ** 31) <= value <= (2 ** 31 - 1) else "I64", kind=TypeKind.BASIC)
         if ctx.FLOAT_LITERAL() is not None:
             return Type(name="F64", kind=TypeKind.BASIC)
         if ctx.STRING_LITERAL() is not None:
@@ -266,6 +279,24 @@ class SemanticAnalyzer(EzLangVisitor):
         if ctx.BOOL_LITERAL() is not None:
             return Type(name="Bool", kind=TypeKind.BASIC)
         return None
+
+    def _union_payload_type(self, type_: Type) -> Optional[Type]:
+        """返回当前联合运行时 value 槽采用的语义类型。"""
+        if type_.kind != TypeKind.UNION or not type_.union_types:
+            return None
+        width = {
+            "Bool": 1,
+            "I8": 1,
+            "U8": 1,
+            "I32": 4,
+            "U32": 4,
+            "F32": 4,
+            "I64": 8,
+            "U64": 8,
+            "F64": 8,
+            "Str": 8,
+        }
+        return max(type_.union_types, key=lambda t: width.get(t.name, 8) if t is not None else 0)
 
     def _check_type_compat(self, expected: Optional[Type], actual: Optional[Type],
                            ctx, msg_prefix: str = "类型") -> bool:
@@ -294,6 +325,116 @@ class SemanticAnalyzer(EzLangVisitor):
             )
             return Type(name="unknown", kind=TypeKind.BASIC)
         return left_type  # 运算结果类型与操作数相同
+
+    @staticmethod
+    def _has_token(ctx, name: str) -> bool:
+        """兼容 ANTLR 单 token 和重复 token 访问器。"""
+        if not hasattr(ctx, name):
+            return False
+        token = getattr(ctx, name)()
+        if isinstance(token, list):
+            return len(token) > 0
+        return token is not None
+
+    def _make_vec_type(self, element_type: Type, size: int) -> Type:
+        """构造 SIMD 向量类型。"""
+        result = Type(kind=TypeKind.VEC, name=f"Vec<{element_type.name}>[{size}]")
+        result.element_type = element_type
+        result.vec_size = size
+        return result
+
+    def _is_numeric_vec(self, type_: Optional[Type]) -> bool:
+        return (
+            type_ is not None
+            and type_.kind == TypeKind.VEC
+            and type_.element_type is not None
+            and type_.element_type.is_numeric()
+        )
+
+    def _is_integer_vec(self, type_: Optional[Type]) -> bool:
+        return (
+            type_ is not None
+            and type_.kind == TypeKind.VEC
+            and type_.element_type is not None
+            and type_.element_type.is_integer()
+        )
+
+    def _is_mask_vec(self, type_: Optional[Type]) -> bool:
+        return (
+            type_ is not None
+            and type_.kind == TypeKind.VEC
+            and type_.element_type is not None
+            and type_.element_type.is_bool()
+        )
+
+    def _vec_binary_type(self, left_type: Type, right_type: Type, ctx, op_text: str,
+                         comparison: bool = False) -> Optional[Type]:
+        """检查 SIMD 向量二元运算，支持标量广播。"""
+        left_vec = left_type.kind == TypeKind.VEC
+        right_vec = right_type.kind == TypeKind.VEC
+        if not left_vec and not right_vec:
+            return None
+
+        vector_type = left_type if left_vec else right_type
+        scalar_type = None if left_vec and right_vec else (right_type if left_vec else left_type)
+        line = ctx.start.line if hasattr(ctx, 'start') else 0
+        elem_type = vector_type.element_type
+        if elem_type is None:
+            return Type(name="unknown", kind=TypeKind.BASIC)
+
+        if left_vec and right_vec:
+            if left_type.vec_size != right_type.vec_size:
+                self.symbols.add_error(
+                    f"行 {line}: SIMD 向量长度不匹配：'{left_type}' 和 '{right_type}'"
+                )
+                return Type(name="unknown", kind=TypeKind.BASIC)
+            if left_type.element_type != right_type.element_type:
+                self.symbols.add_error(
+                    f"行 {line}: SIMD 向量元素类型不匹配：'{left_type}' 和 '{right_type}'"
+                )
+                return Type(name="unknown", kind=TypeKind.BASIC)
+        elif scalar_type is not None:
+            same_numeric_family = (
+                elem_type.is_integer() and scalar_type.is_integer()
+            ) or (
+                elem_type.is_float() and scalar_type.is_float()
+            )
+            if not same_numeric_family:
+                self.symbols.add_error(
+                    f"行 {line}: SIMD 向量与标量类型不匹配：'{vector_type}' 和 '{scalar_type}'"
+                )
+                return Type(name="unknown", kind=TypeKind.BASIC)
+
+        op_is_shift = op_text in {"<<", ">>"}
+        op_is_bitwise = op_text in {"&", "|", "^"}
+        op_is_arithmetic = op_text in {"+", "-", "*", "/", "%"}
+
+        if comparison:
+            if not self._is_numeric_vec(vector_type):
+                self.symbols.add_error(f"行 {line}: SIMD 向量比较要求数值元素类型，实际为 '{vector_type}'")
+                return Type(name="unknown", kind=TypeKind.BASIC)
+            return self._make_vec_type(Type(name="Bool", kind=TypeKind.BASIC), vector_type.vec_size)
+
+        if op_is_arithmetic and not self._is_numeric_vec(vector_type):
+            self.symbols.add_error(f"行 {line}: SIMD 向量算术运算要求数值元素类型，实际为 '{vector_type}'")
+            return Type(name="unknown", kind=TypeKind.BASIC)
+        if op_is_shift and not self._is_integer_vec(vector_type):
+            self.symbols.add_error(f"行 {line}: SIMD 向量移位要求整数元素类型，实际为 '{vector_type}'")
+            return Type(name="unknown", kind=TypeKind.BASIC)
+        if op_is_bitwise and not (self._is_integer_vec(vector_type) or self._is_mask_vec(vector_type)):
+            self.symbols.add_error(f"行 {line}: SIMD 向量位运算要求整数或布尔掩码元素类型，实际为 '{vector_type}'")
+            return Type(name="unknown", kind=TypeKind.BASIC)
+        if not (op_is_arithmetic or op_is_shift or op_is_bitwise):
+            self.symbols.add_error(f"行 {line}: SIMD 向量不支持运算符 '{op_text}'")
+            return Type(name="unknown", kind=TypeKind.BASIC)
+        return vector_type
+
+    def _is_unsigned_shift_rhs_type(self, type_: Optional[Type]) -> bool:
+        if type_ is None or type_.name == "unknown":
+            return True
+        if type_.kind == TypeKind.VEC and type_.element_type is not None:
+            return type_.element_type.name in {"U8", "U32", "U64"}
+        return type_.is_integer() and type_.name in {"U8", "U32", "U64"}
 
     def _get_lvalue_name(self, ctx) -> Optional[str]:
         """从赋值表达式左侧的 pipelineExpression 获取被赋值的变量名"""
@@ -371,6 +512,130 @@ class SemanticAnalyzer(EzLangVisitor):
             return self._get_call_name(ctx.postfixExpression())
         return None
 
+    def _replace_generic_type(self, type_: Optional[Type], type_map: dict[str, Type]) -> Optional[Type]:
+        """用推导出的具体类型替换泛型参数类型。"""
+        if type_ is None:
+            return None
+        if type_.kind == TypeKind.BASIC and type_.name in type_map:
+            return type_map[type_.name]
+        result = Type(name=type_.name, kind=type_.kind)
+        result.is_optional = type_.is_optional
+        result.is_union = type_.is_union
+        result.element_type = self._replace_generic_type(type_.element_type, type_map)
+        result.key_type = self._replace_generic_type(type_.key_type, type_map)
+        result.value_type = self._replace_generic_type(type_.value_type, type_map)
+        result.vec_size = type_.vec_size
+        result.param_types = [self._replace_generic_type(t, type_map) for t in type_.param_types]
+        result.param_names = list(type_.param_names)
+        result.default_param_names = set(type_.default_param_names)
+        result.return_type = self._replace_generic_type(type_.return_type, type_map)
+        result.union_types = [self._replace_generic_type(t, type_map) for t in type_.union_types]
+        result.fields = {name: self._replace_generic_type(field_type, type_map) for name, field_type in type_.fields.items()}
+        result.pointee_type = self._replace_generic_type(type_.pointee_type, type_map)
+        if hasattr(type_, 'generic_base'):
+            result.generic_base = type_.generic_base
+        if hasattr(type_, 'type_args'):
+            result.type_args = [self._replace_generic_type(t, type_map) for t in type_.type_args]
+        return result
+
+    def _instantiate_struct_type(self, struct_type: Type, type_args: list[Type]) -> Type:
+        """按显式类型参数实例化泛型结构体字段类型。"""
+        generic_names = self.struct_generic_params.get(struct_type.name, [])
+        if not generic_names or len(generic_names) != len(type_args):
+            return struct_type
+        type_map = dict(zip(generic_names, type_args))
+        result = Type(
+            name=f"{struct_type.name}<" + ", ".join(str(t) for t in type_args) + ">",
+            kind=TypeKind.STRUCT,
+        )
+        result.generic_base = struct_type.name
+        result.type_args = list(type_args)
+        result.fields = {
+            field_name: self._replace_generic_type(field_type, type_map)
+            for field_name, field_type in struct_type.fields.items()
+        }
+        return result
+
+    def _function_type_from_fn_like(self, fn_like) -> Type:
+        """从结构体方法签名/函数字面量提取函数类型。"""
+        func_type = Type(name="function", kind=TypeKind.FUNCTION)
+        func_type.return_type = self._get_type_from_ctx(fn_like.type_()) if fn_like.type_() is not None else None
+        params = fn_like.paramList()
+        if params is not None:
+            for param in params.param():
+                func_type.param_names.append(param.VAR_IDENTIFIER().getText())
+                func_type.param_types.append(self._get_type_from_ctx(param.type_()) if param.type_() is not None else None)
+                if param.expression() is not None:
+                    func_type.default_param_names.add(param.VAR_IDENTIFIER().getText())
+        return func_type
+
+    def _method_type_for_struct(self, struct_type: Type, method_name: str) -> Optional[Type]:
+        base_name = getattr(struct_type, 'generic_base', struct_type.name)
+        methods = self.struct_method_types.get(base_name, {})
+        method_type = methods.get(method_name)
+        if method_type is None:
+            return None
+        generic_names = self.struct_generic_params.get(base_name, [])
+        type_args = getattr(struct_type, 'type_args', [])
+        if generic_names and len(type_args) == len(generic_names):
+            return self._replace_generic_type(method_type, dict(zip(generic_names, type_args)))
+        return method_type
+
+    def _bind_generic_type(self, expected: Optional[Type], actual: Optional[Type], type_map: dict[str, Type]) -> None:
+        """根据形参类型和实参类型推导泛型参数。"""
+        if expected is None or actual is None:
+            return
+        if expected.kind == TypeKind.BASIC and expected.name in self._current_generic_names:
+            type_map.setdefault(expected.name, actual)
+            return
+        if expected.element_type is not None:
+            self._bind_generic_type(expected.element_type, actual.element_type, type_map)
+        if expected.key_type is not None:
+            self._bind_generic_type(expected.key_type, actual.key_type, type_map)
+        if expected.value_type is not None:
+            self._bind_generic_type(expected.value_type, actual.value_type, type_map)
+        if expected.pointee_type is not None:
+            self._bind_generic_type(expected.pointee_type, actual.pointee_type, type_map)
+
+    def _infer_struct_type_args_from_fields(self, struct_type: Type, init_list) -> list[Type] | None:
+        """根据结构体字段初始化值推导泛型结构体类型实参。"""
+        generic_names = self.struct_generic_params.get(struct_type.name, [])
+        if not generic_names or init_list is None:
+            return None
+        self._current_generic_names = set(generic_names)
+        type_map: dict[str, Type] = {}
+        for init in init_list.structFieldInit():
+            if init.ELLIPSIS() is not None or init.expression() is None:
+                continue
+            fname = init.VAR_IDENTIFIER().getText()
+            expected = struct_type.fields.get(fname)
+            actual = init.expression().accept(self)
+            self._bind_generic_type(expected, actual, type_map)
+        self._current_generic_names = set()
+        if any(name not in type_map for name in generic_names):
+            return None
+        return [type_map[name] for name in generic_names]
+
+    def _infer_generic_function_type(self, call_name: Optional[str], target_type: Optional[Type], named_args: dict[str, Optional[Type]]) -> Optional[Type]:
+        if call_name is None or target_type is None or call_name not in self.generic_templates:
+            return target_type
+        gen_names, _ = self.generic_templates[call_name]
+        self._current_generic_names = set(gen_names)
+        type_map: dict[str, Type] = {}
+        for index, pname in enumerate(target_type.param_names):
+            if pname not in named_args or index >= len(target_type.param_types):
+                continue
+            self._bind_generic_type(target_type.param_types[index], named_args[pname], type_map)
+        self._current_generic_names = set()
+        if not type_map:
+            return target_type
+        inferred = Type(name="function", kind=TypeKind.FUNCTION)
+        inferred.return_type = self._replace_generic_type(target_type.return_type, type_map)
+        inferred.param_types = [self._replace_generic_type(t, type_map) for t in target_type.param_types]
+        inferred.param_names = list(target_type.param_names)
+        inferred.default_param_names = set(target_type.default_param_names)
+        return inferred
+
     # ==================== 声明访问 ====================
 
     def visitVariableDecl(self, ctx: EzLangParser.VariableDeclContext):
@@ -437,6 +702,8 @@ class SemanticAnalyzer(EzLangVisitor):
         """处理结构体声明: struct Name<T> { ... }"""
         name = ctx.TYPE_IDENTIFIER().getText()
         struct_type = Type(name=name, kind=TypeKind.STRUCT)
+        if ctx.genericParams() is not None:
+            self.struct_generic_params[name] = [t.getText() for t in ctx.genericParams().TYPE_IDENTIFIER()]
         symbol = Symbol(name, SymbolKind.STRUCT, struct_type, line=ctx.start.line)
         self.symbols.define(symbol)
 
@@ -463,6 +730,10 @@ class SemanticAnalyzer(EzLangVisitor):
         type_ = self._get_type_from_ctx(type_ctx) if type_ctx is not None else None
         symbol = Symbol(name, SymbolKind.VARIABLE, type_, mutable=True, line=ctx.start.line)
         self.symbols.define(symbol)
+        if self.current_struct:
+            struct_symbol = self.symbols.global_scope.resolve(self.current_struct)
+            if struct_symbol is not None and struct_symbol.type is not None:
+                struct_symbol.type.fields[name] = type_
         return None
 
     def visitStructMethod(self, ctx: EzLangParser.StructMethodContext):
@@ -475,6 +746,8 @@ class SemanticAnalyzer(EzLangVisitor):
         fn = ctx.functionLiteral()
         sig = ctx.functionSignature()
         fn_like = fn or sig
+        if self.current_struct and fn_like is not None:
+            self.struct_method_types.setdefault(self.current_struct, {})[name] = self._function_type_from_fn_like(fn_like)
         if fn_like is not None:
             # 验证 this 参数：首个参数应为 this: StructType
             params = fn_like.paramList()
@@ -488,7 +761,8 @@ class SemanticAnalyzer(EzLangVisitor):
                 # 验证 this 的类型匹配当前结构体
                 if pname == 'this' and self.current_struct and first_param.type_() is not None:
                     param_type = self._get_type_from_ctx(first_param.type_())
-                    if param_type and param_type.name != self.current_struct and param_type.name != "unknown":
+                    param_base = getattr(param_type, 'generic_base', param_type.name if param_type else None)
+                    if param_type and param_base != self.current_struct and param_type.name != "unknown":
                         self.symbols.add_warning(
                             f"行 {ctx.start.line}: 方法 'this' 参数类型应为 '{self.current_struct}'，"
                             f"实际为 '{param_type.name}'"
@@ -498,10 +772,16 @@ class SemanticAnalyzer(EzLangVisitor):
             if params is not None:
                 for param in params.param():
                     param.accept(self)
+            prev_return = self.current_function_return
+            prev_in_func = self.in_function
+            self.current_function_return = self._get_type_from_ctx(fn_like.type_()) if fn_like.type_() is not None else None
+            self.in_function = True
             if fn is not None and fn.expression() is not None:
                 fn.expression().accept(self)
             elif fn is not None and fn.block() is not None:
                 fn.block().accept(self)
+            self.in_function = prev_in_func
+            self.current_function_return = prev_return
             self.symbols.pop_scope()
         return None
 
@@ -619,6 +899,10 @@ class SemanticAnalyzer(EzLangVisitor):
         id_token = ctx.VAR_IDENTIFIER() or ctx.TYPE_IDENTIFIER()
         name = id_token.getText()
         symbol = self.symbols.resolve(name)
+        if symbol is not None and symbol.kind in (SymbolKind.STRUCT, SymbolKind.TYPE_ALIAS):
+            return Type(name="I32", kind=TypeKind.BASIC)
+        if symbol is None and builtin_type(name) is not None:
+            return Type(name="I32", kind=TypeKind.BASIC)
         if symbol is None and name == "race":
             func_type = Type(name="function", kind=TypeKind.FUNCTION)
             func_type.return_type = Type(name="I32", kind=TypeKind.BASIC)
@@ -676,20 +960,23 @@ class SemanticAnalyzer(EzLangVisitor):
 
         # 判断运算符类型，决定返回类型
         op_is_comparison = (
-            (hasattr(ctx, 'EQ') and ctx.EQ() is not None) or
-            (hasattr(ctx, 'NE') and ctx.NE() is not None) or
-            (hasattr(ctx, 'LANGLE') and ctx.LANGLE() is not None and
-             not (hasattr(ctx, 'SHL') and ctx.SHL() is not None)) or
-            (hasattr(ctx, 'RANGLE') and ctx.RANGLE() is not None and
-             not (hasattr(ctx, 'SHR') and ctx.SHR() is not None)) or
-            (hasattr(ctx, 'LE') and ctx.LE() is not None) or
-            (hasattr(ctx, 'GE') and ctx.GE() is not None)
+            self._has_token(ctx, 'EQ') or
+            self._has_token(ctx, 'NE') or
+            (self._has_token(ctx, 'LANGLE') and not self._has_token(ctx, 'SHL')) or
+            (self._has_token(ctx, 'RANGLE') and not self._has_token(ctx, 'SHR')) or
+            self._has_token(ctx, 'LE') or
+            self._has_token(ctx, 'GE')
         )
 
         op_is_logical = (
-            (hasattr(ctx, 'AND') and ctx.AND() is not None) or
-            (hasattr(ctx, 'OR') and ctx.OR() is not None)
+            self._has_token(ctx, 'AND') or
+            self._has_token(ctx, 'OR')
         )
+
+        op_text = ctx.getChild(1).getText() if ctx.getChildCount() > 1 else ""
+        vector_result = self._vec_binary_type(left_type, right_type, ctx, op_text, op_is_comparison)
+        if vector_result is not None:
+            return vector_result
 
         # 类型兼容性检查
         self._check_binary_op(left_type, right_type, ctx, "二元运算")
@@ -699,53 +986,60 @@ class SemanticAnalyzer(EzLangVisitor):
         return left_type
 
     def visitMultiplicativeExpression(self, ctx: EzLangParser.MultiplicativeExpressionContext) -> Optional[Type]:
-        if ctx.STAR() is not None or ctx.SLASH() is not None or ctx.PERCENT() is not None:
+        if self._has_token(ctx, 'STAR') or self._has_token(ctx, 'SLASH') or self._has_token(ctx, 'PERCENT'):
             return self._binop_type(ctx)
         return ctx.getChild(0).accept(self) if ctx.getChildCount() > 0 else None
 
     def visitAdditiveExpression(self, ctx: EzLangParser.AdditiveExpressionContext) -> Optional[Type]:
-        if ctx.PLUS() is not None or ctx.MINUS() is not None:
+        if self._has_token(ctx, 'PLUS') or self._has_token(ctx, 'MINUS'):
             return self._binop_type(ctx)
         return ctx.getChild(0).accept(self) if ctx.getChildCount() > 0 else None
 
     def visitShiftExpression(self, ctx: EzLangParser.ShiftExpressionContext) -> Optional[Type]:
-        if ctx.SHL() is not None or ctx.SHR() is not None:
+        if self._has_token(ctx, 'SHL') or self._has_token(ctx, 'SHR'):
+            exprs = list(ctx.additiveExpression())
+            for rhs in exprs[1:]:
+                rhs_type = rhs.accept(self)
+                if not self._is_unsigned_shift_rhs_type(rhs_type):
+                    self.symbols.add_error(
+                        f"行 {ctx.start.line}: 移位右操作数必须是无符号整数类型，实际为 '{rhs_type}'"
+                    )
             return self._binop_type(ctx)
         return ctx.getChild(0).accept(self) if ctx.getChildCount() > 0 else None
 
     def visitRelationalExpression(self, ctx: EzLangParser.RelationalExpressionContext) -> Optional[Type]:
-        if (ctx.LANGLE() is not None or ctx.RANGLE() is not None or
-                ctx.LE() is not None or ctx.GE() is not None):
+        if (self._has_token(ctx, 'LANGLE') or self._has_token(ctx, 'RANGLE') or
+                self._has_token(ctx, 'LE') or self._has_token(ctx, 'GE')):
             return self._binop_type(ctx)
         return ctx.getChild(0).accept(self) if ctx.getChildCount() > 0 else None
 
     def visitEqualityExpression(self, ctx: EzLangParser.EqualityExpressionContext) -> Optional[Type]:
-        if ctx.EQ() is not None or ctx.NE() is not None:
+        if self._has_token(ctx, 'EQ') or self._has_token(ctx, 'NE'):
             return self._binop_type(ctx)
         return ctx.getChild(0).accept(self) if ctx.getChildCount() > 0 else None
 
     def visitBitAndExpression(self, ctx: EzLangParser.BitAndExpressionContext) -> Optional[Type]:
-        if ctx.AMPERSAND() is not None:
+        if self._has_token(ctx, 'AMPERSAND'):
             return self._binop_type(ctx)
         return ctx.getChild(0).accept(self) if ctx.getChildCount() > 0 else None
 
     def visitBitXorExpression(self, ctx: EzLangParser.BitXorExpressionContext) -> Optional[Type]:
-        if ctx.CARET() is not None:
+        if self._has_token(ctx, 'CARET'):
             return self._binop_type(ctx)
         return ctx.getChild(0).accept(self) if ctx.getChildCount() > 0 else None
 
     def visitBitOrExpression(self, ctx: EzLangParser.BitOrExpressionContext) -> Optional[Type]:
-        if ctx.PIPE() is not None:
+        if self._has_token(ctx, 'PIPE'):
             return self._binop_type(ctx)
         return ctx.getChild(0).accept(self) if ctx.getChildCount() > 0 else None
 
     def visitAndExpression(self, ctx: EzLangParser.AndExpressionContext) -> Optional[Type]:
-        if ctx.AND() is not None:
+        if self._has_token(ctx, 'AND'):
             return self._binop_type(ctx)
         return ctx.getChild(0).accept(self) if ctx.getChildCount() > 0 else None
 
     def visitOrExpression(self, ctx: EzLangParser.OrExpressionContext) -> Optional[Type]:
-        if ctx.OR() is not None:
+        if self._has_token(ctx, 'OR'):
             return self._binop_type(ctx)
         return ctx.getChild(0).accept(self) if ctx.getChildCount() > 0 else None
 
@@ -785,15 +1079,47 @@ class SemanticAnalyzer(EzLangVisitor):
 
         field_name = ctx.VAR_IDENTIFIER().getText()
 
+        if isinstance(ctx.postfixExpression(), EzLangParser.OptionalUnwrapContext) and target_type is not None:
+            field_type = None
+            if target_type.kind == TypeKind.STRUCT:
+                if target_type.fields and field_name in target_type.fields:
+                    field_type = target_type.fields[field_name]
+                else:
+                    field_type = self._method_type_for_struct(target_type, field_name)
+            if field_type is not None:
+                result_type = field_type.return_type if field_type.kind == TypeKind.FUNCTION else field_type
+                if result_type is not None:
+                    result = Type(kind=TypeKind.OPTIONAL, name=f"{result_type.name}?")
+                    result.element_type = result_type
+                    return result
+            result = Type(kind=TypeKind.OPTIONAL, name=f"{target_type.name}?")
+            result.element_type = target_type
+            return result
+
         # 结构体成员访问：从 struct_type.fields 查找
         if target_type and target_type.kind == TypeKind.STRUCT:
             if target_type.fields and field_name in target_type.fields:
                 return target_type.fields[field_name]
+            method_type = self._method_type_for_struct(target_type, field_name)
+            if method_type is not None:
+                return method_type
             if target_type.name != "unknown":
                 self.symbols.add_warning(
                     f"行 {ctx.start.line}: 结构体 '{target_type.name}' 没有字段 '{field_name}'"
                 )
             return None
+
+        if target_type and target_type.kind == TypeKind.OPTIONAL:
+            if field_name == "ok":
+                return Type(name="Bool", kind=TypeKind.BASIC)
+            if field_name == "value":
+                return target_type.element_type
+
+        if target_type and target_type.kind == TypeKind.UNION:
+            if field_name == "tag":
+                return Type(name="I32", kind=TypeKind.BASIC)
+            if field_name == "value":
+                return self._union_payload_type(target_type)
 
         return None
 
@@ -803,6 +1129,7 @@ class SemanticAnalyzer(EzLangVisitor):
         if target is not None:
             call_name = self._get_call_name(target)
             target_type = target.accept(self)
+            implicit_this = isinstance(target, EzLangParser.MemberAccessContext)
 
             # 收集调用时提供的命名参数及其类型
             named_args: dict[str, Optional[Type]] = {}
@@ -811,6 +1138,8 @@ class SemanticAnalyzer(EzLangVisitor):
                     arg_type = arg.expression().accept(self) if arg.expression() is not None else None
                     arg_name = arg.VAR_IDENTIFIER().getText()
                     named_args[arg_name] = arg_type
+
+            target_type = self._infer_generic_function_type(call_name, target_type, named_args)
 
             if call_name == "race":
                 if not self._is_in_flow():
@@ -838,12 +1167,17 @@ class SemanticAnalyzer(EzLangVisitor):
                             self.symbols.add_error(
                                 f"行 {ctx.start.line}: 未知参数 '{arg_name}'"
                             )
+                implicit_this_name = target_type.param_names[0] if implicit_this and target_type.param_names else None
                 for pname in target_type.param_names:
+                    if pname == implicit_this_name:
+                        continue
                     if pname not in named_args and pname not in target_type.default_param_names:
                         self.symbols.add_error(
                             f"行 {ctx.start.line}: 缺少必填参数 '{pname}'"
                         )
                 for i, pname in enumerate(target_type.param_names):
+                    if pname == implicit_this_name:
+                        continue
                     if pname in named_args:
                         actual = named_args[pname]
                         expected = target_type.param_types[i] if i < len(target_type.param_types) else None
@@ -947,6 +1281,9 @@ class SemanticAnalyzer(EzLangVisitor):
         index_type = None
         if ctx.expression() is not None:
             index_type = ctx.expression().accept(self)
+        if target_type and target_type.kind == TypeKind.DICT:
+            self._check_type_compat(target_type.key_type, index_type, ctx, "字典键类型")
+            return target_type.value_type
         if index_type and not index_type.is_integer() and index_type.name != "unknown":
             self.symbols.add_warning(
                 f"行 {ctx.start.line}: 数组索引应为整数类型，实际为 '{index_type}'"
@@ -1025,6 +1362,17 @@ class SemanticAnalyzer(EzLangVisitor):
             return Type(name=name, kind=TypeKind.STRUCT)
         # 返回符号表中的结构体类型（保留 fields 信息），内置对象类型走内建表。
         struct_type = resolved.type if resolved and resolved.type else builtin
+        if ctx.structLiteral().genericArgs() is not None and struct_type is not None:
+            type_args = [self._get_type_from_ctx(t) for t in ctx.structLiteral().genericArgs().type_()]
+            if None not in type_args:
+                struct_type = self._instantiate_struct_type(struct_type, type_args)
+        elif struct_type is not None and struct_type.name in self.struct_generic_params:
+            type_args = self._infer_struct_type_args_from_fields(
+                struct_type,
+                ctx.structLiteral().structFieldInitList(),
+            )
+            if type_args is not None:
+                struct_type = self._instantiate_struct_type(struct_type, type_args)
 
         # 遍历字段初始化，验证字段名有效性
         init_list = ctx.structLiteral().structFieldInitList()
@@ -1163,12 +1511,10 @@ class SemanticAnalyzer(EzLangVisitor):
         # 判断分支类型的一致性
         then_type = None
         else_type = None
-        if ctx.expression(1) is not None:
-            then_type = ctx.expression(1).accept(self)
-        elif ctx.block(0) is not None:
+        if ctx.block(0) is not None:
             then_type = ctx.block(0).accept(self)
-        if len(ctx.expression()) > 2 and ctx.expression(2) is not None:
-            else_type = ctx.expression(2).accept(self)
+        if len(ctx.expression()) > 1 and ctx.expression(1) is not None:
+            else_type = ctx.expression(1).accept(self)
         elif len(ctx.block()) > 1 and ctx.block(1) is not None:
             else_type = ctx.block(1).accept(self)
 
@@ -1210,20 +1556,24 @@ class SemanticAnalyzer(EzLangVisitor):
     def visitDictExpr(self, ctx: EzLangParser.DictExprContext) -> Optional[Type]:
         """字典字面量"""
         dict_type = Type(name="Dict", kind=TypeKind.DICT)
-        key_type = Type(name="Str", kind=TypeKind.BASIC)
+        key_type = None
         value_type = None
         if ctx.dictLiteral() is not None:
             for field in ctx.dictLiteral().dictField():
                 key_ctx = field.dictKey()
-                if key_ctx is not None and key_ctx.expression() is not None:
-                    inferred_key = key_ctx.expression().accept(self)
-                    if inferred_key is not None:
-                        if key_type is None:
-                            key_type = inferred_key
-                        elif not key_type.compatible_with(inferred_key):
-                            self.symbols.add_warning(
-                                f"行 {ctx.start.line}: 字典键类型不一致：'{key_type}' 和 '{inferred_key}'"
-                            )
+                inferred_key = None
+                if key_ctx is not None:
+                    if key_ctx.expression() is not None:
+                        inferred_key = key_ctx.expression().accept(self)
+                    elif key_ctx.VAR_IDENTIFIER() is not None or key_ctx.STRING_LITERAL() is not None:
+                        inferred_key = Type(name="Str", kind=TypeKind.BASIC)
+                if inferred_key is not None:
+                    if key_type is None:
+                        key_type = inferred_key
+                    elif not key_type.compatible_with(inferred_key):
+                        self.symbols.add_warning(
+                            f"行 {ctx.start.line}: 字典键类型不一致：'{key_type}' 和 '{inferred_key}'"
+                        )
                 if field.expression() is not None:
                     current_value_type = field.expression().accept(self)
                     if value_type is None:
@@ -1232,28 +1582,97 @@ class SemanticAnalyzer(EzLangVisitor):
                         self.symbols.add_warning(
                             f"行 {ctx.start.line}: 字典值类型不一致：'{value_type}' 和 '{current_value_type}'"
                         )
-        dict_type.key_type = key_type
+        dict_type.key_type = key_type or Type(name="Str", kind=TypeKind.BASIC)
         dict_type.value_type = value_type
         return dict_type
+
+    def _markup_attr_type(self, attr) -> Optional[Type]:
+        if attr.expression() is not None:
+            return attr.expression().accept(self)
+        if attr.STRING_LITERAL() is not None:
+            return Type(name="Str", kind=TypeKind.BASIC)
+        if attr.INTEGER_LITERAL() is not None:
+            return Type(name="I32", kind=TypeKind.BASIC)
+        if attr.BOOL_LITERAL() is not None:
+            return Type(name="Bool", kind=TypeKind.BASIC)
+        return None
+
+    def _markup_children_type(self, ctx) -> Type:
+        element_type = None
+        for child in ctx.markupChild():
+            current_type = None
+            if child.markupLiteral() is not None:
+                current_type = self.visitMarkupLiteral(child.markupLiteral())
+            elif child.expression() is not None:
+                current_type = child.expression().accept(self)
+            elif child.STRING_LITERAL() is not None:
+                current_type = Type(name="Str", kind=TypeKind.BASIC)
+            if element_type is None:
+                element_type = current_type
+            elif current_type and element_type and not element_type.compatible_with(current_type):
+                self.symbols.add_error(
+                    f"行 {ctx.start.line}: 标记子节点类型不一致：'{element_type}' 和 '{current_type}'"
+                )
+        result = Type(kind=TypeKind.ARRAY, name="array")
+        result.element_type = element_type or Type(name="Str", kind=TypeKind.BASIC)
+        return result
 
     def visitMarkupExpr(self, ctx: EzLangParser.MarkupExprContext) -> Optional[Type]:
         return self.visitMarkupLiteral(ctx.markupLiteral())
 
     def visitMarkupLiteral(self, ctx: EzLangParser.MarkupLiteralContext) -> Optional[Type]:
-        for attr in ctx.markupAttr():
-            if attr.expression() is not None:
-                attr.expression().accept(self)
-        for child in ctx.markupChild():
-            if child.markupLiteral() is not None:
-                self.visitMarkupLiteral(child.markupLiteral())
-            elif child.expression() is not None:
-                child.expression().accept(self)
         names = ctx.VAR_IDENTIFIER()
+        tag_name = names[0].getText() if names else "tag"
         if len(names) >= 2 and names[0].getText() != names[-1].getText():
             self.symbols.add_error(
                 f"行 {ctx.start.line}: 标记闭合名称不匹配：'{names[0].getText()}' 和 '{names[-1].getText()}'"
             )
-        return Type(name="Str", kind=TypeKind.BASIC)
+        symbol = self.symbols.resolve(tag_name)
+        if symbol is not None and symbol.type is not None and symbol.type.kind == TypeKind.FUNCTION:
+            func_type = symbol.type
+            expected_names = set(func_type.param_names)
+            provided_names: set[str] = set()
+            for attr in ctx.markupAttr():
+                attr_name = attr.VAR_IDENTIFIER().getText()
+                provided_names.add(attr_name)
+                if func_type.param_names and attr_name not in expected_names:
+                    self.symbols.add_error(f"行 {ctx.start.line}: 未知参数 '{attr_name}'")
+                if attr_name in func_type.param_names:
+                    idx = func_type.param_names.index(attr_name)
+                    expected = func_type.param_types[idx] if idx < len(func_type.param_types) else None
+                    actual = self._markup_attr_type(attr)
+                    if expected and actual and expected.name != "unknown" and actual.name != "unknown":
+                        if not expected.compatible_with(actual):
+                            self.symbols.add_error(
+                                f"行 {ctx.start.line}: 参数 '{attr_name}' 类型不匹配：期望 '{expected}'，实际 '{actual}'"
+                            )
+            has_children = bool(ctx.markupChild())
+            if has_children:
+                provided_names.add('children')
+                if 'children' in func_type.param_names:
+                    idx = func_type.param_names.index('children')
+                    expected = func_type.param_types[idx] if idx < len(func_type.param_types) else None
+                    actual = self._markup_children_type(ctx)
+                    if expected and actual and not expected.compatible_with(actual):
+                        self.symbols.add_error(
+                            f"行 {ctx.start.line}: 参数 'children' 类型不匹配：期望 '{expected}'，实际 '{actual}'"
+                        )
+                else:
+                    self._markup_children_type(ctx)
+                    self.symbols.add_error(f"行 {ctx.start.line}: 未知参数 'children'")
+            elif 'children' in expected_names and 'children' not in func_type.default_param_names:
+                self.symbols.add_error(f"行 {ctx.start.line}: 缺少必填参数 'children'")
+            for pname in func_type.param_names:
+                if pname not in provided_names and pname not in func_type.default_param_names:
+                    self.symbols.add_error(f"行 {ctx.start.line}: 缺少必填参数 '{pname}'")
+            return func_type.return_type
+        for attr in ctx.markupAttr():
+            self._markup_attr_type(attr)
+        self._markup_children_type(ctx)
+        self.symbols.add_error(
+            f"行 {ctx.start.line}: 标记 '<{tag_name}>' 需要作用域内存在同名工厂函数 '{tag_name}'"
+        )
+        return Type(name="unknown", kind=TypeKind.BASIC)
 
     def visitFlowBlockExpr(self, ctx: EzLangParser.FlowBlockExprContext) -> Optional[Type]:
         if ctx.flowBlock() is not None:
@@ -1272,12 +1691,11 @@ class SemanticAnalyzer(EzLangVisitor):
 
     def visitTypeofExpr(self, ctx: EzLangParser.TypeofExprContext) -> Optional[Type]:
         """typeof 表达式 — 校验目标表达式/类型，运行时返回稳定类型标识。"""
-        # typeof expr: 推导表达式类型
-        if ctx.expression() is not None:
-            ctx.expression().accept(self)
         # typeof type_: 解析类型
         if ctx.type_() is not None:
             self._get_type_from_ctx(ctx.type_())
+        elif ctx.unaryExpression() is not None:
+            ctx.unaryExpression().accept(self)
         return Type(name="I32", kind=TypeKind.BASIC)
 
     def visitPlaceholderExpr(self, ctx: EzLangParser.PlaceholderExprContext) -> Optional[Type]:
@@ -1386,7 +1804,7 @@ class SemanticAnalyzer(EzLangVisitor):
             ctx.block().accept(self)
         self.symbols.pop_scope()
         thrown_types = self._catch_throw_stack.pop()
-        return thrown_types[-1] if thrown_types else None
+        return thrown_types[-1] if thrown_types else builtin_type("Error")
 
     # ==================== 表达式语句 ====================
 

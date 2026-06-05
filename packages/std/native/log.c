@@ -7,6 +7,17 @@
 #include <string.h>
 #include <time.h>
 
+#if defined(__ANDROID__)
+#include <android/log.h>
+#endif
+
+#if defined(__APPLE__)
+#include <TargetConditionals.h>
+#if TARGET_OS_IPHONE
+#include <os/log.h>
+#endif
+#endif
+
 #if defined(_WIN32)
 #include <windows.h>
 #else
@@ -28,6 +39,14 @@ typedef struct {
 } LogConfig;
 
 static LogConfig ez_log_config = {2, 0, true, true};
+static FILE *ez_log_file = NULL;
+
+enum {
+    EZ_LOG_TARGET_STDERR = 0,
+    EZ_LOG_TARGET_STDOUT = 1,
+    EZ_LOG_TARGET_CONSOLE = 2,
+    EZ_LOG_TARGET_FILE = 3,
+};
 
 static const char *ez_level_name(int32_t level) {
     switch (level) {
@@ -41,7 +60,16 @@ static const char *ez_level_name(int32_t level) {
 }
 
 static FILE *ez_log_stream(void) {
-    return ez_log_config.target == 1 ? stdout : stderr;
+    if (ez_log_config.target == EZ_LOG_TARGET_STDOUT) return stdout;
+    if (ez_log_config.target == EZ_LOG_TARGET_FILE && ez_log_file) return ez_log_file;
+    return stderr;
+}
+
+static void ez_log_close_file(void) {
+    if (ez_log_file) {
+        fclose(ez_log_file);
+        ez_log_file = NULL;
+    }
 }
 
 static int64_t ez_timestamp_ms(void) {
@@ -76,6 +104,18 @@ static void ez_log_write_impl(int32_t level, const char *msg, const char *file, 
     }
     fputc('\n', out);
     fflush(out);
+
+#if defined(__ANDROID__)
+    if (ez_log_config.target != EZ_LOG_TARGET_FILE) {
+        int android_level = level >= 4 ? ANDROID_LOG_ERROR : (level >= 3 ? ANDROID_LOG_WARN : ANDROID_LOG_INFO);
+        __android_log_write(android_level, "EzLang", msg ? msg : "");
+    }
+#elif defined(__APPLE__) && TARGET_OS_IPHONE
+    if (ez_log_config.target != EZ_LOG_TARGET_FILE) {
+        os_log_type_t os_level = level >= 4 ? OS_LOG_TYPE_ERROR : (level >= 3 ? OS_LOG_TYPE_DEFAULT : OS_LOG_TYPE_INFO);
+        os_log_with_type(OS_LOG_DEFAULT, os_level, "%{public}s", msg ? msg : "");
+    }
+#endif
 }
 
 LogConfig logDefaultConfig(void) {
@@ -83,11 +123,23 @@ LogConfig logDefaultConfig(void) {
 }
 
 void logConfigure(const LogConfig *config) {
-    if (config) ez_log_config = *config;
+    if (!config) return;
+    if (config->target != EZ_LOG_TARGET_FILE) ez_log_close_file();
+    ez_log_config = *config;
 }
 
 void logSetLevel(int32_t level) {
     ez_log_config.minLevel = level;
+}
+
+bool logSetFile(const char *path) {
+    if (!path || !*path) return false;
+    FILE *next = fopen(path, "a");
+    if (!next) return false;
+    ez_log_close_file();
+    ez_log_file = next;
+    ez_log_config.target = EZ_LOG_TARGET_FILE;
+    return true;
 }
 
 void logWrite(int32_t level, const char *msg) {

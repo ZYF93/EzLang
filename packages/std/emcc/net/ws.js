@@ -1,4 +1,5 @@
 // EzLang std/net/ws Emscripten JS 封装层
+// WebAssembly 同步 ABI 当前不支持浏览器 WebSocket；所有接口明确返回不可用结果。
 mergeInto(LibraryManager.library, {
   wsConnect: function (ret, url) {
     HEAPU8[ret] = 0;

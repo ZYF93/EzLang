@@ -2,9 +2,9 @@
 
 `ez-ios-ui` 提供面向 `ios` 目标的**原生 UIKit View 底层绑定**（基于 Objective-C runtime 桥接）。包本身不做框架和调度——这些由使用者自行实现。**View 树修改必须在主线程执行**，包提供主线程调度桥接。
 
-> **当前实现状态**：仓库内已提供可编译链接的 ABI 占位，真实 Objective-C/UIKit 桥接尚未接入。当前 native wrapper 返回零句柄、空字符串、空可选值、`false` 或执行 no-op，用于明确表示不可用；后续接入平台实现时保持这些公开签名。
+> **当前实现状态**：仓库内已提供可编译链接的原生句柄状态层，可维护根视图、节点表、父子关系、文本、frame、可见性等基础状态；配置 `output.sdk` 构建 iOS 目标且项目导入 `ez-ios-ui` 时，CLI 会随 `lib<name>.dylib` 生成 `ez-ios-ui-bridge/` 宿主模板（Swift ViewController、Package.swift、Info.plist），用于把动态库接入 Xcode/UIKit 工程。`runOnMainThread` / `scheduleFrame` 在最小句柄层内同步执行回调；真实 iOS 主线程队列、事件分发与权限查询由宿主模板扩展实现，公开签名保持稳定。
 
-> **使用前提**：`project.toml` 中 `os = "ios"`，`sdk` 指向 Xcode SDK。
+> **使用前提**：`project.toml` 中 `os = "ios"`，`sdk` 指向 Xcode SDK；构建产物中的 `ez-ios-ui-bridge/` 可加入 Xcode 工程。
 
 ---
 
@@ -329,38 +329,38 @@ from "ez-ios-ui" import {
 }
 
 struct Fiber {
-    type:      Str
-    props:     { [key: Str]: Str }
-    children:  Fiber[]
-    stateNode: Node?      // 对应真实 UIView
-    effectTag: I32        // 0=NONE 1=PLACEMENT 2=UPDATE 3=DELETION
-    next:      Fiber?
+    kind:      Str;
+    props:     { [key: Str]: Str };
+    children:  Fiber[];
+    stateNode: Node?;      // 对应真实 UIView
+    effectTag: I32;        // 0=NONE 1=PLACEMENT 2=UPDATE 3=DELETION
+    next:      Fiber?;
 }
 
 // reconcile 在 flow 内并发运行（不触碰 UIView）
-const reconcile = (fiber: Fiber) => Void => {
+const reconcile = (fiber: Fiber): Void => {
     // 计算子树差量，收集 effect list ...
-}
+};
 
 // commit 必须在主线程
-const commitEffects = (effectList: Fiber[]) => Void => {
+const commitEffects = (effectList: Fiber[]): Void => {
     runOnMainThread(work = () => {
         loop effect in effectList {
             (effect.effectTag == 1) ? {
                 // PLACEMENT
-                let view = createLabel()
-                setText(node = view, text = effect.props["text"]!)
-                addSubview(parent = getRootView(), child = view)
+                let view = createLabel();
+                setText(node = view, text = effect.props["text"]!);
+                addSubview(parent = getRootView(), child = view);
             }
         }
-    })
-}
+    });
+};
 
-const workLoop = () => Void => {
+const workLoop = (): Void => {
     flow {
-        let root = Fiber(type = "root", props = {}, children = [], stateNode = getRootView(), effectTag = 0, next = ?)
-        reconcile(fiber = root)
-        commitEffects(effectList = [])
+        let root = Fiber(kind = "root", props = {}, children = [], stateNode = getRootView(), effectTag = 0, next = ?);
+        reconcile(fiber = root);
+        commitEffects(effectList = []);
     }
-}
+};
 ```

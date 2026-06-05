@@ -15,8 +15,19 @@ export declare const testNotEqualI64: (actual: I64, expected: I64, msg: Str) => 
 export declare const testEqualStr: (actual: Str, expected: Str, msg: Str) => Void;
 export declare const testSkip: (msg: Str) => Void;
 
+// 异常断言依赖语言层 catch 的 Error 传播语义。
+export const testThrows = (body: () => Void, expectedCode: I32, msg: Str): Void => {
+    const err = catch {
+        body();
+    };
+    testEqualI64(actual = err.code, expected = expectedCode, msg = msg);
+};
+
 // === 显式注册与统计 ===
 export declare const testRegister: (name: Str) => Void;
+export declare const testRegisterParam: (name: Str, param: Str) => Void;
+export declare const testCount: () => I32;
+export declare const testName: (index: I32) => Str;
 export declare const testPassed: () => I32;
 export declare const testFailed: () => I32;
 export declare const testSkipped: () => I32;

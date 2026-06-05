@@ -8,6 +8,11 @@
     return UTF8ToString(path || 0);
   }
 
+  function pathValue(path) {
+    var text = pathText(path);
+    return text.length === 0 ? null : text;
+  }
+
   function ok(fn) {
     try {
       fn();
@@ -90,9 +95,10 @@
   }
 
   function writeFileImpl(pathPtr, blobPtr, append) {
+    var path = pathValue(pathPtr);
+    if (path === null) return 0;
     return ok(function () {
       ensureIdbfs();
-      var path = pathText(pathPtr);
       ensureParent(path);
       var data = blobBytes(blobPtr);
       if (append) {
@@ -124,7 +130,12 @@
     readFile: function (ret, path) {
       try {
         ensureIdbfs();
-        writeBlob(ret, FS.readFile(pathText(path), { encoding: 'binary' }));
+        var target = pathValue(path);
+        if (target === null) {
+          writeBlob(ret, new Uint8Array(0));
+          return;
+        }
+        writeBlob(ret, FS.readFile(target, { encoding: 'binary' }));
       } catch (e) {
         writeBlob(ret, new Uint8Array(0));
       }
@@ -136,15 +147,20 @@
       return writeFileImpl(path, content, true);
     },
     removeFile: function (path) {
-      return ok(function () { ensureIdbfs(); FS.unlink(pathText(path)); syncFs(); });
+      var target = pathValue(path);
+      if (target === null) return 0;
+      return ok(function () { ensureIdbfs(); FS.unlink(target); syncFs(); });
     },
     mkdir: function (path) {
-      return ok(function () { ensureIdbfs(); FS.mkdirTree(pathText(path)); syncFs(); });
+      var target = pathValue(path);
+      if (target === null) return 0;
+      return ok(function () { ensureIdbfs(); FS.mkdirTree(target); syncFs(); });
     },
     removeDir: function (path, recursive) {
+      var target = pathValue(path);
+      if (target === null) return 0;
       return ok(function () {
         ensureIdbfs();
-        var target = pathText(path);
         if (recursive) removeTree(target);
         else FS.rmdir(target);
         syncFs();
@@ -153,22 +169,38 @@
     listDir: function (ret, path) {
       try {
         ensureIdbfs();
-        writeStrList(ret, FS.readdir(pathText(path)).filter(function (name) { return name !== '.' && name !== '..'; }));
+        var target = pathValue(path);
+        if (target === null) {
+          writeStrList(ret, []);
+          return;
+        }
+        writeStrList(ret, FS.readdir(target).filter(function (name) { return name !== '.' && name !== '..'; }));
       } catch (e) {
         writeStrList(ret, []);
       }
     },
     exists: function (path) {
-      return ok(function () { ensureIdbfs(); FS.stat(pathText(path)); });
+      var target = pathValue(path);
+      if (target === null) return 0;
+      return ok(function () { ensureIdbfs(); FS.stat(target); });
     },
     isDir: function (path) {
-      try { ensureIdbfs(); return FS.isDir(FS.stat(pathText(path)).mode) ? 1 : 0; } catch (e) { return 0; }
+      try {
+        ensureIdbfs();
+        var target = pathValue(path);
+        return target !== null && FS.isDir(FS.stat(target).mode) ? 1 : 0;
+      } catch (e) { return 0; }
     },
     stat: function (ret, path) {
-      try { ensureIdbfs(); writeStat(ret, FS.stat(pathText(path))); } catch (e) { writeStat(ret, null); }
+      try {
+        ensureIdbfs();
+        var target = pathValue(path);
+        writeStat(ret, target === null ? null : FS.stat(target));
+      } catch (e) { writeStat(ret, null); }
     },
     absPath: function (path) {
-      var raw = pathText(path);
+      var raw = pathValue(path);
+      if (raw === null) return stringToNewUTF8('');
       return raw.charAt(0) === '/' ? path : stringToNewUTF8('/' + raw);
     },
     __ez_fs_sync: function () {

@@ -144,8 +144,8 @@
     return out || (absolute ? '/' : '.');
   }
 
-  function percentEncode(value, queryMode) {
-    value = text(value);
+  function percentEncodeString(value, queryMode) {
+    value = String(value || '');
     var bytes = [];
     var len = lengthBytesUTF8(value);
     var ptr = _malloc(len + 1);
@@ -162,6 +162,10 @@
     return out;
   }
 
+  function percentEncode(value, queryMode) {
+    return percentEncodeString(text(value), queryMode);
+  }
+
   function hexValue(ch) {
     if (ch >= '0' && ch <= '9') return ch.charCodeAt(0) - 48;
     if (ch >= 'A' && ch <= 'F') return ch.charCodeAt(0) - 55;
@@ -169,8 +173,8 @@
     return -1;
   }
 
-  function percentDecode(value, queryMode) {
-    value = text(value);
+  function percentDecodeString(value, queryMode) {
+    value = String(value || '');
     var bytes = [];
     for (var i = 0; i < value.length; i++) {
       var ch = value.charAt(i);
@@ -197,6 +201,15 @@
     }
   }
 
+  function percentDecode(value, queryMode) {
+    return percentDecodeString(text(value), queryMode);
+  }
+
+  function queryKeyMatches(rawKey, key) {
+    var decoded = percentDecodeString(rawKey, true);
+    return decoded !== null && decoded === key;
+  }
+
   function queryGet(queryPtr, keyPtr) {
     var query = text(queryPtr);
     var key = text(keyPtr);
@@ -205,7 +218,7 @@
       var entry = entries[i];
       var eq = entry.indexOf('=');
       var rawKey = eq >= 0 ? entry.slice(0, eq) : entry;
-      if (rawKey === key) return eq >= 0 ? percentDecode(stringToNewUTF8(entry.slice(eq + 1)), true) : '';
+      if (queryKeyMatches(rawKey, key)) return eq >= 0 ? percentDecodeString(entry.slice(eq + 1), true) : '';
     }
     return null;
   }
@@ -213,18 +226,19 @@
   function querySet(queryPtr, keyPtr, valuePtr) {
     var query = text(queryPtr);
     var key = text(keyPtr);
-    var value = percentEncode(valuePtr, true);
+    var encodedKey = percentEncodeString(key, true);
+    var encodedValue = percentEncode(valuePtr, true);
     var entries = query ? query.split('&') : [];
     var replaced = false;
     for (var i = 0; i < entries.length; i++) {
       var eq = entries[i].indexOf('=');
       var rawKey = eq >= 0 ? entries[i].slice(0, eq) : entries[i];
-      if (!replaced && rawKey === key) {
-        entries[i] = key + '=' + value;
+      if (!replaced && queryKeyMatches(rawKey, key)) {
+        entries[i] = encodedKey + '=' + encodedValue;
         replaced = true;
       }
     }
-    if (!replaced) entries.push(key + '=' + value);
+    if (!replaced) entries.push(encodedKey + '=' + encodedValue);
     return entries.join('&');
   }
 

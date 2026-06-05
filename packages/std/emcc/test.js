@@ -3,6 +3,8 @@
   var passed = 0;
   var failed = 0;
   var skipped = 0;
+  var tests = [];
+  var currentTest = '';
 
   function text(ptr) {
     return UTF8ToString(ptr || 0);
@@ -11,8 +13,14 @@
   function failNow(message) {
     failed += 1;
     var msg = message || 'assertion failed';
-    if (typeof console !== 'undefined' && console.error) console.error('test failed: ' + msg);
+    if (typeof console !== 'undefined' && console.error) console.error('test failed: ' + (currentTest ? currentTest + ': ' : '') + msg);
     throw new Error(msg);
+  }
+
+  function remember(name) {
+    var value = name || '';
+    tests.push(value);
+    currentTest = value;
   }
 
   mergeInto(LibraryManager.library, {
@@ -38,10 +46,16 @@
       skipped += 1;
       if (typeof console !== 'undefined' && console.warn) console.warn('test skipped: ' + text(msg));
     },
-    testRegister: function () {},
+    testRegister: function (name) { remember(text(name)); },
+    testRegisterParam: function (name, param) { remember(text(name) + '[' + text(param) + ']'); },
+    testCount: function () { return tests.length | 0; },
+    testName: function (index) {
+      var value = tests[index | 0] || '';
+      return stringToNewUTF8(value);
+    },
     testPassed: function () { return passed | 0; },
     testFailed: function () { return failed | 0; },
     testSkipped: function () { return skipped | 0; },
-    testReset: function () { passed = 0; failed = 0; skipped = 0; },
+    testReset: function () { passed = 0; failed = 0; skipped = 0; tests = []; currentTest = ''; },
   });
 })();

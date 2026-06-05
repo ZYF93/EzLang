@@ -4,13 +4,19 @@
 #include <stdint.h>
 
 typedef struct { int32_t id; } Node;
+typedef struct { uint8_t *data; int64_t size; } Blob;
+typedef struct { bool ok; Blob value; } OptBlob;
+typedef struct { const char *eventType; int32_t targetId; OptBlob data; } Event;
 typedef struct { float x; float y; float width; float height; } Rect;
+typedef struct { Node **pages; int64_t length; int64_t capacity; int64_t page_count; } NodeList;
+typedef struct { char ***key_pages; char ***value_pages; int32_t count; int32_t capacity; int32_t page_count; } Dict;
 typedef struct { bool ok; Node value; } OptNode;
 typedef struct { bool ok; const char *value; } OptStr;
 
 static Node no_node(void) { return (Node){0}; }
 static OptNode no_opt_node(void) { return (OptNode){false, {0}}; }
 static const char *empty_str(void) { return ""; }
+static NodeList no_node_list(void) { return (NodeList){0}; }
 
 Node createElement(const char *tag) { (void)tag; return no_node(); }
 Node createTextNode(const char *content) { (void)content; return no_node(); }
@@ -20,14 +26,17 @@ void insertBefore(const Node *parent, const Node *child, const Node *ref) { (voi
 void removeChild(const Node *parent, const Node *child) { (void)parent; (void)child; }
 void replaceChild(const Node *parent, const Node *newChild, const Node *oldChild) { (void)parent; (void)newChild; (void)oldChild; }
 OptNode getParent(const Node *node) { (void)node; return no_opt_node(); }
+NodeList getChildren(const Node *node) { (void)node; return no_node_list(); }
 OptNode getHostNode(const char *selector) { (void)selector; return no_opt_node(); }
 OptStr getAttribute(const Node *node, const char *key) { (void)node; (void)key; return (OptStr){false, 0}; }
 void setAttribute(const Node *node, const char *key, const char *value) { (void)node; (void)key; (void)value; }
 void removeAttribute(const Node *node, const char *key) { (void)node; (void)key; }
+void setAttributes(const Node *node, const Dict *attrs) { (void)node; (void)attrs; }
 const char *getProperty(const Node *node, const char *key) { (void)node; (void)key; return empty_str(); }
 void setProperty(const Node *node, const char *key, const char *value) { (void)node; (void)key; (void)value; }
 const char *getStyle(const Node *node, const char *prop) { (void)node; (void)prop; return empty_str(); }
 void setStyle(const Node *node, const char *prop, const char *value) { (void)node; (void)prop; (void)value; }
+void setStyles(const Node *node, const Dict *styles) { (void)node; (void)styles; }
 void addClass(const Node *node, const char *name) { (void)node; (void)name; }
 void removeClass(const Node *node, const char *name) { (void)node; (void)name; }
 bool hasClass(const Node *node, const char *name) { (void)node; (void)name; return false; }
@@ -37,6 +46,15 @@ const char *getTextContent(const Node *node) { (void)node; return empty_str(); }
 void setTextContent(const Node *node, const char *text) { (void)node; (void)text; }
 const char *getInnerHTML(const Node *node) { (void)node; return empty_str(); }
 void setInnerHTML(const Node *node, const char *html) { (void)node; (void)html; }
+void addEventListener(const Node *node, const char *event, void (*handler)(Event), bool capture) { (void)node; (void)event; (void)handler; (void)capture; }
+void removeEventListener(const Node *node, const char *event, void (*handler)(Event)) { (void)node; (void)event; (void)handler; }
+void delegateEvent(const Node *parent, const char *event, const char *selector, void (*handler)(Event)) { (void)parent; (void)event; (void)selector; (void)handler; }
+const char *getEventValue(const Event *e) { (void)e; return empty_str(); }
+const char *getEventKey(const Event *e) { (void)e; return empty_str(); }
+float getEventClientX(const Event *e) { (void)e; return 0.0f; }
+float getEventClientY(const Event *e) { (void)e; return 0.0f; }
+void preventDefault(const Event *e) { (void)e; }
+void stopPropagation(const Event *e) { (void)e; }
 Rect getBoundingRect(const Node *node) { (void)node; return (Rect){0, 0, 0, 0}; }
 float getScrollTop(const Node *node) { (void)node; return 0.0f; }
 float getScrollLeft(const Node *node) { (void)node; return 0.0f; }

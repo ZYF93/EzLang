@@ -103,7 +103,7 @@ let inferred = identity(42)  // 推断为 I32
 
 ### LLVM 映射
 * 无符号类型映射为相应无符号 LLVM 整数。
-* `Type[]`（List）映射为 `{ i64 len, i64 cap, Type* data }`。
+* `Type[]` / `List<Type>` 映射为分页数组 ABI：`{ Type** pages, i64 length, i64 capacity, i64 page_count }`，索引时先按固定页大小定位页，再访问页内元素。
 * `Vec<Type>[N]` 映射为 LLVM `<N x Type>`。
 * `Fn` 映射为函数指针。
 * 可选类型映射为 `{ i1 has_value, T value }`。
@@ -119,52 +119,52 @@ let inferred = identity(42)  // 推断为 I32
 ```ez
 // 结构体定义与继承展开
 struct Person {
-    name: Str = "default"
-    id: I32
-    say = (this: User) => this.name
+    name: Str = "default";
+    id: I32;
+    say = (this: Person): Str => { return this.name; };
 }
 
 struct User {
-    ...Person
-    age: I32 = 0
+    ...Person;
+    age: I32 = 0;
 }
 
 // 展开实例化与命名初始化
-let user = User(name = "s", id = 1)
-let user2 = User(id = 2) // name 使用默认值
-let user3 = User(...user, age = 20)
+let user = User(name = "s", id = 1);
+let user2 = User(id = 2); // name 使用默认值
+let user3 = User(...user, age = 20);
 
 // 内置结构体：Date, Error, Blob
 struct Date {
-    timestamp: I64
+    timestamp: I64;
 
-    getYear = (this: Date) => I32
-    getMonth = (this: Date) => I32
-    getDay = (this: Date) => I32
-    getHour = (this: Date) => I32
-    getMinute = (this: Date) => I32
-    getSecond = (this: Date) => I32
+    getYear(this: Date) => I32;
+    getMonth(this: Date) => I32;
+    getDay(this: Date) => I32;
+    getHour(this: Date) => I32;
+    getMinute(this: Date) => I32;
+    getSecond(this: Date) => I32;
 
-    add(this: Date, year: I32?, month: I32?, day: I32?, hour: I32?, minute: I32?, second: I32?) => Void
-    sub(this: Date, year: I32?, month: I32?, day: I32?, hour: I32?, minute: I32?, second: I32?) => Void
+    add(this: Date, year: I32?, month: I32?, day: I32?, hour: I32?, minute: I32?, second: I32?) => Void;
+    sub(this: Date, year: I32?, month: I32?, day: I32?, hour: I32?, minute: I32?, second: I32?) => Void;
 
-    format = (this: Date, fmt: Str) => Str
+    format(this: Date, fmt: Str) => Str;
 }
 
 struct Error {
-    code:    I32    // 正值为业务错误，负值为系统错误（见 stdlib ErrCode 常量）
-    message: Str
-    data:    Blob?
+    code:    I32;    // 正值为业务错误，负值为系统错误（见 stdlib ErrCode 常量）
+    message: Str;
+    data:    Blob?;
 
-    toString = (this: Error) => Str
+    toString(this: Error) => Str;
 }
 
 struct Blob {
-    size: I64
-    data: *I8
+    size: I64;
+    data: *I8;
 
-    get = (this: Blob, index: I64) => I8
-    slice = (this: Blob, start: I64, len: I64) => Blob
+    get(this: Blob, index: I64) => I8;
+    slice(this: Blob, start: I64, len: I64) => Blob;
 }
 ```
 
@@ -217,7 +217,7 @@ let copy = count
 ### LLVM 映射
 * 局部变量映射为 `alloca` 或 Arena 内存地址。拷贝使用 `llvm.memcpy`。
 * `static` 变量映射为全局常量或全局可变区。
-* Arena 使用单一底层缓冲区和游标管理，作用域结束仅需移动游标，无需逐个析构对象。
+* Arena 使用线程本地底层缓冲区、容量与游标管理；容量不足时按需扩容，作用域结束仅需移动游标，无需逐个析构对象。
 * 变量锁当前会在语义阶段记录 `rp`/`wp` 策略，并在 LLVM IR 中为直接变量读写生成 `__ezrt_lock_read_*` / `__ezrt_lock_write_*` hook；这些 hook 目前是可链接 ABI 占位，完整跨任务读优先、写优先与顺序锁调度仍是后续目标。
 * Arena 分配器会根据类型的 `alignof` 自动内存对齐，确保 SIMD 和大结构体符合目标架构要求。
 
@@ -284,19 +284,19 @@ const ret = flow {
 
 ### 语义说明与规范
 * **flow**：`flow { ... }` 为并发调度作用域。flow 不改变程序的顺序语义。flow 内代码在语义上严格按源码顺序执行，但 runtime 可对无依赖阻塞操作进行调度优化，且调度不得改变可观察行为。
-* **当前实现**：编译器会记录 flow/parallel/suspend point 元数据，并在 LLVM IR 中生成可链接的 `__ezrt_flow_*`、`__ezrt_parallel_*`、`__ezrt_sleep`、`__ezrt_race` hook。当前 codegen 保持同步 lowering；`flow` / `parallel` 块内的 `return` 会被捕获为表达式结果，不会提前退出外层函数。
-* **阻塞操作**：flow 外部如 `fetch()` 为同步阻塞。flow 内部的阻塞调用当前保留稳定 hook ABI，真实挂起调度由后续运行时状态机接入。
-* **parallel 块**：`const ret = parallel { code... return... }` 当前按同步块执行，并以 `return` 的值作为整个 `parallel` 表达式的值。真实线程创建、等待唤醒、异常跨任务传播和 join 语义是后续运行时实现目标。
-* **自动依赖等待**：读取未完成阻塞结果时，目标 runtime 会自动等待依赖；当前同步 lowering 下不会产生未完成结果。
+* **当前实现**：编译器会记录 flow/parallel/suspend point 元数据，并在 LLVM IR 中生成可链接的 `__ezrt_flow_*`、`__ezrt_parallel_*`、`__ezrt_sleep`、`__ezrt_race` hook。`__ezrt_sleep` 会真实挂起当前执行线程；`race(pl = [...], timeout = ...)` 对零捕获 `() => I32` 分支使用原生任务运行时并发执行，返回首个完成值并取消其余分支。`flow` / `parallel` 块内的 `return` 会被捕获为表达式结果，不会提前退出外层函数。
+* **阻塞操作**：flow 外部如 `fetch()` 为同步阻塞。flow 内部的 `sleep` 与 `race(pl)` 已接入运行时调度；其它阻塞 I/O 仍保留稳定同步 ABI，后续可替换为平台等待源。
+* **parallel 块**：`const ret = parallel { code... return... }` 在 flow 内、零捕获且返回 `I32` 时会启动后台任务；读取 `ret` 会等待任务完成，flow 退出前会 join 未读取任务，确保副作用提交。其它返回类型或捕获场景保持同步 lowering。
+* **自动依赖等待**：读取 flow 内未完成的 `parallel` 结果会自动 join；当前依赖等待覆盖零捕获 `I32` 任务，其它阻塞结果仍按同步 ABI 执行。
 * **flow 返回**：flow 返回前必须保证所有前序语义操作完成，且所有副作用已提交。
-* **race 函数**：目标语义为并发运行所有分支，返回首个完成值并自动取消其它分支；当前支持 `race(pl = [...], timeout = ...)` 语法进入语义分析并 lowering 到 `__ezrt_race` hook。当前 codegen 会把 `pl` 作为分支数量元数据传给 hook，并同步执行第一个零参数函数字面量分支作为表达式结果；不会并发执行其它分支，也不会执行取消、超时返回或跨任务异常传播。
+* **race 函数**：并发运行 `pl` 中的零捕获 `() => I32` 分支，返回首个完成值并取消其它分支；`timeout` 到期时返回零值并标记超时槽。异常通过运行时异常槽传回外层 `catch`。暂不支持捕获闭包和非 `I32` 返回值的异步 race，相关场景回退到同步 lowering。
 * **cancel**：取消不会立即终止同步代码。取消仅中断 IO、sleep、timer、wait 等 suspend source。底层 suspend source 被取消时，`throw Error(code = errCancel, message = "操作已取消")` 并沿同步调用栈传播；可在 `catch {}` 中通过 `err.code == errCancel` 判断并特殊处理。
 * **非阻塞同步代码**：普通同步 CPU 代码不会被中断。
 * **副作用一致性**：runtime 不允许改变副作用顺序、锁语义、可观察行为。
 
 ### LLVM 映射
-* **当前**：lowering 为同步执行块 + 可链接 runtime hook + flow/parallel 返回值槽。
-* **目标**：后续可将 hook 替换为状态机、平台等待源（epoll、io_uring、kqueue、timerfd 等）、线程/任务创建、结果存储、等待唤醒、异常传播与 join。
+* **当前**：lowering 为 runtime hook + flow/parallel 返回值槽；`sleep`、`race(pl)` 和 flow 内零捕获 `I32` `parallel` 已接入原生任务运行时。
+* **目标**：后续可继续把其它阻塞 I/O 替换为状态机、平台等待源（epoll、io_uring、kqueue、timerfd 等）、结果存储、等待唤醒与更完整的捕获闭包调度。
 
 ---
 
@@ -358,7 +358,8 @@ const err = catch {
 let a: I32 = 10; let b: I32 = 3
 let sum = a + b; let rem = a % b
 let logic = (a > b) && !(a == b)
-let shift = a << 1
+let shiftBy: U32 = 1
+let shift = a << shiftBy
 let bit = a & 0b1111
 
 // 复合赋值
@@ -374,17 +375,17 @@ let masked = (v1 < v2) ? v1 : v2
 ```
 
 ### 语义说明与规范
-* **算术与位运算**：支持 `+`, `-`, `*`, `/`, `%` 及 `&`, `|`, `^`, `<<`, `>>`。整数除法向下取整。浮点运算遵循 IEEE 754。无符号类型右移填充零，有符号类型算术右移。移位右操作数必须为无符号类型。
+* **算术与位运算**：支持 `+`, `-`, `*`, `/`, `%` 及 `&`, `|`, `^`, `<<`, `>>`。整数除法向下取整。浮点运算遵循 IEEE 754。无符号类型的除法、取余与右移分别生成无符号运算，右移填充零；有符号类型右移使用算术右移。移位右操作数必须为无符号类型。
 * **逻辑与比较运算**：支持 `&&`, `||`, `!` 与 `==`, `!=`, `<`, `>`, `<=`, `>=`。逻辑运算支持短路求值。不支持结构体/联合类型直接比较（除非实现相关方法）。
-* **复合赋值**：如 `+=`, `<<=` 等价于展开运算。当前实现对裸变量和结构体字段左值生成加载、运算、存储序列，并避免重复求值字段所属对象；索引左值的完整单次求值规则仍需后续补齐。
+* **复合赋值**：如 `+=`, `<<=` 等价于展开运算。当前实现对裸变量、结构体字段和数组/List 索引左值生成加载、运算、存储序列，并避免重复求值字段所属对象或索引表达式。
 * **优先级**：`!` > `*`, `/`, `%` > `+`, `-` > `<<`, `>>` > `&` > `^` > `|` > 比较 > `&&` > `||`。位运算 `&` 优先级高于比较运算 `==` 但低于移位。建议显式加括号以避免歧义。
-* **SIMD 语义**：`Vec<Type>[N]` 操作逐元素并行执行。向量长度必须匹配。标量与向量混合运算时，标量自动广播成等长向量后再计算。
+* **SIMD 语义**：`Vec<Type>[N]` 操作逐元素并行执行。向量长度必须匹配。标量与向量混合运算时，标量自动广播成等长向量后再计算；向量比较生成同宽布尔 mask。
 
 ### LLVM 映射
-* 基本运算符映射为相应 LLVM 指令（如 `add`, `sub`, `icmp`, `fcmp`, `shl`, `and`, `sdiv`/`udiv`, `srem`/`urem` 等）。
+* 基本运算符映射为相应 LLVM 指令（如 `add`, `sub`, `icmp`, `fcmp`, `shl`, `ashr`/`lshr`, `and`, `sdiv`/`udiv`, `srem`/`urem` 等）。
 * 逻辑运算映射为条件分支和 `phi` 节点，实现短路求值。
 * 复合赋值映射为加载、运算、存储序列。
-* 向量类型映射为 LLVM 向量类型（如 `<4 x i32>`），运算映射为对应的 SIMD 指令（如 `add <4 x i32>`）。
+* 向量类型映射为 LLVM 向量类型（如 `<4 x i32>`），运算映射为对应的 SIMD 指令（如 `add <4 x i32>`、`icmp <4 x i32>`）；向量/标量混合运算会先用 `insertelement` 广播标量。
 
 ---
 
@@ -475,7 +476,7 @@ let isError = typeof err & Error == Error
 
 ### 语义说明与规范
 * **元编程与装饰器**：`@Dec` 将变量包装为 `Meta<T>`。`Meta<T>` 包含 `value`, `getter`, `setter`, `type`, `name`，访问时通过函数指针调用拦截逻辑。
-* **标记语法**：XML 风格标记语法当前会校验属性与子表达式，并 lowering 为标签名字符串，便于保留语法入口和 IR 可生成性；翻译为普通函数调用与结构体构造表达式是后续目标。
+* **标记语法**：XML 风格标记语法只会 lowering 为普通函数调用。作用域内必须存在同名工厂函数，编译器会将属性按具名参数传入，并把子节点打包为 `children` 数组；若不存在同名工厂函数、属性类型不匹配或 `children` 类型不匹配，语义分析会直接报错。
 * **管道与插值**：管道 `->` 配合 `%` 占位符重写为命名参数调用（如 `a -> fn(x = %)` 重写为 `fn(x = a)`）；字符串插值编译为最小内存复制拼接逻辑。
 * **类型安全机制**：
   * `Type! expr`：无检查的类型断言，适用于强制拆包或位级重解释。
@@ -483,6 +484,6 @@ let isError = typeof err & Error == Error
 
 ### LLVM 映射
 * 装饰器生成 `Meta<T>` 结构体，按值传递，拦截逻辑表现为 `call` 指令调用 `getter`/`setter`。
-* 标记语法当前生成标签名字符串；目标 lowering 是在编译前端翻译展开为普通函数调用与结构体构造表达式。管道语法在编译前端翻译展开；字符串插值生成相应的内存复制拼接逻辑。
+* 标记语法必须找到同名工厂函数并生成普通 `call` 指令，属性按函数参数名重排，子节点通过当前数组/List ABI 传给 `children`；无工厂函数或参数类型不匹配时是编译错误。管道语法在编译前端翻译展开；字符串插值生成相应的内存复制拼接逻辑。
 * `Type! expr` 映射为位级重解释（`bitcast`）或 `load` 操作。
 * `typeof` 映射为通过结构体内部隐含的 TypeID 进行数值比较。

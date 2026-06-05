@@ -10,7 +10,7 @@ else:
 
 def serializedATN():
     return [
-        4,1,99,1007,2,0,7,0,2,1,7,1,2,2,7,2,2,3,7,3,2,4,7,4,2,5,7,5,2,6,
+        4,1,99,1004,2,0,7,0,2,1,7,1,2,2,7,2,2,3,7,3,2,4,7,4,2,5,7,5,2,6,
         7,6,2,7,7,7,2,8,7,8,2,9,7,9,2,10,7,10,2,11,7,11,2,12,7,12,2,13,7,
         13,2,14,7,14,2,15,7,15,2,16,7,16,2,17,7,17,2,18,7,18,2,19,7,19,2,
         20,7,20,2,21,7,21,2,22,7,22,2,23,7,23,2,24,7,24,2,25,7,25,2,26,7,
@@ -92,83 +92,83 @@ def serializedATN():
         73,1,74,1,74,1,74,1,75,1,75,1,75,1,76,1,76,1,76,5,76,931,8,76,10,
         76,12,76,934,9,76,1,76,1,76,1,77,1,77,1,77,1,77,1,77,1,77,3,77,944,
         8,77,1,77,3,77,947,8,77,1,78,1,78,1,78,1,79,1,79,1,79,1,79,1,79,
-        1,79,3,79,958,8,79,1,79,1,79,1,79,3,79,963,8,79,3,79,965,8,79,1,
-        80,1,80,1,80,1,80,3,80,971,8,80,1,80,1,80,1,81,1,81,1,81,1,81,1,
-        81,1,81,3,81,981,8,81,1,82,1,82,3,82,985,8,82,1,83,1,83,3,83,989,
-        8,83,1,83,3,83,992,8,83,1,84,1,84,3,84,996,8,84,1,85,1,85,3,85,1000,
-        8,85,1,86,1,86,1,86,3,86,1005,8,86,1,86,0,2,48,98,87,0,2,4,6,8,10,
-        12,14,16,18,20,22,24,26,28,30,32,34,36,38,40,42,44,46,48,50,52,54,
-        56,58,60,62,64,66,68,70,72,74,76,78,80,82,84,86,88,90,92,94,96,98,
-        100,102,104,106,108,110,112,114,116,118,120,122,124,126,128,130,
-        132,134,136,138,140,142,144,146,148,150,152,154,156,158,160,162,
-        164,166,168,170,172,0,13,1,0,1,3,1,0,18,19,1,0,1,2,1,0,49,50,1,0,
-        39,44,2,0,63,63,84,93,1,0,76,77,2,0,57,58,78,79,1,0,80,81,1,0,71,
-        72,1,0,73,75,2,0,65,65,70,72,1,0,45,48,1100,0,179,1,0,0,0,2,191,
-        1,0,0,0,4,196,1,0,0,0,6,215,1,0,0,0,8,217,1,0,0,0,10,225,1,0,0,0,
-        12,228,1,0,0,0,14,247,1,0,0,0,16,249,1,0,0,0,18,254,1,0,0,0,20,264,
-        1,0,0,0,22,273,1,0,0,0,24,286,1,0,0,0,26,303,1,0,0,0,28,314,1,0,
-        0,0,30,319,1,0,0,0,32,329,1,0,0,0,34,340,1,0,0,0,36,351,1,0,0,0,
-        38,356,1,0,0,0,40,358,1,0,0,0,42,366,1,0,0,0,44,375,1,0,0,0,46,377,
-        1,0,0,0,48,427,1,0,0,0,50,457,1,0,0,0,52,459,1,0,0,0,54,470,1,0,
-        0,0,56,481,1,0,0,0,58,489,1,0,0,0,60,497,1,0,0,0,62,508,1,0,0,0,
-        64,512,1,0,0,0,66,514,1,0,0,0,68,520,1,0,0,0,70,522,1,0,0,0,72,535,
-        1,0,0,0,74,543,1,0,0,0,76,548,1,0,0,0,78,556,1,0,0,0,80,564,1,0,
-        0,0,82,572,1,0,0,0,84,580,1,0,0,0,86,588,1,0,0,0,88,596,1,0,0,0,
-        90,604,1,0,0,0,92,612,1,0,0,0,94,620,1,0,0,0,96,631,1,0,0,0,98,633,
-        1,0,0,0,100,694,1,0,0,0,102,696,1,0,0,0,104,701,1,0,0,0,106,703,
-        1,0,0,0,108,714,1,0,0,0,110,718,1,0,0,0,112,729,1,0,0,0,114,735,
-        1,0,0,0,116,745,1,0,0,0,118,761,1,0,0,0,120,763,1,0,0,0,122,779,
-        1,0,0,0,124,793,1,0,0,0,126,795,1,0,0,0,128,801,1,0,0,0,130,808,
-        1,0,0,0,132,848,1,0,0,0,134,850,1,0,0,0,136,864,1,0,0,0,138,867,
-        1,0,0,0,140,884,1,0,0,0,142,894,1,0,0,0,144,905,1,0,0,0,146,912,
-        1,0,0,0,148,921,1,0,0,0,150,924,1,0,0,0,152,927,1,0,0,0,154,937,
-        1,0,0,0,156,948,1,0,0,0,158,951,1,0,0,0,160,966,1,0,0,0,162,980,
-        1,0,0,0,164,982,1,0,0,0,166,986,1,0,0,0,168,993,1,0,0,0,170,997,
-        1,0,0,0,172,1001,1,0,0,0,174,178,3,162,81,0,175,178,3,2,1,0,176,
-        178,3,42,21,0,177,174,1,0,0,0,177,175,1,0,0,0,177,176,1,0,0,0,178,
-        181,1,0,0,0,179,177,1,0,0,0,179,180,1,0,0,0,180,182,1,0,0,0,181,
-        179,1,0,0,0,182,183,5,0,0,1,183,1,1,0,0,0,184,192,3,30,15,0,185,
-        192,3,4,2,0,186,192,3,12,6,0,187,192,3,22,11,0,188,192,3,32,16,0,
-        189,192,3,40,20,0,190,192,3,46,23,0,191,184,1,0,0,0,191,185,1,0,
-        0,0,191,186,1,0,0,0,191,187,1,0,0,0,191,188,1,0,0,0,191,189,1,0,
-        0,0,191,190,1,0,0,0,192,3,1,0,0,0,193,195,3,10,5,0,194,193,1,0,0,
-        0,195,198,1,0,0,0,196,194,1,0,0,0,196,197,1,0,0,0,197,200,1,0,0,
-        0,198,196,1,0,0,0,199,201,3,6,3,0,200,199,1,0,0,0,200,201,1,0,0,
-        0,201,202,1,0,0,0,202,203,7,0,0,0,203,206,3,8,4,0,204,205,5,60,0,
-        0,205,207,3,48,24,0,206,204,1,0,0,0,206,207,1,0,0,0,207,210,1,0,
-        0,0,208,209,5,63,0,0,209,211,3,64,32,0,210,208,1,0,0,0,210,211,1,
-        0,0,0,211,213,1,0,0,0,212,214,5,59,0,0,213,212,1,0,0,0,213,214,1,
-        0,0,0,214,5,1,0,0,0,215,216,7,1,0,0,216,7,1,0,0,0,217,222,5,50,0,
-        0,218,219,5,62,0,0,219,221,5,50,0,0,220,218,1,0,0,0,221,224,1,0,
-        0,0,222,220,1,0,0,0,222,223,1,0,0,0,223,9,1,0,0,0,224,222,1,0,0,
-        0,225,226,5,66,0,0,226,227,5,50,0,0,227,11,1,0,0,0,228,229,5,4,0,
-        0,229,231,5,49,0,0,230,232,3,52,26,0,231,230,1,0,0,0,231,232,1,0,
-        0,0,232,233,1,0,0,0,233,237,5,53,0,0,234,236,3,14,7,0,235,234,1,
-        0,0,0,236,239,1,0,0,0,237,235,1,0,0,0,237,238,1,0,0,0,238,240,1,
-        0,0,0,239,237,1,0,0,0,240,242,5,54,0,0,241,243,5,59,0,0,242,241,
-        1,0,0,0,242,243,1,0,0,0,243,13,1,0,0,0,244,248,3,18,9,0,245,248,
-        3,20,10,0,246,248,3,16,8,0,247,244,1,0,0,0,247,245,1,0,0,0,247,246,
-        1,0,0,0,248,15,1,0,0,0,249,250,5,96,0,0,250,252,3,48,24,0,251,253,
-        5,59,0,0,252,251,1,0,0,0,252,253,1,0,0,0,253,17,1,0,0,0,254,255,
-        5,50,0,0,255,256,5,60,0,0,256,259,3,48,24,0,257,258,5,63,0,0,258,
-        260,3,64,32,0,259,257,1,0,0,0,259,260,1,0,0,0,260,262,1,0,0,0,261,
-        263,5,59,0,0,262,261,1,0,0,0,262,263,1,0,0,0,263,19,1,0,0,0,264,
-        268,5,50,0,0,265,266,5,63,0,0,266,269,3,138,69,0,267,269,3,140,70,
-        0,268,265,1,0,0,0,268,267,1,0,0,0,269,271,1,0,0,0,270,272,5,59,0,
-        0,271,270,1,0,0,0,271,272,1,0,0,0,272,21,1,0,0,0,273,274,5,5,0,0,
-        274,276,5,49,0,0,275,277,3,52,26,0,276,275,1,0,0,0,276,277,1,0,0,
-        0,277,278,1,0,0,0,278,281,5,63,0,0,279,282,3,24,12,0,280,282,3,48,
-        24,0,281,279,1,0,0,0,281,280,1,0,0,0,282,284,1,0,0,0,283,285,5,59,
-        0,0,284,283,1,0,0,0,284,285,1,0,0,0,285,23,1,0,0,0,286,291,5,53,
-        0,0,287,290,3,26,13,0,288,290,3,28,14,0,289,287,1,0,0,0,289,288,
-        1,0,0,0,290,293,1,0,0,0,291,289,1,0,0,0,291,292,1,0,0,0,292,294,
-        1,0,0,0,293,291,1,0,0,0,294,295,5,54,0,0,295,25,1,0,0,0,296,304,
-        5,50,0,0,297,298,5,55,0,0,298,299,5,50,0,0,299,300,5,60,0,0,300,
-        301,3,48,24,0,301,302,5,56,0,0,302,304,1,0,0,0,303,296,1,0,0,0,303,
-        297,1,0,0,0,304,305,1,0,0,0,305,306,5,60,0,0,306,309,3,48,24,0,307,
-        308,5,63,0,0,308,310,3,64,32,0,309,307,1,0,0,0,309,310,1,0,0,0,310,
-        312,1,0,0,0,311,313,5,59,0,0,312,311,1,0,0,0,312,313,1,0,0,0,313,
-        27,1,0,0,0,314,315,5,96,0,0,315,317,3,48,24,0,316,318,5,59,0,0,317,
+        1,79,1,79,1,79,3,79,960,8,79,3,79,962,8,79,1,80,1,80,1,80,1,80,3,
+        80,968,8,80,1,80,1,80,1,81,1,81,1,81,1,81,1,81,1,81,3,81,978,8,81,
+        1,82,1,82,3,82,982,8,82,1,83,1,83,3,83,986,8,83,1,83,3,83,989,8,
+        83,1,84,1,84,3,84,993,8,84,1,85,1,85,3,85,997,8,85,1,86,1,86,1,86,
+        3,86,1002,8,86,1,86,0,2,48,98,87,0,2,4,6,8,10,12,14,16,18,20,22,
+        24,26,28,30,32,34,36,38,40,42,44,46,48,50,52,54,56,58,60,62,64,66,
+        68,70,72,74,76,78,80,82,84,86,88,90,92,94,96,98,100,102,104,106,
+        108,110,112,114,116,118,120,122,124,126,128,130,132,134,136,138,
+        140,142,144,146,148,150,152,154,156,158,160,162,164,166,168,170,
+        172,0,13,1,0,1,3,1,0,18,19,1,0,1,2,1,0,49,50,1,0,39,44,2,0,63,63,
+        84,93,1,0,76,77,2,0,57,58,78,79,1,0,80,81,1,0,71,72,1,0,73,75,2,
+        0,65,65,70,72,1,0,45,48,1096,0,179,1,0,0,0,2,191,1,0,0,0,4,196,1,
+        0,0,0,6,215,1,0,0,0,8,217,1,0,0,0,10,225,1,0,0,0,12,228,1,0,0,0,
+        14,247,1,0,0,0,16,249,1,0,0,0,18,254,1,0,0,0,20,264,1,0,0,0,22,273,
+        1,0,0,0,24,286,1,0,0,0,26,303,1,0,0,0,28,314,1,0,0,0,30,319,1,0,
+        0,0,32,329,1,0,0,0,34,340,1,0,0,0,36,351,1,0,0,0,38,356,1,0,0,0,
+        40,358,1,0,0,0,42,366,1,0,0,0,44,375,1,0,0,0,46,377,1,0,0,0,48,427,
+        1,0,0,0,50,457,1,0,0,0,52,459,1,0,0,0,54,470,1,0,0,0,56,481,1,0,
+        0,0,58,489,1,0,0,0,60,497,1,0,0,0,62,508,1,0,0,0,64,512,1,0,0,0,
+        66,514,1,0,0,0,68,520,1,0,0,0,70,522,1,0,0,0,72,535,1,0,0,0,74,543,
+        1,0,0,0,76,548,1,0,0,0,78,556,1,0,0,0,80,564,1,0,0,0,82,572,1,0,
+        0,0,84,580,1,0,0,0,86,588,1,0,0,0,88,596,1,0,0,0,90,604,1,0,0,0,
+        92,612,1,0,0,0,94,620,1,0,0,0,96,631,1,0,0,0,98,633,1,0,0,0,100,
+        694,1,0,0,0,102,696,1,0,0,0,104,701,1,0,0,0,106,703,1,0,0,0,108,
+        714,1,0,0,0,110,718,1,0,0,0,112,729,1,0,0,0,114,735,1,0,0,0,116,
+        745,1,0,0,0,118,761,1,0,0,0,120,763,1,0,0,0,122,779,1,0,0,0,124,
+        793,1,0,0,0,126,795,1,0,0,0,128,801,1,0,0,0,130,808,1,0,0,0,132,
+        848,1,0,0,0,134,850,1,0,0,0,136,864,1,0,0,0,138,867,1,0,0,0,140,
+        884,1,0,0,0,142,894,1,0,0,0,144,905,1,0,0,0,146,912,1,0,0,0,148,
+        921,1,0,0,0,150,924,1,0,0,0,152,927,1,0,0,0,154,937,1,0,0,0,156,
+        948,1,0,0,0,158,951,1,0,0,0,160,963,1,0,0,0,162,977,1,0,0,0,164,
+        979,1,0,0,0,166,983,1,0,0,0,168,990,1,0,0,0,170,994,1,0,0,0,172,
+        998,1,0,0,0,174,178,3,162,81,0,175,178,3,2,1,0,176,178,3,42,21,0,
+        177,174,1,0,0,0,177,175,1,0,0,0,177,176,1,0,0,0,178,181,1,0,0,0,
+        179,177,1,0,0,0,179,180,1,0,0,0,180,182,1,0,0,0,181,179,1,0,0,0,
+        182,183,5,0,0,1,183,1,1,0,0,0,184,192,3,30,15,0,185,192,3,4,2,0,
+        186,192,3,12,6,0,187,192,3,22,11,0,188,192,3,32,16,0,189,192,3,40,
+        20,0,190,192,3,46,23,0,191,184,1,0,0,0,191,185,1,0,0,0,191,186,1,
+        0,0,0,191,187,1,0,0,0,191,188,1,0,0,0,191,189,1,0,0,0,191,190,1,
+        0,0,0,192,3,1,0,0,0,193,195,3,10,5,0,194,193,1,0,0,0,195,198,1,0,
+        0,0,196,194,1,0,0,0,196,197,1,0,0,0,197,200,1,0,0,0,198,196,1,0,
+        0,0,199,201,3,6,3,0,200,199,1,0,0,0,200,201,1,0,0,0,201,202,1,0,
+        0,0,202,203,7,0,0,0,203,206,3,8,4,0,204,205,5,60,0,0,205,207,3,48,
+        24,0,206,204,1,0,0,0,206,207,1,0,0,0,207,210,1,0,0,0,208,209,5,63,
+        0,0,209,211,3,64,32,0,210,208,1,0,0,0,210,211,1,0,0,0,211,213,1,
+        0,0,0,212,214,5,59,0,0,213,212,1,0,0,0,213,214,1,0,0,0,214,5,1,0,
+        0,0,215,216,7,1,0,0,216,7,1,0,0,0,217,222,5,50,0,0,218,219,5,62,
+        0,0,219,221,5,50,0,0,220,218,1,0,0,0,221,224,1,0,0,0,222,220,1,0,
+        0,0,222,223,1,0,0,0,223,9,1,0,0,0,224,222,1,0,0,0,225,226,5,66,0,
+        0,226,227,5,50,0,0,227,11,1,0,0,0,228,229,5,4,0,0,229,231,5,49,0,
+        0,230,232,3,52,26,0,231,230,1,0,0,0,231,232,1,0,0,0,232,233,1,0,
+        0,0,233,237,5,53,0,0,234,236,3,14,7,0,235,234,1,0,0,0,236,239,1,
+        0,0,0,237,235,1,0,0,0,237,238,1,0,0,0,238,240,1,0,0,0,239,237,1,
+        0,0,0,240,242,5,54,0,0,241,243,5,59,0,0,242,241,1,0,0,0,242,243,
+        1,0,0,0,243,13,1,0,0,0,244,248,3,18,9,0,245,248,3,20,10,0,246,248,
+        3,16,8,0,247,244,1,0,0,0,247,245,1,0,0,0,247,246,1,0,0,0,248,15,
+        1,0,0,0,249,250,5,96,0,0,250,252,3,48,24,0,251,253,5,59,0,0,252,
+        251,1,0,0,0,252,253,1,0,0,0,253,17,1,0,0,0,254,255,5,50,0,0,255,
+        256,5,60,0,0,256,259,3,48,24,0,257,258,5,63,0,0,258,260,3,64,32,
+        0,259,257,1,0,0,0,259,260,1,0,0,0,260,262,1,0,0,0,261,263,5,59,0,
+        0,262,261,1,0,0,0,262,263,1,0,0,0,263,19,1,0,0,0,264,268,5,50,0,
+        0,265,266,5,63,0,0,266,269,3,138,69,0,267,269,3,140,70,0,268,265,
+        1,0,0,0,268,267,1,0,0,0,269,271,1,0,0,0,270,272,5,59,0,0,271,270,
+        1,0,0,0,271,272,1,0,0,0,272,21,1,0,0,0,273,274,5,5,0,0,274,276,5,
+        49,0,0,275,277,3,52,26,0,276,275,1,0,0,0,276,277,1,0,0,0,277,278,
+        1,0,0,0,278,281,5,63,0,0,279,282,3,24,12,0,280,282,3,48,24,0,281,
+        279,1,0,0,0,281,280,1,0,0,0,282,284,1,0,0,0,283,285,5,59,0,0,284,
+        283,1,0,0,0,284,285,1,0,0,0,285,23,1,0,0,0,286,291,5,53,0,0,287,
+        290,3,26,13,0,288,290,3,28,14,0,289,287,1,0,0,0,289,288,1,0,0,0,
+        290,293,1,0,0,0,291,289,1,0,0,0,291,292,1,0,0,0,292,294,1,0,0,0,
+        293,291,1,0,0,0,294,295,5,54,0,0,295,25,1,0,0,0,296,304,5,50,0,0,
+        297,298,5,55,0,0,298,299,5,50,0,0,299,300,5,60,0,0,300,301,3,48,
+        24,0,301,302,5,56,0,0,302,304,1,0,0,0,303,296,1,0,0,0,303,297,1,
+        0,0,0,304,305,1,0,0,0,305,306,5,60,0,0,306,309,3,48,24,0,307,308,
+        5,63,0,0,308,310,3,64,32,0,309,307,1,0,0,0,309,310,1,0,0,0,310,312,
+        1,0,0,0,311,313,5,59,0,0,312,311,1,0,0,0,312,313,1,0,0,0,313,27,
+        1,0,0,0,314,315,5,96,0,0,315,317,3,48,24,0,316,318,5,59,0,0,317,
         316,1,0,0,0,317,318,1,0,0,0,318,29,1,0,0,0,319,320,7,2,0,0,320,322,
         5,50,0,0,321,323,3,52,26,0,322,321,1,0,0,0,322,323,1,0,0,0,323,324,
         1,0,0,0,324,325,5,63,0,0,325,327,3,138,69,0,326,328,5,59,0,0,327,
@@ -246,16 +246,16 @@ def serializedATN():
         0,0,554,77,1,0,0,0,555,553,1,0,0,0,556,561,3,80,40,0,557,558,5,82,
         0,0,558,560,3,80,40,0,559,557,1,0,0,0,560,563,1,0,0,0,561,559,1,
         0,0,0,561,562,1,0,0,0,562,79,1,0,0,0,563,561,1,0,0,0,564,569,3,82,
-        41,0,565,566,5,68,0,0,566,568,3,82,41,0,567,565,1,0,0,0,568,571,
-        1,0,0,0,569,567,1,0,0,0,569,570,1,0,0,0,570,81,1,0,0,0,571,569,1,
-        0,0,0,572,577,3,84,42,0,573,574,5,69,0,0,574,576,3,84,42,0,575,573,
+        41,0,565,566,7,6,0,0,566,568,3,82,41,0,567,565,1,0,0,0,568,571,1,
+        0,0,0,569,567,1,0,0,0,569,570,1,0,0,0,570,81,1,0,0,0,571,569,1,0,
+        0,0,572,577,3,84,42,0,573,574,7,7,0,0,574,576,3,84,42,0,575,573,
         1,0,0,0,576,579,1,0,0,0,577,575,1,0,0,0,577,578,1,0,0,0,578,83,1,
-        0,0,0,579,577,1,0,0,0,580,585,3,86,43,0,581,582,5,67,0,0,582,584,
+        0,0,0,579,577,1,0,0,0,580,585,3,86,43,0,581,582,5,68,0,0,582,584,
         3,86,43,0,583,581,1,0,0,0,584,587,1,0,0,0,585,583,1,0,0,0,585,586,
         1,0,0,0,586,85,1,0,0,0,587,585,1,0,0,0,588,593,3,88,44,0,589,590,
-        7,6,0,0,590,592,3,88,44,0,591,589,1,0,0,0,592,595,1,0,0,0,593,591,
+        5,69,0,0,590,592,3,88,44,0,591,589,1,0,0,0,592,595,1,0,0,0,593,591,
         1,0,0,0,593,594,1,0,0,0,594,87,1,0,0,0,595,593,1,0,0,0,596,601,3,
-        90,45,0,597,598,7,7,0,0,598,600,3,90,45,0,599,597,1,0,0,0,600,603,
+        90,45,0,597,598,5,67,0,0,598,600,3,90,45,0,599,597,1,0,0,0,600,603,
         1,0,0,0,601,599,1,0,0,0,601,602,1,0,0,0,602,89,1,0,0,0,603,601,1,
         0,0,0,604,609,3,92,46,0,605,606,7,8,0,0,606,608,3,92,46,0,607,605,
         1,0,0,0,608,611,1,0,0,0,609,607,1,0,0,0,609,610,1,0,0,0,610,91,1,
@@ -279,17 +279,17 @@ def serializedATN():
         666,669,1,0,0,0,667,665,1,0,0,0,667,668,1,0,0,0,668,99,1,0,0,0,669,
         667,1,0,0,0,670,695,3,104,52,0,671,695,3,114,57,0,672,674,7,3,0,
         0,673,675,3,54,27,0,674,673,1,0,0,0,674,675,1,0,0,0,675,695,1,0,
-        0,0,676,677,5,51,0,0,677,678,3,64,32,0,678,679,5,52,0,0,679,695,
-        1,0,0,0,680,695,5,64,0,0,681,695,3,120,60,0,682,695,3,146,73,0,683,
-        695,3,126,63,0,684,695,3,128,64,0,685,695,3,138,69,0,686,695,3,148,
-        74,0,687,695,3,150,75,0,688,695,3,152,76,0,689,695,3,156,78,0,690,
-        695,3,160,80,0,691,695,3,158,79,0,692,695,3,102,51,0,693,695,3,132,
+        0,0,676,695,3,158,79,0,677,678,5,51,0,0,678,679,3,64,32,0,679,680,
+        5,52,0,0,680,695,1,0,0,0,681,695,5,64,0,0,682,695,3,120,60,0,683,
+        695,3,146,73,0,684,695,3,126,63,0,685,695,3,128,64,0,686,695,3,138,
+        69,0,687,695,3,148,74,0,688,695,3,150,75,0,689,695,3,152,76,0,690,
+        695,3,156,78,0,691,695,3,160,80,0,692,695,3,102,51,0,693,695,3,132,
         66,0,694,670,1,0,0,0,694,671,1,0,0,0,694,672,1,0,0,0,694,676,1,0,
-        0,0,694,680,1,0,0,0,694,681,1,0,0,0,694,682,1,0,0,0,694,683,1,0,
+        0,0,694,677,1,0,0,0,694,681,1,0,0,0,694,682,1,0,0,0,694,683,1,0,
         0,0,694,684,1,0,0,0,694,685,1,0,0,0,694,686,1,0,0,0,694,687,1,0,
         0,0,694,688,1,0,0,0,694,689,1,0,0,0,694,690,1,0,0,0,694,691,1,0,
         0,0,694,692,1,0,0,0,694,693,1,0,0,0,695,101,1,0,0,0,696,699,5,20,
-        0,0,697,700,3,64,32,0,698,700,3,48,24,0,699,697,1,0,0,0,699,698,
+        0,0,697,700,3,48,24,0,698,700,3,96,48,0,699,697,1,0,0,0,699,698,
         1,0,0,0,700,103,1,0,0,0,701,702,7,12,0,0,702,105,1,0,0,0,703,708,
         3,108,54,0,704,705,5,61,0,0,705,707,3,108,54,0,706,704,1,0,0,0,707,
         710,1,0,0,0,708,706,1,0,0,0,708,709,1,0,0,0,709,712,1,0,0,0,710,
@@ -366,32 +366,31 @@ def serializedATN():
         0,943,942,1,0,0,0,944,946,1,0,0,0,945,947,5,61,0,0,946,945,1,0,0,
         0,946,947,1,0,0,0,947,155,1,0,0,0,948,949,5,14,0,0,949,950,3,146,
         73,0,950,157,1,0,0,0,951,952,5,51,0,0,952,953,3,64,32,0,953,954,
-        5,52,0,0,954,957,5,64,0,0,955,958,3,64,32,0,956,958,3,146,73,0,957,
-        955,1,0,0,0,957,956,1,0,0,0,958,964,1,0,0,0,959,962,5,60,0,0,960,
-        963,3,64,32,0,961,963,3,146,73,0,962,960,1,0,0,0,962,961,1,0,0,0,
-        963,965,1,0,0,0,964,959,1,0,0,0,964,965,1,0,0,0,965,159,1,0,0,0,
-        966,970,5,7,0,0,967,968,5,50,0,0,968,969,5,22,0,0,969,971,3,74,37,
-        0,970,967,1,0,0,0,970,971,1,0,0,0,971,972,1,0,0,0,972,973,3,146,
-        73,0,973,161,1,0,0,0,974,981,3,2,1,0,975,981,3,164,82,0,976,981,
-        3,166,83,0,977,981,3,168,84,0,978,981,3,170,85,0,979,981,3,172,86,
-        0,980,974,1,0,0,0,980,975,1,0,0,0,980,976,1,0,0,0,980,977,1,0,0,
-        0,980,978,1,0,0,0,980,979,1,0,0,0,981,163,1,0,0,0,982,984,3,64,32,
-        0,983,985,5,59,0,0,984,983,1,0,0,0,984,985,1,0,0,0,985,165,1,0,0,
-        0,986,988,5,21,0,0,987,989,3,64,32,0,988,987,1,0,0,0,988,989,1,0,
-        0,0,989,991,1,0,0,0,990,992,5,59,0,0,991,990,1,0,0,0,991,992,1,0,
-        0,0,992,167,1,0,0,0,993,995,5,8,0,0,994,996,5,59,0,0,995,994,1,0,
-        0,0,995,996,1,0,0,0,996,169,1,0,0,0,997,999,5,9,0,0,998,1000,5,59,
-        0,0,999,998,1,0,0,0,999,1000,1,0,0,0,1000,171,1,0,0,0,1001,1002,
-        5,15,0,0,1002,1004,3,64,32,0,1003,1005,5,59,0,0,1004,1003,1,0,0,
-        0,1004,1005,1,0,0,0,1005,173,1,0,0,0,124,177,179,191,196,200,206,
-        210,213,222,231,237,242,247,252,259,262,268,271,276,281,284,289,
-        291,303,309,312,317,322,327,334,338,345,349,354,364,370,373,383,
-        406,427,437,439,455,457,465,476,486,491,502,506,518,526,530,533,
-        541,546,553,561,569,577,585,593,601,609,617,625,631,642,658,662,
-        665,667,674,694,699,708,712,723,727,733,737,741,750,754,761,769,
-        773,775,782,793,797,804,813,817,824,834,841,848,856,864,867,871,
-        876,881,884,888,899,903,910,916,932,943,946,957,962,964,970,980,
-        984,988,991,995,999,1004
+        5,52,0,0,954,955,5,64,0,0,955,961,3,146,73,0,956,959,5,60,0,0,957,
+        960,3,64,32,0,958,960,3,146,73,0,959,957,1,0,0,0,959,958,1,0,0,0,
+        960,962,1,0,0,0,961,956,1,0,0,0,961,962,1,0,0,0,962,159,1,0,0,0,
+        963,967,5,7,0,0,964,965,5,50,0,0,965,966,5,22,0,0,966,968,3,74,37,
+        0,967,964,1,0,0,0,967,968,1,0,0,0,968,969,1,0,0,0,969,970,3,146,
+        73,0,970,161,1,0,0,0,971,978,3,2,1,0,972,978,3,164,82,0,973,978,
+        3,166,83,0,974,978,3,168,84,0,975,978,3,170,85,0,976,978,3,172,86,
+        0,977,971,1,0,0,0,977,972,1,0,0,0,977,973,1,0,0,0,977,974,1,0,0,
+        0,977,975,1,0,0,0,977,976,1,0,0,0,978,163,1,0,0,0,979,981,3,64,32,
+        0,980,982,5,59,0,0,981,980,1,0,0,0,981,982,1,0,0,0,982,165,1,0,0,
+        0,983,985,5,21,0,0,984,986,3,64,32,0,985,984,1,0,0,0,985,986,1,0,
+        0,0,986,988,1,0,0,0,987,989,5,59,0,0,988,987,1,0,0,0,988,989,1,0,
+        0,0,989,167,1,0,0,0,990,992,5,8,0,0,991,993,5,59,0,0,992,991,1,0,
+        0,0,992,993,1,0,0,0,993,169,1,0,0,0,994,996,5,9,0,0,995,997,5,59,
+        0,0,996,995,1,0,0,0,996,997,1,0,0,0,997,171,1,0,0,0,998,999,5,15,
+        0,0,999,1001,3,64,32,0,1000,1002,5,59,0,0,1001,1000,1,0,0,0,1001,
+        1002,1,0,0,0,1002,173,1,0,0,0,123,177,179,191,196,200,206,210,213,
+        222,231,237,242,247,252,259,262,268,271,276,281,284,289,291,303,
+        309,312,317,322,327,334,338,345,349,354,364,370,373,383,406,427,
+        437,439,455,457,465,476,486,491,502,506,518,526,530,533,541,546,
+        553,561,569,577,585,593,601,609,617,625,631,642,658,662,665,667,
+        674,694,699,708,712,723,727,733,737,741,750,754,761,769,773,775,
+        782,793,797,804,813,817,824,834,841,848,856,864,867,871,876,881,
+        884,888,899,903,910,916,932,943,946,959,961,967,977,981,985,988,
+        992,996,1001
     ]
 
 class EzLangParser ( Parser ):
@@ -481,11 +480,11 @@ class EzLangParser ( Parser ):
     RULE_rangeExpression = 37
     RULE_orExpression = 38
     RULE_andExpression = 39
-    RULE_bitOrExpression = 40
-    RULE_bitXorExpression = 41
-    RULE_bitAndExpression = 42
-    RULE_equalityExpression = 43
-    RULE_relationalExpression = 44
+    RULE_equalityExpression = 40
+    RULE_relationalExpression = 41
+    RULE_bitOrExpression = 42
+    RULE_bitXorExpression = 43
+    RULE_bitAndExpression = 44
     RULE_shiftExpression = 45
     RULE_additiveExpression = 46
     RULE_multiplicativeExpression = 47
@@ -539,18 +538,19 @@ class EzLangParser ( Parser ):
                    "typeList", "functionType", "paramTypeList", "paramType",
                    "expression", "assignmentExpression", "assignmentOperator",
                    "pipelineExpression", "conditionalExpression", "rangeExpression",
-                   "orExpression", "andExpression", "bitOrExpression", "bitXorExpression",
-                   "bitAndExpression", "equalityExpression", "relationalExpression",
-                   "shiftExpression", "additiveExpression", "multiplicativeExpression",
-                   "unaryExpression", "postfixExpression", "primaryExpression",
-                   "typeofExpr", "literal", "namedArgList", "namedArg",
-                   "pipelineArgList", "pipelineArg", "structLiteral", "structFieldInitList",
-                   "structFieldInit", "dictLiteral", "dictField", "dictKey",
-                   "arrayLiteral", "vecLiteral", "expressionList", "markupLiteral",
-                   "markupAttr", "markupChild", "functionLiteral", "functionSignature",
-                   "paramList", "param", "block", "flowBlock", "parallelBlock",
-                   "matchBlock", "matchClause", "catchBlock", "ifLikeExpr",
-                   "loopExpr", "statement", "expressionStatement", "returnStatement",
+                   "orExpression", "andExpression", "equalityExpression",
+                   "relationalExpression", "bitOrExpression", "bitXorExpression",
+                   "bitAndExpression", "shiftExpression", "additiveExpression",
+                   "multiplicativeExpression", "unaryExpression", "postfixExpression",
+                   "primaryExpression", "typeofExpr", "literal", "namedArgList",
+                   "namedArg", "pipelineArgList", "pipelineArg", "structLiteral",
+                   "structFieldInitList", "structFieldInit", "dictLiteral",
+                   "dictField", "dictKey", "arrayLiteral", "vecLiteral",
+                   "expressionList", "markupLiteral", "markupAttr", "markupChild",
+                   "functionLiteral", "functionSignature", "paramList",
+                   "param", "block", "flowBlock", "parallelBlock", "matchBlock",
+                   "matchClause", "catchBlock", "ifLikeExpr", "loopExpr",
+                   "statement", "expressionStatement", "returnStatement",
                    "breakStatement", "continueStatement", "throwStatement" ]
 
     EOF = Token.EOF
@@ -4430,11 +4430,11 @@ class EzLangParser ( Parser ):
             super().__init__(parent, invokingState)
             self.parser = parser
 
-        def bitOrExpression(self, i:int=None):
+        def equalityExpression(self, i:int=None):
             if i is None:
-                return self.getTypedRuleContexts(EzLangParser.BitOrExpressionContext)
+                return self.getTypedRuleContexts(EzLangParser.EqualityExpressionContext)
             else:
-                return self.getTypedRuleContext(EzLangParser.BitOrExpressionContext,i)
+                return self.getTypedRuleContext(EzLangParser.EqualityExpressionContext,i)
 
 
         def AND(self, i:int=None):
@@ -4470,7 +4470,7 @@ class EzLangParser ( Parser ):
         try:
             self.enterOuterAlt(localctx, 1)
             self.state = 556
-            self.bitOrExpression()
+            self.equalityExpression()
             self.state = 561
             self._errHandler.sync(self)
             _alt = self._interp.adaptivePredict(self._input,57,self._ctx)
@@ -4479,220 +4479,10 @@ class EzLangParser ( Parser ):
                     self.state = 557
                     self.match(EzLangParser.AND)
                     self.state = 558
-                    self.bitOrExpression()
+                    self.equalityExpression()
                 self.state = 563
                 self._errHandler.sync(self)
                 _alt = self._interp.adaptivePredict(self._input,57,self._ctx)
-
-        except RecognitionException as re:
-            localctx.exception = re
-            self._errHandler.reportError(self, re)
-            self._errHandler.recover(self, re)
-        finally:
-            self.exitRule()
-        return localctx
-
-
-    class BitOrExpressionContext(ParserRuleContext):
-        __slots__ = 'parser'
-
-        def __init__(self, parser, parent:ParserRuleContext=None, invokingState:int=-1):
-            super().__init__(parent, invokingState)
-            self.parser = parser
-
-        def bitXorExpression(self, i:int=None):
-            if i is None:
-                return self.getTypedRuleContexts(EzLangParser.BitXorExpressionContext)
-            else:
-                return self.getTypedRuleContext(EzLangParser.BitXorExpressionContext,i)
-
-
-        def PIPE(self, i:int=None):
-            if i is None:
-                return self.getTokens(EzLangParser.PIPE)
-            else:
-                return self.getToken(EzLangParser.PIPE, i)
-
-        def getRuleIndex(self):
-            return EzLangParser.RULE_bitOrExpression
-
-        def enterRule(self, listener:ParseTreeListener):
-            if hasattr( listener, "enterBitOrExpression" ):
-                listener.enterBitOrExpression(self)
-
-        def exitRule(self, listener:ParseTreeListener):
-            if hasattr( listener, "exitBitOrExpression" ):
-                listener.exitBitOrExpression(self)
-
-        def accept(self, visitor:ParseTreeVisitor):
-            if hasattr( visitor, "visitBitOrExpression" ):
-                return visitor.visitBitOrExpression(self)
-            else:
-                return visitor.visitChildren(self)
-
-
-
-
-    def bitOrExpression(self):
-
-        localctx = EzLangParser.BitOrExpressionContext(self, self._ctx, self.state)
-        self.enterRule(localctx, 80, self.RULE_bitOrExpression)
-        try:
-            self.enterOuterAlt(localctx, 1)
-            self.state = 564
-            self.bitXorExpression()
-            self.state = 569
-            self._errHandler.sync(self)
-            _alt = self._interp.adaptivePredict(self._input,58,self._ctx)
-            while _alt!=2 and _alt!=ATN.INVALID_ALT_NUMBER:
-                if _alt==1:
-                    self.state = 565
-                    self.match(EzLangParser.PIPE)
-                    self.state = 566
-                    self.bitXorExpression()
-                self.state = 571
-                self._errHandler.sync(self)
-                _alt = self._interp.adaptivePredict(self._input,58,self._ctx)
-
-        except RecognitionException as re:
-            localctx.exception = re
-            self._errHandler.reportError(self, re)
-            self._errHandler.recover(self, re)
-        finally:
-            self.exitRule()
-        return localctx
-
-
-    class BitXorExpressionContext(ParserRuleContext):
-        __slots__ = 'parser'
-
-        def __init__(self, parser, parent:ParserRuleContext=None, invokingState:int=-1):
-            super().__init__(parent, invokingState)
-            self.parser = parser
-
-        def bitAndExpression(self, i:int=None):
-            if i is None:
-                return self.getTypedRuleContexts(EzLangParser.BitAndExpressionContext)
-            else:
-                return self.getTypedRuleContext(EzLangParser.BitAndExpressionContext,i)
-
-
-        def CARET(self, i:int=None):
-            if i is None:
-                return self.getTokens(EzLangParser.CARET)
-            else:
-                return self.getToken(EzLangParser.CARET, i)
-
-        def getRuleIndex(self):
-            return EzLangParser.RULE_bitXorExpression
-
-        def enterRule(self, listener:ParseTreeListener):
-            if hasattr( listener, "enterBitXorExpression" ):
-                listener.enterBitXorExpression(self)
-
-        def exitRule(self, listener:ParseTreeListener):
-            if hasattr( listener, "exitBitXorExpression" ):
-                listener.exitBitXorExpression(self)
-
-        def accept(self, visitor:ParseTreeVisitor):
-            if hasattr( visitor, "visitBitXorExpression" ):
-                return visitor.visitBitXorExpression(self)
-            else:
-                return visitor.visitChildren(self)
-
-
-
-
-    def bitXorExpression(self):
-
-        localctx = EzLangParser.BitXorExpressionContext(self, self._ctx, self.state)
-        self.enterRule(localctx, 82, self.RULE_bitXorExpression)
-        try:
-            self.enterOuterAlt(localctx, 1)
-            self.state = 572
-            self.bitAndExpression()
-            self.state = 577
-            self._errHandler.sync(self)
-            _alt = self._interp.adaptivePredict(self._input,59,self._ctx)
-            while _alt!=2 and _alt!=ATN.INVALID_ALT_NUMBER:
-                if _alt==1:
-                    self.state = 573
-                    self.match(EzLangParser.CARET)
-                    self.state = 574
-                    self.bitAndExpression()
-                self.state = 579
-                self._errHandler.sync(self)
-                _alt = self._interp.adaptivePredict(self._input,59,self._ctx)
-
-        except RecognitionException as re:
-            localctx.exception = re
-            self._errHandler.reportError(self, re)
-            self._errHandler.recover(self, re)
-        finally:
-            self.exitRule()
-        return localctx
-
-
-    class BitAndExpressionContext(ParserRuleContext):
-        __slots__ = 'parser'
-
-        def __init__(self, parser, parent:ParserRuleContext=None, invokingState:int=-1):
-            super().__init__(parent, invokingState)
-            self.parser = parser
-
-        def equalityExpression(self, i:int=None):
-            if i is None:
-                return self.getTypedRuleContexts(EzLangParser.EqualityExpressionContext)
-            else:
-                return self.getTypedRuleContext(EzLangParser.EqualityExpressionContext,i)
-
-
-        def AMPERSAND(self, i:int=None):
-            if i is None:
-                return self.getTokens(EzLangParser.AMPERSAND)
-            else:
-                return self.getToken(EzLangParser.AMPERSAND, i)
-
-        def getRuleIndex(self):
-            return EzLangParser.RULE_bitAndExpression
-
-        def enterRule(self, listener:ParseTreeListener):
-            if hasattr( listener, "enterBitAndExpression" ):
-                listener.enterBitAndExpression(self)
-
-        def exitRule(self, listener:ParseTreeListener):
-            if hasattr( listener, "exitBitAndExpression" ):
-                listener.exitBitAndExpression(self)
-
-        def accept(self, visitor:ParseTreeVisitor):
-            if hasattr( visitor, "visitBitAndExpression" ):
-                return visitor.visitBitAndExpression(self)
-            else:
-                return visitor.visitChildren(self)
-
-
-
-
-    def bitAndExpression(self):
-
-        localctx = EzLangParser.BitAndExpressionContext(self, self._ctx, self.state)
-        self.enterRule(localctx, 84, self.RULE_bitAndExpression)
-        try:
-            self.enterOuterAlt(localctx, 1)
-            self.state = 580
-            self.equalityExpression()
-            self.state = 585
-            self._errHandler.sync(self)
-            _alt = self._interp.adaptivePredict(self._input,60,self._ctx)
-            while _alt!=2 and _alt!=ATN.INVALID_ALT_NUMBER:
-                if _alt==1:
-                    self.state = 581
-                    self.match(EzLangParser.AMPERSAND)
-                    self.state = 582
-                    self.equalityExpression()
-                self.state = 587
-                self._errHandler.sync(self)
-                _alt = self._interp.adaptivePredict(self._input,60,self._ctx)
 
         except RecognitionException as re:
             localctx.exception = re
@@ -4752,29 +4542,29 @@ class EzLangParser ( Parser ):
     def equalityExpression(self):
 
         localctx = EzLangParser.EqualityExpressionContext(self, self._ctx, self.state)
-        self.enterRule(localctx, 86, self.RULE_equalityExpression)
+        self.enterRule(localctx, 80, self.RULE_equalityExpression)
         self._la = 0 # Token type
         try:
             self.enterOuterAlt(localctx, 1)
-            self.state = 588
+            self.state = 564
             self.relationalExpression()
-            self.state = 593
+            self.state = 569
             self._errHandler.sync(self)
-            _alt = self._interp.adaptivePredict(self._input,61,self._ctx)
+            _alt = self._interp.adaptivePredict(self._input,58,self._ctx)
             while _alt!=2 and _alt!=ATN.INVALID_ALT_NUMBER:
                 if _alt==1:
-                    self.state = 589
+                    self.state = 565
                     _la = self._input.LA(1)
                     if not(_la==76 or _la==77):
                         self._errHandler.recoverInline(self)
                     else:
                         self._errHandler.reportMatch(self)
                         self.consume()
-                    self.state = 590
+                    self.state = 566
                     self.relationalExpression()
-                self.state = 595
+                self.state = 571
                 self._errHandler.sync(self)
-                _alt = self._interp.adaptivePredict(self._input,61,self._ctx)
+                _alt = self._interp.adaptivePredict(self._input,58,self._ctx)
 
         except RecognitionException as re:
             localctx.exception = re
@@ -4792,11 +4582,11 @@ class EzLangParser ( Parser ):
             super().__init__(parent, invokingState)
             self.parser = parser
 
-        def shiftExpression(self, i:int=None):
+        def bitOrExpression(self, i:int=None):
             if i is None:
-                return self.getTypedRuleContexts(EzLangParser.ShiftExpressionContext)
+                return self.getTypedRuleContexts(EzLangParser.BitOrExpressionContext)
             else:
-                return self.getTypedRuleContext(EzLangParser.ShiftExpressionContext,i)
+                return self.getTypedRuleContext(EzLangParser.BitOrExpressionContext,i)
 
 
         def LANGLE(self, i:int=None):
@@ -4846,8 +4636,223 @@ class EzLangParser ( Parser ):
     def relationalExpression(self):
 
         localctx = EzLangParser.RelationalExpressionContext(self, self._ctx, self.state)
-        self.enterRule(localctx, 88, self.RULE_relationalExpression)
+        self.enterRule(localctx, 82, self.RULE_relationalExpression)
         self._la = 0 # Token type
+        try:
+            self.enterOuterAlt(localctx, 1)
+            self.state = 572
+            self.bitOrExpression()
+            self.state = 577
+            self._errHandler.sync(self)
+            _alt = self._interp.adaptivePredict(self._input,59,self._ctx)
+            while _alt!=2 and _alt!=ATN.INVALID_ALT_NUMBER:
+                if _alt==1:
+                    self.state = 573
+                    _la = self._input.LA(1)
+                    if not(((((_la - 57)) & ~0x3f) == 0 and ((1 << (_la - 57)) & 6291459) != 0)):
+                        self._errHandler.recoverInline(self)
+                    else:
+                        self._errHandler.reportMatch(self)
+                        self.consume()
+                    self.state = 574
+                    self.bitOrExpression()
+                self.state = 579
+                self._errHandler.sync(self)
+                _alt = self._interp.adaptivePredict(self._input,59,self._ctx)
+
+        except RecognitionException as re:
+            localctx.exception = re
+            self._errHandler.reportError(self, re)
+            self._errHandler.recover(self, re)
+        finally:
+            self.exitRule()
+        return localctx
+
+
+    class BitOrExpressionContext(ParserRuleContext):
+        __slots__ = 'parser'
+
+        def __init__(self, parser, parent:ParserRuleContext=None, invokingState:int=-1):
+            super().__init__(parent, invokingState)
+            self.parser = parser
+
+        def bitXorExpression(self, i:int=None):
+            if i is None:
+                return self.getTypedRuleContexts(EzLangParser.BitXorExpressionContext)
+            else:
+                return self.getTypedRuleContext(EzLangParser.BitXorExpressionContext,i)
+
+
+        def PIPE(self, i:int=None):
+            if i is None:
+                return self.getTokens(EzLangParser.PIPE)
+            else:
+                return self.getToken(EzLangParser.PIPE, i)
+
+        def getRuleIndex(self):
+            return EzLangParser.RULE_bitOrExpression
+
+        def enterRule(self, listener:ParseTreeListener):
+            if hasattr( listener, "enterBitOrExpression" ):
+                listener.enterBitOrExpression(self)
+
+        def exitRule(self, listener:ParseTreeListener):
+            if hasattr( listener, "exitBitOrExpression" ):
+                listener.exitBitOrExpression(self)
+
+        def accept(self, visitor:ParseTreeVisitor):
+            if hasattr( visitor, "visitBitOrExpression" ):
+                return visitor.visitBitOrExpression(self)
+            else:
+                return visitor.visitChildren(self)
+
+
+
+
+    def bitOrExpression(self):
+
+        localctx = EzLangParser.BitOrExpressionContext(self, self._ctx, self.state)
+        self.enterRule(localctx, 84, self.RULE_bitOrExpression)
+        try:
+            self.enterOuterAlt(localctx, 1)
+            self.state = 580
+            self.bitXorExpression()
+            self.state = 585
+            self._errHandler.sync(self)
+            _alt = self._interp.adaptivePredict(self._input,60,self._ctx)
+            while _alt!=2 and _alt!=ATN.INVALID_ALT_NUMBER:
+                if _alt==1:
+                    self.state = 581
+                    self.match(EzLangParser.PIPE)
+                    self.state = 582
+                    self.bitXorExpression()
+                self.state = 587
+                self._errHandler.sync(self)
+                _alt = self._interp.adaptivePredict(self._input,60,self._ctx)
+
+        except RecognitionException as re:
+            localctx.exception = re
+            self._errHandler.reportError(self, re)
+            self._errHandler.recover(self, re)
+        finally:
+            self.exitRule()
+        return localctx
+
+
+    class BitXorExpressionContext(ParserRuleContext):
+        __slots__ = 'parser'
+
+        def __init__(self, parser, parent:ParserRuleContext=None, invokingState:int=-1):
+            super().__init__(parent, invokingState)
+            self.parser = parser
+
+        def bitAndExpression(self, i:int=None):
+            if i is None:
+                return self.getTypedRuleContexts(EzLangParser.BitAndExpressionContext)
+            else:
+                return self.getTypedRuleContext(EzLangParser.BitAndExpressionContext,i)
+
+
+        def CARET(self, i:int=None):
+            if i is None:
+                return self.getTokens(EzLangParser.CARET)
+            else:
+                return self.getToken(EzLangParser.CARET, i)
+
+        def getRuleIndex(self):
+            return EzLangParser.RULE_bitXorExpression
+
+        def enterRule(self, listener:ParseTreeListener):
+            if hasattr( listener, "enterBitXorExpression" ):
+                listener.enterBitXorExpression(self)
+
+        def exitRule(self, listener:ParseTreeListener):
+            if hasattr( listener, "exitBitXorExpression" ):
+                listener.exitBitXorExpression(self)
+
+        def accept(self, visitor:ParseTreeVisitor):
+            if hasattr( visitor, "visitBitXorExpression" ):
+                return visitor.visitBitXorExpression(self)
+            else:
+                return visitor.visitChildren(self)
+
+
+
+
+    def bitXorExpression(self):
+
+        localctx = EzLangParser.BitXorExpressionContext(self, self._ctx, self.state)
+        self.enterRule(localctx, 86, self.RULE_bitXorExpression)
+        try:
+            self.enterOuterAlt(localctx, 1)
+            self.state = 588
+            self.bitAndExpression()
+            self.state = 593
+            self._errHandler.sync(self)
+            _alt = self._interp.adaptivePredict(self._input,61,self._ctx)
+            while _alt!=2 and _alt!=ATN.INVALID_ALT_NUMBER:
+                if _alt==1:
+                    self.state = 589
+                    self.match(EzLangParser.CARET)
+                    self.state = 590
+                    self.bitAndExpression()
+                self.state = 595
+                self._errHandler.sync(self)
+                _alt = self._interp.adaptivePredict(self._input,61,self._ctx)
+
+        except RecognitionException as re:
+            localctx.exception = re
+            self._errHandler.reportError(self, re)
+            self._errHandler.recover(self, re)
+        finally:
+            self.exitRule()
+        return localctx
+
+
+    class BitAndExpressionContext(ParserRuleContext):
+        __slots__ = 'parser'
+
+        def __init__(self, parser, parent:ParserRuleContext=None, invokingState:int=-1):
+            super().__init__(parent, invokingState)
+            self.parser = parser
+
+        def shiftExpression(self, i:int=None):
+            if i is None:
+                return self.getTypedRuleContexts(EzLangParser.ShiftExpressionContext)
+            else:
+                return self.getTypedRuleContext(EzLangParser.ShiftExpressionContext,i)
+
+
+        def AMPERSAND(self, i:int=None):
+            if i is None:
+                return self.getTokens(EzLangParser.AMPERSAND)
+            else:
+                return self.getToken(EzLangParser.AMPERSAND, i)
+
+        def getRuleIndex(self):
+            return EzLangParser.RULE_bitAndExpression
+
+        def enterRule(self, listener:ParseTreeListener):
+            if hasattr( listener, "enterBitAndExpression" ):
+                listener.enterBitAndExpression(self)
+
+        def exitRule(self, listener:ParseTreeListener):
+            if hasattr( listener, "exitBitAndExpression" ):
+                listener.exitBitAndExpression(self)
+
+        def accept(self, visitor:ParseTreeVisitor):
+            if hasattr( visitor, "visitBitAndExpression" ):
+                return visitor.visitBitAndExpression(self)
+            else:
+                return visitor.visitChildren(self)
+
+
+
+
+    def bitAndExpression(self):
+
+        localctx = EzLangParser.BitAndExpressionContext(self, self._ctx, self.state)
+        self.enterRule(localctx, 88, self.RULE_bitAndExpression)
         try:
             self.enterOuterAlt(localctx, 1)
             self.state = 596
@@ -4858,12 +4863,7 @@ class EzLangParser ( Parser ):
             while _alt!=2 and _alt!=ATN.INVALID_ALT_NUMBER:
                 if _alt==1:
                     self.state = 597
-                    _la = self._input.LA(1)
-                    if not(((((_la - 57)) & ~0x3f) == 0 and ((1 << (_la - 57)) & 6291459) != 0)):
-                        self._errHandler.recoverInline(self)
-                    else:
-                        self._errHandler.reportMatch(self)
-                        self.consume()
+                    self.match(EzLangParser.AMPERSAND)
                     self.state = 598
                     self.shiftExpression()
                 self.state = 603
@@ -6109,98 +6109,98 @@ class EzLangParser ( Parser ):
                 pass
 
             elif la_ == 4:
-                localctx = EzLangParser.ParenExprContext(self, localctx)
+                localctx = EzLangParser.IfLikePrimaryExprContext(self, localctx)
                 self.enterOuterAlt(localctx, 4)
                 self.state = 676
-                self.match(EzLangParser.LPAREN)
-                self.state = 677
-                self.expression()
-                self.state = 678
-                self.match(EzLangParser.RPAREN)
+                self.ifLikeExpr()
                 pass
 
             elif la_ == 5:
-                localctx = EzLangParser.PlaceholderExprContext(self, localctx)
+                localctx = EzLangParser.ParenExprContext(self, localctx)
                 self.enterOuterAlt(localctx, 5)
-                self.state = 680
-                self.match(EzLangParser.QUESTION)
+                self.state = 677
+                self.match(EzLangParser.LPAREN)
+                self.state = 678
+                self.expression()
+                self.state = 679
+                self.match(EzLangParser.RPAREN)
                 pass
 
             elif la_ == 6:
-                localctx = EzLangParser.DictExprContext(self, localctx)
+                localctx = EzLangParser.PlaceholderExprContext(self, localctx)
                 self.enterOuterAlt(localctx, 6)
                 self.state = 681
-                self.dictLiteral()
+                self.match(EzLangParser.QUESTION)
                 pass
 
             elif la_ == 7:
-                localctx = EzLangParser.BlockExprContext(self, localctx)
+                localctx = EzLangParser.DictExprContext(self, localctx)
                 self.enterOuterAlt(localctx, 7)
                 self.state = 682
-                self.block()
+                self.dictLiteral()
                 pass
 
             elif la_ == 8:
-                localctx = EzLangParser.ArrayLiteralExprContext(self, localctx)
+                localctx = EzLangParser.BlockExprContext(self, localctx)
                 self.enterOuterAlt(localctx, 8)
                 self.state = 683
-                self.arrayLiteral()
+                self.block()
                 pass
 
             elif la_ == 9:
-                localctx = EzLangParser.VecLiteralExprContext(self, localctx)
+                localctx = EzLangParser.ArrayLiteralExprContext(self, localctx)
                 self.enterOuterAlt(localctx, 9)
                 self.state = 684
-                self.vecLiteral()
+                self.arrayLiteral()
                 pass
 
             elif la_ == 10:
-                localctx = EzLangParser.FnLiteralExprContext(self, localctx)
+                localctx = EzLangParser.VecLiteralExprContext(self, localctx)
                 self.enterOuterAlt(localctx, 10)
                 self.state = 685
-                self.functionLiteral()
+                self.vecLiteral()
                 pass
 
             elif la_ == 11:
-                localctx = EzLangParser.FlowBlockExprContext(self, localctx)
+                localctx = EzLangParser.FnLiteralExprContext(self, localctx)
                 self.enterOuterAlt(localctx, 11)
                 self.state = 686
-                self.flowBlock()
+                self.functionLiteral()
                 pass
 
             elif la_ == 12:
-                localctx = EzLangParser.ParallelBlockExprContext(self, localctx)
+                localctx = EzLangParser.FlowBlockExprContext(self, localctx)
                 self.enterOuterAlt(localctx, 12)
                 self.state = 687
-                self.parallelBlock()
+                self.flowBlock()
                 pass
 
             elif la_ == 13:
-                localctx = EzLangParser.MatchBlockExprContext(self, localctx)
+                localctx = EzLangParser.ParallelBlockExprContext(self, localctx)
                 self.enterOuterAlt(localctx, 13)
                 self.state = 688
-                self.matchBlock()
+                self.parallelBlock()
                 pass
 
             elif la_ == 14:
-                localctx = EzLangParser.CatchBlockExprContext(self, localctx)
+                localctx = EzLangParser.MatchBlockExprContext(self, localctx)
                 self.enterOuterAlt(localctx, 14)
                 self.state = 689
-                self.catchBlock()
+                self.matchBlock()
                 pass
 
             elif la_ == 15:
-                localctx = EzLangParser.LoopPrimaryExprContext(self, localctx)
+                localctx = EzLangParser.CatchBlockExprContext(self, localctx)
                 self.enterOuterAlt(localctx, 15)
                 self.state = 690
-                self.loopExpr()
+                self.catchBlock()
                 pass
 
             elif la_ == 16:
-                localctx = EzLangParser.IfLikePrimaryExprContext(self, localctx)
+                localctx = EzLangParser.LoopPrimaryExprContext(self, localctx)
                 self.enterOuterAlt(localctx, 16)
                 self.state = 691
-                self.ifLikeExpr()
+                self.loopExpr()
                 pass
 
             elif la_ == 17:
@@ -6237,12 +6237,12 @@ class EzLangParser ( Parser ):
         def TYPEOF(self):
             return self.getToken(EzLangParser.TYPEOF, 0)
 
-        def expression(self):
-            return self.getTypedRuleContext(EzLangParser.ExpressionContext,0)
-
-
         def type_(self):
             return self.getTypedRuleContext(EzLangParser.Type_Context,0)
+
+
+        def unaryExpression(self):
+            return self.getTypedRuleContext(EzLangParser.UnaryExpressionContext,0)
 
 
         def getRuleIndex(self):
@@ -6278,12 +6278,12 @@ class EzLangParser ( Parser ):
             la_ = self._interp.adaptivePredict(self._input,74,self._ctx)
             if la_ == 1:
                 self.state = 697
-                self.expression()
+                self.type_(0)
                 pass
 
             elif la_ == 2:
                 self.state = 698
-                self.type_(0)
+                self.unaryExpression()
                 pass
 
 
@@ -8498,36 +8498,24 @@ class EzLangParser ( Parser ):
             self.match(EzLangParser.RPAREN)
             self.state = 954
             self.match(EzLangParser.QUESTION)
-            self.state = 957
+            self.state = 955
+            self.block()
+            self.state = 961
             self._errHandler.sync(self)
-            la_ = self._interp.adaptivePredict(self._input,113,self._ctx)
+            la_ = self._interp.adaptivePredict(self._input,114,self._ctx)
             if la_ == 1:
-                self.state = 955
-                self.expression()
-                pass
-
-            elif la_ == 2:
                 self.state = 956
-                self.block()
-                pass
-
-
-            self.state = 964
-            self._errHandler.sync(self)
-            la_ = self._interp.adaptivePredict(self._input,115,self._ctx)
-            if la_ == 1:
-                self.state = 959
                 self.match(EzLangParser.COLON)
-                self.state = 962
+                self.state = 959
                 self._errHandler.sync(self)
-                la_ = self._interp.adaptivePredict(self._input,114,self._ctx)
+                la_ = self._interp.adaptivePredict(self._input,113,self._ctx)
                 if la_ == 1:
-                    self.state = 960
+                    self.state = 957
                     self.expression()
                     pass
 
                 elif la_ == 2:
-                    self.state = 961
+                    self.state = 958
                     self.block()
                     pass
 
@@ -8594,21 +8582,21 @@ class EzLangParser ( Parser ):
         self._la = 0 # Token type
         try:
             self.enterOuterAlt(localctx, 1)
-            self.state = 966
+            self.state = 963
             self.match(EzLangParser.LOOP)
-            self.state = 970
+            self.state = 967
             self._errHandler.sync(self)
             _la = self._input.LA(1)
             if _la==50:
-                self.state = 967
+                self.state = 964
                 self.match(EzLangParser.VAR_IDENTIFIER)
-                self.state = 968
+                self.state = 965
                 self.match(EzLangParser.IN)
-                self.state = 969
+                self.state = 966
                 self.rangeExpression()
 
 
-            self.state = 972
+            self.state = 969
             self.block()
         except RecognitionException as re:
             localctx.exception = re
@@ -8675,37 +8663,37 @@ class EzLangParser ( Parser ):
         localctx = EzLangParser.StatementContext(self, self._ctx, self.state)
         self.enterRule(localctx, 162, self.RULE_statement)
         try:
-            self.state = 980
+            self.state = 977
             self._errHandler.sync(self)
             token = self._input.LA(1)
             if token in [1, 2, 3, 4, 5, 6, 11, 12, 18, 19, 66]:
                 self.enterOuterAlt(localctx, 1)
-                self.state = 974
+                self.state = 971
                 self.declaration()
                 pass
             elif token in [7, 13, 14, 16, 17, 20, 37, 45, 46, 47, 48, 49, 50, 51, 53, 55, 57, 64, 65, 70, 71, 72]:
                 self.enterOuterAlt(localctx, 2)
-                self.state = 975
+                self.state = 972
                 self.expressionStatement()
                 pass
             elif token in [21]:
                 self.enterOuterAlt(localctx, 3)
-                self.state = 976
+                self.state = 973
                 self.returnStatement()
                 pass
             elif token in [8]:
                 self.enterOuterAlt(localctx, 4)
-                self.state = 977
+                self.state = 974
                 self.breakStatement()
                 pass
             elif token in [9]:
                 self.enterOuterAlt(localctx, 5)
-                self.state = 978
+                self.state = 975
                 self.continueStatement()
                 pass
             elif token in [15]:
                 self.enterOuterAlt(localctx, 6)
-                self.state = 979
+                self.state = 976
                 self.throwStatement()
                 pass
             else:
@@ -8761,13 +8749,13 @@ class EzLangParser ( Parser ):
         self._la = 0 # Token type
         try:
             self.enterOuterAlt(localctx, 1)
-            self.state = 982
+            self.state = 979
             self.expression()
-            self.state = 984
+            self.state = 981
             self._errHandler.sync(self)
             _la = self._input.LA(1)
             if _la==59:
-                self.state = 983
+                self.state = 980
                 self.match(EzLangParser.SEMI)
 
 
@@ -8824,21 +8812,21 @@ class EzLangParser ( Parser ):
         self._la = 0 # Token type
         try:
             self.enterOuterAlt(localctx, 1)
-            self.state = 986
+            self.state = 983
             self.match(EzLangParser.RETURN)
-            self.state = 988
+            self.state = 985
             self._errHandler.sync(self)
-            la_ = self._interp.adaptivePredict(self._input,119,self._ctx)
+            la_ = self._interp.adaptivePredict(self._input,118,self._ctx)
             if la_ == 1:
-                self.state = 987
+                self.state = 984
                 self.expression()
 
 
-            self.state = 991
+            self.state = 988
             self._errHandler.sync(self)
             _la = self._input.LA(1)
             if _la==59:
-                self.state = 990
+                self.state = 987
                 self.match(EzLangParser.SEMI)
 
 
@@ -8891,13 +8879,13 @@ class EzLangParser ( Parser ):
         self._la = 0 # Token type
         try:
             self.enterOuterAlt(localctx, 1)
-            self.state = 993
+            self.state = 990
             self.match(EzLangParser.BREAK)
-            self.state = 995
+            self.state = 992
             self._errHandler.sync(self)
             _la = self._input.LA(1)
             if _la==59:
-                self.state = 994
+                self.state = 991
                 self.match(EzLangParser.SEMI)
 
 
@@ -8950,13 +8938,13 @@ class EzLangParser ( Parser ):
         self._la = 0 # Token type
         try:
             self.enterOuterAlt(localctx, 1)
-            self.state = 997
+            self.state = 994
             self.match(EzLangParser.CONTINUE)
-            self.state = 999
+            self.state = 996
             self._errHandler.sync(self)
             _la = self._input.LA(1)
             if _la==59:
-                self.state = 998
+                self.state = 995
                 self.match(EzLangParser.SEMI)
 
 
@@ -9013,15 +9001,15 @@ class EzLangParser ( Parser ):
         self._la = 0 # Token type
         try:
             self.enterOuterAlt(localctx, 1)
-            self.state = 1001
+            self.state = 998
             self.match(EzLangParser.THROW)
-            self.state = 1002
+            self.state = 999
             self.expression()
-            self.state = 1004
+            self.state = 1001
             self._errHandler.sync(self)
             _la = self._input.LA(1)
             if _la==59:
-                self.state = 1003
+                self.state = 1000
                 self.match(EzLangParser.SEMI)
 
 

@@ -110,6 +110,22 @@ static OptStr ez_percent_decode(const char *s, bool query_mode) {
     return (OptStr){true, out};
 }
 
+static OptStr ez_percent_decode_range(const char *start, size_t len, bool query_mode) {
+    char *slice = ez_strdup_range(start, len);
+    if (!slice) return (OptStr){false, NULL};
+    OptStr decoded = ez_percent_decode(slice, query_mode);
+    free(slice);
+    return decoded;
+}
+
+static bool ez_query_key_matches(const char *start, size_t len, const char *key) {
+    OptStr decoded = ez_percent_decode_range(start, len, true);
+    if (!decoded.ok) return false;
+    bool matched = strcmp(decoded.value ? decoded.value : "", key ? key : "") == 0;
+    free((char *)decoded.value);
+    return matched;
+}
+
 static char *ez_lower_range(const char *start, size_t len) {
     char *out = ez_strdup_range(start, len);
     if (!out) return NULL;
@@ -344,7 +360,6 @@ OptStr uriDecodePathSegment(const char *s) { return ez_percent_decode(s, false);
 OptStr uriQueryGet(const char *query, const char *key) {
     if (!query) query = "";
     if (!key) key = "";
-    size_t key_len = strlen(key);
     const char *p = query;
     while (*p) {
         const char *entry_start = p;
@@ -352,9 +367,9 @@ OptStr uriQueryGet(const char *query, const char *key) {
         const char *entry_end = p;
         const char *eq = memchr(entry_start, '=', (size_t)(entry_end - entry_start));
         const char *raw_key_end = eq ? eq : entry_end;
-        if ((size_t)(raw_key_end - entry_start) == key_len && strncmp(entry_start, key, key_len) == 0) {
+        if (ez_query_key_matches(entry_start, (size_t)(raw_key_end - entry_start), key)) {
             if (!eq) return (OptStr){true, ez_strdup_safe("")};
-            return ez_percent_decode(eq + 1, true);
+            return ez_percent_decode_range(eq + 1, (size_t)(entry_end - (eq + 1)), true);
         }
         if (*p == '&') p++;
     }
@@ -364,13 +379,18 @@ OptStr uriQueryGet(const char *query, const char *key) {
 const char *uriQuerySet(const char *query, const char *key, const char *value) {
     if (!query) query = "";
     if (!key) key = "";
-    char *encoded = ez_percent_encode(value, true);
-    if (!encoded) return NULL;
-    size_t key_len = strlen(key);
-    size_t out_cap = strlen(query) + key_len + strlen(encoded) + 4;
+    char *encoded_key = ez_percent_encode(key, true);
+    char *encoded_value = ez_percent_encode(value, true);
+    if (!encoded_key || !encoded_value) {
+        free(encoded_key);
+        free(encoded_value);
+        return NULL;
+    }
+    size_t out_cap = strlen(query) + strlen(encoded_key) + strlen(encoded_value) + 4;
     char *out = (char *)malloc(out_cap);
     if (!out) {
-        free(encoded);
+        free(encoded_key);
+        free(encoded_value);
         return NULL;
     }
     out[0] = '\0';
@@ -383,10 +403,10 @@ const char *uriQuerySet(const char *query, const char *key, const char *value) {
         const char *eq = memchr(entry_start, '=', (size_t)(entry_end - entry_start));
         const char *raw_key_end = eq ? eq : entry_end;
         if (out[0] != '\0') strcat(out, "&");
-        if (!replaced && (size_t)(raw_key_end - entry_start) == key_len && strncmp(entry_start, key, key_len) == 0) {
-            strcat(out, key);
+        if (!replaced && ez_query_key_matches(entry_start, (size_t)(raw_key_end - entry_start), key)) {
+            strcat(out, encoded_key);
             strcat(out, "=");
-            strcat(out, encoded);
+            strcat(out, encoded_value);
             replaced = true;
         } else {
             strncat(out, entry_start, (size_t)(entry_end - entry_start));
@@ -395,10 +415,11 @@ const char *uriQuerySet(const char *query, const char *key, const char *value) {
     }
     if (!replaced) {
         if (out[0] != '\0') strcat(out, "&");
-        strcat(out, key);
+        strcat(out, encoded_key);
         strcat(out, "=");
-        strcat(out, encoded);
+        strcat(out, encoded_value);
     }
-    free(encoded);
+    free(encoded_key);
+    free(encoded_value);
     return out;
 }

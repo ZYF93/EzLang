@@ -476,6 +476,24 @@ class EzLangListener(ParseTreeListener):
         pass
 
 
+    # Enter a parse tree produced by EzLangParser#equalityExpression.
+    def enterEqualityExpression(self, ctx:EzLangParser.EqualityExpressionContext):
+        pass
+
+    # Exit a parse tree produced by EzLangParser#equalityExpression.
+    def exitEqualityExpression(self, ctx:EzLangParser.EqualityExpressionContext):
+        pass
+
+
+    # Enter a parse tree produced by EzLangParser#relationalExpression.
+    def enterRelationalExpression(self, ctx:EzLangParser.RelationalExpressionContext):
+        pass
+
+    # Exit a parse tree produced by EzLangParser#relationalExpression.
+    def exitRelationalExpression(self, ctx:EzLangParser.RelationalExpressionContext):
+        pass
+
+
     # Enter a parse tree produced by EzLangParser#bitOrExpression.
     def enterBitOrExpression(self, ctx:EzLangParser.BitOrExpressionContext):
         pass
@@ -500,24 +518,6 @@ class EzLangListener(ParseTreeListener):
 
     # Exit a parse tree produced by EzLangParser#bitAndExpression.
     def exitBitAndExpression(self, ctx:EzLangParser.BitAndExpressionContext):
-        pass
-
-
-    # Enter a parse tree produced by EzLangParser#equalityExpression.
-    def enterEqualityExpression(self, ctx:EzLangParser.EqualityExpressionContext):
-        pass
-
-    # Exit a parse tree produced by EzLangParser#equalityExpression.
-    def exitEqualityExpression(self, ctx:EzLangParser.EqualityExpressionContext):
-        pass
-
-
-    # Enter a parse tree produced by EzLangParser#relationalExpression.
-    def enterRelationalExpression(self, ctx:EzLangParser.RelationalExpressionContext):
-        pass
-
-    # Exit a parse tree produced by EzLangParser#relationalExpression.
-    def exitRelationalExpression(self, ctx:EzLangParser.RelationalExpressionContext):
         pass
 
 
@@ -647,6 +647,15 @@ class EzLangListener(ParseTreeListener):
         pass
 
 
+    # Enter a parse tree produced by EzLangParser#ifLikePrimaryExpr.
+    def enterIfLikePrimaryExpr(self, ctx:EzLangParser.IfLikePrimaryExprContext):
+        pass
+
+    # Exit a parse tree produced by EzLangParser#ifLikePrimaryExpr.
+    def exitIfLikePrimaryExpr(self, ctx:EzLangParser.IfLikePrimaryExprContext):
+        pass
+
+
     # Enter a parse tree produced by EzLangParser#parenExpr.
     def enterParenExpr(self, ctx:EzLangParser.ParenExprContext):
         pass
@@ -752,15 +761,6 @@ class EzLangListener(ParseTreeListener):
 
     # Exit a parse tree produced by EzLangParser#loopPrimaryExpr.
     def exitLoopPrimaryExpr(self, ctx:EzLangParser.LoopPrimaryExprContext):
-        pass
-
-
-    # Enter a parse tree produced by EzLangParser#ifLikePrimaryExpr.
-    def enterIfLikePrimaryExpr(self, ctx:EzLangParser.IfLikePrimaryExprContext):
-        pass
-
-    # Exit a parse tree produced by EzLangParser#ifLikePrimaryExpr.
-    def exitIfLikePrimaryExpr(self, ctx:EzLangParser.IfLikePrimaryExprContext):
         pass
 
 

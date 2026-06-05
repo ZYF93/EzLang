@@ -22,6 +22,7 @@ export declare const strToBytes: (s: Str) => Blob;
 export declare const strFromBytes: (data: Blob) => Str?;
 
 // === 查询与匹配 ===
+export declare const strEqual: (a: Str, b: Str) => Bool;
 export declare const strContains: (s: Str, needle: Str) => Bool;
 export declare const strStartsWith: (s: Str, prefix: Str) => Bool;
 export declare const strEndsWith: (s: Str, suffix: Str) => Bool;

@@ -29,10 +29,20 @@ const result = 100
 // 字符串插值
 const name = "World";
 const greeting = "Hello {{name}}!";
+
+// 标记语法需要同名工厂函数
+const div = (id: I32): Str => {
+    return "div";
+};
+
+const text = (color: Str, children: Str[]): Str => {
+    return color;
+};
+
 const ui = <text color="blue">
     "Welcome"
     <div id=1 />
-    {1 + 2}
+    "3"
 </text>;
 
 // 装饰器语法

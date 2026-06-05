@@ -21,12 +21,14 @@ export struct HttpResponse {
     status: I32;
     headers: Headers;
     body: Blob;
+    text(this: HttpResponse) => Str;
 };
 
 export type RouteHandler = (req: HttpRequest) => HttpResponse;
 
 export struct HttpServer {
     handle: I64;
+    // HTTP 服务端当前明确不支持：handle = 0，以下方法为空操作。
     on = (this: HttpServer, path: Str, handler: RouteHandler): Void => {};
     start = (this: HttpServer): Void => {};
     stop = (this: HttpServer): Void => {};

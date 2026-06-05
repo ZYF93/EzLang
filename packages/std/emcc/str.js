@@ -136,6 +136,9 @@
       HEAPU8[ret] = 1;
       setValue(ret + 8, stringToNewUTF8(UTF8ArrayToString(bytes, 0)), '*');
     },
+    strEqual: function (a, b) {
+      return text(a) === text(b) ? 1 : 0;
+    },
     strContains: function (s, needle) {
       return text(s).indexOf(text(needle)) >= 0 ? 1 : 0;
     },

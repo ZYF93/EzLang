@@ -11,9 +11,12 @@ from parser.EzLangVisitor import EzLangVisitor
 class LLVMCodeGenerator(EzLangVisitor):
     """LLVM IR 代码生成访问器"""
 
-    def __init__(self, module_name: str = "ezlang", compile_target: Optional[str] = None):
+    def __init__(self, module_name: str = "ezlang", compile_target: Optional[str] = None,
+                 target_arch: Optional[str] = None, log_compile_min_level: Optional[int] = None):
         self.module = ir.Module(name=module_name)
         self.compile_target = compile_target
+        self.target_arch = target_arch
+        self.log_compile_min_level = log_compile_min_level
         self.builder: ir.IRBuilder = None
         self.current_function: ir.Function = None
         self._method_this: ir.Value = None
@@ -28,21 +31,30 @@ class LLVMCodeGenerator(EzLangVisitor):
         self.catch_exit_blocks: list[ir.Block] = []
         self.catch_error_allocas: list[ir.AllocaInstr] = []
         self.catch_result_allocas: list[ir.AllocaInstr] = []
+        self._function_throw_exit_stack: list[ir.Block] = []
+        self._function_return_type_ctx_stack: list[object] = []
         self.structs: dict[str, ir.IdentifiedStructType] = {}
         self.struct_fields: dict[str, list[str]] = {}
         self.struct_defaults: dict[str, dict[str, any]] = {}  # struct_name → {field_name: expression_ctx}
         self.struct_methods: dict[str, dict[str, str]] = {}
+        self.struct_generic_params: dict[str, list[str]] = {}
+        self.struct_generic_templates: dict[str, object] = {}
+        self._struct_monomorphized: set[str] = set()
         self.type_aliases: dict[str, ir.Type] = {}
         self.func_defaults: dict[str, dict[str, ir.Value]] = {}
         self.func_param_names: dict[str, list[str]] = {}
         self.func_return_unsigned: dict[str, bool] = {}
+        self.func_return_dict_types: dict[str, tuple[ir.Type, ir.Type]] = {}
         self.generic_templates: dict[str, tuple] = {}
         self._monomorphized: set[str] = set()
+        self._generic_type_map_stack: list[dict[str, ir.Type]] = []
+        self._mapping_with_map = False
         self.extern_libs: list[tuple[str, Optional[str]]] = []  # (lib_path, target)
         self.active_extern_libs: list[str] = []
         self._extern_diagnostics: list[str] = []
         self._declare_names: list[str] = []
         self._sret_functions: dict[str, ir.Type] = {}
+        self._c_abi_return_bridges: dict[str, tuple[ir.Type, ir.Type]] = {}
         self._non_extern_decls_seen = 0
         self._list_collection_builtins = {
             'listPush', 'listPop', 'listShift', 'listUnshift', 'listSort',
@@ -64,12 +76,22 @@ class LLVMCodeGenerator(EzLangVisitor):
         self._type_align_cache: dict[str, int] = {}
         self._zero_constant_cache: dict[str, ir.Constant] = {}
         self._type_ids: dict[str, int] = {}
+        self._runtime_required = False
+        self._race_branch_counter = 0
+        self._flow_future_stack: list[dict[str, dict[str, ir.Value]]] = []
         self._flow_depth = 0
         self._parallel_result_stack: list[ir.AllocaInstr] = []
         self._parallel_exit_stack: list[ir.Block] = []
+        self._parallel_arena_depth_stack: list[int] = []
+        self._arena_scope_stack: list[ir.Value] = []
         self._lock_policies: dict[str, int] = {}
         self._uncaught_throw: ir.Function | None = None
+        self._throw_active: ir.GlobalVariable | None = None
+        self._throw_value: ir.GlobalVariable | None = None
         self._curried_closures: dict[str, tuple[ir.Function, list[str]]] = {}
+        self._locals_type_names: dict[str, str] = {}
+        self._globals_type_names: dict[str, str] = {}
+        self._dict_item_types: dict[int, tuple[ir.Type, ir.Type]] = {}
         self._declare_builtins()
 
     def _declare_builtins(self):
@@ -90,7 +112,7 @@ class LLVMCodeGenerator(EzLangVisitor):
         flow_hook_type = ir.FunctionType(void, [])
         self._flow_enter = self._define_runtime_void_hook('__ezrt_flow_enter', flow_hook_type)
         self._flow_exit = self._define_runtime_void_hook('__ezrt_flow_exit', flow_hook_type)
-        self._flow_sleep = self._define_runtime_void_hook('__ezrt_sleep', ir.FunctionType(void, [i64]))
+        self._flow_sleep = self._define_sleep_hook('__ezrt_sleep', ir.FunctionType(void, [i64]))
         self._flow_race = self._define_runtime_race_hook('__ezrt_race', ir.FunctionType(i32, [i32, i32]))
         self._parallel_enter = self._define_runtime_void_hook('__ezrt_parallel_enter', flow_hook_type)
         self._parallel_exit = self._define_runtime_void_hook('__ezrt_parallel_exit', flow_hook_type)
@@ -106,6 +128,7 @@ class LLVMCodeGenerator(EzLangVisitor):
             err_type.set_body(i32, i8_ptr)
         self.structs['Error'] = err_type
         self.struct_fields['Error'] = ['code', 'message']
+        self._declare_throw_state(err_type)
 
         # 内置结构体: Date = { i64 timestamp }
         date_type = ir.global_context.get_identified_type('Date')
@@ -151,6 +174,36 @@ class LLVMCodeGenerator(EzLangVisitor):
         builder.ret(func.args[0])
         return func
 
+    def _define_sleep_hook(self, name: str, func_type: ir.FunctionType) -> ir.Function:
+        """flow 内 sleep suspend point；本机目标映射到 usleep 保留可验证挂起。"""
+        func = ir.Function(self.module, func_type, name)
+        entry = func.append_basic_block('entry')
+        builder = ir.IRBuilder(entry)
+        usleep_fn = self._get_or_declare_function('usleep', ir.FunctionType(ir.IntType(32), [ir.IntType(32)]))
+        ms = func.args[0]
+        ms32 = builder.trunc(ms, ir.IntType(32)) if isinstance(ms.type, ir.IntType) and ms.type.width > 32 else ms
+        micros = builder.mul(ms32, ir.Constant(ir.IntType(32), 1000), name='_sleep_us')
+        builder.call(usleep_fn, [micros])
+        builder.ret_void()
+        return func
+
+    def _runtime_lib_path(self) -> str:
+        root = Path(__file__).resolve().parents[3]
+        return str((root / 'packages' / 'std' / 'native' / 'runtime.c').resolve())
+
+    def _require_runtime(self) -> None:
+        """标记需要链接语言运行时 C helper。"""
+        self._runtime_required = True
+        path = self._runtime_lib_path()
+        if path not in self.active_extern_libs:
+            self.active_extern_libs.append(path)
+        if self.compile_target != 'windows' and 'pthread' not in self.active_extern_libs:
+            self.active_extern_libs.append('pthread')
+        if (path, None) not in self.extern_libs:
+            self.extern_libs.append((path, None))
+        if ('pthread', None) not in self.extern_libs and self.compile_target != 'windows':
+            self.extern_libs.append(('pthread', None))
+
     def _get_or_declare_function(self, name: str, func_type: ir.FunctionType) -> ir.Function:
         existing = self.module.globals.get(name)
         if isinstance(existing, ir.Function):
@@ -159,6 +212,8 @@ class LLVMCodeGenerator(EzLangVisitor):
 
     def _define_uncaught_throw_hook(self) -> ir.Function:
         """未捕获 throw 的最小终止路径。"""
+        if self._uncaught_throw is not None:
+            return self._uncaught_throw
         void = ir.VoidType()
         i8_ptr = ir.PointerType(ir.IntType(8))
         i32 = ir.IntType(32)
@@ -181,47 +236,184 @@ class LLVMCodeGenerator(EzLangVisitor):
         builder.call(puts_fn, [msg_ptr])
         builder.call(exit_fn, [ir.Constant(i32, 1)])
         builder.unreachable()
+        self._uncaught_throw = func
         return func
 
+    def _declare_throw_state(self, err_type: ir.IdentifiedStructType):
+        """声明模块内异常槽，供同步函数调用边界传播 Error。"""
+        active = ir.GlobalVariable(self.module, ir.IntType(1), '__ezrt_throw_active')
+        active.linkage = 'internal'
+        active.initializer = ir.Constant(ir.IntType(1), 0)
+        value = ir.GlobalVariable(self.module, err_type, '__ezrt_throw_value')
+        value.linkage = 'internal'
+        value.initializer = self._zero_constant(err_type)
+        self._throw_active = active
+        self._throw_value = value
+
+    def _throw_is_active(self) -> ir.Value:
+        return self.builder.load(self._throw_active, name='_throw_active')
+
+    def _clear_throw_state(self):
+        self.builder.store(ir.Constant(ir.IntType(1), 0), self._throw_active)
+
+    def _store_throw_value(self, value: ir.Value | None):
+        if value is None:
+            value = self._zero_constant(self.structs['Error'])
+        if self._is_aggregate_ptr(value):
+            value = self.builder.load(value)
+        value = self._coerce_value(value, self.structs['Error'])
+        self.builder.store(value, self._throw_value)
+        self.builder.store(ir.Constant(ir.IntType(1), 1), self._throw_active)
+
+    def _branch_to_throw_exit_or_abort(self):
+        if self.catch_exit_blocks:
+            self.builder.branch(self.catch_exit_blocks[-1])
+            return
+        if self._function_throw_exit_stack:
+            self.builder.branch(self._function_throw_exit_stack[-1])
+            return
+        self.builder.call(self._define_uncaught_throw_hook(), [])
+        self.builder.unreachable()
+
+    def _emit_throw_check_after_call(self):
+        if self.builder is None or self.builder.block.is_terminated:
+            return
+        active = self._throw_is_active()
+        throw_bb = self.builder.append_basic_block('call_throw')
+        cont_bb = self.builder.append_basic_block('call_continue')
+        self.builder.cbranch(active, throw_bb, cont_bb)
+        self.builder.position_at_start(throw_bb)
+        self._branch_to_throw_exit_or_abort()
+        self.builder.position_at_start(cont_bb)
+
+    def _finish_function_with_throw_exit(self, ret_type: ir.Type, result: ir.Value | None = None):
+        """补全普通出口和异常出口；异常出口返回零值，由调用边界继续传播。"""
+        normal_block = self.builder.block if self.builder is not None else None
+        throw_exit = self._function_throw_exit_stack.pop()
+
+        if normal_block is not None and not normal_block.is_terminated:
+            if isinstance(ret_type, ir.VoidType):
+                self.builder.ret_void()
+            elif isinstance(result, ir.Value) and not isinstance(result.type, ir.VoidType):
+                if self._is_aggregate_ptr(result):
+                    result = self.builder.load(result)
+                if result.type != ret_type:
+                    result = self._coerce_return_value(result, ret_type)
+                self._restore_active_arena_scopes_for_return(result, ret_type)
+                self.builder.ret(result)
+            else:
+                self._restore_active_arena_scopes_for_return(ret_type=ret_type)
+                self.builder.ret(self._zero_constant(ret_type))
+
+        if not throw_exit.is_terminated:
+            self.builder.position_at_start(throw_exit)
+            if self.current_function is not None and self.current_function.name == 'main':
+                self.builder.call(self._define_uncaught_throw_hook(), [])
+                self.builder.unreachable()
+                return
+            if isinstance(ret_type, ir.VoidType):
+                self.builder.ret_void()
+            else:
+                self.builder.ret(self._zero_constant(ret_type))
+
     def _declare_arena(self):
-        """声明 Arena 内存管理基础设施：缓冲区 + 游标 + 分配函数"""
+        """声明 Arena 内存管理基础设施：线程本地缓冲区 + 游标 + 可扩容分配函数"""
         i8 = ir.IntType(8)
+        i32 = ir.IntType(32)
         i64 = ir.IntType(64)
         i8_ptr = ir.PointerType(i8)
+        void = ir.VoidType()
 
-        # Arena 缓冲区（1MB）
-        arena_size = 1048576
-        buf_type = ir.ArrayType(i8, arena_size)
-        arena_buf = ir.GlobalVariable(self.module, buf_type, '__arena_buffer')
-        arena_buf.initializer = ir.Constant(buf_type, ir.Undefined)
+        # Arena 缓冲区指针与容量。每个线程持有独立游标，满足 flow/parallel 的基础隔离语义。
+        arena_buf = ir.GlobalVariable(self.module, i8_ptr, '__arena_buffer')
+        arena_buf.initializer = ir.Constant(i8_ptr, None)
         arena_buf.linkage = 'internal'
+        arena_buf.storage_class = 'thread_local'
+
+        arena_capacity = ir.GlobalVariable(self.module, i64, '__arena_capacity')
+        arena_capacity.initializer = ir.Constant(i64, 0)
+        arena_capacity.linkage = 'internal'
+        arena_capacity.storage_class = 'thread_local'
 
         # Arena 游标（当前分配位置）
         arena_cursor = ir.GlobalVariable(self.module, i64, '__arena_cursor')
         arena_cursor.initializer = ir.Constant(i64, 0)
         arena_cursor.linkage = 'internal'
+        arena_cursor.storage_class = 'thread_local'
+
+        realloc_type = ir.FunctionType(i8_ptr, [i8_ptr, i64])
+        realloc_fn = ir.Function(self.module, realloc_type, 'realloc')
+        trap_fn = ir.Function(self.module, ir.FunctionType(void, []), 'llvm.trap')
 
         # __arena_alloc(size: i64, align: i64) -> i8*
         func_type = ir.FunctionType(i8_ptr, [i64, i64])
         arena_alloc = ir.Function(self.module, func_type, '__arena_alloc')
         entry = arena_alloc.append_basic_block('entry')
+        grow_check = arena_alloc.append_basic_block('grow_check')
+        grow_loop = arena_alloc.append_basic_block('grow_loop')
+        grow_done = arena_alloc.append_basic_block('grow_done')
+        oom = arena_alloc.append_basic_block('oom')
+        ok = arena_alloc.append_basic_block('ok')
         builder = ir.IRBuilder(entry)
         size = arena_alloc.args[0]
         align = arena_alloc.args[1]
 
-        # 加载当前游标
+        # 加载当前游标并对齐: aligned = (cursor + align - 1) & ~(align - 1)
         cursor = builder.load(arena_cursor, name='cursor')
-        # 对齐: aligned = (cursor + align - 1) & ~(align - 1)
         align_minus_1 = builder.sub(align, ir.Constant(i64, 1))
         misaligned = builder.add(cursor, align_minus_1)
         mask = builder.xor(align_minus_1, ir.Constant(i64, -1))
         aligned = builder.and_(misaligned, mask)
         # 新游标位置
         next_pos = builder.add(aligned, size)
+        capacity = builder.load(arena_capacity, name='arena_capacity')
+        existing_buf = builder.load(arena_buf, name='arena_buffer_existing')
+        fits = builder.icmp_unsigned('<=', next_pos, capacity, name='arena_fits')
+        builder.cbranch(fits, ok, grow_check)
+
+        # 容量不足时按 2 倍增长，至少扩到当前需求；realloc 失败时 trap。
+        builder.position_at_start(grow_check)
+        old_capacity = builder.load(arena_capacity, name='old_arena_capacity')
+        has_capacity = builder.icmp_unsigned('>', old_capacity, ir.Constant(i64, 0), name='arena_has_capacity')
+        initial_capacity = builder.select(has_capacity, old_capacity, ir.Constant(i64, 1048576), name='arena_initial_capacity')
+        enough_initial = builder.icmp_unsigned('>=', initial_capacity, next_pos, name='arena_initial_enough')
+        builder.cbranch(enough_initial, grow_done, grow_loop)
+
+        builder.position_at_start(grow_loop)
+        current_capacity = builder.phi(i64, name='arena_grow_capacity')
+        current_capacity.add_incoming(initial_capacity, grow_check)
+        doubled_capacity = builder.shl(current_capacity, ir.Constant(i64, 1), name='arena_doubled_capacity')
+        overflowed = builder.icmp_unsigned('<', doubled_capacity, current_capacity, name='arena_capacity_overflow')
+        next_capacity = builder.select(overflowed, next_pos, doubled_capacity, name='arena_next_capacity')
+        enough_next = builder.icmp_unsigned('>=', next_capacity, next_pos, name='arena_next_enough')
+        current_capacity.add_incoming(next_capacity, grow_loop)
+        builder.cbranch(enough_next, grow_done, grow_loop)
+
+        builder.position_at_start(grow_done)
+        target_capacity = builder.phi(i64, name='arena_target_capacity')
+        target_capacity.add_incoming(initial_capacity, grow_check)
+        target_capacity.add_incoming(next_capacity, grow_loop)
+        old_buf = builder.load(arena_buf, name='old_arena_buffer')
+        new_buf = builder.call(realloc_fn, [old_buf, target_capacity], name='new_arena_buffer')
+        realloc_ok = builder.icmp_unsigned('!=', new_buf, ir.Constant(i8_ptr, None), name='arena_realloc_ok')
+        builder.cbranch(realloc_ok, ok, oom)
+
+        builder.position_at_start(oom)
+        builder.call(trap_fn, [])
+        builder.unreachable()
+
+        builder.position_at_start(ok)
+        active_buf = builder.phi(i8_ptr, name='arena_active_buffer')
+        active_buf.add_incoming(existing_buf, entry)
+        active_buf.add_incoming(new_buf, grow_done)
+        active_capacity = builder.phi(i64, name='arena_active_capacity')
+        active_capacity.add_incoming(capacity, entry)
+        active_capacity.add_incoming(target_capacity, grow_done)
+        builder.store(active_buf, arena_buf)
+        builder.store(active_capacity, arena_capacity)
         builder.store(next_pos, arena_cursor)
-        # 返回缓冲区中偏移后的指针
-        buf_ptr = builder.bitcast(arena_buf, i8_ptr)
-        result = builder.gep(buf_ptr, [aligned], name='arena_ptr')
+        # 返回缓冲区中偏移后的指针。
+        result = builder.gep(active_buf, [aligned], name='arena_ptr')
         builder.ret(result)
 
         # 保存/恢复游标函数（作用域管理用）
@@ -241,6 +433,7 @@ class LLVMCodeGenerator(EzLangVisitor):
 
         # 存储引用供其他方法使用
         self._arena_buffer = arena_buf
+        self._arena_capacity = arena_capacity
         self._arena_cursor = arena_cursor
         self._arena_alloc = arena_alloc
         self._arena_save = save_fn
@@ -255,11 +448,148 @@ class LLVMCodeGenerator(EzLangVisitor):
             return isinstance(val.type.pointee, (ir.LiteralStructType, ir.IdentifiedStructType, ir.ArrayType))
         return False
 
+    @staticmethod
+    def _is_optional_type(t: ir.Type) -> bool:
+        return isinstance(t, ir.LiteralStructType) and len(t.elements) == 2 and t.elements[0] == ir.IntType(1)
+
+    @staticmethod
+    def _is_union_type(t: ir.Type) -> bool:
+        return isinstance(t, ir.LiteralStructType) and len(t.elements) == 2 and isinstance(t.elements[0], ir.IntType) and t.elements[0].width == 32
+
     def _load_if_aggregate_ptr(self, val: ir.Value) -> ir.Value:
         """如果 val 是聚合类型的指针，load 它；否则原样返回"""
         if self._is_aggregate_ptr(val) and self.builder is not None:
             return self.builder.load(val)
         return val
+
+    def _copy_aggregate_value(self, val: ir.Value, name: str = "") -> ir.Value:
+        """复制聚合值，避免普通变量共享同一块结构体/数组存储。"""
+        if not self._is_aggregate_ptr(val) or self.builder is None:
+            return val
+        pointee = val.type.pointee
+        if self._is_list_type(pointee):
+            return self._copy_list_value(val, name=name)
+        if pointee == self.structs.get('Dict'):
+            return self._copy_dict_value(val, name=name)
+        value = self.builder.load(val)
+        ptr = self._arena_allocate(value.type, name=name)
+        self.builder.store(value, ptr)
+        return ptr
+
+    def _copy_list_value(self, src_ptr: ir.Value, name: str = "") -> ir.Value:
+        """复制 List/数组分页存储，避免两个变量共享元素页。"""
+        i64 = ir.IntType(64)
+        elem_type = self._list_elem_type(src_ptr)
+        length = self._list_length(src_ptr)
+        dst_ptr = self._list_new(elem_type, length)
+        if name:
+            dst_ptr.name = name
+
+        index_ptr = self.builder.alloca(i64, name='_list_value_copy_i')
+        self.builder.store(ir.Constant(i64, 0), index_ptr)
+        cond_block = self.builder.append_basic_block('list_value_copy_cond')
+        body_block = self.builder.append_basic_block('list_value_copy_body')
+        done_block = self.builder.append_basic_block('list_value_copy_done')
+        self.builder.branch(cond_block)
+
+        self.builder.position_at_start(cond_block)
+        index = self.builder.load(index_ptr, name='_list_value_copy_i_val')
+        more = self.builder.icmp_unsigned('<', index, length, name='_list_value_copy_more')
+        self.builder.cbranch(more, body_block, done_block)
+
+        self.builder.position_at_start(body_block)
+        item = self.builder.load(self._list_element_ptr(src_ptr, index), name='_list_value_copy_item')
+        self.builder.store(item, self._list_element_ptr(dst_ptr, index))
+        self.builder.store(self.builder.add(index, ir.Constant(i64, 1)), index_ptr)
+        self.builder.branch(cond_block)
+
+        self.builder.position_at_start(done_block)
+        self._mark_list_elem_unsigned(dst_ptr, self._list_type_is_unsigned(src_ptr.type))
+        return dst_ptr
+
+    def _copy_dict_value(self, src_ptr: ir.Value, name: str = "") -> ir.Value:
+        """复制 Dict 分页存储，避免两个变量共享 key/value 页。"""
+        i32 = ir.IntType(32)
+        dict_type = self.structs['Dict']
+        dst_ptr = self._arena_allocate(dict_type, name=name or '_tmp_dict_copy')
+        self.builder.store(self._zero_constant(dict_type), dst_ptr)
+
+        key_type, value_type = self._dict_item_types_for_value(src_ptr)
+        count = self._dict_count(src_ptr)
+        index_ptr = self.builder.alloca(i32, name='_dict_value_copy_i')
+        self.builder.store(ir.Constant(i32, 0), index_ptr)
+        cond_block = self.builder.append_basic_block('dict_value_copy_cond')
+        body_block = self.builder.append_basic_block('dict_value_copy_body')
+        done_block = self.builder.append_basic_block('dict_value_copy_done')
+        self.builder.branch(cond_block)
+
+        self.builder.position_at_start(cond_block)
+        index = self.builder.load(index_ptr, name='_dict_value_copy_i_val')
+        more = self.builder.icmp_unsigned('<', index, count, name='_dict_value_copy_more')
+        self.builder.cbranch(more, body_block, done_block)
+
+        self.builder.position_at_start(body_block)
+        raw_key = self.builder.load(self._dict_key_slot_ptr(src_ptr, index), name='_dict_value_copy_key_raw')
+        raw_value = self.builder.load(self._dict_value_slot_ptr(src_ptr, index), name='_dict_value_copy_value_raw')
+        key = self._dict_from_i8_ptr(raw_key, key_type)
+        value = self._dict_from_i8_ptr(raw_value, value_type)
+        self._gen_dict_set(dst_ptr, key, value)
+        self.builder.store(self.builder.add(index, ir.Constant(i32, 1)), index_ptr)
+        self.builder.branch(cond_block)
+
+        self.builder.position_at_start(done_block)
+        self._mark_dict_item_types(dst_ptr, key_type, value_type)
+        return dst_ptr
+
+    def _bind_function_param(self, name: str, param_type: ir.Type, arg: ir.Value, *, this_ref: bool = False):
+        """把函数参数绑定到局部符号；this 聚合参数保留引用语义。"""
+        if this_ref and isinstance(param_type, ir.PointerType) and isinstance(param_type.pointee, (ir.LiteralStructType, ir.IdentifiedStructType)):
+            self.locals[name] = arg
+            return arg
+        alloca = self.builder.alloca(param_type, name=name)
+        self.builder.store(arg, alloca)
+        if isinstance(param_type, (ir.LiteralStructType, ir.IdentifiedStructType)):
+            copied = self._copy_aggregate_value(alloca, name=name)
+            self.locals[name] = copied
+            return copied
+        self.locals[name] = alloca
+        return alloca
+
+    def _restore_active_arena_scopes(self, target_depth: int = 0) -> None:
+        """提前退出当前控制流前恢复所有活动块作用域 Arena 游标。"""
+        if self.builder is None or not hasattr(self, '_arena_restore'):
+            return
+        while len(self._arena_scope_stack) > target_depth:
+            saved_pos = self._arena_scope_stack.pop()
+            self.builder.call(self._arena_restore, [saved_pos])
+
+    @staticmethod
+    def _type_may_reference_arena(t: ir.Type) -> bool:
+        """判断值类型内部是否可能保存 Arena 指针，返回时需要提升到外层生命周期。"""
+        if isinstance(t, ir.PointerType):
+            return True
+        if isinstance(t, ir.LiteralStructType):
+            return any(LLVMCodeGenerator._type_may_reference_arena(e) for e in t.elements)
+        if isinstance(t, ir.IdentifiedStructType) and not t.is_opaque:
+            return any(LLVMCodeGenerator._type_may_reference_arena(e) for e in t.elements)
+        if isinstance(t, ir.ArrayType):
+            return LLVMCodeGenerator._type_may_reference_arena(t.element)
+        return False
+
+    def _restore_active_arena_scopes_for_return(self, ret_value: ir.Value | None = None,
+                                                ret_type: ir.Type | None = None,
+                                                target_depth: int = 0) -> None:
+        """return 前恢复作用域；若返回值含 Arena 指针，则保留当前块分配避免悬垂引用。"""
+        value_type = ret_type
+        if value_type is None and isinstance(ret_value, ir.Value):
+            value_type = ret_value.type.pointee if self._is_aggregate_ptr(ret_value) else ret_value.type
+        if value_type is not None and self._type_may_reference_arena(value_type):
+            if target_depth > 0:
+                del self._arena_scope_stack[target_depth:]
+            else:
+                self._arena_scope_stack.clear()
+            return
+        self._restore_active_arena_scopes(target_depth)
 
     def _type_ctx_is_unsigned(self, ctx) -> bool:
         """判断语法类型是否为无符号整数类型。"""
@@ -275,6 +605,71 @@ class LLVMCodeGenerator(EzLangVisitor):
             if inner is not None and not isinstance(inner, list):
                 return self._type_ctx_is_unsigned(inner)
         return False
+
+    def _type_ctx_name(self, ctx) -> str:
+        """把类型语法规范化为 TypeID 使用的 EzLang 类型名。"""
+        if ctx is None:
+            return "unknown"
+        if isinstance(ctx, EzLangParser.OptionalTypeContext):
+            return f"{self._type_ctx_name(ctx.type_())}?"
+        if isinstance(ctx, EzLangParser.ArrayTypeContext):
+            return f"{self._type_ctx_name(ctx.type_())}[]"
+        if isinstance(ctx, EzLangParser.ListTypeContext):
+            return f"List<{self._type_ctx_name(ctx.type_())}>"
+        if isinstance(ctx, EzLangParser.VecTypeContext):
+            return f"Vec<{self._type_ctx_name(ctx.type_())}>[{ctx.INTEGER_LITERAL().getText()}]"
+        if isinstance(ctx, EzLangParser.PointerTypeContext):
+            return f"*{self._type_ctx_name(ctx.type_())}"
+        if isinstance(ctx, EzLangParser.ParenTypeContext):
+            return self._type_ctx_name(ctx.type_())
+        if isinstance(ctx, EzLangParser.UnionTypeContext):
+            return " | ".join(self._type_ctx_name(t) for t in ctx.type_())
+        if isinstance(ctx, EzLangParser.TypeShapeTypeContext):
+            return "Dict" if self._type_shape_is_dynamic(ctx.typeShape()) else "shape"
+        if isinstance(ctx, EzLangParser.TypeofTypeContext):
+            return "I32"
+        if hasattr(ctx, 'baseType') and ctx.baseType() is not None:
+            return self._base_type_name(ctx.baseType())
+        text = ctx.getText() if hasattr(ctx, 'getText') else ""
+        return text or "unknown"
+
+    def _base_type_name(self, bt) -> str:
+        if bt.I8() is not None: return "I8"
+        if bt.I32() is not None: return "I32"
+        if bt.I64() is not None: return "I64"
+        if bt.U8() is not None: return "U8"
+        if bt.U32() is not None: return "U32"
+        if bt.U64() is not None: return "U64"
+        if bt.F32() is not None: return "F32"
+        if bt.F64() is not None: return "F64"
+        if bt.STR() is not None: return "Str"
+        if bt.BOOL() is not None: return "Bool"
+        if bt.VOID() is not None: return "Void"
+        if bt.TYPE_IDENTIFIER() is not None:
+            name = bt.TYPE_IDENTIFIER().getText()
+            if bt.genericArgs() is not None:
+                args = ", ".join(self._type_ctx_name(t) for t in bt.genericArgs().type_())
+                return f"{name}<{args}>"
+            return name
+        return "unknown"
+
+    def _type_shape_is_dynamic(self, shape_ctx) -> bool:
+        if shape_ctx is None:
+            return False
+        members = list(shape_ctx.typeShapeMember())
+        return bool(members) and all(member.LBRACK() is not None for member in members)
+
+    def _remember_type_name(self, name: str, llvm_type: ir.Type, type_ctx=None, value: ir.Value | None = None,
+                            *, global_scope: bool = False) -> None:
+        type_name = self._type_ctx_name(type_ctx) if type_ctx is not None else None
+        if (type_name is None or type_name == "unknown") and value is not None:
+            type_name = self._type_name_from_value(value)
+        if type_name is None or type_name == "unknown":
+            type_name = self._type_name_from_ir_type(llvm_type)
+        if global_scope:
+            self._globals_type_names[name] = type_name
+        else:
+            self._locals_type_names[name] = type_name
 
     def _mark_unsigned(self, value: ir.Value | None, unsigned: bool) -> None:
         if value is None:
@@ -302,8 +697,42 @@ class LLVMCodeGenerator(EzLangVisitor):
         self._mark_unsigned(coerced, unsigned)
         return coerced
 
+    def _coerce_integer_value(self, value: ir.Value, target_type: ir.IntType) -> ir.Value:
+        if not isinstance(value.type, ir.IntType):
+            return value
+        if value.type == target_type:
+            return value
+        if value.type.width < target_type.width:
+            return self.builder.zext(value, target_type) if self._is_unsigned_value(value) else self.builder.sext(value, target_type)
+        if value.type.width > target_type.width:
+            return self.builder.trunc(value, target_type)
+        return value
+
     def _binary_result_unsigned(self, left: ir.Value, right: ir.Value) -> bool:
         return self._is_unsigned_value(left) or self._is_unsigned_value(right)
+
+    @staticmethod
+    def _is_vector_value(value: ir.Value | None) -> bool:
+        return value is not None and isinstance(value.type, ir.VectorType)
+
+    def _broadcast_scalar_to_vector(self, scalar: ir.Value, vector_type: ir.VectorType) -> ir.Value:
+        """把标量广播为与目标向量同宽的 LLVM 向量。"""
+        elem_type = vector_type.element
+        if scalar.type != elem_type:
+            scalar = self._coerce_preserve_unsigned(scalar, elem_type)
+        value = ir.Constant(vector_type, ir.Undefined)
+        for index in range(vector_type.count):
+            value = self.builder.insert_element(value, scalar, ir.Constant(ir.IntType(32), index))
+        self._mark_unsigned(value, self._is_unsigned_value(scalar))
+        return value
+
+    def _prepare_vector_binary_operands(self, left: ir.Value, right: ir.Value) -> tuple[ir.Value, ir.Value]:
+        """向量/标量混合运算时，将标量广播成向量。"""
+        if self._is_vector_value(left) and not self._is_vector_value(right):
+            return left, self._broadcast_scalar_to_vector(right, left.type)
+        if self._is_vector_value(right) and not self._is_vector_value(left):
+            return self._broadcast_scalar_to_vector(left, right.type), right
+        return left, right
 
     def _list_type_is_unsigned(self, list_type: ir.Type) -> bool:
         elem_type = None
@@ -321,6 +750,207 @@ class LLVMCodeGenerator(EzLangVisitor):
             list_type = list_value.type.pointee if isinstance(list_value.type, ir.PointerType) else list_value.type
         if self._is_list_type(list_type):
             self._list_elem_unsigned[id(list_type)] = unsigned
+
+    def _mark_dict_item_types(self, dict_value: ir.Value | ir.Type | None, key_type: ir.Type, value_type: ir.Type) -> None:
+        if dict_value is None:
+            return
+        if isinstance(dict_value, ir.Value):
+            self._dict_item_types[id(dict_value)] = (key_type, value_type)
+            return
+        self._dict_item_types[id(dict_value)] = (key_type, value_type)
+
+    def _dict_item_types_for_value(self, dict_value: ir.Value | None) -> tuple[ir.Type, ir.Type]:
+        i8_ptr = ir.PointerType(ir.IntType(8))
+        if dict_value is None:
+            return i8_ptr, i8_ptr
+        found = self._dict_item_types.get(id(dict_value))
+        if found is not None:
+            return found
+        dict_type = dict_value.type.pointee if isinstance(dict_value.type, ir.PointerType) else dict_value.type
+        return self._dict_item_types.get(id(dict_type), (i8_ptr, i8_ptr))
+
+    def _dict_types_from_type_ctx(self, ctx) -> tuple[ir.Type, ir.Type] | None:
+        if ctx is None:
+            return None
+        if isinstance(ctx, EzLangParser.TypeShapeTypeContext):
+            members = list(ctx.typeShape().typeShapeMember()) if ctx.typeShape() is not None else []
+            dynamic_members = [member for member in members if member.LBRACK() is not None]
+            if dynamic_members and len(dynamic_members) == len(members):
+                member = dynamic_members[0]
+                member_types = member.type_()
+                member_types = member_types if isinstance(member_types, list) else [member_types]
+                member_types = [t for t in member_types if t is not None]
+                key_type = self._map_type(member_types[0]) if member_types else ir.PointerType(ir.IntType(8))
+                value_type = self._map_type(member_types[-1]) if len(member_types) > 1 else ir.PointerType(ir.IntType(8))
+                return key_type, value_type
+        if hasattr(ctx, 'baseType') and ctx.baseType() is not None:
+            bt = ctx.baseType()
+            if bt.TYPE_IDENTIFIER() is not None and bt.TYPE_IDENTIFIER().getText() == 'Dict' and bt.genericArgs() is not None:
+                args = list(bt.genericArgs().type_())
+                key_type = self._map_type(args[0]) if args else ir.PointerType(ir.IntType(8))
+                value_type = self._map_type(args[1]) if len(args) > 1 else ir.PointerType(ir.IntType(8))
+                return key_type, value_type
+        if hasattr(ctx, 'type_'):
+            inner = ctx.type_()
+            if inner is not None and not isinstance(inner, list):
+                return self._dict_types_from_type_ctx(inner)
+        return None
+
+    def _dict_types_from_type_ctx_with_map(self, ctx, type_map: dict[str, ir.Type]) -> tuple[ir.Type, ir.Type] | None:
+        if ctx is None:
+            return None
+        if isinstance(ctx, EzLangParser.TypeShapeTypeContext):
+            members = list(ctx.typeShape().typeShapeMember()) if ctx.typeShape() is not None else []
+            dynamic_members = [member for member in members if member.LBRACK() is not None]
+            if dynamic_members and len(dynamic_members) == len(members):
+                member = dynamic_members[0]
+                member_types = member.type_()
+                member_types = member_types if isinstance(member_types, list) else [member_types]
+                member_types = [t for t in member_types if t is not None]
+                key_type = self._map_type_with_map(member_types[0], type_map) if member_types else ir.PointerType(ir.IntType(8))
+                value_type = self._map_type_with_map(member_types[-1], type_map) if len(member_types) > 1 else ir.PointerType(ir.IntType(8))
+                return key_type, value_type
+        if hasattr(ctx, 'baseType') and ctx.baseType() is not None:
+            bt = ctx.baseType()
+            if bt.TYPE_IDENTIFIER() is not None and bt.TYPE_IDENTIFIER().getText() == 'Dict' and bt.genericArgs() is not None:
+                args = list(bt.genericArgs().type_())
+                key_type = self._map_type_with_map(args[0], type_map) if args else ir.PointerType(ir.IntType(8))
+                value_type = self._map_type_with_map(args[1], type_map) if len(args) > 1 else ir.PointerType(ir.IntType(8))
+                return key_type, value_type
+        if hasattr(ctx, 'type_'):
+            inner = ctx.type_()
+            if inner is not None and not isinstance(inner, list):
+                return self._dict_types_from_type_ctx_with_map(inner, type_map)
+        return None
+
+    def _struct_mono_name(self, base_name: str, type_args: list[ir.Type]) -> str:
+        suffix = '_'.join(self._type_name(t) for t in type_args)
+        return f"{base_name}_{suffix}" if suffix else base_name
+
+    def _struct_name_from_generic_args(self, base_name: str, generic_args_ctx) -> str:
+        if generic_args_ctx is None or base_name not in self.struct_generic_templates:
+            return base_name
+        type_arg_ctxs = list(generic_args_ctx.type_())
+        type_args = [self._map_type(t) for t in type_arg_ctxs]
+        type_arg_unsigned = [self._type_ctx_is_unsigned(t) for t in type_arg_ctxs]
+        return self._monomorphize_struct(base_name, type_args, type_arg_unsigned)
+
+    def _struct_name_from_literal(self, ctx) -> str:
+        base_name = ctx.TYPE_IDENTIFIER().getText()
+        return self._struct_name_from_generic_args(base_name, ctx.genericArgs())
+
+    def _infer_struct_type_args_from_values(self, base_name: str,
+                                           provided: dict[str, ir.Value]) -> tuple[list[ir.Type], list[bool]] | None:
+        """根据构造字段实参值推导泛型结构体类型实参。"""
+        generic_names = self.struct_generic_params.get(base_name, [])
+        template_ctx = self.struct_generic_templates.get(base_name)
+        if not generic_names or template_ctx is None or not provided:
+            return None
+        type_map: dict[str, ir.Type] = {}
+        unsigned_map: dict[str, bool] = {}
+        generic_set = set(generic_names)
+        for member_ctx in template_ctx.structMember():
+            field_ctx = member_ctx.structField()
+            if field_ctx is None:
+                continue
+            fname = field_ctx.VAR_IDENTIFIER().getText()
+            actual = provided.get(fname)
+            if actual is None:
+                continue
+            actual_type = self._value_type_for_generic_inference(actual)
+            before = dict(type_map)
+            self._infer_generic_type_from_ctx(field_ctx.type_(), actual_type, type_map, generic_set)
+            for name, typ in type_map.items():
+                if name not in before and typ == actual_type:
+                    unsigned_map[name] = self._is_unsigned_value(actual)
+        if any(name not in type_map for name in generic_names):
+            return None
+        return [type_map[name] for name in generic_names], [unsigned_map.get(name, False) for name in generic_names]
+
+    def _monomorphize_struct(self, base_name: str, type_args: list[ir.Type],
+                             type_arg_unsigned: list[bool] | None = None) -> str:
+        """为显式泛型结构体实参生成独立 LLVM 布局。"""
+        generic_names = self.struct_generic_params.get(base_name, [])
+        if not generic_names or len(generic_names) != len(type_args):
+            return base_name
+
+        mono_name = self._struct_mono_name(base_name, type_args)
+        if mono_name in self._struct_monomorphized:
+            return mono_name
+        template_ctx = self.struct_generic_templates.get(base_name)
+        if template_ctx is None:
+            return base_name
+
+        self._struct_monomorphized.add(mono_name)
+        type_map = dict(zip(generic_names, type_args))
+        unsigned_map = dict(zip(generic_names, type_arg_unsigned or [False] * len(generic_names)))
+
+        struct_type = ir.global_context.get_identified_type(mono_name)
+        self.structs[mono_name] = struct_type
+        field_names: list[str] = []
+        field_types: list[ir.Type] = []
+        field_unsigned: list[bool] = []
+        defaults: dict[str, object] = {}
+        methods: list[tuple[str, object, object]] = []
+
+        for member_ctx in template_ctx.structMember():
+            field_ctx = member_ctx.structField()
+            if field_ctx is not None:
+                fname = field_ctx.VAR_IDENTIFIER().getText()
+                ftype = self._map_type_with_map(field_ctx.type_(), type_map)
+                field_names.append(fname)
+                field_types.append(ftype)
+                if self._type_ctx_is_generic_name(field_ctx.type_(), unsigned_map):
+                    field_unsigned.append(unsigned_map.get(field_ctx.type_().baseType().TYPE_IDENTIFIER().getText(), False))
+                else:
+                    field_unsigned.append(self._type_ctx_is_unsigned(field_ctx.type_()))
+                if field_ctx.expression() is not None:
+                    defaults[fname] = field_ctx.expression()
+
+            spread_ctx = member_ctx.structSpread()
+            if spread_ctx is not None:
+                base_type = self._map_type_with_map(spread_ctx.type_(), type_map)
+                spread_name = base_type.name if isinstance(base_type, ir.IdentifiedStructType) else None
+                if spread_name in self.struct_fields:
+                    for bf in self.struct_fields[spread_name]:
+                        if bf in field_names:
+                            continue
+                        bf_idx = self.struct_fields[spread_name].index(bf)
+                        field_names.append(bf)
+                        field_types.append(base_type.elements[bf_idx])
+                        base_unsigned = self._struct_field_unsigned.get(spread_name, [])
+                        field_unsigned.append(base_unsigned[bf_idx] if bf_idx < len(base_unsigned) else False)
+
+            method_ctx = member_ctx.structMethod()
+            if method_ctx is not None:
+                methods.append((method_ctx.VAR_IDENTIFIER().getText(), method_ctx.functionLiteral(), method_ctx.functionSignature()))
+
+        if struct_type.is_opaque:
+            struct_type.set_body(*field_types)
+        self.struct_fields[mono_name] = field_names
+        self._struct_field_unsigned[mono_name] = field_unsigned
+        self.struct_defaults[mono_name] = defaults
+        if methods:
+            self.struct_methods[mono_name] = {}
+            self._generic_type_map_stack.append(type_map)
+            try:
+                for mname, fn_lit, sig in methods:
+                    func_name = f"{mono_name}_{mname}"
+                    self.struct_methods[mono_name][mname] = func_name
+                    if fn_lit is not None:
+                        self._gen_method_func(func_name, fn_lit, mono_name)
+                    elif sig is not None:
+                        self._declare_method_signature(func_name, sig)
+            finally:
+                self._generic_type_map_stack.pop()
+        return mono_name
+
+    def _type_ctx_is_generic_name(self, ctx, unsigned_map: dict[str, bool]) -> bool:
+        return isinstance(ctx, EzLangParser.BaseTypeRefContext) \
+            and ctx.baseType() is not None \
+            and ctx.baseType().TYPE_IDENTIFIER() is not None \
+            and ctx.baseType().TYPE_IDENTIFIER().getText() in unsigned_map \
+            and ctx.baseType().genericArgs() is None
 
     def _save_unsigned_state(self):
         return dict(self._ptr_unsigned), dict(self._value_unsigned)
@@ -351,6 +981,8 @@ class LLVMCodeGenerator(EzLangVisitor):
         """EzLang 类型 → LLVM 类型 (默认为 i32)"""
         if ctx is None:
             return ir.IntType(32)
+        if self._generic_type_map_stack and not self._mapping_with_map:
+            return self._map_type_with_map(ctx, self._generic_type_map_stack[-1])
 
         P = EzLangParser
 
@@ -373,12 +1005,12 @@ class LLVMCodeGenerator(EzLangVisitor):
             max_type = max(types, key=lambda t: self._type_width(t))
             return ir.LiteralStructType([ir.IntType(32), max_type])
 
-        # 数组类型: T[] → { data, length, capacity }
+        # 数组类型: T[] → { pages, length, capacity, page_count }
         if isinstance(ctx, P.ArrayTypeContext):
             inner = self._map_type(ctx.type_())
             return ir.LiteralStructType([ir.PointerType(ir.PointerType(inner)), ir.IntType(64), ir.IntType(64), ir.IntType(64)])
 
-        # List 类型: List<T> → { data, length, capacity }
+        # List 类型: List<T> → { pages, length, capacity, page_count }
         if isinstance(ctx, P.ListTypeContext):
             inner = self._map_type(ctx.type_())
             return ir.LiteralStructType([ir.PointerType(ir.PointerType(inner)), ir.IntType(64), ir.IntType(64), ir.IntType(64)])
@@ -434,6 +1066,35 @@ class LLVMCodeGenerator(EzLangVisitor):
 
         return ir.IntType(32)
 
+    def _union_variant_tag(self, union_ctx, value_type: ir.Type) -> int:
+        """按联合类型声明顺序计算变体 tag。"""
+        if not isinstance(union_ctx, EzLangParser.UnionTypeContext):
+            return 0
+        for index, type_ctx in enumerate(union_ctx.type_()):
+            variant_type = self._map_type(type_ctx)
+            if variant_type == value_type:
+                return index
+            if isinstance(value_type, ir.IntType) and isinstance(variant_type, ir.IntType):
+                return index
+            if isinstance(value_type, ir.PointerType) and isinstance(variant_type, ir.PointerType):
+                return index
+        return 0
+
+    def _union_variant_tag_for_type(self, target_type: ir.LiteralStructType, value_type: ir.Type) -> int:
+        """缺少语法上下文时，根据联合载荷类型推断最可能的 tag。"""
+        if value_type == target_type:
+            return 0
+        variant_type = target_type.elements[1]
+        if value_type == variant_type:
+            return 0
+        type_name = self._type_name(value_type)
+        payload_name = self._type_name(variant_type)
+        if payload_name == 'Str' and type_name != 'Str':
+            return 0
+        if payload_name != 'Str' and type_name == 'Str':
+            return 1
+        return 0
+
     def _map_type_shape(self, shape_ctx) -> ir.Type:
         if shape_ctx is None:
             return ir.IntType(32)
@@ -466,6 +1127,12 @@ class LLVMCodeGenerator(EzLangVisitor):
         if bt.VOID() is not None: return ir.VoidType()
         if bt.TYPE_IDENTIFIER() is not None:
             name = bt.TYPE_IDENTIFIER().getText()
+            if name in self.struct_generic_templates and bt.genericArgs() is not None:
+                type_arg_ctxs = list(bt.genericArgs().type_())
+                type_args = [self._map_type(t) for t in type_arg_ctxs]
+                type_arg_unsigned = [self._type_ctx_is_unsigned(t) for t in type_arg_ctxs]
+                mono_name = self._monomorphize_struct(name, type_args, type_arg_unsigned)
+                return self.structs.get(mono_name, self.structs.get(name, ir.IntType(32)))
             if name == 'List' and bt.genericArgs() is not None:
                 args = list(bt.genericArgs().type_())
                 inner = self._map_type(args[0]) if args else ir.IntType(32)
@@ -601,6 +1268,42 @@ class LLVMCodeGenerator(EzLangVisitor):
             return True
         return self._type_width(ret_type) > 16
 
+    def _c_abi_return_type(self, ret_type: ir.Type) -> ir.Type:
+        """native C ABI 中的小可选聚合会按目标 ABI 重新分类返回值。"""
+        if self.compile_target not in {'linux', 'macos', 'windows', 'android', 'ios'}:
+            return ret_type
+        if not (
+            isinstance(ret_type, ir.LiteralStructType)
+            and len(ret_type.elements) == 2
+            and ret_type.elements[0] == ir.IntType(1)
+        ):
+            return ret_type
+
+        value_type = ret_type.elements[1]
+        if value_type == ir.IntType(32) or isinstance(value_type, ir.FloatType):
+            return ir.IntType(64)
+        if (
+            value_type == ir.IntType(64)
+            or isinstance(value_type, ir.DoubleType)
+            or isinstance(value_type, ir.PointerType)
+        ):
+            if self.target_arch in {'aarch64', 'arm64'}:
+                return ir.ArrayType(ir.IntType(64), 2)
+            if self.target_arch in {'x86_64', 'amd64'}:
+                ok_type = ir.IntType(8)
+                return ir.LiteralStructType([ok_type, value_type])
+        return ret_type
+
+    def _restore_c_abi_return(self, func_name: str, value: ir.Value) -> ir.Value:
+        bridge = self._c_abi_return_bridges.get(func_name)
+        if bridge is None:
+            return value
+        ret_type, abi_ret_type = bridge
+        slot = self.builder.alloca(ret_type, name=f"_{func_name}_abi_ret")
+        raw_slot = self.builder.bitcast(slot, ir.PointerType(abi_ret_type))
+        self.builder.store(value, raw_slot)
+        return self.builder.load(slot, name=f"_{func_name}_ret")
+
     def _zero_constant(self, t: ir.Type) -> ir.Constant:
         """为任意 LLVM 类型生成零值常量，并缓存纯常量构造。"""
         key = str(t)
@@ -637,11 +1340,11 @@ class LLVMCodeGenerator(EzLangVisitor):
             return val
         if self._is_aggregate_ptr(val) and val.type.pointee == target_type:
             return self.builder.load(val)
+        duck = self._coerce_struct_duck_value(val, target_type)
+        if duck is not None:
+            return duck
         if isinstance(val.type, ir.IntType) and isinstance(target_type, ir.IntType):
-            if val.type.width < target_type.width:
-                return self.builder.zext(val, target_type)
-            if val.type.width > target_type.width:
-                return self.builder.trunc(val, target_type)
+            return self._coerce_integer_value(val, target_type)
         if isinstance(val.type, ir.FloatType) and isinstance(target_type, ir.DoubleType):
             return self.builder.fpext(val, target_type)
         if isinstance(val.type, ir.DoubleType) and isinstance(target_type, ir.FloatType):
@@ -680,22 +1383,166 @@ class LLVMCodeGenerator(EzLangVisitor):
                     v = self.builder.insert_value(undef, ir.Constant(ir.IntType(1), 1), 0)
                     return self.builder.insert_value(v, val, 1)
             # 联合类型包装: T → {i32, T_max}
-            if len(target_type.elements) == 2 and isinstance(target_type.elements[0], ir.IntType) and target_type.elements[0].width == 32:
-                undef = ir.Constant(target_type, ir.Undefined)
-                v = self.builder.insert_value(undef, ir.Constant(ir.IntType(32), 0), 0)
-                variant_type = target_type.elements[1]
-                # 值类型与联合体槽位类型不一致时，尝试转换
-                if val.type != variant_type:
-                    if isinstance(val.type, ir.IntType) and isinstance(variant_type, ir.IntType):
-                        val = self.builder.zext(val, variant_type)
-                    elif isinstance(val.type, ir.IntType) and isinstance(variant_type, ir.PointerType):
-                        val = self.builder.inttoptr(val, variant_type)
-                    elif isinstance(val.type, ir.PointerType) and isinstance(variant_type, ir.IntType):
-                        val = self.builder.ptrtoint(val, variant_type)
-                    else:
-                        return val  # 无法转换，保持原样，之后可能会报错
-                return self.builder.insert_value(v, val, 1)
+            if self._is_union_type(target_type):
+                return self._coerce_union_value(val, target_type, self._union_variant_tag_for_type(target_type, val.type))
         return val
+
+    def _coerce_struct_duck_value(self, val: ir.Value, target_type: ir.Type) -> ir.Value | None:
+        """按字段名把兼容结构体值重组为目标结构体布局。"""
+        if not isinstance(target_type, ir.IdentifiedStructType):
+            return None
+        target_name = target_type.name
+        target_fields = self.struct_fields.get(target_name, []) if target_name else []
+        if not target_fields:
+            return None
+
+        src_ptr = val if self._is_aggregate_ptr(val) else None
+        src_type = val.type.pointee if src_ptr is not None else val.type
+        if not isinstance(src_type, (ir.IdentifiedStructType, ir.LiteralStructType)) or src_type == target_type:
+            return None
+        src_name = src_type.name if isinstance(src_type, ir.IdentifiedStructType) else None
+        src_fields = self.struct_fields.get(src_name, []) if src_name else []
+        if not src_fields:
+            return None
+
+        result = ir.Constant(target_type, ir.Undefined)
+        for target_idx, field_name in enumerate(target_fields):
+            if field_name not in src_fields:
+                return None
+            src_idx = src_fields.index(field_name)
+            if src_idx >= len(src_type.elements) or target_idx >= len(target_type.elements):
+                return None
+            if src_ptr is not None:
+                src_field_ptr = self.builder.gep(src_ptr, [
+                    ir.Constant(ir.IntType(32), 0),
+                    ir.Constant(ir.IntType(32), src_idx),
+                ], inbounds=True)
+                field_val = self.builder.load(src_field_ptr)
+            else:
+                field_val = self.builder.extract_value(val, src_idx)
+            target_field_type = target_type.elements[target_idx]
+            if field_val.type != target_field_type:
+                field_val = self._coerce_value(field_val, target_field_type)
+            if field_val.type != target_field_type:
+                return None
+            result = self.builder.insert_value(result, field_val, target_idx)
+        return result
+
+    def _coerce_union_value(self, val: ir.Value, target_type: ir.LiteralStructType, tag: int) -> ir.Value:
+        """把具体值包装成联合值，tag 由联合声明顺序决定。"""
+        if val.type == target_type:
+            return val
+        undef = ir.Constant(target_type, ir.Undefined)
+        result = self.builder.insert_value(undef, ir.Constant(ir.IntType(32), tag), 0)
+        variant_type = target_type.elements[1]
+        if self._is_aggregate_ptr(val) and val.type.pointee == variant_type:
+            val = self.builder.load(val)
+        if val.type != variant_type:
+            if isinstance(val.type, ir.IntType) and isinstance(variant_type, ir.IntType):
+                val = self._coerce_integer_value(val, variant_type)
+            elif isinstance(val.type, ir.IntType) and isinstance(variant_type, ir.PointerType):
+                val = self.builder.inttoptr(val, variant_type)
+            elif isinstance(val.type, ir.PointerType) and isinstance(variant_type, ir.IntType):
+                val = self.builder.ptrtoint(val, variant_type)
+            else:
+                return val
+        return self.builder.insert_value(result, val, 1)
+
+    def _optional_method_call(self, call_ctx, unwrap_ctx, method_name: str, args_ctx) -> ir.Value | None:
+        """生成 opt?.method(...)：空值返回空可选，非空时调用方法并包装返回值。"""
+        opt_val = self._eval(unwrap_ctx.postfixExpression())
+        if opt_val is None or not hasattr(opt_val, 'type'):
+            return None
+        opt_type = opt_val.type.pointee if isinstance(opt_val.type, ir.PointerType) else opt_val.type
+        if not self._is_optional_type(opt_type):
+            return None
+        value_type = opt_type.elements[1]
+        if not isinstance(value_type, ir.IdentifiedStructType):
+            return None
+        struct_name = value_type.name
+        method_table = self.struct_methods.get(struct_name, {})
+        func_name = method_table.get(method_name)
+        if func_name is None:
+            return None
+        try:
+            func = self.module.get_global(func_name)
+        except KeyError:
+            return None
+        if func is None or not isinstance(func, ir.Function):
+            return None
+
+        func_type = func.type.pointee if isinstance(func.type, ir.PointerType) else None
+        if func_type is None:
+            return None
+        ret_type = func_type.return_type
+        if isinstance(ret_type, ir.VoidType):
+            return None
+        result_type = ir.LiteralStructType([ir.IntType(1), ret_type])
+        result_ptr = self.builder.alloca(result_type, name='_optional_method_result')
+        self.builder.store(self._optional_value(ret_type, False), result_ptr)
+        if not isinstance(opt_val.type, ir.PointerType):
+            tmp = self.builder.alloca(opt_type, name='_optional_method_tmp')
+            self.builder.store(opt_val, tmp)
+            opt_val = tmp
+
+        ok_ptr = self.builder.gep(opt_val, [
+            ir.Constant(ir.IntType(32), 0),
+            ir.Constant(ir.IntType(32), 0),
+        ], inbounds=True)
+        ok = self.builder.load(ok_ptr, name='_optional_method_ok')
+        call_block = self.builder.append_basic_block('optional_method_call')
+        done_block = self.builder.append_basic_block('optional_method_done')
+        self.builder.cbranch(ok, call_block, done_block)
+
+        self.builder.position_at_start(call_block)
+        this_ptr = self.builder.gep(opt_val, [
+            ir.Constant(ir.IntType(32), 0),
+            ir.Constant(ir.IntType(32), 1),
+        ], inbounds=True)
+        provided: dict[str, ir.Value] = {}
+        if args_ctx is not None:
+            for a in args_ctx.namedArg():
+                if a.VAR_IDENTIFIER() is None or a.expression() is None:
+                    continue
+                val = self._eval(a.expression())
+                if val is not None:
+                    provided[a.VAR_IDENTIFIER().getText()] = val
+        expected_names = self.func_param_names.get(func_name, [])
+        call_args = []
+        abi_arg_types = list(func_type.args)
+        if expected_names:
+            call_args.append(this_ptr)
+            for pname in expected_names[1:]:
+                if pname in provided:
+                    call_args.append(provided[pname])
+                elif pname in self.func_defaults.get(func_name, {}):
+                    default_val = self._eval(self.func_defaults[func_name][pname])
+                    call_args.append(default_val if default_val is not None else ir.Constant(ir.IntType(32), 0))
+                else:
+                    call_args.append(ir.Constant(ir.IntType(32), 0))
+        else:
+            call_args.append(this_ptr)
+            call_args.extend(provided.values())
+        call_args = [
+            self._coerce_value(arg, abi_arg_types[i]) if i < len(abi_arg_types) and arg.type != abi_arg_types[i] else arg
+            for i, arg in enumerate(call_args)
+        ]
+        ret_val = self.builder.call(func, call_args)
+        self._emit_throw_check_after_call()
+        if self.builder is not None and not self.builder.block.is_terminated:
+            self.builder.store(self._optional_value(ret_type, True, ret_val), result_ptr)
+            self.builder.branch(done_block)
+        self.builder.position_at_start(done_block)
+        return self.builder.load(result_ptr, name='_optional_method_value')
+
+    def _coerce_return_value(self, val: ir.Value, ret_type: ir.Type) -> ir.Value:
+        """按当前函数返回类型转换返回值，联合类型需要保留声明顺序 tag。"""
+        if val.type == ret_type:
+            return val
+        ret_ctx = self._function_return_type_ctx_stack[-1] if self._function_return_type_ctx_stack else None
+        if isinstance(ret_ctx, EzLangParser.UnionTypeContext) and self._is_union_type(ret_type):
+            return self._coerce_union_value(val, ret_type, self._union_variant_tag(ret_ctx, val.type))
+        return self._coerce_value(val, ret_type)
 
     # ==================== 辅助 ====================
 
@@ -735,11 +1582,7 @@ class LLVMCodeGenerator(EzLangVisitor):
             if val is not None:
                 if isinstance(val, ir.AllocaInstr):
                     val = self.builder.load(val)
-                if val.type == ir.PointerType(ir.IntType(8)):
-                    return val
-                tmp = self.builder.alloca(val.type, name="_dict_key_val")
-                self.builder.store(val, tmp)
-                return self.builder.bitcast(tmp, ir.PointerType(ir.IntType(8)))
+                return val
         text = self._dict_key_text(field_ctx) or ""
         return self._make_global_string(text, prefix="_dict_key")
 
@@ -857,6 +1700,51 @@ class LLVMCodeGenerator(EzLangVisitor):
             ], inbounds=True)
         return None
 
+    def _dict_index_target(self, ctx) -> tuple[ir.Value, ir.Value, ir.Type, ir.Type] | None:
+        """识别简单 Dict 索引左值，并求出对象、key 与键值类型。"""
+        index_ctx = ctx if isinstance(ctx, EzLangParser.IndexContext) else self._outer_postfix_ctx(ctx)
+        if not isinstance(index_ctx, EzLangParser.IndexContext):
+            return None
+
+        target_name = self._simple_lvalue_name(index_ctx.postfixExpression())
+        storage = self.locals.get(target_name) if target_name else None
+        if storage is None and target_name:
+            storage = self.globals.get(target_name)
+        if storage is None or not isinstance(getattr(storage, 'type', None), ir.PointerType):
+            return None
+        storage_pointee = storage.type.pointee
+        if not isinstance(storage_pointee, ir.IdentifiedStructType) or storage_pointee.name != 'Dict':
+            return None
+
+        obj_ptr = self._eval(index_ctx.postfixExpression())
+        if obj_ptr is None or not isinstance(getattr(obj_ptr, 'type', None), ir.PointerType):
+            return None
+        pointee = obj_ptr.type.pointee
+        if not isinstance(pointee, ir.IdentifiedStructType) or pointee.name != 'Dict':
+            return None
+        key = self._eval(index_ctx.expression())
+        if key is None:
+            return None
+        key_type, value_type = self._dict_item_types_for_value(obj_ptr)
+        return obj_ptr, key, key_type, value_type
+
+    def _dict_index_assignment(self, target: tuple[ir.Value, ir.Value, ir.Type, ir.Type] | None,
+                               val: ir.Value | None, op_ctx) -> ir.Value | None:
+        """处理 Dict 索引赋值，按 key 更新已存在元素或插入新元素。"""
+        if target is None or val is None:
+            return None
+        obj_ptr, key, key_type, value_type = target
+        store_val = val
+        if isinstance(store_val, ir.AllocaInstr):
+            store_val = self.builder.load(store_val)
+        if op_ctx is not None and op_ctx.ASSIGN() is None:
+            current = self._gen_dict_lookup_value(obj_ptr, key, key_type, value_type)
+            store_val = self._apply_assignment_operator(current, store_val, op_ctx)
+        if store_val.type != value_type:
+            store_val = self._coerce_preserve_unsigned(store_val, value_type)
+        self._gen_dict_upsert_value(obj_ptr, key, store_val, key_type, value_type)
+        return store_val
+
     def _find_member_access_ctx(self, ctx):
         if ctx is None:
             return None
@@ -900,11 +1788,17 @@ class LLVMCodeGenerator(EzLangVisitor):
             self._mark_unsigned(result, unsigned)
             return result
         if op_ctx.AMPERSAND_ASSIGN() is not None:
-            return self.builder.and_(current, rhs, name="_assign_value")
+            result = self.builder.and_(current, rhs, name="_assign_value")
+            self._mark_unsigned(result, unsigned)
+            return result
         if op_ctx.PIPE_ASSIGN() is not None:
-            return self.builder.or_(current, rhs, name="_assign_value")
+            result = self.builder.or_(current, rhs, name="_assign_value")
+            self._mark_unsigned(result, unsigned)
+            return result
         if op_ctx.CARET_ASSIGN() is not None:
-            return self.builder.xor(current, rhs, name="_assign_value")
+            result = self.builder.xor(current, rhs, name="_assign_value")
+            self._mark_unsigned(result, unsigned)
+            return result
         if op_ctx.SHL_ASSIGN() is not None:
             result = self.builder.shl(current, rhs, name="_assign_value")
             self._mark_unsigned(result, unsigned)
@@ -940,6 +1834,67 @@ class LLVMCodeGenerator(EzLangVisitor):
         if text.startswith('"') and text.endswith('"'):
             return "Str"
         return text or "unknown"
+
+    def _type_name_from_value(self, value: ir.Value | None) -> str:
+        if value is None:
+            return "unknown"
+        return self._type_name_from_ir_type(value.type)
+
+    def _type_name_from_ir_type(self, typ: ir.Type | None) -> str:
+        if typ is None:
+            return "unknown"
+        if isinstance(typ, ir.PointerType):
+            if typ.pointee == ir.IntType(8):
+                return "Str"
+            return self._type_name_from_ir_type(typ.pointee)
+        if isinstance(typ, ir.IntType):
+            if typ.width == 1:
+                return "Bool"
+            return f"I{typ.width}"
+        if isinstance(typ, ir.FloatType):
+            return "F32"
+        if isinstance(typ, ir.DoubleType):
+            return "F64"
+        if isinstance(typ, ir.VectorType):
+            return f"Vec<{self._type_name_from_ir_type(typ.element)}>[{typ.count}]"
+        if self._is_list_type(typ):
+            elem_type = typ.elements[0].pointee.pointee
+            return f"{self._type_name_from_ir_type(elem_type)}[]"
+        if isinstance(typ, ir.IdentifiedStructType):
+            return typ.name or "Struct"
+        if isinstance(typ, ir.LiteralStructType):
+            return "Struct"
+        if isinstance(typ, ir.ArrayType):
+            return f"[{self._type_name_from_ir_type(typ.element)};{typ.count}]"
+        if isinstance(typ, ir.VoidType):
+            return "Void"
+        return "unknown"
+
+    def _typeof_name_from_expr(self, expr_ctx) -> str:
+        ident = self._leftmost_identifier_ctx(expr_ctx)
+        if ident is not None and ident.getText() == expr_ctx.getText():
+            token = ident.VAR_IDENTIFIER() or ident.TYPE_IDENTIFIER()
+            name = token.getText() if token is not None else ""
+            if name in self._locals_type_names:
+                return self._locals_type_names[name]
+            if name in self._globals_type_names:
+                return self._globals_type_names[name]
+            if name in self.locals:
+                return self._type_name_from_ir_type(self.locals[name].type.pointee)
+            if name in self.globals:
+                return self._type_name_from_ir_type(self.globals[name].type.pointee)
+            if name in self.structs or name in self.type_aliases:
+                return name
+
+        struct_name = self._expr_struct_literal_name(expr_ctx)
+        if struct_name is not None:
+            return struct_name
+
+        text_name = self._typeof_name(expr_ctx)
+        if text_name != (expr_ctx.getText() if expr_ctx is not None else "unknown"):
+            return text_name
+
+        return self._type_name_from_ir_type(self._infer_global_initializer_type(expr_ctx))
 
     def visitChildren(self, ctx):
         """重写：根据 Context 类型自动分发到对应的 visit 方法"""
@@ -1019,9 +1974,13 @@ class LLVMCodeGenerator(EzLangVisitor):
         old_builder = self.builder
         old_func = self.current_function
         old_locals = self.locals
+        old_type_names = self._locals_type_names
         self.builder = ir.IRBuilder(entry)
         self.current_function = func
         self.locals = {}
+        self._locals_type_names = {}
+        throw_exit = func.append_basic_block('throw_exit')
+        self._function_throw_exit_stack.append(throw_exit)
 
         for stmt in statements:
             var_decl = self._top_level_variable_decl(stmt)
@@ -1032,12 +1991,12 @@ class LLVMCodeGenerator(EzLangVisitor):
             if self.builder.block.is_terminated:
                 break
 
-        if not self.builder.block.is_terminated:
-            self.builder.ret(ir.Constant(ir.IntType(32), 0))
+        self._finish_function_with_throw_exit(ir.IntType(32), ir.Constant(ir.IntType(32), 0))
 
         self.builder = old_builder
         self.current_function = old_func
         self.locals = old_locals
+        self._locals_type_names = old_type_names
         return func
 
     def _init_global_variable(self, ctx: EzLangParser.VariableDeclContext):
@@ -1063,6 +2022,8 @@ class LLVMCodeGenerator(EzLangVisitor):
             return ir.IntType(32)
         if text.startswith('parallel'):
             return self._infer_parallel_result_type(initializer)
+        if text.startswith('race('):
+            return ir.IntType(32)
         if text.startswith('"'):
             return ir.PointerType(ir.IntType(8))
         if text.startswith('{'):
@@ -1070,7 +2031,7 @@ class LLVMCodeGenerator(EzLangVisitor):
         if text in {'true', 'false'}:
             return ir.IntType(1)
         if re.fullmatch(r'[-+]?\d+', text):
-            return ir.IntType(32)
+            return self._integer_literal_type(int(text, 0))
         if re.fullmatch(r'[-+]?\d+\.\d+(?:[eE][-+]?\d+)?', text):
             return ir.DoubleType()
 
@@ -1128,6 +2089,8 @@ class LLVMCodeGenerator(EzLangVisitor):
         if call_name is not None and call_name in self.module.globals:
             if call_name in self._sret_functions:
                 return self._sret_functions[call_name]
+            if call_name in self._c_abi_return_bridges:
+                return self._c_abi_return_bridges[call_name][0]
             callee = self.module.globals[call_name]
             func_type = callee.type.pointee if isinstance(callee.type, ir.PointerType) else None
             if isinstance(func_type, ir.FunctionType):
@@ -1190,12 +2153,12 @@ class LLVMCodeGenerator(EzLangVisitor):
     def _infer_catch_result_type(self, block_ctx) -> ir.Type:
         """从 catch 块中的首个 throw 表达式粗略推断捕获值类型。"""
         if block_ctx is None:
-            return ir.VoidType()
+            return self.structs['Error']
         for stmt in block_ctx.statement():
             thrown = self._infer_throw_expression_type(stmt)
             if thrown is not None:
                 return thrown
-        return ir.VoidType()
+        return self.structs['Error']
 
     def _infer_throw_expression_type(self, ctx) -> ir.Type | None:
         if ctx is None:
@@ -1322,13 +2285,16 @@ class LLVMCodeGenerator(EzLangVisitor):
                         pt = ir.PointerType(pt)
                     param_types.append(pt)
             uses_sret = self._uses_c_sret(ret_type)
-            abi_ret_type = ir.VoidType() if uses_sret else ret_type
+            bridged_ret_type = self._c_abi_return_type(ret_type)
+            abi_ret_type = ir.VoidType() if uses_sret else bridged_ret_type
             abi_param_types = ([ir.PointerType(ret_type)] if uses_sret else []) + param_types
             func_type = ir.FunctionType(abi_ret_type, abi_param_types)
             func = ir.Function(self.module, func_type, name)
             if uses_sret:
                 func.args[0].add_attribute('sret')
                 self._sret_functions[name] = ret_type
+            elif bridged_ret_type != ret_type:
+                self._c_abi_return_bridges[name] = (ret_type, bridged_ret_type)
             # 记录参数名供 visitCall 使用
             param_names = []
             if params is not None:
@@ -1467,8 +2433,10 @@ class LLVMCodeGenerator(EzLangVisitor):
             if type_ctx is None and initializer is not None:
                 llvm_type = self._infer_global_initializer_type(initializer)
             gv = ir.GlobalVariable(self.module, llvm_type, name)
-            gv.initializer = self._zero_constant(llvm_type)
+            const_initializer = self._global_const_initializer(initializer, llvm_type)
+            gv.initializer = const_initializer if const_initializer is not None else self._zero_constant(llvm_type)
             self.globals[name] = gv
+            self._remember_type_name(name, llvm_type, type_ctx, global_scope=True)
             self._mark_unsigned(gv, self._type_ctx_is_unsigned(type_ctx))
             if type_ctx is not None:
                 self._mark_list_elem_unsigned(gv, self._type_ctx_is_unsigned(type_ctx))
@@ -1478,36 +2446,65 @@ class LLVMCodeGenerator(EzLangVisitor):
                 llvm_type = self._map_type(type_ctx)
                 alloca = self.builder.alloca(llvm_type, name=name)
                 self.locals[name] = alloca
+                self._remember_type_name(name, llvm_type, type_ctx)
+                dict_item_types = self._dict_types_from_type_ctx(type_ctx)
+                if dict_item_types is not None:
+                    self._mark_dict_item_types(alloca, dict_item_types[0], dict_item_types[1])
                 self._mark_unsigned(alloca, self._type_ctx_is_unsigned(type_ctx))
                 self._mark_list_elem_unsigned(alloca, self._type_ctx_is_unsigned(type_ctx))
                 if initializer is not None:
                     val = self._eval_expr(initializer)
                     if val is not None:
                         if self._is_aggregate_ptr(val):
+                            val = self._copy_aggregate_value(val, name=f"_{name}_copy")
                             val = self.builder.load(val)
-                        val = self._coerce_value(val, llvm_type)
+                        if isinstance(type_ctx, EzLangParser.UnionTypeContext) and self._is_union_type(llvm_type):
+                            val = self._coerce_union_value(val, llvm_type, self._union_variant_tag(type_ctx, val.type))
+                        else:
+                            val = self._coerce_value(val, llvm_type)
                         self._emit_lock_access(name, "write", lambda: self.builder.store(val, alloca))
                 else:
                     self._emit_lock_access(name, "write", lambda: self.builder.store(self._zero_constant(llvm_type), alloca))
             elif initializer is not None:
                 # 类型推断：先求值，根据结果确定类型
+                parallel_block = self._parallel_block_from_initializer(initializer)
+                if parallel_block is not None and self._flow_depth > 0:
+                    future_handle = self._start_flow_parallel_i32_future(name, parallel_block)
+                    if future_handle is not None:
+                        alloca = self.builder.alloca(ir.IntType(32), name=name)
+                        self.builder.store(ir.Constant(ir.IntType(32), 0), alloca)
+                        self.locals[name] = alloca
+                        self._remember_type_name(name, ir.IntType(32))
+                        self._mark_unsigned(alloca, False)
+                        return None
                 val = self._eval_expr(initializer)
                 if val is not None:
                     if isinstance(val, ir.AllocaInstr) or self._is_aggregate_ptr(val):
-                        # 结构体字面量返回指针，直接复用
-                        val.name = name
-                        self.locals[name] = val
-                        self._mark_list_elem_unsigned(val, self._list_type_is_unsigned(val.type))
+                        source_dict_types = None
+                        if isinstance(val.type, ir.PointerType) and val.type.pointee == self.structs.get('Dict'):
+                            source_dict_types = self._dict_item_types_for_value(val)
+                        copied = self._copy_aggregate_value(val, name=name)
+                        self.locals[name] = copied
+                        self._remember_type_name(name, copied.type.pointee, value=copied)
+                        if copied.type.pointee == self.structs['Dict']:
+                            key_type, value_type = source_dict_types or self._dict_item_types_for_value(val)
+                            self._mark_dict_item_types(copied, key_type, value_type)
+                        self._mark_list_elem_unsigned(copied, self._list_type_is_unsigned(copied.type))
                     else:
                         alloca = self.builder.alloca(val.type, name=name)
                         self._emit_lock_access(name, "write", lambda: self.builder.store(val, alloca))
                         self.locals[name] = alloca
+                        self._remember_type_name(name, val.type, value=val)
+                        if val.type == self.structs.get('Dict'):
+                            key_type, value_type = self._dict_item_types_for_value(val)
+                            self._mark_dict_item_types(alloca, key_type, value_type)
                         self._mark_unsigned(alloca, self._is_unsigned_value(val))
             else:
                 # 无类型无初值，默认 i32
                 alloca = self.builder.alloca(ir.IntType(32), name=name)
                 self._emit_lock_access(name, "write", lambda: self.builder.store(ir.Constant(ir.IntType(32), 0), alloca))
                 self.locals[name] = alloca
+                self._remember_type_name(name, ir.IntType(32))
                 self._mark_unsigned(alloca, False)
 
     # ==================== 类型别名 ====================
@@ -1554,6 +2551,11 @@ class LLVMCodeGenerator(EzLangVisitor):
         """注册结构体类型 → LLVM IdentifiedStructType"""
         self._non_extern_decls_seen += 1
         name = ctx.TYPE_IDENTIFIER().getText()
+        if ctx.genericParams() is not None:
+            self.struct_generic_params[name] = [t.getText() for t in ctx.genericParams().TYPE_IDENTIFIER()]
+            self.struct_generic_templates[name] = ctx
+            return None
+
         struct_type = ir.global_context.get_identified_type(name)
         self.structs[name] = struct_type
         field_names = []
@@ -1561,6 +2563,7 @@ class LLVMCodeGenerator(EzLangVisitor):
         field_unsigned = []
 
         defaults = {}
+        methods = []
         for member_ctx in ctx.structMember():
             # 字段
             field_ctx = member_ctx.structField()
@@ -1592,16 +2595,10 @@ class LLVMCodeGenerator(EzLangVisitor):
             method_ctx = member_ctx.structMethod()
             if method_ctx is not None:
                 mname = method_ctx.VAR_IDENTIFIER().getText()
-                fn_lit = method_ctx.functionLiteral()
-                sig = method_ctx.functionSignature()
                 if name not in self.struct_methods:
                     self.struct_methods[name] = {}
                 self.struct_methods[name][mname] = f"{name}_{mname}"
-                if fn_lit is not None:
-                    func_name = f"{name}_{mname}"
-                    self._gen_method_func(func_name, fn_lit, name)
-                elif sig is not None:
-                    self._declare_method_signature(f"{name}_{mname}", sig)
+                methods.append((mname, method_ctx.functionLiteral(), method_ctx.functionSignature()))
 
         if not struct_type.elements:
             struct_type.set_body(*field_types)
@@ -1609,19 +2606,32 @@ class LLVMCodeGenerator(EzLangVisitor):
         self.struct_fields[name] = field_names
         self._struct_field_unsigned[name] = field_unsigned
         self.struct_defaults[name] = defaults
+        for mname, fn_lit, sig in methods:
+            func_name = f"{name}_{mname}"
+            if fn_lit is not None:
+                self._gen_method_func(func_name, fn_lit, name)
+            elif sig is not None:
+                self._declare_method_signature(func_name, sig)
         return None
 
     def _declare_method_signature(self, func_name: str, sig_ctx):
         """结构体方法签名声明：只生成外部函数原型。"""
         ret_type = self._map_type(sig_ctx.type_())
         self.func_return_unsigned[func_name] = self._type_ctx_is_unsigned(sig_ctx.type_())
+        ret_dict_types = self._dict_types_from_type_ctx(sig_ctx.type_())
+        if ret_dict_types is not None:
+            self.func_return_dict_types[func_name] = ret_dict_types
         param_types = []
         param_names = []
         params = sig_ctx.paramList()
         if params is not None:
-            for p in params.param():
-                param_types.append(self._map_type(p.type_()))
-                param_names.append(p.VAR_IDENTIFIER().getText())
+            for index, p in enumerate(params.param()):
+                pname = p.VAR_IDENTIFIER().getText()
+                ptype = self._map_type(p.type_())
+                if index == 0 and pname == 'this' and isinstance(ptype, (ir.LiteralStructType, ir.IdentifiedStructType)):
+                    ptype = ir.PointerType(ptype)
+                param_types.append(ptype)
+                param_names.append(pname)
         if func_name in self.module.globals:
             return self.module.globals[func_name]
         func = ir.Function(self.module, ir.FunctionType(ret_type, param_types), func_name)
@@ -1634,13 +2644,20 @@ class LLVMCodeGenerator(EzLangVisitor):
         """生成结构体方法对应的 LLVM 函数"""
         ret_type = self._map_type(fn_lit_ctx.type_())
         self.func_return_unsigned[func_name] = self._type_ctx_is_unsigned(fn_lit_ctx.type_())
+        ret_dict_types = self._dict_types_from_type_ctx(fn_lit_ctx.type_())
+        if ret_dict_types is not None:
+            self.func_return_dict_types[func_name] = ret_dict_types
         param_types = []
         param_names = []
         params = fn_lit_ctx.paramList()
         if params is not None:
-            for p in params.param():
-                param_types.append(self._map_type(p.type_()))
-                param_names.append(p.VAR_IDENTIFIER().getText())
+            for index, p in enumerate(params.param()):
+                pname = p.VAR_IDENTIFIER().getText()
+                ptype = self._map_type(p.type_())
+                if index == 0 and pname == 'this' and isinstance(ptype, (ir.LiteralStructType, ir.IdentifiedStructType)):
+                    ptype = ir.PointerType(ptype)
+                param_types.append(ptype)
+                param_names.append(pname)
 
         func_type = ir.FunctionType(ret_type, param_types)
         func = ir.Function(self.module, func_type, func_name)
@@ -1658,31 +2675,32 @@ class LLVMCodeGenerator(EzLangVisitor):
             prev_func = self.current_function
             prev_locals = self.locals
             prev_unsigned = self._save_unsigned_state()
+            prev_type_names = self._locals_type_names
 
             self.builder = ir.IRBuilder(entry)
             self.current_function = func
             self.locals = {}
+            throw_exit = func.append_basic_block('throw_exit')
+            self._function_throw_exit_stack.append(throw_exit)
+            self._function_return_type_ctx_stack.append(fn_lit_ctx.type_())
+            self._locals_type_names = {}
 
             for i, pn in enumerate(param_names):
-                alloca = self.builder.alloca(param_types[i], name=pn)
-                self.builder.store(func.args[i], alloca)
-                self.locals[pn] = alloca
+                alloca = self._bind_function_param(pn, param_types[i], func.args[i], this_ref=(i == 0 and pn == 'this'))
                 param_ctx = params.param()[i] if params is not None else None
+                self._remember_type_name(pn, param_types[i], param_ctx.type_() if param_ctx is not None else None)
                 if param_ctx is not None:
                     self._mark_unsigned(alloca, self._type_ctx_is_unsigned(param_ctx.type_()))
                     self._mark_list_elem_unsigned(alloca, self._type_ctx_is_unsigned(param_ctx.type_()))
 
-            self._eval(body)
-
-            if not self.builder.block.is_terminated:
-                if ret_type == ir.VoidType():
-                    self.builder.ret_void()
-                else:
-                    self.builder.ret(self._zero_constant(ret_type))
+            val = self._eval(body)
+            self._finish_function_with_throw_exit(ret_type, val)
+            self._function_return_type_ctx_stack.pop()
 
             self.builder = prev_builder
             self.current_function = prev_func
             self.locals = prev_locals
+            self._locals_type_names = prev_type_names
             self._restore_unsigned_state(prev_unsigned)
 
     # ==================== 函数声明 ====================
@@ -1710,6 +2728,9 @@ class LLVMCodeGenerator(EzLangVisitor):
         """从函数字面量生成 LLVM 函数"""
         ret_type = self._map_type(fn_lit_ctx.type_())
         self.func_return_unsigned[name] = self._type_ctx_is_unsigned(fn_lit_ctx.type_())
+        ret_dict_types = self._dict_types_from_type_ctx(fn_lit_ctx.type_())
+        if ret_dict_types is not None:
+            self.func_return_dict_types[name] = ret_dict_types
         param_types = []
         params = fn_lit_ctx.paramList()
         param_names = []
@@ -1740,9 +2761,14 @@ class LLVMCodeGenerator(EzLangVisitor):
         old_func = self.current_function
         old_locals = self.locals
         old_unsigned = self._save_unsigned_state()
+        old_type_names = self._locals_type_names
         self.builder = ir.IRBuilder(block)
         self.current_function = func
         self.locals = {}
+        self._locals_type_names = {}
+        throw_exit = func.append_basic_block('throw_exit')
+        self._function_throw_exit_stack.append(throw_exit)
+        self._function_return_type_ctx_stack.append(fn_lit_ctx.type_())
 
         # 参数 alloca
         for i, pn in enumerate(param_names):
@@ -1750,26 +2776,24 @@ class LLVMCodeGenerator(EzLangVisitor):
             self.builder.store(func.args[i], alloca)
             self.locals[pn] = alloca
             param_ctx = params.param()[i] if params is not None else None
+            self._remember_type_name(pn, param_types[i], param_ctx.type_() if param_ctx is not None else None)
             if param_ctx is not None:
                 self._mark_unsigned(alloca, self._type_ctx_is_unsigned(param_ctx.type_()))
                 self._mark_list_elem_unsigned(alloca, self._type_ctx_is_unsigned(param_ctx.type_()))
 
         # 函数体
         body = fn_lit_ctx.block() or fn_lit_ctx.expression()
+        val = None
         if body is not None:
             val = self._eval(body)
 
-        if not block.is_terminated:
-            if isinstance(ret_type, ir.VoidType):
-                self.builder.ret_void()
-            elif isinstance(val, ir.Value) and not isinstance(val.type, ir.VoidType):
-                self.builder.ret(val)
-            else:
-                self.builder.ret_void()
+        self._finish_function_with_throw_exit(ret_type, val)
+        self._function_return_type_ctx_stack.pop()
 
         self.builder = old_builder
         self.current_function = old_func
         self.locals = old_locals
+        self._locals_type_names = old_type_names
         self._restore_unsigned_state(old_unsigned)
         return func
 
@@ -1786,6 +2810,11 @@ class LLVMCodeGenerator(EzLangVisitor):
 
     def _is_float(self, typ):
         return isinstance(typ, (ir.FloatType, ir.DoubleType))
+
+    def _is_float_or_float_vector(self, typ):
+        if self._is_float(typ):
+            return True
+        return isinstance(typ, ir.VectorType) and self._is_float(typ.element)
 
     # ==================== 字符串插值 ====================
 
@@ -1895,9 +2924,33 @@ class LLVMCodeGenerator(EzLangVisitor):
                 return ir.Constant(ir.PointerType(ir.IntType(8)), None)
             return ptr
         try:
-            return ir.Constant(ir.IntType(32), int(text, 0))
+            value = int(text, 0)
+            return ir.Constant(self._integer_literal_type(value), value)
         except ValueError:
             return None
+
+    def _integer_literal_type(self, value: int) -> ir.IntType:
+        """未标注类型的整数字面量默认使用能容纳其值的最小内置整型。"""
+        return ir.IntType(32) if -(2 ** 31) <= value <= (2 ** 31 - 1) else ir.IntType(64)
+
+    def _global_const_initializer(self, ctx, target_type: ir.Type) -> Optional[ir.Constant]:
+        """将可编译期求值的字面量写入全局 initializer。"""
+        if ctx is None:
+            return None
+        text = ctx.getText()
+        if isinstance(target_type, ir.IntType):
+            if text == 'true' or text == 'false':
+                return ir.Constant(target_type, int(text == 'true'))
+            try:
+                return ir.Constant(target_type, int(text, 0))
+            except ValueError:
+                return None
+        if isinstance(target_type, (ir.FloatType, ir.DoubleType)):
+            try:
+                return ir.Constant(target_type, float(text))
+            except ValueError:
+                return None
+        return None
 
     # 字面量
     def visitLiteralExpr(self, ctx: EzLangParser.LiteralExprContext):
@@ -1908,10 +2961,10 @@ class LLVMCodeGenerator(EzLangVisitor):
         if lit.INTEGER_LITERAL() is not None:
             val_text = lit.INTEGER_LITERAL().getText()
             try:
-                val = int(val_text)
-            except ValueError:
                 val = int(val_text, 0)
-            return ir.Constant(ir.IntType(32), val)
+            except ValueError:
+                val = 0
+            return ir.Constant(self._integer_literal_type(val), val)
 
         if lit.FLOAT_LITERAL() is not None:
             return ir.Constant(ir.DoubleType(), float(lit.FLOAT_LITERAL().getText()))
@@ -1943,6 +2996,7 @@ class LLVMCodeGenerator(EzLangVisitor):
             name = self._monomorphize(name, type_args)
 
         if name in self.locals:
+            self._join_flow_future(name)
             alloca = self.locals[name]
             if isinstance(alloca.type.pointee, (ir.IdentifiedStructType, ir.LiteralStructType, ir.ArrayType)):
                 return alloca
@@ -1954,6 +3008,8 @@ class LLVMCodeGenerator(EzLangVisitor):
             if isinstance(gv.type.pointee, (ir.IdentifiedStructType, ir.LiteralStructType, ir.ArrayType)):
                 return gv
             return self._emit_lock_access(name, "read", lambda: self._load_with_unsigned(gv, name=name))
+        if name in self.structs or name in self.type_aliases or name in {"I8", "I32", "I64", "U8", "U32", "U64", "F32", "F64", "Str", "Bool", "Void", "List", "Dict", "Vec"}:
+            return ir.Constant(ir.IntType(32), self._type_id(name))
         return ir.Constant(ir.IntType(32), 0)
 
     def _monomorphize(self, base_name: str, type_args: list[ir.Type]) -> str:
@@ -1990,6 +3046,9 @@ class LLVMCodeGenerator(EzLangVisitor):
             # 泛型 declare：只生成外部函数声明（无函数体）
             gen_ctx = template_ctx
             ret_type = self._map_type_with_map(gen_ctx.type_(), type_map)
+            ret_dict_types = self._dict_types_from_type_ctx_with_map(gen_ctx.type_(), type_map)
+            if ret_dict_types is not None:
+                self.func_return_dict_types[mono_name] = ret_dict_types
             orig_param_names = []
             param_types = []
             ptl = gen_ctx.paramTypeList()
@@ -2004,13 +3063,16 @@ class LLVMCodeGenerator(EzLangVisitor):
                     param_types.append(ptype)
 
             uses_sret = self._uses_c_sret(ret_type)
-            abi_ret_type = ir.VoidType() if uses_sret else ret_type
+            bridged_ret_type = self._c_abi_return_type(ret_type)
+            abi_ret_type = ir.VoidType() if uses_sret else bridged_ret_type
             abi_param_types = ([ir.PointerType(ret_type)] if uses_sret else []) + param_types
             func_type = ir.FunctionType(abi_ret_type, abi_param_types)
             func = ir.Function(self.module, func_type, mono_name)
             if uses_sret:
                 func.args[0].add_attribute('sret')
                 self._sret_functions[mono_name] = ret_type
+            elif bridged_ret_type != ret_type:
+                self._c_abi_return_bridges[mono_name] = (ret_type, bridged_ret_type)
             offset = 1 if uses_sret else 0
             for i, pn in enumerate(orig_param_names):
                 func.args[i + offset].name = pn
@@ -2021,6 +3083,9 @@ class LLVMCodeGenerator(EzLangVisitor):
         fn_lit = template_ctx.functionLiteral()
 
         ret_type = self._map_type_with_map(fn_lit.type_(), type_map)
+        ret_dict_types = self._dict_types_from_type_ctx_with_map(fn_lit.type_(), type_map)
+        if ret_dict_types is not None:
+            self.func_return_dict_types[mono_name] = ret_dict_types
         orig_param_names = []
         param_types = []
         params = fn_lit.paramList()
@@ -2046,32 +3111,43 @@ class LLVMCodeGenerator(EzLangVisitor):
             prev_func = self.current_function
             prev_locals = self.locals
             prev_unsigned = self._save_unsigned_state()
+            prev_type_names = self._locals_type_names
 
             self.builder = ir.IRBuilder(entry)
             self.current_function = func
             self.locals = {}
+            self._locals_type_names = {}
+            self._generic_type_map_stack.append(type_map)
+            throw_exit = func.append_basic_block('throw_exit')
+            self._function_throw_exit_stack.append(throw_exit)
+            self._function_return_type_ctx_stack.append(fn_lit.type_())
 
             for i, pn in enumerate(orig_param_names):
-                alloca = self.builder.alloca(param_types[i], name=pn)
-                self.builder.store(func.args[i], alloca)
-                self.locals[pn] = alloca
+                alloca = self._bind_function_param(pn, param_types[i], func.args[i])
+                self._remember_type_name(pn, param_types[i])
 
-            self._eval(body)
-
-            if not self.builder.block.is_terminated:
-                if isinstance(ret_type, ir.VoidType):
-                    self.builder.ret_void()
-                else:
-                    self.builder.ret(self._zero_constant(ret_type))
+            val = self._eval(body)
+            self._finish_function_with_throw_exit(ret_type, val)
+            self._function_return_type_ctx_stack.pop()
+            self._generic_type_map_stack.pop()
 
             self.builder = prev_builder
             self.current_function = prev_func
             self.locals = prev_locals
+            self._locals_type_names = prev_type_names
             self._restore_unsigned_state(prev_unsigned)
 
         return mono_name
 
     def _map_type_with_map(self, ctx, type_map: dict[str, ir.Type]) -> ir.Type:
+        prev_mapping = self._mapping_with_map
+        self._mapping_with_map = True
+        try:
+            return self._map_type_with_map_impl(ctx, type_map)
+        finally:
+            self._mapping_with_map = prev_mapping
+
+    def _map_type_with_map_impl(self, ctx, type_map: dict[str, ir.Type]) -> ir.Type:
         """带泛型参数替换的类型映射 — 递归处理复合类型"""
         if ctx is None:
             return ir.IntType(32)
@@ -2088,6 +3164,11 @@ class LLVMCodeGenerator(EzLangVisitor):
             # 带泛型参数的内置复合类型引用，如 Dict<K, V> / List<T>
             if bt.genericArgs() is not None:
                 args = list(bt.genericArgs().type_())
+                if name in self.struct_generic_templates:
+                    type_args = [self._map_type_with_map(t, type_map) for t in args]
+                    type_arg_unsigned = [self._type_ctx_is_unsigned(t) for t in args]
+                    mono_name = self._monomorphize_struct(name, type_args, type_arg_unsigned)
+                    return self.structs.get(mono_name, self.structs.get(name, ir.IntType(32)))
                 if name == 'Dict':
                     return self.structs['Dict']
                 if name == 'List':
@@ -2100,12 +3181,12 @@ class LLVMCodeGenerator(EzLangVisitor):
             inner = self._map_type_with_map(ctx.type_(), type_map)
             return ir.LiteralStructType([ir.IntType(1), inner])
 
-        # List 类型: List<T> → { data, length, capacity }
+        # List 类型: List<T> → { pages, length, capacity, page_count }
         if isinstance(ctx, P.ListTypeContext):
             inner = self._map_type_with_map(ctx.type_(), type_map)
             return ir.LiteralStructType([ir.PointerType(ir.PointerType(inner)), ir.IntType(64), ir.IntType(64), ir.IntType(64)])
 
-        # 数组类型: T[] → { data, length, capacity }
+        # 数组类型: T[] → { pages, length, capacity, page_count }
         if isinstance(ctx, P.ArrayTypeContext):
             inner = self._map_type_with_map(ctx.type_(), type_map)
             return ir.LiteralStructType([ir.PointerType(ir.PointerType(inner)), ir.IntType(64), ir.IntType(64), ir.IntType(64)])
@@ -2181,7 +3262,25 @@ class LLVMCodeGenerator(EzLangVisitor):
 
     def visitStructLiteral(self, ctx: EzLangParser.StructLiteralContext):
         """创建结构体实例: Point(x = 10, y = 20)"""
-        name = ctx.TYPE_IDENTIFIER().getText()
+        base_name = ctx.TYPE_IDENTIFIER().getText()
+        name = self._struct_name_from_literal(ctx)
+        init_list = ctx.structFieldInitList()
+        precomputed_values: dict[int, ir.Value] = {}
+
+        if ctx.genericArgs() is None and base_name in self.struct_generic_templates and init_list is not None:
+            provided_for_inference: dict[str, ir.Value] = {}
+            for init_ctx in init_list.structFieldInit():
+                if init_ctx.ELLIPSIS() is not None or init_ctx.expression() is None:
+                    continue
+                fname = init_ctx.VAR_IDENTIFIER().getText()
+                val = self._eval(init_ctx.expression())
+                if val is not None:
+                    precomputed_values[id(init_ctx)] = val
+                    provided_for_inference[fname] = val
+            inferred = self._infer_struct_type_args_from_values(base_name, provided_for_inference)
+            if inferred is not None:
+                type_args, type_arg_unsigned = inferred
+                name = self._monomorphize_struct(base_name, type_args, type_arg_unsigned)
         if name not in self.structs:
             return None
         struct_type = self.structs[name]
@@ -2209,7 +3308,6 @@ class LLVMCodeGenerator(EzLangVisitor):
                 self.builder.store(val, ptr)
 
         # 处理字段初始化
-        init_list = ctx.structFieldInitList()
         if init_list is not None:
             for init_ctx in init_list.structFieldInit():
                 # 实例展开: ...instance → 复制 instance 的所有字段
@@ -2240,7 +3338,9 @@ class LLVMCodeGenerator(EzLangVisitor):
 
                 fname = init_ctx.VAR_IDENTIFIER().getText()
                 if fname in field_names and init_ctx.expression() is not None:
-                    val = self._eval(init_ctx.expression())
+                    val = precomputed_values.get(id(init_ctx))
+                    if val is None:
+                        val = self._eval(init_ctx.expression())
                     _set_field(fname, val)
                     provided_fields.add(fname)
 
@@ -2256,8 +3356,84 @@ class LLVMCodeGenerator(EzLangVisitor):
     def visitStructLiteralExpr(self, ctx: EzLangParser.StructLiteralExprContext):
         return self.visitStructLiteral(ctx.structLiteral())
 
+    def _optional_safe_member_access(self, optional_ctx, field_name: str) -> ir.Value | None:
+        """生成 opt?.field：空值返回空可选，非空时读取字段并包装。"""
+        opt_val = self._eval(optional_ctx.postfixExpression())
+        if opt_val is None or not hasattr(opt_val, 'type'):
+            return None
+        opt_type = opt_val.type.pointee if isinstance(opt_val.type, ir.PointerType) else opt_val.type
+        if not self._is_optional_type(opt_type):
+            return None
+        value_type = opt_type.elements[1]
+        if not isinstance(value_type, (ir.IdentifiedStructType, ir.LiteralStructType)):
+            return None
+        if not isinstance(opt_val.type, ir.PointerType):
+            tmp = self.builder.alloca(opt_type, name='_optional_chain_tmp')
+            self.builder.store(opt_val, tmp)
+            opt_val = tmp
+
+        field_names = None
+        if isinstance(value_type, ir.IdentifiedStructType):
+            field_names = self.struct_fields.get(value_type.name, [])
+        if field_names is None and self._is_optional_type(value_type):
+            field_names = ['ok', 'value']
+        if not field_names or field_name not in field_names:
+            return None
+        field_index = field_names.index(field_name)
+        field_type = value_type.elements[field_index]
+        result_type = ir.LiteralStructType([ir.IntType(1), field_type])
+        result_ptr = self.builder.alloca(result_type, name='_optional_chain_result')
+        self.builder.store(self._optional_value(field_type, False), result_ptr)
+
+        ok_ptr = self.builder.gep(opt_val, [
+            ir.Constant(ir.IntType(32), 0),
+            ir.Constant(ir.IntType(32), 0),
+        ], inbounds=True)
+        ok = self.builder.load(ok_ptr, name='_optional_chain_ok')
+        value_block = self.builder.append_basic_block('optional_chain_value')
+        done_block = self.builder.append_basic_block('optional_chain_done')
+        self.builder.cbranch(ok, value_block, done_block)
+
+        self.builder.position_at_start(value_block)
+        value_ptr = self.builder.gep(opt_val, [
+            ir.Constant(ir.IntType(32), 0),
+            ir.Constant(ir.IntType(32), 1),
+        ], inbounds=True)
+        field_ptr = self.builder.gep(value_ptr, [
+            ir.Constant(ir.IntType(32), 0),
+            ir.Constant(ir.IntType(32), field_index),
+        ], inbounds=True)
+        field_value = field_ptr if isinstance(field_type, (ir.IdentifiedStructType, ir.LiteralStructType, ir.ArrayType)) else self._load_with_unsigned(field_ptr, name=field_name)
+        self.builder.store(self._optional_value(field_type, True, field_value), result_ptr)
+        self.builder.branch(done_block)
+
+        self.builder.position_at_start(done_block)
+        return self.builder.load(result_ptr, name='_optional_chain_value')
+
     def _gen_struct_literal_from_call(self, struct_name: str, call_ctx):
         """从 CallContext 生成结构体实例（当语法解析为 # call 路径时）"""
+        base_name = struct_name
+        if struct_name not in self.structs and struct_name in self.struct_generic_templates:
+            target = call_ctx.postfixExpression() if hasattr(call_ctx, 'postfixExpression') else None
+            ident = self._leftmost_identifier_ctx(target)
+            if ident is not None:
+                struct_name = self._struct_name_from_generic_args(struct_name, ident.genericArgs())
+        precomputed_values: dict[str, ir.Value] = {}
+        args = call_ctx.namedArgList()
+        if struct_name == base_name and struct_name not in self.structs and base_name in self.struct_generic_templates and args is not None:
+            provided_for_inference: dict[str, ir.Value] = {}
+            for a in args.namedArg():
+                if a.VAR_IDENTIFIER() is None or a.expression() is None:
+                    continue
+                fname = a.VAR_IDENTIFIER().getText()
+                val = self._eval(a.expression())
+                if val is not None:
+                    precomputed_values[fname] = val
+                    provided_for_inference[fname] = val
+            inferred = self._infer_struct_type_args_from_values(base_name, provided_for_inference)
+            if inferred is not None:
+                type_args, type_arg_unsigned = inferred
+                struct_name = self._monomorphize_struct(base_name, type_args, type_arg_unsigned)
         if struct_name not in self.structs:
             return None
         struct_type = self.structs[struct_name]
@@ -2273,7 +3449,7 @@ class LLVMCodeGenerator(EzLangVisitor):
                 field_type = struct_type.elements[idx]
                 if val.type != field_type:
                     if isinstance(val.type, ir.IntType) and isinstance(field_type, ir.IntType):
-                        val = self.builder.zext(val, field_type) if val.type.width < field_type.width else self.builder.trunc(val, field_type)
+                        val = self._coerce_integer_value(val, field_type)
                     elif isinstance(val.type, ir.IntType) and isinstance(field_type, ir.PointerType):
                         val = self.builder.inttoptr(val, field_type)
                     elif isinstance(val.type, ir.PointerType) and isinstance(field_type, ir.IntType):
@@ -2286,13 +3462,14 @@ class LLVMCodeGenerator(EzLangVisitor):
 
         # 处理命名参数（等价于结构体字段初始化）
         provided = set()
-        args = call_ctx.namedArgList()
         if args and args.namedArg():
             for a in args.namedArg():
                 if a.VAR_IDENTIFIER() is None or a.expression() is None:
                     continue
                 fname = a.VAR_IDENTIFIER().getText()
-                val = self._eval(a.expression())
+                val = precomputed_values.get(fname)
+                if val is None:
+                    val = self._eval(a.expression())
                 _set_field(fname, val)
                 provided.add(fname)
 
@@ -2307,6 +3484,11 @@ class LLVMCodeGenerator(EzLangVisitor):
 
     def visitMemberAccess(self, ctx: EzLangParser.MemberAccessContext):
         """对象字段访问: obj.field 或方法访问: obj.method"""
+        if isinstance(ctx.postfixExpression(), EzLangParser.OptionalUnwrapContext):
+            safe_value = self._optional_safe_member_access(ctx.postfixExpression(), ctx.VAR_IDENTIFIER().getText())
+            if safe_value is not None:
+                return safe_value
+
         obj_ptr = self._eval(ctx.postfixExpression())
         if obj_ptr is None:
             return None
@@ -2318,10 +3500,35 @@ class LLVMCodeGenerator(EzLangVisitor):
 
         struct_name = pointee.name if isinstance(pointee, ir.IdentifiedStructType) else None
 
-        if isinstance(pointee, ir.LiteralStructType) and len(pointee.elements) == 2 and pointee.elements[0] == ir.IntType(1):
+        if self._is_list_type(pointee):
+            list_fields = {'pages': 0, 'length': 1, 'capacity': 2, 'page_count': 3}
+            if field_name in list_fields:
+                idx = list_fields[field_name]
+                gep = self.builder.gep(obj_ptr, [
+                    ir.Constant(ir.IntType(32), 0),
+                    ir.Constant(ir.IntType(32), idx)
+                ], inbounds=True)
+                if idx == 0:
+                    return self.builder.load(gep, name=field_name)
+                return self._load_with_unsigned(gep, name=field_name)
+
+        if self._is_optional_type(pointee):
             optional_fields = {'ok': 0, 'value': 1}
             if field_name in optional_fields:
                 idx = optional_fields[field_name]
+                gep = self.builder.gep(obj_ptr, [
+                    ir.Constant(ir.IntType(32), 0),
+                    ir.Constant(ir.IntType(32), idx)
+                ], inbounds=True)
+                field_type = pointee.elements[idx]
+                if isinstance(field_type, (ir.IdentifiedStructType, ir.LiteralStructType, ir.ArrayType)):
+                    return gep
+                return self._load_with_unsigned(gep, name=field_name)
+
+        if self._is_union_type(pointee):
+            union_fields = {'tag': 0, 'value': 1}
+            if field_name in union_fields:
+                idx = union_fields[field_name]
                 gep = self.builder.gep(obj_ptr, [
                     ir.Constant(ir.IntType(32), 0),
                     ir.Constant(ir.IntType(32), idx)
@@ -2405,7 +3612,7 @@ class LLVMCodeGenerator(EzLangVisitor):
 
         for i, v in enumerate(values):
             if v.type != elem_type and isinstance(v.type, ir.IntType) and isinstance(elem_type, ir.IntType):
-                v = self.builder.zext(v, elem_type) if v.type.width < elem_type.width else self.builder.trunc(v, elem_type)
+                v = self._coerce_integer_value(v, elem_type)
             page_ptr = current_pages[i // page_size]
             ptr = self.builder.gep(page_ptr, [
                 ir.Constant(ir.IntType(32), 0),
@@ -2439,16 +3646,21 @@ class LLVMCodeGenerator(EzLangVisitor):
         dict_type = self.structs['Dict']
         alloca = self._arena_allocate(dict_type, name="_tmp_dict")
         self.builder.store(self._zero_constant(dict_type), alloca)
+        key_type = ir.PointerType(ir.IntType(8))
+        value_type = ir.PointerType(ir.IntType(8))
+        saw_value_type = False
         for f in fields:
             key = self._dict_key_value(f)
+            if key.type != ir.PointerType(ir.IntType(8)):
+                key_type = key.type
             val = self._eval(f.expression())
             if isinstance(val, ir.AllocaInstr):
                 val = self.builder.load(val)
-            if val is not None and val.type != ir.PointerType(ir.IntType(8)):
-                tmp = self.builder.alloca(val.type, name="_dict_val")
-                self.builder.store(val, tmp)
-                val = self.builder.bitcast(tmp, ir.PointerType(ir.IntType(8)))
+            if val is not None and not saw_value_type:
+                value_type = val.type
+                saw_value_type = True
             self._gen_dict_set(alloca, key, val)
+        self._mark_dict_item_types(alloca, key_type, value_type)
         return alloca
 
     def visitDictExpr(self, ctx: EzLangParser.DictExprContext):
@@ -2465,25 +3677,192 @@ class LLVMCodeGenerator(EzLangVisitor):
     def visitMarkupExpr(self, ctx: EzLangParser.MarkupExprContext):
         return self.visitMarkupLiteral(ctx.markupLiteral())
 
+    def _markup_attr_value(self, attr) -> ir.Value | None:
+        if attr.expression() is not None:
+            return self._eval(attr.expression())
+        if attr.STRING_LITERAL() is not None:
+            text = attr.STRING_LITERAL().getText()[1:-1]
+            return self._make_global_string(text, prefix="_markup_attr")
+        if attr.INTEGER_LITERAL() is not None:
+            return ir.Constant(ir.IntType(32), int(attr.INTEGER_LITERAL().getText(), 0))
+        if attr.BOOL_LITERAL() is not None:
+            return ir.Constant(ir.IntType(1), int(attr.BOOL_LITERAL().getText() == 'true'))
+        return None
+
+    def _markup_child_value(self, child) -> ir.Value | None:
+        if child.markupLiteral() is not None:
+            return self.visitMarkupLiteral(child.markupLiteral())
+        if child.expression() is not None:
+            return self._eval(child.expression())
+        if child.STRING_LITERAL() is not None:
+            return self._make_global_string(child.STRING_LITERAL().getText()[1:-1], prefix="_markup_child")
+        return None
+
+    def _markup_children_array(self, children) -> ir.Value:
+        values = []
+        for child in children:
+            value = self._markup_child_value(child)
+            if value is None:
+                continue
+            if isinstance(value, ir.AllocaInstr):
+                value = self.builder.load(value)
+            values.append((child, value))
+
+        elem_type = values[0][1].type if values else ir.PointerType(ir.IntType(8))
+        i64 = ir.IntType(64)
+        page_size = 8
+        page_count = max((len(values) + page_size - 1) // page_size, 1)
+        arr_type = ir.LiteralStructType([ir.PointerType(ir.PointerType(elem_type)), i64, i64, i64])
+        alloca = self._arena_allocate(arr_type, name="_markup_children")
+        page_table_type = ir.ArrayType(ir.PointerType(elem_type), page_count)
+        page_table = self._arena_allocate(page_table_type, name="_markup_children_pages")
+        page_ptrs = []
+        for page_idx in range(page_count):
+            page_type = ir.ArrayType(elem_type, page_size)
+            page_ptr = self._arena_allocate(page_type, name="_markup_children_page")
+            page_base = self.builder.gep(page_ptr, [
+                ir.Constant(ir.IntType(32), 0),
+                ir.Constant(ir.IntType(32), 0)
+            ], inbounds=True)
+            page_slot = self.builder.gep(page_table, [
+                ir.Constant(ir.IntType(32), 0),
+                ir.Constant(ir.IntType(32), page_idx)
+            ], inbounds=True)
+            self.builder.store(page_base, page_slot)
+            page_ptrs.append(page_ptr)
+
+        for index, (child, value) in enumerate(values):
+            if value.type != elem_type:
+                coerced = self._coerce_value(value, elem_type)
+                if coerced.type != elem_type:
+                    self._extern_diagnostics.append(
+                        f"行 {child.start.line}: 标记子节点类型不一致"
+                    )
+                    value = self._zero_constant(elem_type)
+                else:
+                    value = coerced
+            page_ptr = page_ptrs[index // page_size]
+            slot = self.builder.gep(page_ptr, [
+                ir.Constant(ir.IntType(32), 0),
+                ir.Constant(ir.IntType(32), index % page_size)
+            ], inbounds=True)
+            self.builder.store(value, slot)
+
+        pages_base = self.builder.gep(page_table, [
+            ir.Constant(ir.IntType(32), 0),
+            ir.Constant(ir.IntType(32), 0)
+        ], inbounds=True)
+        self.builder.store(pages_base, self._list_field_ptr(alloca, 0))
+        self.builder.store(ir.Constant(i64, len(values)), self._list_field_ptr(alloca, 1))
+        self.builder.store(ir.Constant(i64, page_count * page_size), self._list_field_ptr(alloca, 2))
+        self.builder.store(ir.Constant(i64, page_count), self._list_field_ptr(alloca, 3))
+        return alloca
+
+    def _markup_list_type_mismatch(self, actual: ir.Type, expected: ir.Type) -> bool:
+        if isinstance(actual, ir.PointerType):
+            actual = actual.pointee
+        if isinstance(expected, ir.PointerType):
+            expected = expected.pointee
+        if not (self._is_list_type(actual) and self._is_list_type(expected)):
+            return False
+        actual_elem = actual.elements[0].pointee.pointee
+        expected_elem = expected.elements[0].pointee.pointee
+        return not self._markup_ir_types_compatible(actual_elem, expected_elem)
+
+    def _markup_ir_types_compatible(self, actual: ir.Type, expected: ir.Type) -> bool:
+        if actual == expected:
+            return True
+        if isinstance(actual, ir.IntType) and isinstance(expected, ir.IntType):
+            return True
+        if isinstance(actual, (ir.FloatType, ir.DoubleType)) and isinstance(expected, (ir.FloatType, ir.DoubleType)):
+            return True
+        if isinstance(expected, ir.LiteralStructType) and len(expected.elements) == 2 and expected.elements[0] == ir.IntType(1):
+            return self._markup_ir_types_compatible(actual, expected.elements[1])
+        return False
+
+    def _markup_prepare_arg(self, tag_name: str, param_name: str, value: ir.Value,
+                            expected_type: ir.Type, line: int) -> ir.Value:
+        if self._markup_list_type_mismatch(value.type, expected_type):
+            self._extern_diagnostics.append(
+                f"行 {line}: 参数 '{param_name}' 类型不匹配"
+            )
+            return self._zero_constant(expected_type)
+        coerced = self._coerce_value(value, expected_type)
+        if coerced.type != expected_type and self._is_aggregate_ptr(coerced):
+            coerced = self._load_if_aggregate_ptr(coerced)
+        if coerced.type != expected_type:
+            self._extern_diagnostics.append(
+                f"行 {line}: 标记 '<{tag_name}>' 参数 '{param_name}' 类型不匹配"
+            )
+            return self._zero_constant(expected_type)
+        return coerced
+
+    def _markup_factory_call(self, tag_name: str, ctx: EzLangParser.MarkupLiteralContext) -> ir.Value | None:
+        func = self.module.globals.get(tag_name)
+        if not isinstance(func, ir.Function):
+            return None
+
+        expected_names = self.func_param_names.get(tag_name, [])
+        expected_name_set = set(expected_names)
+        provided = {}
+        for attr in ctx.markupAttr():
+            attr_name = attr.VAR_IDENTIFIER().getText()
+            value = self._markup_attr_value(attr)
+            if value is not None:
+                provided[attr_name] = value
+        if ctx.markupChild():
+            provided['children'] = self._markup_children_array(ctx.markupChild())
+
+        for pname in provided:
+            if pname not in expected_name_set:
+                self._extern_diagnostics.append(f"行 {ctx.start.line}: 未知参数 '{pname}'")
+
+        call_args = []
+        defaults = self.func_defaults.get(tag_name, {})
+        abi_arg_types = list(func.function_type.args)
+        if expected_names:
+            for index, pname in enumerate(expected_names):
+                param_type = abi_arg_types[index] if index < len(abi_arg_types) else ir.IntType(32)
+                if pname in provided:
+                    call_args.append(self._markup_prepare_arg(tag_name, pname, provided[pname], param_type, ctx.start.line))
+                elif pname in defaults:
+                    default_value = self._eval(defaults[pname])
+                    if default_value is None:
+                        call_args.append(self._zero_constant(param_type))
+                    else:
+                        call_args.append(self._markup_prepare_arg(tag_name, pname, default_value, param_type, ctx.start.line))
+                else:
+                    self._extern_diagnostics.append(f"行 {ctx.start.line}: 缺少必填参数 '{pname}'")
+                    call_args.append(self._zero_constant(param_type))
+        while len(call_args) < len(abi_arg_types):
+            call_args.append(self._zero_constant(abi_arg_types[len(call_args)]))
+        if len(call_args) > len(abi_arg_types):
+            call_args = call_args[:len(abi_arg_types)]
+        return self.builder.call(func, call_args)
+
     def visitMarkupLiteral(self, ctx: EzLangParser.MarkupLiteralContext):
         names = ctx.VAR_IDENTIFIER()
         tag_name = names[0].getText() if names else "tag"
+        factory_value = self._markup_factory_call(tag_name, ctx)
+        if factory_value is not None:
+            return factory_value
         for attr in ctx.markupAttr():
-            if attr.expression() is not None:
-                self._eval(attr.expression())
+            self._markup_attr_value(attr)
         for child in ctx.markupChild():
-            if child.markupLiteral() is not None:
-                self.visitMarkupLiteral(child.markupLiteral())
-            elif child.expression() is not None:
-                self._eval(child.expression())
-        return self._make_global_string(tag_name, prefix="_markup")
+            self._markup_child_value(child)
+        self._extern_diagnostics.append(
+            f"行 {ctx.start.line}: 标记 '<{tag_name}>' 需要作用域内存在同名工厂函数 '{tag_name}'"
+        )
+        return ir.Constant(ir.IntType(32), 0)
 
     # ==================== typeof 表达式 ====================
 
     def visitTypeofExpr(self, ctx: EzLangParser.TypeofExprContext):
         """typeof 表达式：返回稳定类型 ID。"""
-        target = ctx.type_() if ctx.type_() is not None else ctx.expression()
-        type_name = self._typeof_name(target)
+        if ctx.type_() is not None:
+            type_name = self._type_ctx_name(ctx.type_())
+        else:
+            type_name = self._typeof_name_from_expr(ctx.unaryExpression())
         return ir.Constant(ir.IntType(32), self._type_id(type_name))
 
     def visitTypeofPrimaryExpr(self, ctx: EzLangParser.TypeofPrimaryExprContext):
@@ -2504,6 +3883,8 @@ class LLVMCodeGenerator(EzLangVisitor):
             exit_block = self.builder.append_basic_block(name="flow_exit")
             self._parallel_result_stack.append(result_alloca)
             self._parallel_exit_stack.append(exit_block)
+            self._parallel_arena_depth_stack.append(len(self._arena_scope_stack))
+        self._flow_future_stack.append({})
         self._flow_depth += 1
         self._eval(ctx.block())
         self._flow_depth -= 1
@@ -2512,9 +3893,15 @@ class LLVMCodeGenerator(EzLangVisitor):
                 self._parallel_result_stack.pop()
             if self._parallel_exit_stack and self._parallel_exit_stack[-1] is exit_block:
                 self._parallel_exit_stack.pop()
+            if self._parallel_arena_depth_stack:
+                self._parallel_arena_depth_stack.pop()
             if self.builder is not None and not self.builder.block.is_terminated:
                 self.builder.branch(exit_block)
             self.builder.position_at_start(exit_block)
+        if self.builder is not None and not self.builder.block.is_terminated:
+            self._join_pending_flow_futures()
+        if self._flow_future_stack:
+            self._flow_future_stack.pop()
         if self.builder is not None and not self.builder.block.is_terminated:
             self.builder.call(self._flow_exit, [])
         if result_alloca is not None:
@@ -2539,12 +3926,15 @@ class LLVMCodeGenerator(EzLangVisitor):
             exit_block = self.builder.append_basic_block(name="parallel_exit")
             self._parallel_result_stack.append(result_alloca)
             self._parallel_exit_stack.append(exit_block)
+            self._parallel_arena_depth_stack.append(len(self._arena_scope_stack))
         self._eval(ctx.block())
         if result_alloca is not None:
             if self._parallel_result_stack and self._parallel_result_stack[-1] is result_alloca:
                 self._parallel_result_stack.pop()
             if self._parallel_exit_stack and self._parallel_exit_stack[-1] is exit_block:
                 self._parallel_exit_stack.pop()
+            if self._parallel_arena_depth_stack:
+                self._parallel_arena_depth_stack.pop()
             if self.builder is not None and not self.builder.block.is_terminated:
                 self.builder.branch(exit_block)
             self.builder.position_at_start(exit_block)
@@ -2591,6 +3981,10 @@ class LLVMCodeGenerator(EzLangVisitor):
         if pl_array is None:
             return race_hook
 
+        async_result = self._gen_race_i32_runtime_call(pl_array, timeout_arg)
+        if async_result is not None:
+            return async_result
+
         first_branch = self._first_function_literal_in_array(pl_array)
         if first_branch is None:
             return race_hook
@@ -2605,6 +3999,7 @@ class LLVMCodeGenerator(EzLangVisitor):
         exit_block = self.builder.append_basic_block(name="race_exit")
         self._parallel_result_stack.append(result_alloca)
         self._parallel_exit_stack.append(exit_block)
+        self._parallel_arena_depth_stack.append(len(self._arena_scope_stack))
         expr_block = self._find_block_expr_ctx(first_branch.expression()) if first_branch.expression() is not None else None
         if first_branch.block() is not None:
             self._eval(first_branch.block())
@@ -2621,12 +4016,204 @@ class LLVMCodeGenerator(EzLangVisitor):
             self._parallel_result_stack.pop()
         if self._parallel_exit_stack and self._parallel_exit_stack[-1] is exit_block:
             self._parallel_exit_stack.pop()
+        if self._parallel_arena_depth_stack:
+            self._parallel_arena_depth_stack.pop()
         if self.builder is not None and not self.builder.block.is_terminated:
             self.builder.branch(exit_block)
         self.builder.position_at_start(exit_block)
         if isinstance(branch_type, ir.VoidType):
             return race_hook
         return self.builder.load(result_alloca, name="race_value")
+
+    def _function_literals_in_array(self, array_ctx) -> list:
+        expr_list = array_ctx.expressionList() if array_ctx is not None else None
+        if expr_list is None or not expr_list.expression():
+            return []
+        result = []
+        for expr in expr_list.expression():
+            fn = self._find_function_literal_ctx(expr)
+            if fn is None:
+                return []
+            result.append(fn)
+        return result
+
+    def _gen_race_i32_runtime_call(self, array_ctx, timeout_arg: ir.Value) -> ir.Value | None:
+        """把 race(pl=[() => I32, ...]) lower 为真实并发调度。"""
+        branches = self._function_literals_in_array(array_ctx)
+        if not branches:
+            return None
+        i32 = ir.IntType(32)
+        branch_funcs = []
+        for fn_lit in branches:
+            params = fn_lit.paramList()
+            if params is not None and params.param():
+                return None
+            if self._ctx_references_local_capture(fn_lit):
+                return None
+            ret_type = self._infer_function_literal_return_type(fn_lit)
+            if ret_type != i32:
+                return None
+            branch_funcs.append(self._gen_race_i32_branch_function(fn_lit))
+        self._require_runtime()
+        fn_ptr_type = ir.PointerType(ir.FunctionType(i32, []))
+        array_type = ir.ArrayType(fn_ptr_type, len(branch_funcs))
+        array_ptr = self.builder.alloca(array_type, name='_race_branches')
+        for index, func in enumerate(branch_funcs):
+            slot = self.builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, index)], inbounds=True)
+            self.builder.store(func, slot)
+        first_slot = self.builder.gep(array_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        timed_out = self.builder.alloca(i32, name='_race_timed_out')
+        self.builder.store(ir.Constant(i32, 0), timed_out)
+        runtime_type = ir.FunctionType(i32, [ir.PointerType(fn_ptr_type), i32, i32, ir.PointerType(i32)])
+        runtime = self._get_or_declare_function('__ezrt_race_i32', runtime_type)
+        result = self.builder.call(runtime, [first_slot, ir.Constant(i32, len(branch_funcs)), timeout_arg, timed_out], name='_race_i32')
+        self._emit_throw_check_after_call()
+        return result
+
+    def _gen_race_i32_branch_function(self, fn_lit) -> ir.Function:
+        """生成零捕获 race I32 分支函数。"""
+        i32 = ir.IntType(32)
+        name = f"__ez_race_branch_{self._race_branch_counter}"
+        self._race_branch_counter += 1
+        func = ir.Function(self.module, ir.FunctionType(i32, []), name)
+        entry = func.append_basic_block('entry')
+        prev_builder = self.builder
+        prev_func = self.current_function
+        prev_locals = self.locals
+        prev_unsigned = self._save_unsigned_state()
+        prev_type_names = self._locals_type_names
+        prev_flow_depth = self._flow_depth
+        prev_arena_stack = self._arena_scope_stack
+        prev_catch_exit_blocks = self.catch_exit_blocks
+        prev_catch_error_allocas = self.catch_error_allocas
+        prev_catch_result_allocas = self.catch_result_allocas
+        prev_parallel_result_stack = self._parallel_result_stack
+        prev_parallel_exit_stack = self._parallel_exit_stack
+        prev_parallel_arena_depth_stack = self._parallel_arena_depth_stack
+        prev_loop_exit_blocks = self.loop_exit_blocks
+        prev_loop_continue_blocks = self.loop_continue_blocks
+
+        self.builder = ir.IRBuilder(entry)
+        self.current_function = func
+        self.locals = {}
+        self._locals_type_names = {}
+        self._flow_depth = max(prev_flow_depth, 1)
+        self._arena_scope_stack = []
+        self.catch_exit_blocks = []
+        self.catch_error_allocas = []
+        self.catch_result_allocas = []
+        self._parallel_result_stack = []
+        self._parallel_exit_stack = []
+        self._parallel_arena_depth_stack = []
+        self.loop_exit_blocks = []
+        self.loop_continue_blocks = []
+        throw_exit = func.append_basic_block('throw_exit')
+        self._function_throw_exit_stack.append(throw_exit)
+        self._function_return_type_ctx_stack.append(fn_lit.type_())
+
+        body = fn_lit.block() or fn_lit.expression()
+        val = self._eval(body) if body is not None else ir.Constant(i32, 0)
+        self._finish_function_with_throw_exit(i32, val)
+        self._function_return_type_ctx_stack.pop()
+
+        self.builder = prev_builder
+        self.current_function = prev_func
+        self.locals = prev_locals
+        self._locals_type_names = prev_type_names
+        self._flow_depth = prev_flow_depth
+        self._arena_scope_stack = prev_arena_stack
+        self.catch_exit_blocks = prev_catch_exit_blocks
+        self.catch_error_allocas = prev_catch_error_allocas
+        self.catch_result_allocas = prev_catch_result_allocas
+        self._parallel_result_stack = prev_parallel_result_stack
+        self._parallel_exit_stack = prev_parallel_exit_stack
+        self._parallel_arena_depth_stack = prev_parallel_arena_depth_stack
+        self.loop_exit_blocks = prev_loop_exit_blocks
+        self.loop_continue_blocks = prev_loop_continue_blocks
+        self._restore_unsigned_state(prev_unsigned)
+        return func
+
+    def _parallel_block_from_initializer(self, initializer):
+        """识别 flow 内 const x = parallel { ... } 初始化。"""
+        if initializer is None:
+            return None
+        if isinstance(initializer, EzLangParser.ParallelBlockExprContext):
+            return initializer.parallelBlock()
+        if hasattr(initializer, 'parallelBlock') and initializer.parallelBlock() is not None:
+            return initializer.parallelBlock()
+        if hasattr(initializer, 'getChildCount'):
+            for i in range(initializer.getChildCount()):
+                result = self._parallel_block_from_initializer(initializer.getChild(i))
+                if result is not None:
+                    return result
+        return None
+
+    def _ctx_references_local_capture(self, ctx) -> bool:
+        """保守检测零捕获任务是否读取了外层局部变量。"""
+        local_names = set(self.locals.keys())
+        if not local_names:
+            return False
+
+        def walk(node) -> bool:
+            if node is None:
+                return False
+            if isinstance(node, EzLangParser.IdentifierExprContext):
+                token = node.VAR_IDENTIFIER() or node.TYPE_IDENTIFIER()
+                return token is not None and token.getText() in local_names
+            if hasattr(node, 'getChildCount'):
+                for i in range(node.getChildCount()):
+                    if walk(node.getChild(i)):
+                        return True
+            return False
+
+        return walk(ctx)
+
+    def _start_flow_parallel_i32_future(self, name: str, parallel_block) -> ir.Value | None:
+        """flow 内 parallel I32 块启动为后台任务，读取变量时 join。"""
+        if self._flow_depth <= 0 or not self._flow_future_stack or parallel_block is None:
+            return None
+        if self._ctx_references_local_capture(parallel_block):
+            return None
+        result_type = self._infer_block_return_type(parallel_block.block())
+        if result_type != ir.IntType(32):
+            return None
+        fake_fn = type('ParallelFutureLiteral', (), {})()
+        fake_fn.block = lambda: parallel_block.block()
+        fake_fn.expression = lambda: None
+        fake_fn.type_ = lambda: None
+        branch = self._gen_race_i32_branch_function(fake_fn)
+        self._require_runtime()
+        i8_ptr = ir.PointerType(ir.IntType(8))
+        start_type = ir.FunctionType(i8_ptr, [ir.PointerType(ir.FunctionType(ir.IntType(32), []))])
+        start = self._get_or_declare_function('__ezrt_task_start_i32', start_type)
+        handle = self.builder.call(start, [branch], name=f'_{name}_future')
+        self._flow_future_stack[-1][name] = {'handle': handle, 'joined': False}
+        return handle
+
+    def _join_flow_future(self, name: str) -> None:
+        if not self._flow_future_stack or name not in self._flow_future_stack[-1]:
+            return
+        meta = self._flow_future_stack[-1][name]
+        if meta.get('joined'):
+            return
+        alloca = self.locals.get(name)
+        if alloca is None:
+            return
+        join_type = ir.FunctionType(ir.IntType(32), [ir.PointerType(ir.IntType(8))])
+        join = self._get_or_declare_function('__ezrt_task_join_i32', join_type)
+        value = self.builder.call(join, [meta['handle']], name=f'_{name}_joined')
+        self._emit_throw_check_after_call()
+        if self.builder is not None and not self.builder.block.is_terminated:
+            self.builder.store(value, alloca)
+            meta['joined'] = True
+
+    def _join_pending_flow_futures(self) -> None:
+        if not self._flow_future_stack:
+            return
+        for name in list(self._flow_future_stack[-1].keys()):
+            if self.builder is None or self.builder.block.is_terminated:
+                return
+            self._join_flow_future(name)
 
     def _find_array_literal_ctx(self, ctx):
         if ctx is None:
@@ -2695,7 +4282,7 @@ class LLVMCodeGenerator(EzLangVisitor):
         return self.visitVecLiteral(ctx.vecLiteral())
 
     def visitIndex(self, ctx: EzLangParser.IndexContext):
-        """数组索引: arr[index]"""
+        """数组/List/Dict 索引。"""
         obj_ptr = self._eval(ctx.postfixExpression())
         if obj_ptr is None:
             return None
@@ -2704,6 +4291,10 @@ class LLVMCodeGenerator(EzLangVisitor):
             return None
 
         pointee = obj_ptr.type.pointee if hasattr(obj_ptr.type, 'pointee') else None
+        if isinstance(pointee, ir.IdentifiedStructType) and pointee.name == 'Dict':
+            key_type, value_type = self._dict_item_types_for_value(obj_ptr)
+            return self._gen_dict_lookup_value(obj_ptr, index_val, key_type, value_type)
+
         if isinstance(pointee, ir.LiteralStructType) and len(pointee.elements) == 4 and isinstance(pointee.elements[0], ir.PointerType):
             pages_field = self.builder.gep(obj_ptr, [
                 ir.Constant(ir.IntType(32), 0),
@@ -2727,14 +4318,53 @@ class LLVMCodeGenerator(EzLangVisitor):
         ], inbounds=True)
         return self._load_with_unsigned(gep)
 
+    def _optional_unwrapped_value(self, ctx) -> ir.Value | None:
+        opt_ptr = self._eval(ctx)
+        if opt_ptr is None or not hasattr(opt_ptr, 'type'):
+            return None
+        opt_type = opt_ptr.type.pointee if isinstance(opt_ptr.type, ir.PointerType) else opt_ptr.type
+        if not self._is_optional_type(opt_type):
+            return opt_ptr
+        if not isinstance(opt_ptr.type, ir.PointerType):
+            tmp = self.builder.alloca(opt_type, name='_optional_tmp')
+            self.builder.store(opt_ptr, tmp)
+            opt_ptr = tmp
+        value_ptr = self.builder.gep(opt_ptr, [
+            ir.Constant(ir.IntType(32), 0),
+            ir.Constant(ir.IntType(32), 1),
+        ], inbounds=True)
+        value_type = opt_type.elements[1]
+        if isinstance(value_type, (ir.IdentifiedStructType, ir.LiteralStructType, ir.ArrayType)):
+            return value_ptr
+        return self._load_with_unsigned(value_ptr, name='_optional_value')
+
+    def visitTypeAssertion(self, ctx: EzLangParser.TypeAssertionContext):
+        return self._optional_unwrapped_value(ctx.postfixExpression())
+
+    def visitOptionalUnwrap(self, ctx: EzLangParser.OptionalUnwrapContext):
+        return self._optional_unwrapped_value(ctx.postfixExpression())
+
     # 函数调用
     def visitCall(self, ctx: EzLangParser.CallContext):
         target_expr = ctx.postfixExpression()
+
+        if isinstance(target_expr, EzLangParser.MemberAccessContext) and isinstance(target_expr.postfixExpression(), EzLangParser.OptionalUnwrapContext):
+            safe_call = self._optional_method_call(
+                ctx,
+                target_expr.postfixExpression(),
+                target_expr.VAR_IDENTIFIER().getText(),
+                ctx.namedArgList(),
+            )
+            if safe_call is not None:
+                return safe_call
 
         # 方法调用：obj.method(...) → 先求值 postfixExpression
         # visitMemberAccess 返回 function 并设置 _method_this
         self._method_this = None
         func = self._eval(target_expr)
+        method_this = self._method_this
+        # _method_this 只属于当前调用目标。求实参时可能发生嵌套方法调用，不能让内层 this 泄漏到外层调用。
+        self._method_this = None
         curried_target = None
         curried_closure_value = None
         if func is not None and isinstance(func, ir.Value) and hasattr(func, 'type'):
@@ -2756,21 +4386,30 @@ class LLVMCodeGenerator(EzLangVisitor):
                 name = id_token.getText()
                 # 泛型函数调用：id<I32>(...) → 使用单态化后的名称 id_I32
                 if id_ctx.genericArgs() is not None:
-                    type_args = [self._map_type(t) for t in id_ctx.genericArgs().type_()]
-                    name = self._monomorphize(name, type_args)
+                    if name in self.struct_generic_templates:
+                        name = self._struct_name_from_generic_args(name, id_ctx.genericArgs())
+                    else:
+                        type_args = [self._map_type(t) for t in id_ctx.genericArgs().type_()]
+                        name = self._monomorphize(name, type_args)
             elif hasattr(inner, 'VAR_IDENTIFIER') and inner.VAR_IDENTIFIER():
                 name = inner.VAR_IDENTIFIER().getText()
                 # 泛型函数调用（primaryExpression 直接返回 IdentifierExprContext 时不走上面分支）
                 if hasattr(inner, 'genericArgs') and inner.genericArgs() is not None:
-                    type_args = [self._map_type(t) for t in inner.genericArgs().type_()]
-                    name = self._monomorphize(name, type_args)
+                    if name in self.struct_generic_templates:
+                        name = self._struct_name_from_generic_args(name, inner.genericArgs())
+                    else:
+                        type_args = [self._map_type(t) for t in inner.genericArgs().type_()]
+                        name = self._monomorphize(name, type_args)
             elif hasattr(inner, 'TYPE_IDENTIFIER') and inner.TYPE_IDENTIFIER():
                 name = inner.TYPE_IDENTIFIER().getText()
             else:
                 return None
 
+            if self._should_drop_log_call(name, ctx.namedArgList()):
+                return None
+
             # 判断是结构体构造还是函数调用
-            if name in self.structs:
+            if name in self.structs or name in self.struct_generic_templates:
                 # 结构体构造：重定向到 structLiteral 逻辑
                 sl_ctx = ctx
                 return self._gen_struct_literal_from_call(name, sl_ctx)
@@ -2790,6 +4429,8 @@ class LLVMCodeGenerator(EzLangVisitor):
             # compiler builtin / 未实现集合函数不生成外部声明。
             if is_compiler_builtin or is_unimplemented_collection:
                 func = None
+            elif name in self.generic_templates:
+                func = None
             elif name:
                 args = ctx.namedArgList()
                 nargs = len(args.namedArg()) if args and args.namedArg() else 1
@@ -2808,6 +4449,9 @@ class LLVMCodeGenerator(EzLangVisitor):
             expected_names = list(placeholder_names)
         else:
             expected_names = self.func_param_names.get(func_name, [])
+
+        if self._should_drop_log_call(func_name, ctx.namedArgList()):
+            return None
 
         # 获取函数期望的参数名列表和默认值
         defaults = self.func_defaults.get(func_name, {})
@@ -2830,6 +4474,18 @@ class LLVMCodeGenerator(EzLangVisitor):
                         if val is not None:
                             provided[pname] = val
 
+        if curried_target is None and name in self.generic_templates and func_name == name:
+            inferred_args = self._infer_generic_call_type_args(name, provided)
+            if inferred_args is not None:
+                func_name = self._monomorphize(name, inferred_args)
+                name = func_name
+                try:
+                    func = self.module.get_global(func_name)
+                except KeyError:
+                    func = None
+                expected_names = self.func_param_names.get(func_name, [])
+                defaults = self.func_defaults.get(func_name, {})
+
         if self._flow_depth > 0 and func_name == 'race':
             return self._gen_race_call(args, provided)
 
@@ -2843,10 +4499,10 @@ class LLVMCodeGenerator(EzLangVisitor):
             if curried_target is not None and curried_closure_value is not None:
                 call_args.append(curried_closure_value)
             # 方法调用：首个参数是 this
-            if self._method_this is not None:
-                call_args.append(self.builder.load(self._method_this) if isinstance(self._method_this, ir.AllocaInstr) else self._method_this)
+            if method_this is not None:
+                call_args.append(method_this)
             for pname in expected_names:
-                if self._method_this is not None and pname == expected_names[0]:
+                if method_this is not None and pname == expected_names[0]:
                     continue  # this 已添加
                 if pname in provided:
                     call_args.append(provided[pname])
@@ -2861,11 +4517,8 @@ class LLVMCodeGenerator(EzLangVisitor):
         else:
             call_args = []
             func_type_for_args = func.type.pointee if func is not None and isinstance(func.type, ir.PointerType) else None
-            if self._method_this is not None and isinstance(func_type_for_args, ir.FunctionType) and func_type_for_args.args:
-                this_arg = self._method_this
-                if self._is_aggregate_ptr(this_arg) and this_arg.type.pointee == func_type_for_args.args[0]:
-                    this_arg = self.builder.load(this_arg)
-                call_args.append(this_arg)
+            if method_this is not None and isinstance(func_type_for_args, ir.FunctionType) and func_type_for_args.args:
+                call_args.append(method_this)
             call_args.extend(provided.values())
 
         # 检查是否为编译器内建函数
@@ -2902,8 +4555,17 @@ class LLVMCodeGenerator(EzLangVisitor):
 
         call = self.builder.call(func, call_args)
         if sret_type is not None:
+            self._emit_throw_check_after_call()
+            ret_dict_types = self.func_return_dict_types.get(func_name)
+            if ret_dict_types is not None:
+                self._mark_dict_item_types(ret_slot, ret_dict_types[0], ret_dict_types[1])
             return ret_slot
+        call = self._restore_c_abi_return(func_name, call)
         self._mark_unsigned(call, self.func_return_unsigned.get(func_name, False))
+        ret_dict_types = self.func_return_dict_types.get(func_name)
+        if ret_dict_types is not None:
+            self._mark_dict_item_types(call, ret_dict_types[0], ret_dict_types[1])
+        self._emit_throw_check_after_call()
         return call
 
     def _call_return_type(self, ctx) -> ir.Type:
@@ -2924,11 +4586,92 @@ class LLVMCodeGenerator(EzLangVisitor):
             return self._map_type_with_map(template_ctx.type_(), type_map)
         return ir.IntType(32)
 
+    def _value_type_for_generic_inference(self, value: ir.Value) -> ir.Type:
+        """泛型推导使用值语义类型，聚合指针按其指向类型推导。"""
+        if self._is_aggregate_ptr(value):
+            return value.type.pointee
+        return value.type
+
+    def _infer_generic_type_from_ctx(self, type_ctx, actual_type: ir.Type, type_map: dict[str, ir.Type], generic_names: set[str]) -> None:
+        """根据形参类型语法和实参 LLVM 类型推导泛型参数。"""
+        if type_ctx is None or actual_type is None:
+            return
+        P = EzLangParser
+        if isinstance(type_ctx, P.OptionalTypeContext):
+            if self._is_optional_type(actual_type):
+                self._infer_generic_type_from_ctx(type_ctx.type_(), actual_type.elements[1], type_map, generic_names)
+            return
+        if isinstance(type_ctx, (P.ArrayTypeContext, P.ListTypeContext)):
+            list_type = actual_type.pointee if isinstance(actual_type, ir.PointerType) else actual_type
+            if self._is_list_type(list_type):
+                self._infer_generic_type_from_ctx(type_ctx.type_(), list_type.elements[0].pointee.pointee, type_map, generic_names)
+            return
+        if isinstance(type_ctx, P.PointerTypeContext):
+            if isinstance(actual_type, ir.PointerType):
+                self._infer_generic_type_from_ctx(type_ctx.type_(), actual_type.pointee, type_map, generic_names)
+            return
+        if isinstance(type_ctx, P.ParenTypeContext):
+            self._infer_generic_type_from_ctx(type_ctx.type_(), actual_type, type_map, generic_names)
+            return
+        if hasattr(type_ctx, 'baseType') and type_ctx.baseType() is not None:
+            bt = type_ctx.baseType()
+            if bt.TYPE_IDENTIFIER() is None:
+                return
+            name = bt.TYPE_IDENTIFIER().getText()
+            if name in generic_names and bt.genericArgs() is None:
+                type_map.setdefault(name, actual_type)
+                return
+            if name == 'List' and bt.genericArgs() is not None:
+                list_type = actual_type.pointee if isinstance(actual_type, ir.PointerType) else actual_type
+                if self._is_list_type(list_type):
+                    args = list(bt.genericArgs().type_())
+                    if args:
+                        self._infer_generic_type_from_ctx(args[0], list_type.elements[0].pointee.pointee, type_map, generic_names)
+
+    def _infer_generic_call_type_args(self, base_name: str, provided: dict[str, ir.Value]) -> list[ir.Type] | None:
+        """从命名实参推导泛型函数类型参数。"""
+        template = self.generic_templates.get(base_name)
+        if template is None or len(template) < 2:
+            return None
+        generic_names, template_ctx = template[0], template[1]
+        if not generic_names or not hasattr(template_ctx, 'functionLiteral'):
+            return None
+        fn_lit = template_ctx.functionLiteral()
+        if fn_lit is None or fn_lit.paramList() is None:
+            return None
+        type_map: dict[str, ir.Type] = {}
+        generic_set = set(generic_names)
+        for param in fn_lit.paramList().param():
+            pname = param.VAR_IDENTIFIER().getText()
+            if pname not in provided:
+                continue
+            actual_type = self._value_type_for_generic_inference(provided[pname])
+            self._infer_generic_type_from_ctx(param.type_(), actual_type, type_map, generic_set)
+        if any(name not in type_map for name in generic_names):
+            return None
+        return [type_map[name] for name in generic_names]
+
     @staticmethod
     def _is_callable_value(value) -> bool:
         if isinstance(value, ir.Function):
             return True
         return isinstance(value, ir.Value) and isinstance(value.type, ir.PointerType) and isinstance(value.type.pointee, ir.FunctionType)
+
+    def _blob_data_ptr(self, value: ir.Value) -> ir.Value:
+        """提取 Blob.data 指针，供 std/mem 内建函数操作底层字节。"""
+        i8_ptr = ir.PointerType(ir.IntType(8))
+        blob_type = self.structs.get('Blob')
+        if value.type == i8_ptr:
+            return value
+        if blob_type is not None and isinstance(value.type, ir.PointerType) and value.type.pointee == blob_type:
+            data_ptr = self.builder.gep(value, [
+                ir.Constant(ir.IntType(32), 0),
+                ir.Constant(ir.IntType(32), 0),
+            ], inbounds=True)
+            return self.builder.load(data_ptr)
+        if blob_type is not None and value.type == blob_type:
+            return self.builder.extract_value(value, 0)
+        return self.builder.bitcast(value, i8_ptr) if value.type != i8_ptr else value
 
     def _try_gen_intrinsic_call(self, name: str, call_args: list) -> Optional[ir.Value]:
         """编译器内建函数：将标准库函数映射为 LLVM 内建操作"""
@@ -2940,8 +4683,8 @@ class LLVMCodeGenerator(EzLangVisitor):
         if name == 'copy' and len(call_args) >= 3:
             # copy(dst: Blob, src: Blob, count: I64) → llvm.memcpy
             memcpy = self.module.get_global('llvm.memcpy.p0.p0.i64')
-            dst = self.builder.bitcast(call_args[0], i8_ptr) if call_args[0].type != i8_ptr else call_args[0]
-            src = self.builder.bitcast(call_args[1], i8_ptr) if call_args[1].type != i8_ptr else call_args[1]
+            dst = self._blob_data_ptr(call_args[0])
+            src = self._blob_data_ptr(call_args[1])
             count = call_args[2]
             is_volatile = ir.Constant(ir.IntType(1), 0)
             # 对 I32 count 做 zext 到 I64
@@ -2958,7 +4701,7 @@ class LLVMCodeGenerator(EzLangVisitor):
                 memset = self.module.get_global(memset_name)
             except KeyError:
                 memset = ir.Function(self.module, memset_type, memset_name)
-            dst = self.builder.bitcast(call_args[0], i8_ptr) if call_args[0].type != i8_ptr else call_args[0]
+            dst = self._blob_data_ptr(call_args[0])
             val = self.builder.trunc(call_args[1], i8) if isinstance(call_args[1].type, ir.IntType) and call_args[1].type.width > 8 else call_args[1]
             count = call_args[2]
             if isinstance(count.type, ir.IntType) and count.type.width < 64:
@@ -3032,6 +4775,42 @@ class LLVMCodeGenerator(EzLangVisitor):
             if name == base or name.startswith(f'{base}_'):
                 return base
         return None
+
+    def _log_level_constant_from_call(self, func_name: str, args_ctx) -> int | None:
+        levels = {
+            'logTraceMsg': 0,
+            'logDebugMsg': 1,
+            'logInfoMsg': 2,
+            'logWarnMsg': 3,
+            'logErrorMsg': 4,
+            'logTrace': 0,
+            'logDebug': 1,
+            'logInfo': 2,
+            'logWarn': 3,
+            'logError': 4,
+        }
+        if func_name in levels:
+            return levels[func_name]
+        if func_name not in {'logWrite', 'logWriteFields', 'logWriteAt'} or args_ctx is None:
+            return None
+        for named in args_ctx.namedArg():
+            if named.VAR_IDENTIFIER() is None or named.expression() is None:
+                continue
+            if named.VAR_IDENTIFIER().getText() != 'level':
+                continue
+            text = named.expression().getText().strip()
+            if text in levels:
+                return levels[text]
+            if re.fullmatch(r'\d+', text):
+                return int(text)
+            return None
+        return None
+
+    def _should_drop_log_call(self, func_name: str, args_ctx) -> bool:
+        if self.log_compile_min_level is None:
+            return False
+        level = self._log_level_constant_from_call(func_name, args_ctx)
+        return level is not None and level < self.log_compile_min_level
 
     def _collection_type_args(self, name: str) -> list[ir.Type]:
         meta = self._collection_mono_types.get(name)
@@ -3608,7 +5387,7 @@ class LLVMCodeGenerator(EzLangVisitor):
             return value
         if self._is_aggregate_ptr(value):
             return self.builder.bitcast(value, i8_ptr)
-        tmp = self.builder.alloca(value.type, name='_dict_item_ptr')
+        tmp = self._arena_allocate(value.type, name='_dict_item_ptr')
         self.builder.store(value, tmp)
         return self.builder.bitcast(tmp, i8_ptr)
 
@@ -3806,6 +5585,66 @@ class LLVMCodeGenerator(EzLangVisitor):
         self.builder.position_at_start(loop_done)
         return result
 
+    def _gen_dict_lookup_raw(self, dict_ptr: ir.Value, key: ir.Value, key_type: ir.Type) -> tuple[ir.Value, ir.Value]:
+        i1 = ir.IntType(1)
+        i8_ptr = ir.PointerType(ir.IntType(8))
+        result_ptr = self.builder.alloca(i8_ptr, name='_dict_lookup_raw')
+        self.builder.store(ir.Constant(i8_ptr, None), result_ptr)
+        found, found_index = self._gen_dict_find_index(dict_ptr, key, key_type)
+        found_block = self.builder.append_basic_block('dict_lookup_found')
+        done_block = self.builder.append_basic_block('dict_lookup_done')
+        self.builder.cbranch(found, found_block, done_block)
+
+        self.builder.position_at_start(found_block)
+        raw = self.builder.load(self._dict_value_slot_ptr(dict_ptr, found_index), name='_dict_lookup_value_raw')
+        self.builder.store(raw, result_ptr)
+        self.builder.branch(done_block)
+
+        self.builder.position_at_start(done_block)
+        return found, self.builder.load(result_ptr, name='_dict_lookup_raw_val')
+
+    def _gen_dict_lookup_value(self, dict_ptr: ir.Value, key: ir.Value, key_type: ir.Type, value_type: ir.Type) -> ir.Value:
+        found, raw = self._gen_dict_lookup_raw(dict_ptr, key, key_type)
+        value_ptr = self.builder.alloca(value_type, name='_dict_lookup_value')
+        self.builder.store(self._zero_constant(value_type), value_ptr)
+        found_block = self.builder.append_basic_block('dict_lookup_typed_found')
+        done_block = self.builder.append_basic_block('dict_lookup_typed_done')
+        self.builder.cbranch(found, found_block, done_block)
+
+        self.builder.position_at_start(found_block)
+        self.builder.store(self._dict_from_i8_ptr(raw, value_type), value_ptr)
+        self.builder.branch(done_block)
+
+        self.builder.position_at_start(done_block)
+        return self.builder.load(value_ptr, name='_dict_lookup_value_val')
+
+    def _gen_dict_upsert_value(self, dict_ptr: ir.Value, key: ir.Value, value: ir.Value,
+                               key_type: ir.Type, value_type: ir.Type) -> ir.Value:
+        """按 key 更新 Dict；不存在时追加一项。"""
+        found, found_index = self._gen_dict_find_index(dict_ptr, key, key_type)
+        update_block = self.builder.append_basic_block('dict_upsert_update')
+        insert_block = self.builder.append_basic_block('dict_upsert_insert')
+        done_block = self.builder.append_basic_block('dict_upsert_done')
+        self.builder.cbranch(found, update_block, insert_block)
+
+        self.builder.position_at_start(update_block)
+        update_value = value
+        if update_value.type != value_type:
+            update_value = self._coerce_preserve_unsigned(update_value, value_type)
+        self.builder.store(self._dict_to_i8_ptr(update_value), self._dict_value_slot_ptr(dict_ptr, found_index))
+        self.builder.branch(done_block)
+
+        self.builder.position_at_start(insert_block)
+        insert_value = value
+        if insert_value.type != value_type:
+            insert_value = self._coerce_preserve_unsigned(insert_value, value_type)
+        self._gen_dict_set(dict_ptr, key, insert_value)
+        self.builder.branch(done_block)
+
+        self.builder.position_at_start(done_block)
+        self._mark_dict_item_types(dict_ptr, key_type, value_type)
+        return value
+
     def _gen_dict_set(self, dict_ptr: ir.Value, key: ir.Value, value: ir.Value) -> ir.Value:
         """dict_set(dict, key, value): 向分页存储追加元素，容量不足时分配新页"""
         i32 = ir.IntType(32)
@@ -3896,44 +5735,18 @@ class LLVMCodeGenerator(EzLangVisitor):
         value_page = self.builder.load(value_page_slot, name='_value_page')
         key_slot = self.builder.gep(key_page, [slot_idx], inbounds=True)
         value_slot = self.builder.gep(value_page, [slot_idx], inbounds=True)
-        k = self.builder.bitcast(key, i8_ptr) if key.type != i8_ptr else key
-        v = self.builder.bitcast(value, i8_ptr) if value.type != i8_ptr else value
+        k = self._dict_to_i8_ptr(key)
+        v = self._dict_to_i8_ptr(value)
         self.builder.store(k, key_slot)
         self.builder.store(v, value_slot)
         self.builder.store(self.builder.add(count, ir.Constant(i32, 1)), count_ptr)
         return None
 
     def _gen_dict_get(self, dict_ptr: ir.Value, key: ir.Value) -> ir.Value:
-        """dict_get(dict, key): 从分页存储读取第一个值，空字典返回 null"""
-        i32 = ir.IntType(32)
-        i8_ptr = ir.PointerType(ir.IntType(8))
-
-        count_ptr = self.builder.gep(dict_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 2)], inbounds=True)
-        count = self.builder.load(count_ptr, name='_count')
-        empty = self.builder.icmp_unsigned('==', count, ir.Constant(i32, 0))
-        current_block = self.builder.block
-        null_block = self.builder.append_basic_block('dict_get_null')
-        value_block = self.builder.append_basic_block('dict_get_value')
-        done_block = self.builder.append_basic_block('dict_get_done')
-        self.builder.cbranch(empty, null_block, value_block)
-
-        self.builder.position_at_start(null_block)
-        self.builder.branch(done_block)
-
-        self.builder.position_at_start(value_block)
-        pages_ptr = self.builder.gep(dict_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
-        value_pages = self.builder.load(pages_ptr, name='_value_pages')
-        first_page_slot = self.builder.gep(value_pages, [ir.Constant(i32, 0)], inbounds=True)
-        first_page = self.builder.load(first_page_slot, name='_first_value_page')
-        value_slot = self.builder.gep(first_page, [ir.Constant(ir.IntType(64), 0)], inbounds=True)
-        value = self.builder.load(value_slot)
-        self.builder.branch(done_block)
-
-        self.builder.position_at_start(done_block)
-        result = self.builder.phi(i8_ptr, name='_dict_value')
-        result.add_incoming(ir.Constant(i8_ptr, None), null_block)
-        result.add_incoming(value, value_block)
-        return result
+        """dict_get(dict, key): 按 key 从分页存储读取原始值指针，缺失返回 null。"""
+        key_type = key.type if key.type != ir.PointerType(ir.IntType(8)) else ir.PointerType(ir.IntType(8))
+        _, raw = self._gen_dict_lookup_raw(dict_ptr, key, key_type)
+        return raw
 
     def _gen_curried_call(self, func, func_name, expected_names, provided, placeholder_params):
         """为带 ? 占位符的调用生成柯里化闭包"""
@@ -3946,13 +5759,15 @@ class LLVMCodeGenerator(EzLangVisitor):
         else:
             return ir.Constant(i32, 0)
 
-        # 分类参数：捕获的参数 vs 占位符参数
+        # 分类参数：捕获的参数 vs 占位符参数。占位符必须按原函数参数顺序保存，
+        # 否则 add(c = ?, a = ?) 这类调用会把实参错位传给跳板函数。
+        ordered_placeholders = [pname for pname in expected_names if pname in placeholder_params]
         captured_types = []
         captured_values = []
         placeholder_types = []
 
         for pname in expected_names:
-            if pname in placeholder_params:
+            if pname in ordered_placeholders:
                 # 找到该参数在函数类型中的位置
                 idx = expected_names.index(pname)
                 if idx < len(func_type.args):
@@ -3987,7 +5802,7 @@ class LLVMCodeGenerator(EzLangVisitor):
             # 如果值与闭包字段类型不匹配，尝试转换
             if val.type != captured_types[i]:
                 if isinstance(val.type, ir.IntType) and isinstance(captured_types[i], ir.IntType):
-                    val = self.builder.zext(val, captured_types[i]) if val.type.width < captured_types[i].width else self.builder.trunc(val, captured_types[i])
+                    val = self._coerce_integer_value(val, captured_types[i])
             v = self.builder.insert_value(v, val, i + 1)
 
         self.builder.store(v, closure)
@@ -3997,8 +5812,8 @@ class LLVMCodeGenerator(EzLangVisitor):
         ret_type = func_type.return_type
         tramp_func_type = ir.FunctionType(ret_type, tramp_param_types)
         tramp_func = ir.Function(self.module, tramp_func_type, name=tramp_name)
-        self.func_param_names[tramp_name] = ['__closure'] + list(placeholder_params)
-        self._curried_closures[str(closure_type)] = (tramp_func, list(placeholder_params))
+        self.func_param_names[tramp_name] = ['__closure'] + ordered_placeholders
+        self._curried_closures[str(closure_type)] = (tramp_func, ordered_placeholders)
 
         # 保存当前 builder 状态，进入跳板函数体
         old_builder = self.builder
@@ -4016,7 +5831,7 @@ class LLVMCodeGenerator(EzLangVisitor):
         placeholder_idx = 0
 
         for pname in expected_names:
-            if pname in placeholder_params:
+            if pname in ordered_placeholders:
                 # 使用传入的占位参数值
                 placeholder_arg = tramp_func.args[1 + placeholder_idx]
                 final_args.append(placeholder_arg)
@@ -4060,8 +5875,9 @@ class LLVMCodeGenerator(EzLangVisitor):
             right = self._eval(ctx.multiplicativeExpression(i))
             if left is None or right is None: continue
             op = ctx.getChild((i * 2) - 1).getText()
+            left, right = self._prepare_vector_binary_operands(left, right)
             unsigned = self._binary_result_unsigned(left, right)
-            if self._is_float(left.type):
+            if self._is_float_or_float_vector(left.type):
                 left = self.builder.fsub(left, right) if op == '-' else self.builder.fadd(left, right)
             else:
                 left = self.builder.sub(left, right) if op == '-' else self.builder.add(left, right)
@@ -4074,8 +5890,9 @@ class LLVMCodeGenerator(EzLangVisitor):
             right = self._eval(ctx.unaryExpression(i))
             if left is None or right is None: continue
             op = ctx.getChild((i * 2) - 1).getText()
+            left, right = self._prepare_vector_binary_operands(left, right)
             unsigned = self._binary_result_unsigned(left, right)
-            if self._is_float(left.type):
+            if self._is_float_or_float_vector(left.type):
                 if op == '*': left = self.builder.fmul(left, right)
                 elif op == '/': left = self.builder.fdiv(left, right)
             else:
@@ -4090,31 +5907,25 @@ class LLVMCodeGenerator(EzLangVisitor):
         for i in range(1, len(ctx.relationalExpression())):
             right = self._eval(ctx.relationalExpression(i))
             if left is None or right is None: continue
-            op = '=='
-            for j in range(ctx.getChildCount()):
-                t = ctx.getChild(j).getText()
-                if t in ('==', '!='):
-                    op = t
-                    break
-            if self._is_float(left.type):
+            op = ctx.getChild((i * 2) - 1).getText()
+            left, right = self._prepare_vector_binary_operands(left, right)
+            if self._is_float_or_float_vector(left.type):
                 left = self.builder.fcmp_ordered(op, left, right)
             else:
                 left = self.builder.icmp_signed(op, left, right)
         return left
 
     def visitRelationalExpression(self, ctx: EzLangParser.RelationalExpressionContext):
-        left = self._eval(ctx.shiftExpression(0))
-        for i in range(1, len(ctx.shiftExpression())):
-            right = self._eval(ctx.shiftExpression(i))
+        left = self._eval(ctx.bitOrExpression(0))
+        for i in range(1, len(ctx.bitOrExpression())):
+            right = self._eval(ctx.bitOrExpression(i))
             if left is None or right is None: continue
-            op = '<'
-            for j in range(ctx.getChildCount()):
-                t = ctx.getChild(j).getText()
-                if t in ('<', '>', '<=', '>='):
-                    op = t
-                    break
-            if self._is_float(left.type):
+            op = ctx.getChild((i * 2) - 1).getText()
+            left, right = self._prepare_vector_binary_operands(left, right)
+            if self._is_float_or_float_vector(left.type):
                 left = self.builder.fcmp_ordered(op, left, right)
+            elif self._binary_result_unsigned(left, right):
+                left = self.builder.icmp_unsigned(op, left, right)
             else:
                 left = self.builder.icmp_signed(op, left, right)
         return left
@@ -4127,6 +5938,7 @@ class LLVMCodeGenerator(EzLangVisitor):
             right = self._eval(ctx.additiveExpression(i))
             if left is None or right is None: continue
             op = ctx.getChild((i * 2) - 1).getText()
+            left, right = self._prepare_vector_binary_operands(left, right)
             unsigned = self._is_unsigned_value(left)
             if op == '<<':
                 left = self.builder.shl(left, right)
@@ -4136,11 +5948,14 @@ class LLVMCodeGenerator(EzLangVisitor):
         return left
 
     def visitBitAndExpression(self, ctx: EzLangParser.BitAndExpressionContext):
-        left = self._eval(ctx.equalityExpression(0))
-        for i in range(1, len(ctx.equalityExpression())):
-            right = self._eval(ctx.equalityExpression(i))
+        left = self._eval(ctx.shiftExpression(0))
+        for i in range(1, len(ctx.shiftExpression())):
+            right = self._eval(ctx.shiftExpression(i))
             if left is None or right is None: continue
+            left, right = self._prepare_vector_binary_operands(left, right)
+            unsigned = self._binary_result_unsigned(left, right)
             left = self.builder.and_(left, right)
+            self._mark_unsigned(left, unsigned)
         return left
 
     def visitBitXorExpression(self, ctx: EzLangParser.BitXorExpressionContext):
@@ -4148,7 +5963,10 @@ class LLVMCodeGenerator(EzLangVisitor):
         for i in range(1, len(ctx.bitAndExpression())):
             right = self._eval(ctx.bitAndExpression(i))
             if left is None or right is None: continue
+            left, right = self._prepare_vector_binary_operands(left, right)
+            unsigned = self._binary_result_unsigned(left, right)
             left = self.builder.xor(left, right)
+            self._mark_unsigned(left, unsigned)
         return left
 
     def visitBitOrExpression(self, ctx: EzLangParser.BitOrExpressionContext):
@@ -4156,7 +5974,10 @@ class LLVMCodeGenerator(EzLangVisitor):
         for i in range(1, len(ctx.bitXorExpression())):
             right = self._eval(ctx.bitXorExpression(i))
             if left is None or right is None: continue
+            left, right = self._prepare_vector_binary_operands(left, right)
+            unsigned = self._binary_result_unsigned(left, right)
             left = self.builder.or_(left, right)
+            self._mark_unsigned(left, unsigned)
         return left
 
     # ==================== 逻辑运算（短路求值）====================
@@ -4203,7 +6024,7 @@ class LLVMCodeGenerator(EzLangVisitor):
         return left
 
     def visitAndExpression(self, ctx: EzLangParser.AndExpressionContext):
-        lhs_list = ctx.bitOrExpression()
+        lhs_list = ctx.equalityExpression()
         if len(lhs_list) == 0:
             return None
         left = self._eval(lhs_list[0])
@@ -4231,8 +6052,11 @@ class LLVMCodeGenerator(EzLangVisitor):
             return self.builder.not_(inner)
         elif ctx.MINUS() is not None:
             if self._is_float(inner.type):
-                return self.builder.fsub(ir.Constant(inner.type, 0.0), inner)
-            return self.builder.sub(ir.Constant(inner.type, 0), inner)
+                result = self.builder.fsub(ir.Constant(inner.type, 0.0), inner)
+            else:
+                result = self.builder.sub(ir.Constant(inner.type, 0), inner)
+            self._mark_unsigned(result, self._is_unsigned_value(inner))
+            return result
         elif ctx.TILDE() is not None:
             return self.builder.not_(inner)
         elif ctx.PLUS() is not None:
@@ -4336,18 +6160,26 @@ class LLVMCodeGenerator(EzLangVisitor):
 
         lvalue_ptr = None
         outer = self._outer_postfix_ctx(left)
-        if isinstance(outer, EzLangParser.IndexContext):
-            lvalue_ptr = self._index_lvalue_ptr(outer)
-        elif isinstance(outer, EzLangParser.MemberAccessContext):
-            lvalue_ptr = self._member_lvalue_ptr(outer)
+        dict_target = self._dict_index_target(outer) if isinstance(outer, EzLangParser.IndexContext) else None
 
         val = None
         if ctx.assignmentExpression():
             val = self._eval(ctx.assignmentExpression())
 
+        if dict_target is not None:
+            dict_store = self._dict_index_assignment(dict_target, val, op_ctx)
+            if dict_store is not None:
+                return dict_store
+
+        if isinstance(outer, EzLangParser.IndexContext):
+            lvalue_ptr = self._index_lvalue_ptr(outer)
+        elif isinstance(outer, EzLangParser.MemberAccessContext):
+            lvalue_ptr = self._member_lvalue_ptr(outer)
+
         if lvalue_ptr is not None and val is not None:
             store_val = val
-            if isinstance(store_val, ir.AllocaInstr):
+            if self._is_aggregate_ptr(store_val):
+                store_val = self._copy_aggregate_value(store_val, name="_assign_copy")
                 store_val = self.builder.load(store_val)
             current = self._load_with_unsigned(lvalue_ptr, name="_assign_current")
             store_val = self._apply_assignment_operator(current, store_val, op_ctx)
@@ -4359,8 +6191,9 @@ class LLVMCodeGenerator(EzLangVisitor):
         if name and val is not None:
             # 如果值是 alloca（结构体字面量），需要 load
             store_val = val
-            if isinstance(val, ir.AllocaInstr):
-                store_val = self.builder.load(val)
+            if self._is_aggregate_ptr(val):
+                store_val = self._copy_aggregate_value(val, name="_assign_copy")
+                store_val = self.builder.load(store_val)
             if name in self.locals:
                 target = self.locals[name]
                 current = self._load_with_unsigned(target, name="_assign_current")
@@ -4375,6 +6208,21 @@ class LLVMCodeGenerator(EzLangVisitor):
         return val
 
     # ==================== 语句 ====================
+
+    def visitStatement(self, ctx: EzLangParser.StatementContext):
+        if ctx.declaration() is not None:
+            return self._eval(ctx.declaration())
+        if ctx.expressionStatement() is not None:
+            return self._eval(ctx.expressionStatement())
+        if ctx.returnStatement() is not None:
+            return self._eval(ctx.returnStatement())
+        if ctx.breakStatement() is not None:
+            return self._eval(ctx.breakStatement())
+        if ctx.continueStatement() is not None:
+            return self._eval(ctx.continueStatement())
+        if ctx.throwStatement() is not None:
+            return self._eval(ctx.throwStatement())
+        return None
 
     def visitExpressionStatement(self, ctx: EzLangParser.ExpressionStatementContext):
         if ctx.expression():
@@ -4391,6 +6239,9 @@ class LLVMCodeGenerator(EzLangVisitor):
                         val = self.builder.load(val)
                     val = self._coerce_value(val, result_alloca.type.pointee)
                     self.builder.store(val, result_alloca)
+            result_type = self._parallel_result_stack[-1].type.pointee if self._parallel_result_stack else None
+            target_depth = self._parallel_arena_depth_stack[-1] if self._parallel_arena_depth_stack else 0
+            self._restore_active_arena_scopes_for_return(ret_type=result_type, target_depth=target_depth)
             self.builder.branch(self._parallel_exit_stack[-1])
             return None
         if ctx.expression():
@@ -4402,11 +6253,14 @@ class LLVMCodeGenerator(EzLangVisitor):
                 if self.current_function is not None:
                     expected = self.current_function.function_type.return_type
                     if not isinstance(expected, ir.VoidType) and val.type != expected:
-                        val = self._coerce_value(val, expected)
+                        val = self._coerce_return_value(val, expected)
+                self._restore_active_arena_scopes_for_return(val, val.type)
                 self.builder.ret(val)
             else:
+                self._restore_active_arena_scopes()
                 self.builder.ret_void()
         else:
+            self._restore_active_arena_scopes()
             self.builder.ret_void()
         return None
 
@@ -4415,12 +6269,17 @@ class LLVMCodeGenerator(EzLangVisitor):
         saved_pos = None
         if self.builder and hasattr(self, '_arena_save'):
             saved_pos = self.builder.call(self._arena_save, [], name='_arena_saved')
+            self._arena_scope_stack.append(saved_pos)
         for stmt in ctx.statement():
             self._eval(stmt)
             if self.builder.block.is_terminated:
+                if saved_pos is not None and self._arena_scope_stack and self._arena_scope_stack[-1] is saved_pos:
+                    self._arena_scope_stack.pop()
                 return None
         if saved_pos is not None:
             self.builder.call(self._arena_restore, [saved_pos])
+            if self._arena_scope_stack and self._arena_scope_stack[-1] is saved_pos:
+                self._arena_scope_stack.pop()
         return None
 
     # ==================== 循环与跳转 ====================
@@ -4571,11 +6430,6 @@ class LLVMCodeGenerator(EzLangVisitor):
         if self.builder is None:
             return None
 
-        # 创建错误状态 alloca（存储抛出的错误值）
-        error_alloca = self.builder.alloca(ir.PointerType(ir.IntType(8)), name="_catch_err")
-        null_ptr = ir.Constant(ir.PointerType(ir.IntType(8)), None)
-        self.builder.store(null_ptr, error_alloca)
-
         result_type = self._infer_catch_result_type(ctx.block())
         result_alloca = None
         if not isinstance(result_type, ir.VoidType):
@@ -4585,7 +6439,6 @@ class LLVMCodeGenerator(EzLangVisitor):
         catch_exit_bb = self.builder.append_basic_block(name="catch_exit")
 
         self.catch_exit_blocks.append(catch_exit_bb)
-        self.catch_error_allocas.append(error_alloca)
         if result_alloca is not None:
             self.catch_result_allocas.append(result_alloca)
 
@@ -4594,7 +6447,6 @@ class LLVMCodeGenerator(EzLangVisitor):
             self._eval(ctx.block())
 
         self.catch_exit_blocks.pop()
-        self.catch_error_allocas.pop()
         if result_alloca is not None:
             self.catch_result_allocas.pop()
 
@@ -4604,6 +6456,18 @@ class LLVMCodeGenerator(EzLangVisitor):
 
         self.builder.position_at_start(catch_exit_bb)
         if result_alloca is not None:
+            caught = self._throw_is_active()
+            caught_bb = self.builder.append_basic_block('catch_caught')
+            done_bb = self.builder.append_basic_block('catch_done')
+            self.builder.cbranch(caught, caught_bb, done_bb)
+
+            self.builder.position_at_start(caught_bb)
+            if result_type == self.structs['Error']:
+                self.builder.store(self.builder.load(self._throw_value, name='catch_error'), result_alloca)
+            self._clear_throw_state()
+            self.builder.branch(done_bb)
+
+            self.builder.position_at_start(done_bb)
             return self.builder.load(result_alloca, name="catch_value")
         return None
 
@@ -4613,26 +6477,14 @@ class LLVMCodeGenerator(EzLangVisitor):
     def visitThrowStatement(self, ctx: EzLangParser.ThrowStatementContext):
         """throw expr → 存储错误标记并跳转到 catch_exit"""
         thrown_value = self._eval(ctx.expression()) if ctx.expression() is not None else None
+        self._store_throw_value(thrown_value)
         if self.catch_result_allocas and thrown_value is not None:
             result_alloca = self.catch_result_allocas[-1]
             if self._is_aggregate_ptr(thrown_value):
                 thrown_value = self.builder.load(thrown_value)
             thrown_value = self._coerce_value(thrown_value, result_alloca.type.pointee)
             self.builder.store(thrown_value, result_alloca)
-
-        if self.catch_error_allocas:
-            # 存储非空标记（i8 1 转为指针）表示发生了异常
-            sentinel = ir.Constant(ir.IntType(64), 1).inttoptr(
-                ir.PointerType(ir.IntType(8)))
-            self.builder.store(sentinel, self.catch_error_allocas[-1])
-
-        if self.catch_exit_blocks:
-            self.builder.branch(self.catch_exit_blocks[-1])
-        else:
-            if self._uncaught_throw is None:
-                self._uncaught_throw = self._define_uncaught_throw_hook()
-            self.builder.call(self._uncaught_throw, [])
-            self.builder.unreachable()
+        self._branch_to_throw_exit_or_abort()
         return None
 
     # ==================== 类 if 表达式 ====================
@@ -4656,9 +6508,7 @@ class LLVMCodeGenerator(EzLangVisitor):
         # then 分支
         self.builder.position_at_start(then_bb)
         then_val = None
-        if ctx.expression(1) is not None:
-            then_val = self._eval(ctx.expression(1))
-        elif ctx.block(0) is not None:
+        if ctx.block(0) is not None:
             self._eval(ctx.block(0))
         then_block = self.builder.block
         if not then_block.is_terminated:
@@ -4667,8 +6517,8 @@ class LLVMCodeGenerator(EzLangVisitor):
         # else 分支
         self.builder.position_at_start(else_bb)
         else_val = None
-        if ctx.expression(2) is not None:
-            else_val = self._eval(ctx.expression(2))
+        if len(ctx.expression()) > 1 and ctx.expression(1) is not None:
+            else_val = self._eval(ctx.expression(1))
         elif ctx.block(1) is not None:
             self._eval(ctx.block(1))
         else_block = self.builder.block
@@ -4693,7 +6543,8 @@ class LLVMCodeGenerator(EzLangVisitor):
         return None
 
 
-def compile_source(source: str, module_name: str = "ezlang", compile_target: Optional[str] = None):
+def compile_source(source: str, module_name: str = "ezlang", compile_target: Optional[str] = None,
+                   target_arch: Optional[str] = None, log_compile_min_level: Optional[int] = None):
     """编译 EzLang 源码 → (LLVM Module, 解析错误, extern 库列表)"""
     from antlr4 import InputStream, CommonTokenStream
     from parser.EzLangLexer import EzLangLexer
@@ -4708,7 +6559,12 @@ def compile_source(source: str, module_name: str = "ezlang", compile_target: Opt
     if _parse_errors:
         return ir.Module(name=module_name), list(_parse_errors), []
 
-    codegen = LLVMCodeGenerator(module_name, compile_target=compile_target)
+    codegen = LLVMCodeGenerator(
+        module_name,
+        compile_target=compile_target,
+        target_arch=target_arch,
+        log_compile_min_level=log_compile_min_level,
+    )
     codegen.visitCompilationUnit(tree)
     errors = list(_parse_errors) + codegen._extern_diagnostics
     libs = codegen.active_extern_libs if compile_target is not None else codegen.extern_libs

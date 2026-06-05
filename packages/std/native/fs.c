@@ -8,9 +8,15 @@
 #include <string.h>
 #include <time.h>
 
+#if defined(__APPLE__)
+#include <TargetConditionals.h>
+#endif
+
 #if defined(_WIN32)
 #include <direct.h>
+#include <io.h>
 #include <sys/stat.h>
+#include <windows.h>
 #define EZ_PATH_SEP '\\'
 #else
 #include <dirent.h>
@@ -22,6 +28,8 @@
 
 #if defined(_WIN32)
 #define EZ_ABI_NAME(name)
+#elif defined(__APPLE__)
+#define EZ_ABI_NAME(name) __asm__("_" #name)
 #else
 #define EZ_ABI_NAME(name) __asm__(#name)
 #endif
@@ -50,11 +58,20 @@ typedef struct {
     FileStat value;
 } OptFileStat;
 
+static char *ez_fs_copy_str(const char *text) {
+    if (!text) return NULL;
+    size_t len = strlen(text) + 1;
+    char *copy = (char *)malloc(len);
+    if (!copy) return NULL;
+    memcpy(copy, text, len);
+    return copy;
+}
+
 static const char *ez_fs_sandbox_root(void) {
 #if defined(__ANDROID__)
     const char *root = getenv("EZLANG_ANDROID_DATA_DIR");
     return root && root[0] ? root : "/data/local/tmp/ezlang";
-#elif defined(__APPLE__) && defined(TARGET_OS_IPHONE)
+#elif defined(__APPLE__) && TARGET_OS_IPHONE
     const char *root = getenv("EZLANG_IOS_DOCUMENTS_DIR");
     return root && root[0] ? root : "/Documents";
 #else
@@ -71,11 +88,15 @@ static bool ez_fs_is_absolute(const char *path) {
 #endif
 }
 
+static bool ez_fs_valid_path(const char *path) {
+    return path && path[0] != '\0';
+}
+
 static char *ez_fs_path(const char *path) {
-    if (!path) return NULL;
-    if (ez_fs_is_absolute(path)) return strdup(path);
+    if (!ez_fs_valid_path(path)) return NULL;
+    if (ez_fs_is_absolute(path)) return ez_fs_copy_str(path);
     const char *root = ez_fs_sandbox_root();
-    if (!root || !root[0]) return strdup(path);
+    if (!root || !root[0]) return ez_fs_copy_str(path);
     size_t root_len = strlen(root);
     size_t path_len = strlen(path);
     bool need_sep = root_len > 0 && root[root_len - 1] != '/' && root[root_len - 1] != '\\';
@@ -97,6 +118,41 @@ static bool ez_fs_mkdir_one(const char *path) {
 
 static bool ez_fs_remove_tree(const char *path) {
 #if defined(_WIN32)
+    size_t path_len = strlen(path);
+    size_t pattern_len = path_len + 3;
+    char *pattern = (char *)malloc(pattern_len);
+    if (!pattern) return false;
+    snprintf(pattern, pattern_len, "%s\\*", path);
+
+    WIN32_FIND_DATAA data;
+    HANDLE handle = FindFirstFileA(pattern, &data);
+    free(pattern);
+    if (handle != INVALID_HANDLE_VALUE) {
+        do {
+            if (strcmp(data.cFileName, ".") == 0 || strcmp(data.cFileName, "..") == 0) continue;
+            size_t child_len = path_len + strlen(data.cFileName) + 2;
+            char *child = (char *)malloc(child_len);
+            if (!child) {
+                FindClose(handle);
+                return false;
+            }
+            snprintf(child, child_len, "%s\\%s", path, data.cFileName);
+            bool ok;
+            if ((data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0) {
+                ok = ez_fs_remove_tree(child);
+            } else {
+                SetFileAttributesA(child, FILE_ATTRIBUTE_NORMAL);
+                ok = DeleteFileA(child) != 0;
+            }
+            free(child);
+            if (!ok) {
+                FindClose(handle);
+                return false;
+            }
+        } while (FindNextFileA(handle, &data) != 0);
+        FindClose(handle);
+    }
+    SetFileAttributesA(path, FILE_ATTRIBUTE_NORMAL);
     return _rmdir(path) == 0;
 #else
     DIR *dir = opendir(path);
@@ -131,8 +187,53 @@ static bool ez_fs_remove_tree(const char *path) {
 
 static StrList ez_fs_list_dir(const char *path) {
 #if defined(_WIN32)
-    (void)path;
-    return (StrList){0};
+    size_t path_len = strlen(path);
+    size_t pattern_len = path_len + 3;
+    char *pattern = (char *)malloc(pattern_len);
+    if (!pattern) return (StrList){0};
+    snprintf(pattern, pattern_len, "%s\\*", path);
+
+    WIN32_FIND_DATAA data;
+    HANDLE handle = FindFirstFileA(pattern, &data);
+    free(pattern);
+    if (handle == INVALID_HANDLE_VALUE) return (StrList){0};
+
+    size_t count = 0;
+    size_t cap = 8;
+    char **flat = (char **)calloc(cap, sizeof(char *));
+    if (!flat) {
+        FindClose(handle);
+        return (StrList){0};
+    }
+    do {
+        if (strcmp(data.cFileName, ".") == 0 || strcmp(data.cFileName, "..") == 0) continue;
+        if (count == cap) {
+            cap *= 2;
+            char **next = (char **)realloc(flat, cap * sizeof(char *));
+            if (!next) break;
+            flat = next;
+        }
+        flat[count++] = ez_fs_copy_str(data.cFileName);
+    } while (FindNextFileA(handle, &data) != 0);
+    FindClose(handle);
+
+    int64_t page_count = count == 0 ? 0 : (int64_t)((count + 7) / 8);
+    char ***pages = page_count == 0 ? NULL : (char ***)calloc((size_t)page_count, sizeof(char **));
+    if (page_count > 0 && !pages) {
+        for (size_t i = 0; i < count; ++i) free(flat[i]);
+        free(flat);
+        return (StrList){0};
+    }
+    for (int64_t page = 0; page < page_count; ++page) {
+        pages[page] = (char **)calloc(8, sizeof(char *));
+        if (!pages[page]) continue;
+        for (int64_t offset = 0; offset < 8; ++offset) {
+            size_t idx = (size_t)(page * 8 + offset);
+            if (idx < count) pages[page][offset] = flat[idx];
+        }
+    }
+    free(flat);
+    return (StrList){pages, (int64_t)count, page_count * 8, page_count};
 #else
     DIR *dir = opendir(path);
     if (!dir) return (StrList){0};
@@ -152,7 +253,7 @@ static StrList ez_fs_list_dir(const char *path) {
             if (!next) break;
             flat = next;
         }
-        flat[count++] = strdup(entry->d_name);
+        flat[count++] = ez_fs_copy_str(entry->d_name);
     }
     closedir(dir);
     int64_t page_count = count == 0 ? 0 : (int64_t)((count + 7) / 8);
@@ -177,7 +278,7 @@ static StrList ez_fs_list_dir(const char *path) {
 
 static void ez_fs_ensure_parent(const char *path) {
     if (!path) return;
-    char *copy = strdup(path);
+    char *copy = ez_fs_copy_str(path);
     if (!copy) return;
     for (char *p = copy + 1; *p; ++p) {
         if (*p == '/' || *p == '\\') {
@@ -263,7 +364,7 @@ bool removeDir(const char *path, bool recursive) {
     char *real_path = ez_fs_path(path);
     if (!real_path) return false;
 #if defined(_WIN32)
-    bool ok = _rmdir(real_path) == 0;
+    bool ok = recursive ? ez_fs_remove_tree(real_path) : (_rmdir(real_path) == 0);
 #else
     bool ok = recursive ? ez_fs_remove_tree(real_path) : (rmdir(real_path) == 0);
 #endif
@@ -283,9 +384,7 @@ bool exists(const char *path) {
     char *real_path = ez_fs_path(path);
     if (!real_path) return false;
 #if defined(_WIN32)
-    FILE *file = fopen(real_path, "rb");
-    bool ok = file != NULL;
-    if (file) fclose(file);
+    bool ok = _access(real_path, 0) == 0;
 #else
     bool ok = access(real_path, F_OK) == 0;
 #endif
@@ -297,8 +396,8 @@ bool isDir(const char *path) {
     char *real_path = ez_fs_path(path);
     if (!real_path) return false;
 #if defined(_WIN32)
-    struct _stat st;
-    bool ok = _stat(real_path, &st) == 0 && (st.st_mode & _S_IFDIR) != 0;
+    struct _stat64 st;
+    bool ok = _stat64(real_path, &st) == 0 && (st.st_mode & _S_IFDIR) != 0;
 #else
     struct stat st;
     bool ok = lstat(real_path, &st) == 0 && S_ISDIR(st.st_mode);
@@ -312,8 +411,8 @@ OptFileStat ez_std_stat(const char *path) {
     char *real_path = ez_fs_path(path);
     if (!real_path) return (OptFileStat){false, {0}};
 #if defined(_WIN32)
-    struct _stat st;
-    if (_stat(real_path, &st) != 0) {
+    struct _stat64 st;
+    if (_stat64(real_path, &st) != 0) {
         free(real_path);
         return (OptFileStat){false, {0}};
     }
@@ -346,8 +445,13 @@ OptFileStat ez_std_stat(const char *path) {
 
 const char *absPath(const char *path) {
     char *real_path = ez_fs_path(path);
-    if (!real_path) return NULL;
+    if (!real_path) return ez_fs_copy_str("");
 #if defined(_WIN32)
+    char *resolved = _fullpath(NULL, real_path, 0);
+    if (resolved) {
+        free(real_path);
+        return resolved;
+    }
     return real_path;
 #else
     char *resolved = realpath(real_path, NULL);
