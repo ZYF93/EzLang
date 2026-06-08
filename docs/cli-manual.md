@@ -1,12 +1,12 @@
 # EzLang CLI 使用手册
 
-EzLang CLI 入口位于 [cli/ez.py](../cli/ez.py)。常用命令如下。
+EzLang CLI 入口位于 [cli/ez.py](../cli/ez.py)。在仓库根目录执行 `pip install -e .` 后会注册本地命令 `ez`。常用命令如下。
 
 ## 查看帮助
 
 ```bash
-python -m cli.ez --help
-python -m cli.ez build --help
+ez --help
+ez build --help
 ```
 
 ## 项目配置
@@ -46,7 +46,7 @@ dir = "dist/linux"
 ## 构建
 
 ```bash
-python -m cli.ez build --project project.toml
+ez build --project project.toml
 ```
 
 构建流程：
@@ -61,7 +61,7 @@ python -m cli.ez build --project project.toml
 ## 运行
 
 ```bash
-python -m cli.ez run --project project.toml
+ez run --project project.toml
 ```
 
 `run` 只支持本机目标。非本机目标会给出错误。
@@ -69,7 +69,7 @@ python -m cli.ez run --project project.toml
 ## 安装依赖
 
 ```bash
-python -m cli.ez install --project project.toml
+ez install --project project.toml
 ```
 
 支持：
@@ -81,8 +81,8 @@ python -m cli.ez install --project project.toml
 ## 格式化
 
 ```bash
-python -m cli.ez fmt --project project.toml src/index.ez
-python -m cli.ez fmt --project project.toml --check src/index.ez
+ez fmt --project project.toml src/index.ez
+ez fmt --project project.toml --check src/index.ez
 ```
 
 ## 发布

@@ -1,5 +1,6 @@
 """ez CLI 工具链测试"""
 
+import builtins
 import os
 import socket
 import subprocess
@@ -63,6 +64,35 @@ def test_help_and_version(capsys):
     assert ez.main(["--version"]) == 0
     out = capsys.readouterr().out
     assert "ezlang 0.1.0" in out
+
+
+def test_help_and_version_do_not_require_compiler_dependencies(monkeypatch, capsys):
+    original_import = builtins.__import__
+    blocked = {"semantic", "codegen", "antlr4", "llvmlite"}
+
+    def guarded_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if name.split(".", 1)[0] in blocked:
+            raise ModuleNotFoundError(f"No module named '{name}'", name=name)
+        return original_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(ez, "_analyze", None)
+    monkeypatch.setattr(ez, "_compile_source", None)
+    monkeypatch.setattr(ez, "llvm", None)
+    monkeypatch.setattr(builtins, "__import__", guarded_import)
+
+    assert ez.main(["--version"]) == 0
+    assert "ezlang 0.1.0" in capsys.readouterr().out
+    assert ez.main(["build", "--help"]) == 0
+    assert "--project" in capsys.readouterr().out
+
+
+def test_root_pyproject_registers_ez_console_script():
+    pyproject = ROOT / "pyproject.toml"
+    text = pyproject.read_text(encoding="utf-8")
+    assert '[project.scripts]' in text
+    assert 'ez = "cli.ez:main"' in text
+    assert 'cli = "cli"' in text
+    assert 'codegen = "compiler/src/codegen"' in text
 
 
 def test_unknown_command_returns_error(capsys):
@@ -582,6 +612,27 @@ def test_run_std_fmt_format_brace_placeholders(tmp_path):
         '    testEqualStr(actual = format(template = "{{}} {}", args = one), expected = "{} EzLang", msg = "brace escaping");\n'
         '    testEqualStr(actual = format(template = "Hello %s", args = two), expected = "Hello old", msg = "percent placeholder");\n'
         '    return testFailed();\n'
+        '};\n',
+        encoding="utf-8",
+    )
+
+    assert ez.main(["run", "--project", str(project_toml)]) == 0
+
+
+def test_run_string_interpolation_uses_dynamic_length(tmp_path):
+    project_toml = write_project(
+        tmp_path,
+        os_name=ez._native_os(),
+        arch=ez._native_arch(),
+    )
+    long_text = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-extra-long-value"
+    expected = f"prefix-{long_text}-suffix"
+    (tmp_path / "src" / "index.ez").write_text(
+        'from "std/str" import { strEqual };\n'
+        'const main = (): I32 => {\n'
+        f'    let name: Str = "{long_text}";\n'
+        '    let greeting: Str = "prefix-{{name}}-suffix";\n'
+        f'    return strEqual(a = greeting, b = "{expected}") ? 0 : 1;\n'
         '};\n',
         encoding="utf-8",
     )
@@ -1914,6 +1965,54 @@ def test_run_flow_parallel_and_lock_hooks_link(tmp_path):
         '        return p;\n'
         '    };\n'
         '    return value == 7 ? 0 : 1;\n'
+        '};\n',
+        encoding="utf-8",
+    )
+
+    assert ez.main(["run", "--project", str(project_toml)]) == 0
+
+
+def test_run_wp_lock_protects_parallel_compound_assignment(tmp_path):
+    project_toml = write_project(
+        tmp_path,
+        os_name=ez._native_os(),
+        arch=ez._native_arch(),
+    )
+    (tmp_path / "src" / "index.ez").write_text(
+        'wp let total: I32 = 0;\n'
+        'const main = (): I32 => {\n'
+        '    const joined = flow {\n'
+        '        const a = parallel { loop i in 0...500 { total += 1; }; return 1; };\n'
+        '        const b = parallel { loop i in 0...500 { total += 1; }; return 1; };\n'
+        '        const c = parallel { loop i in 0...500 { total += 1; }; return 1; };\n'
+        '        const d = parallel { loop i in 0...500 { total += 1; }; return 1; };\n'
+        '        return a + b + c + d;\n'
+        '    };\n'
+        '    return joined == 4 ? (total == 2000 ? 0 : 1) : 1;\n'
+        '};\n',
+        encoding="utf-8",
+    )
+
+    assert ez.main(["run", "--project", str(project_toml)]) == 0
+
+
+def test_run_global_let_default_ordered_lock_protects_parallel_assignment(tmp_path):
+    project_toml = write_project(
+        tmp_path,
+        os_name=ez._native_os(),
+        arch=ez._native_arch(),
+    )
+    (tmp_path / "src" / "index.ez").write_text(
+        'let total: I32 = 0;\n'
+        'const main = (): I32 => {\n'
+        '    const joined = flow {\n'
+        '        const a = parallel { loop i in 0...500 { total += 1; }; return 1; };\n'
+        '        const b = parallel { loop i in 0...500 { total += 1; }; return 1; };\n'
+        '        const c = parallel { loop i in 0...500 { total += 1; }; return 1; };\n'
+        '        const d = parallel { loop i in 0...500 { total += 1; }; return 1; };\n'
+        '        return a + b + c + d;\n'
+        '    };\n'
+        '    return joined == 4 ? (total == 2000 ? 0 : 1) : 1;\n'
         '};\n',
         encoding="utf-8",
     )

@@ -234,6 +234,10 @@ class SemanticAnalyzer(EzLangVisitor):
             return "write_preferred"
         return "ordered"
 
+    def _is_placeholder_argument(self, expr_ctx) -> bool:
+        """判断调用实参是否是完整的柯里化占位符 `?`。"""
+        return expr_ctx is not None and expr_ctx.getText().strip() == '?'
+
     def _type_from_shape(self, shape_ctx) -> Type:
         """把匿名类型结构转换为结构体/字典语义类型。"""
         alias_type = Type(name="shape", kind=TypeKind.STRUCT)
@@ -1135,7 +1139,9 @@ class SemanticAnalyzer(EzLangVisitor):
             named_args: dict[str, Optional[Type]] = {}
             if ctx.namedArgList() is not None:
                 for arg in ctx.namedArgList().namedArg():
-                    arg_type = arg.expression().accept(self) if arg.expression() is not None else None
+                    arg_type = Type(name="unknown", kind=TypeKind.BASIC) if self._is_placeholder_argument(arg.expression()) else (
+                        arg.expression().accept(self) if arg.expression() is not None else None
+                    )
                     arg_name = arg.VAR_IDENTIFIER().getText()
                     named_args[arg_name] = arg_type
 
@@ -1699,8 +1705,11 @@ class SemanticAnalyzer(EzLangVisitor):
         return Type(name="I32", kind=TypeKind.BASIC)
 
     def visitPlaceholderExpr(self, ctx: EzLangParser.PlaceholderExprContext) -> Optional[Type]:
-        """? 占位符（柯里化占位）—— 类型将在调用时确定"""
-        return Type(name="unknown", kind=TypeKind.BASIC)  # 占位符无具体类型
+        """? 只能作为调用实参占位符，独立表达式会产生诊断。"""
+        self.symbols.add_error(
+            f"行 {ctx.start.line}: '?' 只能作为函数调用的柯里化占位参数使用"
+        )
+        return Type(name="unknown", kind=TypeKind.BASIC)
 
     def visitPipeline(self, ctx: EzLangParser.PipelineContext) -> Optional[Type]:
         """管道表达式：expr -> fn(x = %)"""

@@ -2,6 +2,7 @@
 
 import sys
 import os
+import re
 from pathlib import Path
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
@@ -11,6 +12,15 @@ STD_ROOT = ROOT / 'packages' / 'std'
 
 from llvmlite import ir, binding
 from codegen.llvm_codegen import compile_source
+
+
+def function_ir(ir_text: str, name: str) -> str:
+    """提取单个 LLVM 函数文本。"""
+    marker = f' @"{name}"'
+    idx = ir_text.index(marker)
+    start = ir_text.rfind('define ', 0, idx)
+    end = ir_text.index('\n}\n', idx) + 3
+    return ir_text[start:end]
 
 
 def assert_optional_return_bridge(ir_text: str, name: str, value_type: str, arch: str):
@@ -629,7 +639,8 @@ class TestCodegen:
         ir_text = str(module)
         assert 'call void @"__ezrt_flow_enter"()' in ir_text
         assert 'call void @"__ezrt_parallel_enter"()' in ir_text
-        assert 'call i32 @"__ezrt_race"(i32 2, i32 10)' in ir_text
+        assert 'call i32 @"__ezrt_race_i32"' in ir_text
+        assert 'call i32 @"__ezrt_race"(i32 2, i32 10)' not in ir_text
         assert 'store %"Error"' in ir_text
         assert 'store i1 1, i1* @"__ezrt_throw_active"' in ir_text
         assert 'load %"Error", %"Error"* @"__ezrt_throw_value"' in ir_text
@@ -1203,7 +1214,7 @@ class TestCodegen:
         assert 'call i32 @"race"' not in ir_text
 
     def test_flow_race_pl_lowers_to_runtime_stub(self):
-        """文档接口 race(pl=[...], timeout=...) 应调用 hook 并同步执行首个分支。"""
+        """文档接口 race(pl=[...], timeout=...) 应直接调用并发运行时。"""
         source = '''
         const run = (): I32 => {
             const result = flow {
@@ -1216,10 +1227,9 @@ class TestCodegen:
         assert module is not None
         assert len(errors) == 0, f'编译错误: {errors}'
         ir_text = str(module)
-        assert '@"__ezrt_race"' in ir_text
-        assert 'call i32 @"__ezrt_race"(i32 2, i32 10)' in ir_text
         assert 'define i32 @"__ez_race_branch_' in ir_text
         assert 'call i32 @"__ezrt_race_i32"' in ir_text
+        assert 'call i32 @"__ezrt_race"(i32 2, i32 10)' not in ir_text
         assert 'call i32 @"race"' not in ir_text
 
     def test_typeof_expr(self):
@@ -1235,8 +1245,9 @@ class TestCodegen:
         func = module.get_global('run')
         assert func is not None
         ir_text = str(module)
-        assert 'ret i32 0' not in ir_text
-        assert 'store i32 0' not in ir_text
+        run_ir = function_ir(ir_text, 'run')
+        assert re.search(r'store i32 [1-9][0-9]*, i32\* %"t"', run_ir)
+        assert 'ret i32 %"t.1"' in run_ir
 
     def test_typeof_type_has_stable_nonzero_id(self):
         """typeof Type[] 应返回稳定非零类型 ID"""
@@ -1249,9 +1260,8 @@ class TestCodegen:
         module, errors, _ = compile_source(source)
         assert module is not None
         assert len(errors) == 0, f'编译错误: {errors}'
-        ir_text = str(module)
-        assert 'ret i32 0' not in ir_text
-        assert 'ret i32' in ir_text
+        run_ir = function_ir(str(module), 'run')
+        assert re.search(r'ret i32 [1-9][0-9]*', run_ir)
 
     def test_typeof_struct_value_supports_bitmask_comparison(self):
         """typeof err & Error == Error 应按 TypeID 位与比较生成 IR。"""
@@ -1264,10 +1274,10 @@ class TestCodegen:
         module, errors, _ = compile_source(source)
         assert module is not None
         assert len(errors) == 0, f'编译错误: {errors}'
-        ir_text = str(module)
-        assert 'and i32' in ir_text
-        assert 'icmp' in ir_text
-        assert 'ret i1 0' not in ir_text
+        run_ir = function_ir(str(module), 'run')
+        assert 'and i32' in run_ir
+        assert 'icmp' in run_ir
+        assert 'ret i1 %' in run_ir
 
     def test_comprehensive_module(self):
         """综合测试：结构体、方法、可选类型、泛型、管道、字典"""
@@ -1336,8 +1346,15 @@ class TestCodegen:
         '''
         module, errors, _ = compile_source(source)
         assert module is not None
+        assert len(errors) == 0, f'编译错误: {errors}'
         # 应该生成跳板函数 add_curried
         assert module.get_global('add_curried') is not None
+
+    def test_placeholder_expression_reports_error(self):
+        """独立 ? 不能作为普通表达式降级成 0。"""
+        module, errors, _ = compile_source('const x = ?;')
+        assert module is not None
+        assert any('柯里化占位参数' in error for error in errors)
 
     # ==================== 标准库测试 ====================
 
@@ -1589,6 +1606,15 @@ class TestCodegen:
         _, _, android_libs = compile_source(source, compile_target='android')
         assert macos_libs == [str(STD_ROOT / 'native' / 'os.c')]
         assert android_libs == [str(STD_ROOT / 'native' / 'os.c')]
+
+    def test_stdlib_import_does_not_enable_default_global_lock_runtime(self):
+        """导入模块内部声明不应触发用户源默认全局锁运行时。"""
+        source = 'from "./std/os.ez" import { platform };'
+        module, errors, libs = compile_source(source, compile_target='linux')
+        assert module is not None
+        assert len(errors) == 0, f'编译错误: {errors}'
+        assert libs == [str(STD_ROOT / 'native' / 'os.c')]
+        assert not any(str(lib).endswith('packages/std/native/runtime.c') for lib in libs)
 
     def test_stdlib_fs_import(self):
         """std/fs 文件系统导入"""
@@ -3243,7 +3269,66 @@ class TestCodegen:
         ir_text = str(module)
         assert '@"__ez_lock_cache" = internal global i32 1' in ir_text
         assert '@"__ez_lock_queue" = internal global i32 2' in ir_text
+        assert 'declare void @"__ezrt_lock_register"' in ir_text
+        assert 'define void @"__ezrt_lock_register"' not in ir_text
+        assert re.search(r'call void @"__ezrt_lock_register"\(i8\* %"[^"]+", i32 1\)', ir_text)
+        assert re.search(r'call void @"__ezrt_lock_register"\(i8\* %"[^"]+", i32 2\)', ir_text)
         assert ir_text.count('call void @"__ezrt_lock_write_acquire"') >= 2
         assert ir_text.count('call void @"__ezrt_lock_write_release"') >= 2
         assert ir_text.count('call void @"__ezrt_lock_read_acquire"') >= 2
         assert ir_text.count('call void @"__ezrt_lock_read_release"') >= 2
+        assert 'define void @"__ezrt_lock_write_acquire"' not in ir_text
+
+    def test_locked_compound_assignment_keeps_read_modify_write_inside_write_lock(self):
+        """锁变量复合赋值应在同一个写锁内完成读改写。"""
+        source = '''
+        wp let total: I32 = 0;
+        const test = (): I32 => {
+            total += 1;
+            return total;
+        };
+        '''
+        module, errors, _ = compile_source(source)
+        assert module is not None
+        assert len(errors) == 0, f'编译错误: {errors}'
+        ir_text = str(module)
+        write_pos = ir_text.index('call void @"__ezrt_lock_write_acquire"')
+        load_pos = ir_text.index('load i32, i32* @"total"', write_pos)
+        store_pos = ir_text.index('store i32 %"_assign_value", i32* @"total"', load_pos)
+        release_pos = ir_text.index('call void @"__ezrt_lock_write_release"', store_pos)
+        assert write_pos < load_pos < store_pos < release_pos
+
+    def test_global_let_defaults_to_ordered_lock(self):
+        """全局可变 let 未声明 rp/wp 时应使用默认顺序锁。"""
+        source = '''
+        let total: I32 = 0;
+        const test = (): I32 => {
+            total += 1;
+            return total;
+        };
+        '''
+        module, errors, libs = compile_source(source, compile_target='macos')
+        assert module is not None
+        assert len(errors) == 0, f'编译错误: {errors}'
+        ir_text = str(module)
+        assert '@"__ez_lock_total" = internal global i32 0' in ir_text
+        assert re.search(r'call void @"__ezrt_lock_register"\(i8\* %"[^"]+", i32 0\)', ir_text)
+        assert 'call void @"__ezrt_lock_write_acquire"' in ir_text
+        assert any(str(lib).endswith('packages/std/native/runtime.c') for lib in libs)
+
+    def test_emcc_global_let_does_not_link_native_lock_runtime(self):
+        """emcc 目标暂不启用 native 全局默认锁运行时。"""
+        source = '''
+        let total: I32 = 0;
+        const test = (): I32 => {
+            total += 1;
+            return total;
+        };
+        '''
+        module, errors, libs = compile_source(source, compile_target='emcc')
+        assert module is not None
+        assert len(errors) == 0, f'编译错误: {errors}'
+        ir_text = str(module)
+        assert '@"__ez_lock_total"' not in ir_text
+        assert 'call void @"__ezrt_lock_register"' not in ir_text
+        assert not any(str(lib).endswith('packages/std/native/runtime.c') for lib in libs)

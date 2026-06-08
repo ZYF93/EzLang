@@ -2,8 +2,11 @@
 
 import re
 import shutil
+import subprocess
 import sys
 from pathlib import Path
+
+import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
@@ -1053,9 +1056,187 @@ def test_e2e_flow_example_builds_with_runtime_hooks(tmp_path):
     assert 'define void @"__ezrt_flow_enter"' in ir_text
     assert 'define void @"__ezrt_flow_exit"' in ir_text
     assert 'define void @"__ezrt_sleep"' in ir_text
-    assert 'define i32 @"__ezrt_race"' in ir_text
     assert 'call void @"__ezrt_flow_enter"' in ir_text
-    assert 'call i32 @"__ezrt_race"' in ir_text
+    assert 'declare i32 @"__ezrt_race_i32"' in ir_text
+    assert 'call i32 @"__ezrt_race_i32"' in ir_text
+    assert 'call i32 @"__ezrt_race"' not in ir_text
+
+
+def test_e2e_native_runtime_wp_lock_prefers_waiting_writer(tmp_path):
+    cc = shutil.which("cc")
+    if cc is None:
+        pytest.skip("需要 C 编译器验证 native runtime 锁策略")
+    source = tmp_path / "lock_policy.c"
+    source.write_text(
+        r'''
+#include <pthread.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <unistd.h>
+
+void __ezrt_lock_register(const char *name, int32_t policy);
+void __ezrt_lock_read_acquire(const char *name);
+void __ezrt_lock_read_release(const char *name);
+void __ezrt_lock_write_acquire(const char *name);
+void __ezrt_lock_write_release(const char *name);
+
+static int order[2];
+static int pos = 0;
+
+static void *writer(void *arg) {
+    (void)arg;
+    __ezrt_lock_write_acquire("queue");
+    order[pos++] = 1;
+    __ezrt_lock_write_release("queue");
+    return 0;
+}
+
+static void *late_reader(void *arg) {
+    (void)arg;
+    __ezrt_lock_read_acquire("queue");
+    order[pos++] = 2;
+    __ezrt_lock_read_release("queue");
+    return 0;
+}
+
+int main(void) {
+    pthread_t w;
+    pthread_t r;
+    __ezrt_lock_register("queue", 2);
+    __ezrt_lock_read_acquire("queue");
+    pthread_create(&w, 0, writer, 0);
+    usleep(20000);
+    pthread_create(&r, 0, late_reader, 0);
+    usleep(20000);
+    __ezrt_lock_read_release("queue");
+    pthread_join(w, 0);
+    pthread_join(r, 0);
+    return (pos == 2 && order[0] == 1 && order[1] == 2) ? 0 : 1;
+}
+''',
+        encoding="utf-8",
+    )
+    exe = tmp_path / "lock_policy"
+    runtime = ROOT / "packages" / "std" / "native" / "runtime.c"
+    subprocess.run([cc, str(source), str(runtime), "-pthread", "-o", str(exe)], check=True)
+    assert subprocess.run([str(exe)]).returncode == 0
+
+
+def test_e2e_native_runtime_rp_lock_promotes_starved_writer(tmp_path):
+    cc = shutil.which("cc")
+    if cc is None:
+        pytest.skip("需要 C 编译器验证 native runtime 锁策略")
+    source = tmp_path / "lock_rp_policy.c"
+    source.write_text(
+        r'''
+#include <pthread.h>
+#include <stdint.h>
+#include <unistd.h>
+
+void __ezrt_lock_register(const char *name, int32_t policy);
+void __ezrt_lock_read_acquire(const char *name);
+void __ezrt_lock_read_release(const char *name);
+void __ezrt_lock_write_acquire(const char *name);
+void __ezrt_lock_write_release(const char *name);
+
+static int order[2];
+static int pos = 0;
+
+static void *writer(void *arg) {
+    (void)arg;
+    __ezrt_lock_write_acquire("cache");
+    order[pos++] = 1;
+    __ezrt_lock_write_release("cache");
+    return 0;
+}
+
+static void *late_reader(void *arg) {
+    (void)arg;
+    __ezrt_lock_read_acquire("cache");
+    order[pos++] = 2;
+    __ezrt_lock_read_release("cache");
+    return 0;
+}
+
+int main(void) {
+    pthread_t w;
+    pthread_t r;
+    __ezrt_lock_register("cache", 1);
+    __ezrt_lock_read_acquire("cache");
+    pthread_create(&w, 0, writer, 0);
+    usleep(5000);
+    pthread_create(&r, 0, late_reader, 0);
+    usleep(20000);
+    __ezrt_lock_read_release("cache");
+    pthread_join(w, 0);
+    pthread_join(r, 0);
+    return (pos == 2 && order[0] == 1 && order[1] == 2) ? 0 : 1;
+}
+''',
+        encoding="utf-8",
+    )
+    exe = tmp_path / "lock_rp_policy"
+    runtime = ROOT / "packages" / "std" / "native" / "runtime.c"
+    subprocess.run([cc, str(source), str(runtime), "-pthread", "-o", str(exe)], check=True)
+    assert subprocess.run([str(exe)]).returncode == 0
+
+
+def test_e2e_native_runtime_rp_lock_allows_reader_before_starvation(tmp_path):
+    cc = shutil.which("cc")
+    if cc is None:
+        pytest.skip("需要 C 编译器验证 native runtime 锁策略")
+    source = tmp_path / "lock_rp_reader.c"
+    source.write_text(
+        r'''
+#include <pthread.h>
+#include <stdint.h>
+#include <unistd.h>
+
+void __ezrt_lock_register(const char *name, int32_t policy);
+void __ezrt_lock_read_acquire(const char *name);
+void __ezrt_lock_read_release(const char *name);
+void __ezrt_lock_write_acquire(const char *name);
+void __ezrt_lock_write_release(const char *name);
+
+static int order[2];
+static int pos = 0;
+
+static void *writer(void *arg) {
+    (void)arg;
+    __ezrt_lock_write_acquire("cache2");
+    order[pos++] = 1;
+    __ezrt_lock_write_release("cache2");
+    return 0;
+}
+
+static void *late_reader(void *arg) {
+    (void)arg;
+    __ezrt_lock_read_acquire("cache2");
+    order[pos++] = 2;
+    __ezrt_lock_read_release("cache2");
+    return 0;
+}
+
+int main(void) {
+    pthread_t w;
+    pthread_t r;
+    __ezrt_lock_register("cache2", 1);
+    __ezrt_lock_read_acquire("cache2");
+    pthread_create(&w, 0, writer, 0);
+    pthread_create(&r, 0, late_reader, 0);
+    usleep(20000);
+    __ezrt_lock_read_release("cache2");
+    pthread_join(w, 0);
+    pthread_join(r, 0);
+    return (pos == 2 && order[0] == 2 && order[1] == 1) ? 0 : 1;
+}
+''',
+        encoding="utf-8",
+    )
+    exe = tmp_path / "lock_rp_reader"
+    runtime = ROOT / "packages" / "std" / "native" / "runtime.c"
+    subprocess.run([cc, str(source), str(runtime), "-pthread", "-o", str(exe)], check=True)
+    assert subprocess.run([str(exe)]).returncode == 0
 
 
 

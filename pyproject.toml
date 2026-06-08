@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=75.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ezlang"
+version = "0.1.0"
+description = "EzLang 编程语言工具链"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "antlr4-python3-runtime>=4.13.0",
+    "llvmlite>=0.43.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "antlr4-tools>=0.2.1",
+    "pytest>=8.0",
+]
+
+[project.scripts]
+ez = "cli.ez:main"
+
+[tool.setuptools]
+packages = ["cli", "codegen", "parser", "semantic", "runtime"]
+
+[tool.setuptools.package-dir]
+cli = "cli"
+codegen = "compiler/src/codegen"
+parser = "compiler/src/parser"
+semantic = "compiler/src/semantic"
+runtime = "compiler/src/runtime"
+
+[tool.setuptools.package-data]
+parser = ["*.interp", "*.tokens"]
+
+[tool.pytest.ini_options]
+testpaths = ["compiler/tests"]
+pythonpath = [".", "compiler/src"]

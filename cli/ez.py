@@ -27,20 +27,11 @@ try:
 except ModuleNotFoundError:  # pragma: no cover
     tomllib = None
 
-try:
-    from llvmlite import binding as llvm
-except ModuleNotFoundError:  # pragma: no cover
-    llvm = None
-
-try:
-    from semantic.analyzer import analyze
-    from codegen.llvm_codegen import compile_source
-except ModuleNotFoundError:  # pragma: no cover
-    COMPILER_SRC = ROOT / "compiler" / "src"
-    if str(COMPILER_SRC) not in sys.path:
-        sys.path.insert(0, str(COMPILER_SRC))
-    from semantic.analyzer import analyze
-    from codegen.llvm_codegen import compile_source
+llvm = None
+_llvm_import_error: ModuleNotFoundError | ImportError | None = None
+_analyze = None
+_compile_source = None
+_compiler_import_error: ModuleNotFoundError | ImportError | None = None
 
 VERSION = "0.1.0"
 NATIVE_UNSUPPORTED = {"android", "ios", "emcc", "freestanding"}
@@ -173,6 +164,44 @@ def main(argv: list[str] | None = None) -> int:
     except CliError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
+
+
+def _load_compiler_modules():
+    global _analyze, _compile_source, _compiler_import_error
+    if _analyze is not None and _compile_source is not None:
+        return _analyze, _compile_source
+    try:
+        from semantic.analyzer import analyze as loaded_analyze
+        from codegen.llvm_codegen import compile_source as loaded_compile_source
+    except (ModuleNotFoundError, ImportError) as first_exc:
+        compiler_src = ROOT / "compiler" / "src"
+        if str(compiler_src) not in sys.path:
+            sys.path.insert(0, str(compiler_src))
+        try:
+            from semantic.analyzer import analyze as loaded_analyze
+            from codegen.llvm_codegen import compile_source as loaded_compile_source
+        except (ModuleNotFoundError, ImportError) as exc:
+            _compiler_import_error = exc
+            missing = getattr(exc, "name", None) or str(exc)
+            raise CliError(f"编译器依赖不可用: {missing}。请先在仓库根目录执行 `pip install -e .`") from first_exc
+    _analyze = loaded_analyze
+    _compile_source = loaded_compile_source
+    _compiler_import_error = None
+    return _analyze, _compile_source
+
+
+def _load_llvm_binding():
+    global llvm, _llvm_import_error
+    if llvm is not None:
+        return llvm
+    try:
+        from llvmlite import binding as loaded_llvm
+    except (ModuleNotFoundError, ImportError) as exc:
+        _llvm_import_error = exc
+        return None
+    llvm = loaded_llvm
+    _llvm_import_error = None
+    return llvm
 
 
 def cmd_build(args) -> int:
@@ -317,6 +346,7 @@ def cmd_install(args) -> int:
 
 def cmd_fmt(args) -> int:
     config = load_project(args.project, require_main=False)
+    _, compile_source = _load_compiler_modules()
     files = _collect_fmt_files(config, args.paths)
     changed: list[Path] = []
     for file in files:
@@ -526,6 +556,7 @@ def _discover_sources_from(config: ProjectConfig, entry: Path) -> list[Path]:
 
 def _compile_source_plan(config: ProjectConfig, compile_target: str, source_plan: list[Path], base_dir: Path,
                          target_arch: str | None = None):
+    analyze, compile_source = _load_compiler_modules()
     source = "\n".join(_strip_imports(path.read_text(encoding="utf-8")) for path in source_plan)
     analyzer = analyze(source, base_dir=base_dir, compile_target=compile_target)
     if analyzer.symbols.has_errors():
@@ -642,11 +673,11 @@ def _compile_project(config: ProjectConfig, compile_target: str, source_plan: li
 
 
 def _can_emit_native_object(output: OutputConfig) -> bool:
-    return output.os == _native_os() and output.arch == _native_arch() and llvm is not None
+    return output.os == _native_os() and output.arch == _native_arch() and _load_llvm_binding() is not None
 
 
 def _can_emit_object(output: OutputConfig) -> bool:
-    return llvm is not None and output.triple != ""
+    return _load_llvm_binding() is not None and output.triple != ""
 
 
 def _module_defines_main(module) -> bool:
@@ -725,14 +756,15 @@ def _apply_target_triple(module, triple: str):
 
 
 def _emit_object(module, optimize: int, triple: str) -> bytes:
-    if llvm is None:
+    loaded_llvm = _load_llvm_binding()
+    if loaded_llvm is None:
         raise CliError("llvmlite binding 不可用，无法生成对象文件")
     try:
-        llvm.initialize_all_targets()
-        llvm.initialize_all_asmprinters()
-        llvm_module = llvm.parse_assembly(str(module))
+        loaded_llvm.initialize_all_targets()
+        loaded_llvm.initialize_all_asmprinters()
+        llvm_module = loaded_llvm.parse_assembly(str(module))
         llvm_module.verify()
-        target = llvm.Target.from_triple(triple)
+        target = loaded_llvm.Target.from_triple(triple)
         machine = target.create_target_machine(opt=optimize)
         return machine.emit_object(llvm_module)
     except RuntimeError as exc:

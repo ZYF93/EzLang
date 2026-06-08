@@ -1,3 +1,17 @@
+Metadata-Version: 2.4
+Name: ezlang
+Version: 0.1.0
+Summary: EzLang 编程语言工具链
+Requires-Python: >=3.9
+Description-Content-Type: text/markdown
+License-File: LICENSE
+Requires-Dist: antlr4-python3-runtime>=4.13.0
+Requires-Dist: llvmlite>=0.43.0
+Provides-Extra: dev
+Requires-Dist: antlr4-tools>=0.2.1; extra == "dev"
+Requires-Dist: pytest>=8.0; extra == "dev"
+Dynamic: license-file
+
 # EzLang 编程语言
 
 EzLang 是一门以表达式为中心、采用值语义为主的系统编程语言。它结合现代类型系统、Arena 内存模型与 Flow 并发语义，面向高性能系统级开发，并支持跨平台编译到本地和 WebAssembly。

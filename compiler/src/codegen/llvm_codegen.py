@@ -65,7 +65,6 @@ class LLVMCodeGenerator(EzLangVisitor):
         }
         self._collection_builtin_declares = self._list_collection_builtins | self._dict_collection_builtins
         self._compiler_builtin_declares = {'copy', 'set', 'allocRaw'} | self._collection_builtin_declares
-        self._unimplemented_collection_declares = set()
         self._collection_mono_types: dict[str, tuple[str, list[ir.Type]]] = {}
         self._emcc_js_libs: list[str] = []
         self._emcc_binding_counter = 0
@@ -80,6 +79,7 @@ class LLVMCodeGenerator(EzLangVisitor):
         self._race_branch_counter = 0
         self._flow_future_stack: list[dict[str, dict[str, ir.Value]]] = []
         self._flow_depth = 0
+        self._import_depth = 0
         self._parallel_result_stack: list[ir.AllocaInstr] = []
         self._parallel_exit_stack: list[ir.Block] = []
         self._parallel_arena_depth_stack: list[int] = []
@@ -116,11 +116,11 @@ class LLVMCodeGenerator(EzLangVisitor):
         self._flow_race = self._define_runtime_race_hook('__ezrt_race', ir.FunctionType(i32, [i32, i32]))
         self._parallel_enter = self._define_runtime_void_hook('__ezrt_parallel_enter', flow_hook_type)
         self._parallel_exit = self._define_runtime_void_hook('__ezrt_parallel_exit', flow_hook_type)
-        self._lock_register = self._define_runtime_void_hook('__ezrt_lock_register', ir.FunctionType(void, [i8_ptr, i32]))
-        self._lock_read_acquire = self._define_runtime_void_hook('__ezrt_lock_read_acquire', ir.FunctionType(void, [i8_ptr]))
-        self._lock_read_release = self._define_runtime_void_hook('__ezrt_lock_read_release', ir.FunctionType(void, [i8_ptr]))
-        self._lock_write_acquire = self._define_runtime_void_hook('__ezrt_lock_write_acquire', ir.FunctionType(void, [i8_ptr]))
-        self._lock_write_release = self._define_runtime_void_hook('__ezrt_lock_write_release', ir.FunctionType(void, [i8_ptr]))
+        self._lock_register = self._get_or_declare_function('__ezrt_lock_register', ir.FunctionType(void, [i8_ptr, i32]))
+        self._lock_read_acquire = self._get_or_declare_function('__ezrt_lock_read_acquire', ir.FunctionType(void, [i8_ptr]))
+        self._lock_read_release = self._get_or_declare_function('__ezrt_lock_read_release', ir.FunctionType(void, [i8_ptr]))
+        self._lock_write_acquire = self._get_or_declare_function('__ezrt_lock_write_acquire', ir.FunctionType(void, [i8_ptr]))
+        self._lock_write_release = self._get_or_declare_function('__ezrt_lock_write_release', ir.FunctionType(void, [i8_ptr]))
 
         # 内置结构体: Error = { i32 code, i8* message }
         err_type = ir.global_context.get_identified_type('Error')
@@ -1554,14 +1554,27 @@ class LLVMCodeGenerator(EzLangVisitor):
             return token.getText() if token is not None else ""
         return qname.getText()
 
-    def _lock_policy_code(self, ctx) -> int:
+    def _lock_policy_code(self, ctx) -> int | None:
         prefix = ctx.lockPrefix() if hasattr(ctx, 'lockPrefix') else None
         if prefix is None:
-            return 0
+            return None
         if prefix.RP() is not None:
             return 1
         if prefix.WP() is not None:
             return 2
+        return 0
+
+    def _global_lock_policy_code(self, ctx) -> int | None:
+        """用户源全局可变变量在原生可运行目标默认使用顺序锁。"""
+        if ctx.CONST() is not None:
+            return None
+        prefix = ctx.lockPrefix() if hasattr(ctx, 'lockPrefix') else None
+        if prefix is not None:
+            return self._lock_policy_code(ctx)
+        if self._import_depth > 0:
+            return None
+        if self.compile_target not in {'linux', 'macos', 'windows'}:
+            return None
         return 0
 
     def _dict_key_text(self, field_ctx) -> str | None:
@@ -1586,9 +1599,10 @@ class LLVMCodeGenerator(EzLangVisitor):
         text = self._dict_key_text(field_ctx) or ""
         return self._make_global_string(text, prefix="_dict_key")
 
-    def _emit_lock_metadata(self, name: str, policy_code: int):
-        if policy_code == 0:
+    def _emit_lock_metadata(self, name: str, policy_code: int | None):
+        if policy_code is None:
             return None
+        self._require_runtime()
         self._lock_policies[name] = policy_code
         meta_name = "__ez_lock_" + re.sub(r"\W+", "_", name)
         if meta_name in self.module.globals:
@@ -1607,6 +1621,8 @@ class LLVMCodeGenerator(EzLangVisitor):
         name_ptr = self._lock_name_ptr(name)
         if name_ptr is None:
             return thunk()
+        policy_code = self._lock_policies.get(name, 0)
+        self.builder.call(self._lock_register, [name_ptr, ir.Constant(ir.IntType(32), policy_code)])
         if mode == "read":
             acquire = self._lock_read_acquire
             release = self._lock_read_release
@@ -1618,8 +1634,21 @@ class LLVMCodeGenerator(EzLangVisitor):
         self.builder.call(release, [name_ptr])
         return value
 
+    def _emit_locked_assignment(self, name: str, target: ir.Value, rhs: ir.Value, op_ctx):
+        def do_store():
+            store_val = rhs
+            if op_ctx is not None and op_ctx.ASSIGN() is None:
+                current = self._load_with_unsigned(target, name="_assign_current")
+                store_val = self._apply_assignment_operator(current, store_val, op_ctx)
+            if store_val.type != target.type.pointee:
+                store_val = self._coerce_preserve_unsigned(store_val, target.type.pointee)
+            self.builder.store(store_val, target)
+            return store_val
+
+        return self._emit_lock_access(name, "write", do_store)
+
     def _simple_lvalue_name(self, ctx) -> str | None:
-        """仅识别裸标识符左值；成员和索引左值由后续语义完善。"""
+        """识别裸标识符左值名；成员和索引左值由专门路径处理。"""
         if ctx is None:
             return None
         text = ctx.getText() if hasattr(ctx, 'getText') else ''
@@ -2258,10 +2287,7 @@ class LLVMCodeGenerator(EzLangVisitor):
                 bt = t.baseType() if hasattr(t, 'baseType') else None
                 if bt is not None and bt.TYPE_IDENTIFIER() is not None:
                     param_names.append(bt.TYPE_IDENTIFIER().getText())
-            if name in self._unimplemented_collection_declares:
-                self.generic_templates[name] = (param_names, type_ctx, 'unimplemented')
-            else:
-                self.generic_templates[name] = (param_names, type_ctx)
+            self.generic_templates[name] = (param_names, type_ctx)
             return None  # 泛型声明不生成 LLVM 函数，等到单态化时生成
 
         if name in self._compiler_builtin_declares:
@@ -2397,10 +2423,14 @@ class LLVMCodeGenerator(EzLangVisitor):
                 renames[name] = alias
 
         # 访问被导入文件的 AST（符号会注册到当前模块）
-        for i in range(tree.getChildCount()):
-            child = tree.getChild(i)
-            if hasattr(child, 'accept') and child.getChildCount() > 0:
-                child.accept(self)
+        self._import_depth += 1
+        try:
+            for i in range(tree.getChildCount()):
+                child = tree.getChild(i)
+                if hasattr(child, 'accept') and child.getChildCount() > 0:
+                    child.accept(self)
+        finally:
+            self._import_depth -= 1
 
         # 处理重命名：为被导入符号创建别名
         for orig_name, alias in renames.items():
@@ -2419,7 +2449,7 @@ class LLVMCodeGenerator(EzLangVisitor):
         type_ctx = ctx.type_()
         initializer = ctx.expression()
         decorators = [d.VAR_IDENTIFIER().getText() for d in ctx.decorator()]
-        lock_policy_code = self._lock_policy_code(ctx)
+        lock_policy_code = self._global_lock_policy_code(ctx) if self.builder is None else self._lock_policy_code(ctx)
         self._emit_lock_metadata(name, lock_policy_code)
 
         if self.builder is None:
@@ -2836,64 +2866,83 @@ class LLVMCodeGenerator(EzLangVisitor):
         return parts
 
     def _gen_str_interp(self, parts) -> ir.Value:
-        """生成字符串插值的 LLVM IR：栈缓冲区 + memcpy 逐段拼接"""
+        """生成字符串插值的 LLVM IR：按实际长度分配并逐段拼接。"""
         i8 = ir.IntType(8)
-        i32 = ir.IntType(32)
         i64 = ir.IntType(64)
 
-        # 分配 256 字节栈缓冲区
-        buf_type = ir.ArrayType(i8, 256)
-        buf = self.builder.alloca(buf_type, name="_interp_buf")
-        buf_base = self.builder.gep(buf, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
-
-        # 获取 llvm.memcpy
         memcpy = self.module.get_global('llvm.memcpy.p0.p0.i64')
+        strlen = self._get_or_define_strlen()
 
-        seg_idx = 0
-        pos = 0
+        segments: list[tuple[ir.Value, ir.Value]] = []
         for seg_type, seg_content in parts:
             if seg_type == "text" and seg_content:
-                # 创建临时全局字符串（唯一名称）
-                data = bytearray(seg_content, 'utf-8')
-                arr_type = ir.ArrayType(i8, len(data))
-                gv_name = f"_interp_seg_{seg_idx}"
-                gv = ir.GlobalVariable(self.module, arr_type, name=gv_name)
-                gv.initializer = ir.Constant(arr_type, data)
-                gv.global_constant = True
-                gv.linkage = 'internal'
-                src = self.builder.gep(gv, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
-                seg_len = len(data)
-                seg_idx += 1
+                src = self._make_global_string(seg_content, prefix="_interp_seg")
+                seg_len = ir.Constant(i64, len(bytearray(seg_content, 'utf-8')))
             elif seg_type == "expr" and self.builder:
-                # 查找变量
                 var_name = seg_content.strip()
-                if var_name in self.locals:
-                    src_val = self.builder.load(self.locals[var_name])
-                    # Str 类型为 i8*，直接使用
-                    if isinstance(src_val.type, ir.PointerType) and src_val.type.pointee == i8:
-                        src = src_val
-                        seg_len = 64  # 简化：用固定上限
-                    else:
-                        continue
+                storage = self.locals.get(var_name) or self.globals.get(var_name)
+                if storage is None:
+                    continue
+                src_val = self.builder.load(storage)
+                if isinstance(src_val.type, ir.PointerType) and src_val.type.pointee == i8:
+                    src = src_val
+                    seg_len = self.builder.call(strlen, [src], name="_interp_len")
                 else:
                     continue
             else:
                 continue
+            segments.append((src, seg_len))
 
-            # memcpy(dst+pos, src, seg_len)
-            dst_ptr = self.builder.gep(buf_base, [ir.Constant(i32, pos)], inbounds=True)
+        total_len = ir.Constant(i64, 0)
+        for _, seg_len in segments:
+            total_len = self.builder.add(total_len, seg_len, name="_interp_total")
+        alloc_len = self.builder.add(total_len, ir.Constant(i64, 1), name="_interp_alloc_len")
+        buf_base = self.builder.call(self._arena_alloc, [alloc_len, ir.Constant(i64, 1)], name="_interp_buf")
+
+        pos = ir.Constant(i64, 0)
+        for src, seg_len in segments:
+            dst_ptr = self.builder.gep(buf_base, [pos], inbounds=True)
             self.builder.call(memcpy, [
                 dst_ptr, src,
-                ir.Constant(i64, seg_len),
+                seg_len,
                 ir.Constant(ir.IntType(1), 0)
             ])
-            pos += seg_len
+            pos = self.builder.add(pos, seg_len, name="_interp_pos")
 
-        # 添加 null 终止符
-        null_ptr = self.builder.gep(buf_base, [ir.Constant(i32, pos)], inbounds=True)
+        null_ptr = self.builder.gep(buf_base, [pos], inbounds=True)
         self.builder.store(ir.Constant(i8, 0), null_ptr)
-
         return buf_base
+
+    def _get_or_define_strlen(self) -> ir.Function:
+        """定义内部 strlen，避免依赖平台 size_t ABI。"""
+        existing = self.module.globals.get('__ez_strlen')
+        if isinstance(existing, ir.Function):
+            return existing
+
+        i8 = ir.IntType(8)
+        i64 = ir.IntType(64)
+        i8_ptr = ir.PointerType(i8)
+        func = ir.Function(self.module, ir.FunctionType(i64, [i8_ptr]), '__ez_strlen')
+        text = func.args[0]
+        entry = func.append_basic_block('entry')
+        loop = func.append_basic_block('loop')
+        done = func.append_basic_block('done')
+        builder = ir.IRBuilder(entry)
+        builder.branch(loop)
+
+        builder.position_at_start(loop)
+        index = builder.phi(i64, name='_strlen_i')
+        index.add_incoming(ir.Constant(i64, 0), entry)
+        ch_ptr = builder.gep(text, [index], inbounds=True)
+        ch = builder.load(ch_ptr, name='_strlen_ch')
+        is_end = builder.icmp_unsigned('==', ch, ir.Constant(i8, 0), name='_strlen_end')
+        next_index = builder.add(index, ir.Constant(i64, 1), name='_strlen_next')
+        index.add_incoming(next_index, loop)
+        builder.cbranch(is_end, done, loop)
+
+        builder.position_at_start(done)
+        builder.ret(index)
+        return func
 
     def _make_global_string(self, text: str, prefix: str = "_str") -> ir.Value:
         """创建全局字符串常量，返回 i8*"""
@@ -3032,12 +3081,6 @@ class LLVMCodeGenerator(EzLangVisitor):
                 for p in (template_ctx.paramTypeList().paramType() if template_ctx.paramTypeList() is not None else [])
             ]
             return mono_name
-        if len(template) > 2 and template[2] == 'unimplemented':
-            self._extern_diagnostics.append(
-                f"标准库集合函数 '{base_name}' 尚未实现，不能生成外部符号 '{mono_name}'"
-            )
-            return mono_name
-
         # 创建类型替换映射
         type_map = dict(zip(param_names, type_args))
 
@@ -3669,7 +3712,11 @@ class LLVMCodeGenerator(EzLangVisitor):
     # ==================== 占位符 ====================
 
     def visitPlaceholderExpr(self, ctx: EzLangParser.PlaceholderExprContext):
-        """? 占位符（柯里化占位，暂返回零值）"""
+        """独立 ? 非法；仅在调用参数中作为柯里化占位符。"""
+        self._extern_diagnostics.append(
+            f"行 {ctx.start.line}: '?' 只能作为函数调用的柯里化占位参数使用"
+        )
+        # 错误恢复：返回零值让后续 IR 构造继续完成，诊断会阻止产物被当作成功编译。
         return ir.Constant(ir.IntType(32), 0)
 
     # ==================== 标记字面量 ====================
@@ -3977,9 +4024,12 @@ class LLVMCodeGenerator(EzLangVisitor):
             task_arg = self._coerce_value(task_arg, i32) if isinstance(task_arg.type, ir.IntType) else ir.Constant(i32, 0)
 
         timeout_arg = self._coerce_value(timeout_arg, i32) if timeout_arg.type != i32 else timeout_arg
-        race_hook = self.builder.call(self._flow_race, [task_arg, timeout_arg])
+
+        def legacy_race_hook():
+            return self.builder.call(self._flow_race, [task_arg, timeout_arg])
+
         if pl_array is None:
-            return race_hook
+            return legacy_race_hook()
 
         async_result = self._gen_race_i32_runtime_call(pl_array, timeout_arg)
         if async_result is not None:
@@ -3987,10 +4037,10 @@ class LLVMCodeGenerator(EzLangVisitor):
 
         first_branch = self._first_function_literal_in_array(pl_array)
         if first_branch is None:
-            return race_hook
+            return legacy_race_hook()
         params = first_branch.paramList()
         if params is not None and params.param():
-            return race_hook
+            return legacy_race_hook()
 
         branch_type = self._infer_function_literal_return_type(first_branch)
         result_type = i32 if isinstance(branch_type, ir.VoidType) else branch_type
@@ -4022,7 +4072,7 @@ class LLVMCodeGenerator(EzLangVisitor):
             self.builder.branch(exit_block)
         self.builder.position_at_start(exit_block)
         if isinstance(branch_type, ir.VoidType):
-            return race_hook
+            return legacy_race_hook()
         return self.builder.load(result_alloca, name="race_value")
 
     def _function_literals_in_array(self, array_ctx) -> list:
@@ -4418,16 +4468,13 @@ class LLVMCodeGenerator(EzLangVisitor):
             except KeyError:
                 func = None
 
-        is_unimplemented_collection = name and any(
-            name == base or name.startswith(f'{base}_') for base in self._unimplemented_collection_declares
-        )
         is_compiler_builtin = name and any(
             name == base or name.startswith(f'{base}_') for base in self._compiler_builtin_declares
         )
 
         if curried_target is None and (func is None or not self._is_callable_value(func)):
-            # compiler builtin / 未实现集合函数不生成外部声明。
-            if is_compiler_builtin or is_unimplemented_collection:
+            # 编译器内建函数不生成外部声明。
+            if is_compiler_builtin:
                 func = None
             elif name in self.generic_templates:
                 func = None
@@ -6196,16 +6243,12 @@ class LLVMCodeGenerator(EzLangVisitor):
                 store_val = self.builder.load(store_val)
             if name in self.locals:
                 target = self.locals[name]
-                current = self._load_with_unsigned(target, name="_assign_current")
-                store_val = self._apply_assignment_operator(current, store_val, op_ctx)
-                self._emit_lock_access(name, "write", lambda: self.builder.store(store_val, target))
+                store_val = self._emit_locked_assignment(name, target, store_val, op_ctx)
             elif name in self.globals:
                 target = self.globals[name]
-                current = self._load_with_unsigned(target, name="_assign_current")
-                store_val = self._apply_assignment_operator(current, store_val, op_ctx)
-                self._emit_lock_access(name, "write", lambda: self.builder.store(store_val, target))
+                store_val = self._emit_locked_assignment(name, target, store_val, op_ctx)
 
-        return val
+        return store_val if name and val is not None else val
 
     # ==================== 语句 ====================
 

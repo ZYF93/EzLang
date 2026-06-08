@@ -82,6 +82,17 @@ class TestSemantic:
         assert arr is not None and arr.type.kind.name == 'OPTIONAL'
         assert ptr is not None and ptr.type.kind.name == 'POINTER'
 
+    def test_placeholder_expression_requires_call_argument_context(self):
+        """独立 ? 不能静默编译为 0，只能用于调用参数占位。"""
+        anal = analyze('const x = ?;')
+        assert anal.symbols.has_errors()
+        assert any('柯里化占位参数' in error for error in anal.symbols.errors)
+
+    def test_placeholder_call_argument_is_valid(self):
+        """调用参数中的 ? 保留为合法柯里化占位符。"""
+        anal = analyze('const add = (a: I32, b: I32): I32 => { return a + b; }; const add2 = add(a = 2, b = ?);')
+        assert not anal.symbols.has_errors(), f'语义错误: {anal.symbols.errors}'
+
     def test_basics(self):
         """基础语法语义检查"""
         anal = analyze_file(
