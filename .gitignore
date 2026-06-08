@@ -163,3 +163,5 @@ vite.config.ts.timestamp-*
 # 忽略pip相关的日志和缓存
 pip-log.txt
 pip-delete-this-directory.txt
+
+.ez

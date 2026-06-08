@@ -6,6 +6,7 @@ import argparse
 import glob
 import importlib
 import importlib.util
+import os
 import platform
 import re
 import shutil
@@ -16,7 +17,7 @@ import urllib.request
 import zipfile
 from dataclasses import dataclass, field
 from io import BytesIO
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from types import ModuleType
 from typing import Any
 
@@ -114,12 +115,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("-v", "--verbose", action="count", default=0, help="输出更多诊断")
     subparsers = parser.add_subparsers(dest="command")
 
-    build = subparsers.add_parser("build", help="编译项目到 LLVM IR")
+    build = subparsers.add_parser("build", help="编译项目并生成目标产物")
     _add_project_arg(build)
     build.set_defaults(func=cmd_build)
 
     run = subparsers.add_parser("run", help="编译并运行本地目标")
     _add_project_arg(run)
+    run.add_argument("path", nargs="?", help="要运行的 .ez 文件；省略时运行 project.toml 的入口")
     run.set_defaults(func=cmd_run)
 
     test = subparsers.add_parser("test", help="编译并执行 EzLang 测试")
@@ -127,17 +129,18 @@ def build_parser() -> argparse.ArgumentParser:
     test.add_argument("paths", nargs="*", help="测试文件或目录，默认查找 tests/ 下的 .ez 文件")
     test.set_defaults(func=cmd_test)
 
-    install = subparsers.add_parser("install", help="校验依赖安装计划")
+    install = subparsers.add_parser("install", help="安装 project.toml 声明的依赖")
     _add_project_arg(install)
+    install.add_argument("-g", "--global", action="store_true", dest="global_install", help="把版本依赖安装到全局缓存")
     install.set_defaults(func=cmd_install)
 
-    fmt = subparsers.add_parser("fmt", help="解析检查 EzLang 源文件")
+    fmt = subparsers.add_parser("fmt", help="格式化 EzLang 源文件")
     _add_project_arg(fmt)
     fmt.add_argument("paths", nargs="*", help="要检查的文件或目录")
     fmt.add_argument("--dry-run", "--check", action="store_true", dest="check", help="只检查不修改")
     fmt.set_defaults(func=cmd_fmt)
 
-    release = subparsers.add_parser("release", help="校验发布元数据")
+    release = subparsers.add_parser("release", help="打包并发布当前项目")
     _add_project_arg(release)
     release.add_argument("--dry-run", action="store_true", help="只校验不发布")
     release.set_defaults(func=cmd_release)
@@ -253,7 +256,7 @@ def cmd_build(args) -> int:
 
 
 def cmd_run(args) -> int:
-    config = load_project(args.project, require_main=True)
+    config = _load_run_config(args.path, args.project)
     output = _select_run_output(config)
     if output.os != _native_os() or output.os in NATIVE_UNSUPPORTED:
         print(f"error: ez run only supports native target {_native_os()}, got {output.os}", file=sys.stderr)
@@ -271,6 +274,55 @@ def cmd_run(args) -> int:
     _link_executable(obj_file, exe_file, libs, output.dir, output.os)
     completed = subprocess.run([str(exe_file)])
     return completed.returncode
+
+
+def _load_run_config(path: str | None, project_path: str | Path) -> ProjectConfig:
+    if path is None:
+        return load_project(project_path, require_main=True)
+
+    source = _resolve_path(Path.cwd(), path)
+    if not source.exists():
+        raise CliError(f"运行文件不存在: {source}")
+    if source.suffix != ".ez":
+        raise CliError(f"ez run 只支持 .ez 文件: {source}")
+
+    project_file = Path(project_path).expanduser()
+    if not project_file.is_absolute():
+        project_file = Path.cwd() / project_file
+    project_file = project_file.resolve()
+    if project_file.exists():
+        config = load_project(project_file, require_main=False)
+        config.main = source
+        config.outputs = [_native_run_output(config.root, source)]
+        return config
+
+    root = source.parent
+    return ProjectConfig(
+        path=source,
+        root=root,
+        name=_run_module_name(source),
+        version="0.0.0",
+        main=source,
+        optimize=2,
+        public=False,
+        outputs=[_native_run_output(root, source)],
+    )
+
+
+def _native_run_output(root: Path, source: Path) -> OutputConfig:
+    arch = _native_arch()
+    os_name = _native_os()
+    return OutputConfig(
+        arch=arch,
+        os=os_name,
+        dir=root / ".ez" / "run" / _run_module_name(source),
+        triple=_target_triple(arch, os_name),
+    )
+
+
+def _run_module_name(source: Path) -> str:
+    name = re.sub(r"\W+", "_", source.stem).strip("_")
+    return name or "main"
 
 
 def cmd_test(args) -> int:
@@ -327,9 +379,13 @@ def cmd_install(args) -> int:
     config = load_project(args.project, require_main=False)
     for name, spec in config.deps.items():
         if spec == "@workspace":
+            if args.global_install:
+                raise CliError(f"workspace 依赖 {name} 不能全局安装")
             members = _expand_workspace_members(config)
             print(f"workspace {name} {','.join(str(p) for p in members)}")
         elif spec.startswith(".") or spec.startswith("/"):
+            if args.global_install:
+                raise CliError(f"本地路径依赖 {name} 不能全局安装")
             path = _resolve_path(config.root, spec)
             if not path.exists():
                 raise CliError(f"依赖 {name} 路径不存在: {path}")
@@ -337,7 +393,7 @@ def cmd_install(args) -> int:
         else:
             if not SEMVER_RE.match(spec):
                 raise CliError(f"依赖 {name} 版本号无效: {spec}")
-            install_dir = _install_remote_dependency(config, name, spec)
+            install_dir = _install_remote_dependency(config, name, spec, global_install=args.global_install)
             print(f"remote {name} {spec} {install_dir}")
     if not config.deps:
         print("no dependencies")
@@ -1082,6 +1138,7 @@ def _dependency_roots(config: ProjectConfig, package_name: str) -> list[Path]:
             roots.append(_resolve_path(config.root, dep_spec))
         elif SEMVER_RE.match(dep_spec):
             roots.append(config.root / ".ez" / "deps" / package_name / dep_spec)
+            roots.append(_global_dependency_dir(package_name, dep_spec))
 
     installed_root = config.root / ".ez" / "deps" / package_name
     if installed_root.exists():
@@ -1089,6 +1146,14 @@ def _dependency_roots(config: ProjectConfig, package_name: str) -> list[Path]:
             roots.append(installed_root)
         else:
             versions = [p for p in installed_root.iterdir() if p.is_dir()]
+            if len(versions) == 1:
+                roots.append(versions[0])
+    global_installed_root = _ez_home() / "deps" / package_name
+    if global_installed_root.exists():
+        if _package_entry(global_installed_root, package_name, "") is not None:
+            roots.append(global_installed_root)
+        else:
+            versions = [p for p in global_installed_root.iterdir() if p.is_dir()]
             if len(versions) == 1:
                 roots.append(versions[0])
     return sorted(dict.fromkeys(p.resolve() for p in roots))
@@ -1326,30 +1391,54 @@ def _publish_release_package(config: ProjectConfig, package_name: str, package_d
 
 
 
-def _install_remote_dependency(config: ProjectConfig, name: str, version: str) -> Path:
+def _install_remote_dependency(config: ProjectConfig, name: str, version: str, *, global_install: bool = False) -> Path:
     if not config.registry:
         raise CliError(f"远端依赖 {name} 需要 [project].registry")
-    install_dir = config.root / ".ez" / "deps" / name / version
+    install_dir = _global_dependency_dir(name, version) if global_install else config.root / ".ez" / "deps" / name / version
     if _is_http_url(config.registry):
         _download_remote_package(config.registry, name, version, install_dir)
     else:
         source_dir = _resolve_path(config.root, config.registry) / name / version
         if not source_dir.exists():
             raise CliError(f"远端依赖不存在: {source_dir}")
-        _copy_package_dir(source_dir, install_dir)
+        package_zip = source_dir / f"{name}-{version}.zip"
+        if package_zip.exists():
+            _extract_package_zip(package_zip.read_bytes(), install_dir)
+        else:
+            _copy_package_dir(source_dir, install_dir)
     return install_dir
 
 
 
+def _ez_home() -> Path:
+    return Path(os.environ.get("EZLANG_HOME", "~/.ez")).expanduser().resolve()
+
+
+
+def _global_dependency_dir(name: str, version: str) -> Path:
+    return _ez_home() / "deps" / name / version
+
+
+
 def _download_remote_package(registry: str, name: str, version: str, install_dir: Path):
-    url = registry.rstrip("/") + f"/{name}/{version}/{name}.ez"
-    install_dir.mkdir(parents=True, exist_ok=True)
-    target = install_dir / f"{name}.ez"
+    zip_url = registry.rstrip("/") + f"/{name}/{version}/{name}-{version}.zip"
+    legacy_url = registry.rstrip("/") + f"/{name}/{version}/{name}.ez"
     try:
-        with urllib.request.urlopen(url, timeout=30) as response:
-            target.write_bytes(response.read())
-    except (urllib.error.URLError, TimeoutError) as exc:
-        raise CliError(f"远端依赖下载失败 {url}: {exc}") from exc
+        with urllib.request.urlopen(zip_url, timeout=30) as response:
+            package_data = response.read()
+        _extract_package_zip(package_data, install_dir)
+        return
+    except (urllib.error.URLError, TimeoutError) as zip_exc:
+        try:
+            with urllib.request.urlopen(legacy_url, timeout=30) as response:
+                source_data = response.read()
+        except (urllib.error.URLError, TimeoutError) as legacy_exc:
+            raise CliError(f"远端依赖下载失败 {zip_url} 或 {legacy_url}: {legacy_exc}") from zip_exc
+
+    if install_dir.exists():
+        shutil.rmtree(install_dir)
+    install_dir.mkdir(parents=True, exist_ok=True)
+    (install_dir / f"{name}.ez").write_bytes(source_data)
 
 
 
@@ -1357,6 +1446,32 @@ def _copy_package_dir(source_dir: Path, install_dir: Path):
     if install_dir.exists():
         shutil.rmtree(install_dir)
     shutil.copytree(source_dir, install_dir)
+
+
+
+def _extract_package_zip(package_data: bytes, install_dir: Path):
+    if install_dir.exists():
+        shutil.rmtree(install_dir)
+    install_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        with zipfile.ZipFile(BytesIO(package_data)) as archive:
+            for member in archive.infolist():
+                if member.is_dir():
+                    continue
+                member_path = PurePosixPath(member.filename)
+                if (
+                    member_path.is_absolute()
+                    or ".." in member_path.parts
+                    or "\\" in member.filename
+                    or re.match(r"^[A-Za-z]:", member.filename)
+                ):
+                    raise CliError(f"远端依赖包包含非法路径: {member.filename}")
+                target = install_dir / Path(*member_path.parts)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                with archive.open(member) as source:
+                    target.write_bytes(source.read())
+    except zipfile.BadZipFile as exc:
+        raise CliError("远端依赖包不是有效 zip 文件") from exc
 
 
 
@@ -1375,6 +1490,10 @@ def _expand_workspace_members(config: ProjectConfig) -> list[Path]:
 
 def _select_run_output(config: ProjectConfig) -> OutputConfig:
     native = _native_os()
+    native_arch = _native_arch()
+    for output in config.outputs:
+        if output.os == native and output.arch == native_arch:
+            return output
     for output in config.outputs:
         if output.os == native:
             return output

@@ -1,33 +1,40 @@
 [project]
 name = "ezlang"
 version = "0.1.0"
-description = "A simple and efficient programming language"
+description = "EzLang 编程语言工具链"
+main = "examples/types.ez"
 public = true
-registry = "https://www.xxx.com"
-main = "./src/index.ez"
+registry = "dist/registry"
 optimize = 2
 
-[workspace]
-members = ["./packages/**", "./apps/**"]
+[log]
+compile_min_level = 2
 
-[[output]]
-arch = "wasm"
-os = "emcc"
-dir = "./dist/wasm"
+[workspace]
+members = ["packages/*"]
 
 [[output]]
 arch = "x86_64"
 os = "linux"
-dir = "./dist/x86_64"
+dir = "dist/linux-x86_64"
 
-[[plugins]]
-name = "backend"
-args = ["release=true"]
+[[output]]
+arch = "aarch64"
+os = "macos"
+dir = "dist/macos-aarch64"
 
-[[plugins]]
-name = "frontend"
+[[output]]
+arch = "x86_64"
+os = "macos"
+dir = "dist/macos-x86_64"
+
+[[output]]
+arch = "wasm32"
+os = "emcc"
+dir = "dist/emcc-wasm32"
 
 [deps]
-std = "./lib/std.ez"
-utils = "0.1.0"
-packageA = "@workspace"
+std = "./packages/std"
+ez-web-ui = "./packages/ez-web-ui"
+ez-android-ui = "./packages/ez-android-ui"
+ez-ios-ui = "./packages/ez-ios-ui"

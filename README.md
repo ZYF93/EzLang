@@ -41,11 +41,13 @@ EzLang/
 
 EzLang 使用 `project.toml` 作为项目清单，`ez` CLI 提供完整的构建和发布体验。
 
-- `ez install`：解析 `project.toml` 的 `[deps]` 节点，安装本地依赖、远程版本依赖或 Workspace 内部模块。
+- `ez install`：解析 `project.toml` 的 `[deps]` 节点，安装本地依赖、远程版本依赖或 Workspace 内部模块；`-g` 可把版本依赖安装到全局缓存。
 - `ez build`：根据 `[[output]]` 目标编译项目，生成多平台产物。
 - `ez run`：构建并执行本地可执行程序。
+- `ez run path/to/file.ez`：直接运行单个 EzLang 源文件。
+- `ez test`：编译并执行 EzLang 测试文件。
 - `ez fmt`：格式化所有 `.ez` 源码。
-- `ez release`：将包发布到远端注册表。
+- `ez release`：将包打包为 `<name>-<version>.zip` 并发布到注册表。
 
 ### `project.toml` 关键字段
 

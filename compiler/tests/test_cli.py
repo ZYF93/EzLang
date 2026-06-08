@@ -3462,6 +3462,50 @@ def test_run_native_executes_binary_and_returns_exit_code(tmp_path, capsys):
     assert (tmp_path / "dist" / ez._native_os() / "demo").exists()
 
 
+def test_run_prefers_native_arch_when_multiple_same_os_outputs(tmp_path, capsys):
+    other_arch = "aarch64" if ez._native_arch() == "x86_64" else "x86_64"
+    src_dir = tmp_path / "src"
+    src_dir.mkdir()
+    (src_dir / "index.ez").write_text("const main = (): I32 => { return 0; };\n", encoding="utf-8")
+    project_toml = tmp_path / "project.toml"
+    project_toml.write_text(
+        f"""
+[project]
+name = "demo"
+version = "0.1.0"
+main = "src/index.ez"
+
+[[output]]
+arch = "{other_arch}"
+os = "{ez._native_os()}"
+dir = "dist/wrong-arch"
+
+[[output]]
+arch = "{ez._native_arch()}"
+os = "{ez._native_os()}"
+dir = "dist/native"
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+
+    assert ez.main(["run", "--project", str(project_toml)]) == 0
+
+    assert (tmp_path / "dist" / "native" / "demo").exists()
+    assert not (tmp_path / "dist" / "wrong-arch" / "demo").exists()
+
+
+def test_run_accepts_single_ez_file_without_project(tmp_path, monkeypatch):
+    source = tmp_path / "exit_code.ez"
+    source.write_text("const main = (): I32 => { return 5; };\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+
+    assert ez.main(["run", "exit_code.ez"]) == 5
+
+    exe_file = tmp_path / ".ez" / "run" / "exit_code" / "exit_code"
+    assert exe_file.exists()
+
+
 def test_install_prints_validation_plan(tmp_path, capsys):
     (tmp_path / "local.ez").write_text("let x: I32 = 1;\n", encoding="utf-8")
     (tmp_path / "packages" / "lib").mkdir(parents=True)
@@ -3517,6 +3561,142 @@ remote = "1.2.3"
     installed = tmp_path / ".ez" / "deps" / "remote" / "1.2.3" / "remote.ez"
     assert installed.read_text(encoding="utf-8") == "export let answer: I32 = 42;\n"
     assert f"remote remote 1.2.3 {installed.parent}" in out
+
+
+
+def test_install_extracts_released_zip_dependency(tmp_path, capsys):
+    registry = tmp_path / "registry"
+    package = registry / "remote" / "1.2.3"
+    package.mkdir(parents=True)
+    with zipfile.ZipFile(package / "remote-1.2.3.zip", "w") as archive:
+        archive.writestr("project.toml", '[project]\nname = "remote"\nversion = "1.2.3"\nmain = "src/index.ez"\n')
+        archive.writestr("src/index.ez", "export let answer: I32 = 42;\n")
+    project_toml = tmp_path / "project.toml"
+    project_toml.write_text(
+        f"""
+[project]
+name = "demo"
+version = "0.1.0"
+registry = "{registry}"
+
+[deps]
+remote = "1.2.3"
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+
+    assert ez.main(["install", "--project", str(project_toml)]) == 0
+
+    out = capsys.readouterr().out
+    installed = tmp_path / ".ez" / "deps" / "remote" / "1.2.3"
+    assert (installed / "project.toml").exists()
+    assert (installed / "src" / "index.ez").read_text(encoding="utf-8") == "export let answer: I32 = 42;\n"
+    assert f"remote remote 1.2.3 {installed}" in out
+
+
+def test_install_global_installs_remote_dependency_to_ezlang_home(tmp_path, monkeypatch, capsys):
+    ez_home = tmp_path / "home"
+    monkeypatch.setenv("EZLANG_HOME", str(ez_home))
+    registry = tmp_path / "registry"
+    package = registry / "remote" / "1.2.3"
+    package.mkdir(parents=True)
+    with zipfile.ZipFile(package / "remote-1.2.3.zip", "w") as archive:
+        archive.writestr("index.ez", "export let answer: I32 = 42;\n")
+    project_toml = tmp_path / "project.toml"
+    project_toml.write_text(
+        f"""
+[project]
+name = "demo"
+version = "0.1.0"
+registry = "{registry}"
+
+[deps]
+remote = "1.2.3"
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+
+    assert ez.main(["install", "-g", "--project", str(project_toml)]) == 0
+
+    out = capsys.readouterr().out
+    installed = ez_home / "deps" / "remote" / "1.2.3"
+    assert (installed / "index.ez").read_text(encoding="utf-8") == "export let answer: I32 = 42;\n"
+    assert f"remote remote 1.2.3 {installed}" in out
+
+
+def test_build_resolves_global_versioned_dependency(tmp_path, monkeypatch, capsys):
+    ez_home = tmp_path.parent / f"{tmp_path.name}-home"
+    monkeypatch.setenv("EZLANG_HOME", str(ez_home))
+    dep_dir = ez_home / "deps" / "utils" / "1.2.3"
+    dep_dir.mkdir(parents=True)
+    (dep_dir / "index.ez").write_text("export let answer: I32 = 7;\n", encoding="utf-8")
+    project_toml = write_project(tmp_path, os_name="linux")
+    project_toml.write_text(
+        project_toml.read_text(encoding="utf-8")
+        + '\n[deps]\nutils = "1.2.3"\n',
+        encoding="utf-8",
+    )
+    (tmp_path / "src" / "index.ez").write_text(
+        'from "utils" import { answer };\nlet x: I32 = answer;\n',
+        encoding="utf-8",
+    )
+
+    assert ez.main(["build", "--project", str(project_toml)]) == 0
+
+    out = capsys.readouterr().out
+    assert str(dep_dir / "index.ez") in out
+
+
+def test_install_global_rejects_local_dependencies(tmp_path, capsys):
+    (tmp_path / "local.ez").write_text("let x: I32 = 1;\n", encoding="utf-8")
+    project_toml = tmp_path / "project.toml"
+    project_toml.write_text(
+        """
+[project]
+name = "demo"
+version = "0.1.0"
+
+[deps]
+local = "./local.ez"
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+
+    assert ez.main(["install", "-g", "--project", str(project_toml)]) == 1
+
+    err = capsys.readouterr().err
+    assert "本地路径依赖" in err
+
+
+@pytest.mark.parametrize("member_name", ["../escape.ez", "dir\\escape.ez", "C:/escape.ez"])
+def test_install_rejects_zip_path_traversal(tmp_path, capsys, member_name):
+    registry = tmp_path / "registry"
+    package = registry / "remote" / "1.2.3"
+    package.mkdir(parents=True)
+    with zipfile.ZipFile(package / "remote-1.2.3.zip", "w") as archive:
+        archive.writestr(member_name, "let bad = 1;\n")
+    project_toml = tmp_path / "project.toml"
+    project_toml.write_text(
+        f"""
+[project]
+name = "demo"
+version = "0.1.0"
+registry = "{registry}"
+
+[deps]
+remote = "1.2.3"
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+
+    assert ez.main(["install", "--project", str(project_toml)]) == 1
+
+    err = capsys.readouterr().err
+    assert "非法路径" in err
 
 
 

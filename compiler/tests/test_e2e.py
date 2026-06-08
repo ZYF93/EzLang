@@ -886,6 +886,30 @@ def test_e2e_cli_build_links_externs_and_records_emcc_js_libraries():
     assert "SDK 链接产物" in docs
 
 
+def test_e2e_toolchain_docs_cover_test_and_release_install_zip_contract():
+    """工具链文档应覆盖测试命令、全局安装、单文件运行和包格式闭环。"""
+    toolchain = (ROOT / "docs" / "toolchain.md").read_text(encoding="utf-8")
+    manual = (ROOT / "docs" / "cli-manual.md").read_text(encoding="utf-8")
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    cli = (ROOT / "cli" / "ez.py").read_text(encoding="utf-8")
+
+    assert "### `ez test`" in toolchain
+    assert "## 测试" in manual
+    assert "`ez test`" in readme
+    assert "ez install -g" in toolchain
+    assert "ez install -g" in manual
+    assert "EZLANG_HOME" in toolchain
+    assert "ez run path/to/file.ez" in toolchain
+    assert "ez run path/to/file.ez" in manual
+    assert "path/to/file.ez" in readme
+    assert "<name>-<version>.zip" in toolchain
+    assert "name-version.zip" in manual
+    assert f'{{name}}-{{version}}.zip' in cli
+    assert "_extract_package_zip" in cli
+    assert "global_install" in cli
+    assert "_load_run_config" in cli
+
+
 def test_e2e_toolchain_docs_match_cli_defaults_and_targets():
     """工具链文档应与 CLI 默认配置、支持架构和支持系统保持一致。"""
     docs = (ROOT / "docs" / "toolchain.md").read_text(encoding="utf-8")
