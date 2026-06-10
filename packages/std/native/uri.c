@@ -54,6 +54,43 @@ static bool ez_unreserved(unsigned char ch) {
     return isalnum(ch) || ch == '-' || ch == '.' || ch == '_' || ch == '~';
 }
 
+static int ez_utf8_char_width(unsigned char ch) {
+    if (ch < 0x80) return 1;
+    if (ch >= 0xC2 && ch <= 0xDF) return 2;
+    if (ch >= 0xE0 && ch <= 0xEF) return 3;
+    if (ch >= 0xF0 && ch <= 0xF4) return 4;
+    return -1;
+}
+
+static bool ez_utf8_validate_len(const char *s, size_t len) {
+    if (!s) return true;
+    size_t i = 0;
+    while (i < len) {
+        unsigned char ch = (unsigned char)s[i];
+        int width = ez_utf8_char_width(ch);
+        if (width < 0 || i + (size_t)width > len) return false;
+        if (width == 2) {
+            unsigned char b1 = (unsigned char)s[i + 1];
+            if ((b1 & 0xC0) != 0x80) return false;
+        } else if (width == 3) {
+            unsigned char b1 = (unsigned char)s[i + 1];
+            unsigned char b2 = (unsigned char)s[i + 2];
+            if ((b1 & 0xC0) != 0x80 || (b2 & 0xC0) != 0x80) return false;
+            if (ch == 0xE0 && b1 < 0xA0) return false;
+            if (ch == 0xED && b1 >= 0xA0) return false;
+        } else if (width == 4) {
+            unsigned char b1 = (unsigned char)s[i + 1];
+            unsigned char b2 = (unsigned char)s[i + 2];
+            unsigned char b3 = (unsigned char)s[i + 3];
+            if ((b1 & 0xC0) != 0x80 || (b2 & 0xC0) != 0x80 || (b3 & 0xC0) != 0x80) return false;
+            if (ch == 0xF0 && b1 < 0x90) return false;
+            if (ch == 0xF4 && b1 > 0x8F) return false;
+        }
+        i += (size_t)width;
+    }
+    return true;
+}
+
 static char *ez_percent_encode(const char *s, bool query_mode) {
     if (!s) s = "";
     static const char hex[] = "0123456789ABCDEF";
@@ -100,13 +137,22 @@ static OptStr ez_percent_decode(const char *s, bool query_mode) {
                 free(out);
                 return (OptStr){false, NULL};
             }
-            out[offset++] = (char)((hi << 4) | lo);
+            unsigned char byte = (unsigned char)((hi << 4) | lo);
+            if (byte == 0) {
+                free(out);
+                return (OptStr){false, NULL};
+            }
+            out[offset++] = (char)byte;
             i += 2;
         } else {
             out[offset++] = ch;
         }
     }
     out[offset] = '\0';
+    if (!ez_utf8_validate_len(out, offset)) {
+        free(out);
+        return (OptStr){false, NULL};
+    }
     return (OptStr){true, out};
 }
 
@@ -116,6 +162,41 @@ static OptStr ez_percent_decode_range(const char *start, size_t len, bool query_
     OptStr decoded = ez_percent_decode(slice, query_mode);
     free(slice);
     return decoded;
+}
+
+typedef struct {
+    char *data;
+    size_t length;
+    size_t capacity;
+} EzStringBuilder;
+
+static bool ez_builder_reserve(EzStringBuilder *builder, size_t extra) {
+    if (!builder) return false;
+    if (extra > ((size_t)-1) - builder->length - 1) return false;
+    size_t required = builder->length + extra + 1;
+    if (required <= builder->capacity) return true;
+    size_t next = builder->capacity ? builder->capacity : 64;
+    while (next < required) {
+        if (next > ((size_t)-1) / 2) return false;
+        next *= 2;
+    }
+    char *data = (char *)realloc(builder->data, next);
+    if (!data) return false;
+    builder->data = data;
+    builder->capacity = next;
+    return true;
+}
+
+static bool ez_builder_append_range(EzStringBuilder *builder, const char *text, size_t len) {
+    if (!ez_builder_reserve(builder, len)) return false;
+    if (len > 0 && text) memcpy(builder->data + builder->length, text, len);
+    builder->length += len;
+    builder->data[builder->length] = '\0';
+    return true;
+}
+
+static bool ez_builder_append(EzStringBuilder *builder, const char *text) {
+    return ez_builder_append_range(builder, text, text ? strlen(text) : 0);
 }
 
 static bool ez_query_key_matches(const char *start, size_t len, const char *key) {
@@ -131,6 +212,19 @@ static char *ez_lower_range(const char *start, size_t len) {
     if (!out) return NULL;
     for (size_t i = 0; i < len; ++i) out[i] = (char)tolower((unsigned char)out[i]);
     return out;
+}
+
+static bool ez_parse_port(const char *start, const char *end, int32_t *out) {
+    if (!start || !end || start >= end || !out) return false;
+    int32_t value = 0;
+    for (const char *p = start; p < end; ++p) {
+        if (!isdigit((unsigned char)*p)) return false;
+        int digit = *p - '0';
+        if (value > (65535 - digit) / 10) return false;
+        value = value * 10 + digit;
+    }
+    *out = value;
+    return true;
 }
 
 static OptUriParts ez_parse_uri(const char *url) {
@@ -176,13 +270,15 @@ static OptUriParts ez_parse_uri(const char *url) {
             if (!close) return (OptUriParts){false, {0}};
             host_end = close + 1;
             if (host_end < authority_end && *host_end == ':') {
-                parts.port = atoi(host_end + 1);
+                if (!ez_parse_port(host_end + 1, authority_end, &parts.port)) return (OptUriParts){false, {0}};
+            } else if (host_end != authority_end) {
+                return (OptUriParts){false, {0}};
             }
         } else {
             for (const char *scan = authority_end; scan > host_start; --scan) {
                 if (*(scan - 1) == ':') {
                     host_end = scan - 1;
-                    parts.port = atoi(scan);
+                    if (!ez_parse_port(scan, authority_end, &parts.port)) return (OptUriParts){false, {0}};
                     break;
                 }
             }
@@ -208,6 +304,20 @@ static OptUriParts ez_parse_uri(const char *url) {
         parts.fragment = ez_strdup_range(p, (size_t)(end - p));
     }
     return (OptUriParts){true, parts};
+}
+
+static bool ez_uri_has_authority_marker(const char *url) {
+    if (!url) return false;
+    const char *end = url + strlen(url);
+    const char *scheme_end = NULL;
+    for (const char *scan = url; scan < end; ++scan) {
+        if (*scan == ':') {
+            scheme_end = scan;
+            break;
+        }
+        if (*scan == '/' || *scan == '?' || *scan == '#') break;
+    }
+    return scheme_end && scheme_end + 2 < end && scheme_end[1] == '/' && scheme_end[2] == '/';
 }
 
 static char *ez_normalize_path(const char *path) {
@@ -276,7 +386,7 @@ OptUriParts uriParse(const char *url) {
     return ez_parse_uri(url);
 }
 
-const char *uriBuild(const UriParts *parts) {
+static const char *ez_uri_build(const UriParts *parts, bool force_authority) {
     if (!parts || !parts->scheme || !*parts->scheme) return ez_strdup_safe("");
     size_t len = strlen(parts->scheme) + strlen(parts->userInfo ? parts->userInfo : "") + strlen(parts->host ? parts->host : "") + strlen(parts->path ? parts->path : "") + strlen(parts->query ? parts->query : "") + strlen(parts->fragment ? parts->fragment : "") + 32;
     char *out = (char *)malloc(len);
@@ -284,7 +394,8 @@ const char *uriBuild(const UriParts *parts) {
     out[0] = '\0';
     strcat(out, parts->scheme);
     strcat(out, ":");
-    if ((parts->host && *parts->host) || (parts->userInfo && *parts->userInfo)) {
+    bool has_authority = force_authority || (parts->host && *parts->host) || (parts->userInfo && *parts->userInfo);
+    if (has_authority) {
         strcat(out, "//");
         if (parts->userInfo && *parts->userInfo) {
             strcat(out, parts->userInfo);
@@ -298,9 +409,9 @@ const char *uriBuild(const UriParts *parts) {
         }
     }
     if (parts->path && *parts->path) {
-        if ((parts->host && *parts->host) && parts->path[0] != '/') strcat(out, "/");
+        if (has_authority && parts->path[0] != '/') strcat(out, "/");
         strcat(out, parts->path);
-    } else if (parts->host && *parts->host) {
+    } else if (has_authority) {
         strcat(out, "/");
     }
     if (parts->query && *parts->query) {
@@ -314,12 +425,18 @@ const char *uriBuild(const UriParts *parts) {
     return out;
 }
 
+const char *uriBuild(const UriParts *parts) {
+    return ez_uri_build(parts, false);
+}
+
 const char *uriNormalize(const char *url) {
     OptUriParts parsed = ez_parse_uri(url);
     if (!parsed.ok) return ez_strdup_safe("");
-    char *normal_path = ez_normalize_path(parsed.value.path);
+    bool has_authority = ez_uri_has_authority_marker(url);
+    const char *path = parsed.value.path ? parsed.value.path : "";
+    char *normal_path = (!has_authority && path[0] == '\0') ? ez_strdup_safe("") : ez_normalize_path(path);
     if (normal_path) parsed.value.path = normal_path;
-    return uriBuild(&parsed.value);
+    return ez_uri_build(&parsed.value, has_authority);
 }
 
 OptStr uriScheme(const char *url) {
@@ -365,6 +482,10 @@ OptStr uriQueryGet(const char *query, const char *key) {
         const char *entry_start = p;
         while (*p && *p != '&') p++;
         const char *entry_end = p;
+        if (entry_start == entry_end) {
+            if (*p == '&') p++;
+            continue;
+        }
         const char *eq = memchr(entry_start, '=', (size_t)(entry_end - entry_start));
         const char *raw_key_end = eq ? eq : entry_end;
         if (ez_query_key_matches(entry_start, (size_t)(raw_key_end - entry_start), key)) {
@@ -386,40 +507,49 @@ const char *uriQuerySet(const char *query, const char *key, const char *value) {
         free(encoded_value);
         return NULL;
     }
-    size_t out_cap = strlen(query) + strlen(encoded_key) + strlen(encoded_value) + 4;
-    char *out = (char *)malloc(out_cap);
-    if (!out) {
+    EzStringBuilder builder = {0};
+    if (!ez_builder_reserve(&builder, strlen(query) + strlen(encoded_key) + strlen(encoded_value) + 4)) {
         free(encoded_key);
         free(encoded_value);
         return NULL;
     }
-    out[0] = '\0';
     bool replaced = false;
     const char *p = query;
     while (*p) {
         const char *entry_start = p;
         while (*p && *p != '&') p++;
         const char *entry_end = p;
+        if (entry_start == entry_end) {
+            if (*p == '&') p++;
+            continue;
+        }
         const char *eq = memchr(entry_start, '=', (size_t)(entry_end - entry_start));
         const char *raw_key_end = eq ? eq : entry_end;
-        if (out[0] != '\0') strcat(out, "&");
+        if (builder.length > 0 && !ez_builder_append(&builder, "&")) goto fail;
         if (!replaced && ez_query_key_matches(entry_start, (size_t)(raw_key_end - entry_start), key)) {
-            strcat(out, encoded_key);
-            strcat(out, "=");
-            strcat(out, encoded_value);
+            if (!ez_builder_append(&builder, encoded_key) ||
+                !ez_builder_append(&builder, "=") ||
+                !ez_builder_append(&builder, encoded_value)) goto fail;
             replaced = true;
         } else {
-            strncat(out, entry_start, (size_t)(entry_end - entry_start));
+            if (!ez_builder_append_range(&builder, entry_start, (size_t)(entry_end - entry_start))) goto fail;
         }
         if (*p == '&') p++;
     }
     if (!replaced) {
-        if (out[0] != '\0') strcat(out, "&");
-        strcat(out, encoded_key);
-        strcat(out, "=");
-        strcat(out, encoded_value);
+        if (builder.length > 0 && !ez_builder_append(&builder, "&")) goto fail;
+        if (!ez_builder_append(&builder, encoded_key) ||
+            !ez_builder_append(&builder, "=") ||
+            !ez_builder_append(&builder, encoded_value)) goto fail;
     }
     free(encoded_key);
     free(encoded_value);
-    return out;
+    if (!builder.data && !ez_builder_append(&builder, "")) return NULL;
+    return builder.data;
+
+fail:
+    free(builder.data);
+    free(encoded_key);
+    free(encoded_value);
+    return NULL;
 }

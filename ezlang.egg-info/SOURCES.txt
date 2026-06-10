@@ -14,6 +14,7 @@ compiler/src/parser/EzLangListener.py
 compiler/src/parser/EzLangParser.py
 compiler/src/parser/EzLangVisitor.py
 compiler/src/parser/__init__.py
+compiler/src/parser/string_literals.py
 compiler/src/runtime/__init__.py
 compiler/src/semantic/__init__.py
 compiler/src/semantic/analyzer.py

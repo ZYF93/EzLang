@@ -1,9 +1,10 @@
 // std/stream.ez - 流式 IO 抽象标准库
-// 统一内存/Blob 与文件流 ABI；网络、进程管道后续按同一结构接入
+// 统一内存/Blob、文件流、TCP 连接流与进程管道流 ABI；std/compress 压缩流复用该结构
 
 extern "@std/native/stream.c" for linux;
 extern "@std/native/stream.c" for macos;
 extern "@std/native/stream.c" for windows;
+extern "ws2_32" for windows;
 extern "@std/native/stream.c" for android;
 extern "@std/native/stream.c" for ios;
 extern "@std/emcc/stream.js" for emcc;
@@ -12,6 +13,9 @@ export const streamKindMemory: I32 = 1;
 export const streamKindFileRead: I32 = 2;
 export const streamKindFileWrite: I32 = 3;
 export const streamKindTcp: I32 = 4;
+export const streamKindProcessStdin: I32 = 5;
+export const streamKindProcessStdout: I32 = 6;
+export const streamKindProcessStderr: I32 = 7;
 
 export struct Stream {
     handle: I64;

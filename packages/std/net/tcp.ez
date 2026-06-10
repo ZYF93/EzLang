@@ -4,6 +4,7 @@
 extern "@std/native/net/tcp.c" for linux;
 extern "@std/native/net/tcp.c" for macos;
 extern "@std/native/net/tcp.c" for windows;
+extern "ws2_32" for windows;
 extern "@std/native/net/tcp.c" for android;
 extern "@std/native/net/tcp.c" for ios;
 extern "@std/emcc/net/tcp.js" for emcc;
@@ -20,6 +21,12 @@ export struct UdpSocket {
     handle: I64;
 };
 
+export struct UdpPacket {
+    data: Blob;
+    host: Str;
+    port: I32;
+};
+
 // 原生目标提供阻塞式 TCP/UDP socket；emcc 明确不支持并返回空可选值或失败值。
 export declare const tcpConnect: (host: Str, port: I32) => TcpConn?;
 export declare const tcpListen: (host: Str, port: I32) => TcpListener?;
@@ -30,5 +37,6 @@ export declare const tcpClose: (conn: TcpConn) => Bool;
 export declare const tcpListenerClose: (listener: TcpListener) => Bool;
 export declare const udpBind: (host: Str, port: I32) => UdpSocket?;
 export declare const udpSend: (socket: UdpSocket, host: Str, port: I32, data: Blob) => I64;
+export declare const udpRecvFrom: (socket: UdpSocket, maxBytes: I64) => UdpPacket?;
 export declare const udpRecv: (socket: UdpSocket, maxBytes: I64) => Blob?;
 export declare const udpClose: (socket: UdpSocket) => Bool;

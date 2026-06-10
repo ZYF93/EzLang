@@ -1,32 +1,22 @@
-// modules.ez - 模块系统示例
+from "std/fmt" import { format, toString };
+from "std/io" import { println };
 
-// 导入声明
-from "./std.ez" import { print, println };
-from "./math.ez" import { add, sub as subtract };
-
-// 导出声明
-export const pi: F64 = 3.14159265359;
-
-export struct Vector {
-    x: F64;
-    y: F64;
-    length = (this: Vector): F64 => {
-        return sqrt(x = this.x * this.x + this.y * this.y);
-    };
+export const add = (a: I32, b: I32): I32 => {
+    return a + b;
 };
 
-export type Point = { x: I32; y: I32; };
+export const pi: F64 = 3.14159;
 
-// 外部库链接
-extern "./libs/libcrypto.a";
-extern "./libs/libcurl.so" for linux;
-extern "./libs/win32.lib" for windows;
-extern "./libs/macos.framework" for macos;
-extern "./libs/android/libjni.a" for android;
-extern "./libs/ios/objc.framework" for ios;
-extern "./js/bindings.js" for emcc;
+export struct Pair {
+    left: I32;
+    right: I32;
+};
 
-// 外部符号声明
-declare const crypto_hash: (data: Blob, len: I64) => Blob;
-declare const curl_easy_init: () => Blob;
-declare static version: Str;
+const main = (): I32 => {
+    const pair = Pair(left = 20, right = 22);
+    const total = add(a = pair.left, b = pair.right);
+    const args: Str[] = [toString<I32>(value = total)];
+
+    println(msg = format(template = "modules: exported helpers total={}", args = args));
+    return total == 42 ? 0 : 1;
+};

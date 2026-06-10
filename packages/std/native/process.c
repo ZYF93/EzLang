@@ -14,13 +14,14 @@
 #include <windows.h>
 #endif
 
+// Windows 有独立 Win32 实现；该宏只表示 POSIX fork/exec 分支可用。
 #if !defined(_WIN32) && !defined(__ANDROID__) && !(defined(__APPLE__) && TARGET_OS_IPHONE)
-#define EZ_PROCESS_SUPPORTED 1
+#define EZ_PROCESS_POSIX_SUPPORTED 1
 #else
-#define EZ_PROCESS_SUPPORTED 0
+#define EZ_PROCESS_POSIX_SUPPORTED 0
 #endif
 
-#if EZ_PROCESS_SUPPORTED
+#if EZ_PROCESS_POSIX_SUPPORTED
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
@@ -67,16 +68,49 @@ typedef struct {
     bool ok;
 } ProcessResult;
 
+typedef struct {
+    int64_t handle;
+    int32_t kind;
+} Stream;
+
 typedef struct { bool ok; Process value; } OptProcess;
 typedef struct { bool ok; ProcessResult value; } OptProcessResult;
 typedef struct { bool ok; const char *value; } OptStr;
+typedef struct { bool ok; Stream value; } OptStream;
+
+#define STREAM_KIND_PROCESS_STDIN 5
+#define STREAM_KIND_PROCESS_STDOUT 6
+#define STREAM_KIND_PROCESS_STDERR 7
 
 static Blob ez_empty_blob(void) {
     return (Blob){NULL, 0};
 }
 
-static ProcessResult ez_process_result_empty(int32_t exit_code, bool ok) {
-    return (ProcessResult){exit_code, ez_empty_blob(), ez_empty_blob(), ok};
+static OptStream ez_none_stream(void) {
+    return (OptStream){false, {0, 0}};
+}
+
+static bool ez_blob_valid(const Blob *data) {
+    return data && data->size >= 0 && (data->size == 0 || data->data);
+}
+
+static bool ez_command_valid(const Command *command) {
+    return command && command->program && *command->program && ez_blob_valid(&command->stdin);
+}
+
+static bool ez_blob_copy(Blob *out, const Blob *input) {
+    if (!out) return false;
+    out->data = NULL;
+    out->size = 0;
+    if (!ez_blob_valid(input)) return false;
+    if (!input || input->size <= 0) return true;
+    if (!input->data) return false;
+    uint8_t *data = (uint8_t *)malloc((size_t)input->size);
+    if (!data) return false;
+    memcpy(data, input->data, (size_t)input->size);
+    out->data = data;
+    out->size = input->size;
+    return true;
 }
 
 static const char *ez_list_get(const StrList *items, int64_t index) {
@@ -93,6 +127,21 @@ typedef struct {
     size_t length;
     size_t capacity;
 } EzWinBuffer;
+
+typedef struct EzWinSpawnState {
+    struct EzWinSpawnState *next;
+    HANDLE process;
+    HANDLE stdin_write;
+    HANDLE stdout_read;
+    HANDLE stderr_read;
+    Blob stdin_data;
+    size_t stdin_offset;
+    EzWinBuffer out;
+    EzWinBuffer err;
+    DWORD pid;
+} EzWinSpawnState;
+
+static EzWinSpawnState *ez_win_spawn_states = NULL;
 
 typedef struct {
     char *data;
@@ -322,6 +371,7 @@ static bool ez_win_read_available(HANDLE handle, EzWinBuffer *buffer, bool *open
 }
 
 static bool ez_win_write_blob(HANDLE handle, const Blob *input) {
+    if (!ez_blob_valid(input)) return false;
     const uint8_t *data = input && input->data ? input->data : NULL;
     size_t size = input && input->size > 0 ? (size_t)input->size : 0;
     size_t offset = 0;
@@ -424,24 +474,185 @@ static OptProcessResult ez_exec_windows(const Command *command) {
 }
 
 static OptProcess ez_spawn_windows(const Command *command) {
+    SECURITY_ATTRIBUTES attrs = {sizeof(SECURITY_ATTRIBUTES), NULL, TRUE};
+    HANDLE stdin_read = NULL, stdin_write = NULL;
+    HANDLE stdout_read = NULL, stdout_write = NULL;
+    HANDLE stderr_read = NULL, stderr_write = NULL;
+    if (!CreatePipe(&stdin_read, &stdin_write, &attrs, 0) ||
+        !CreatePipe(&stdout_read, &stdout_write, &attrs, 0) ||
+        !CreatePipe(&stderr_read, &stderr_write, &attrs, 0)) {
+        ez_win_close_handle(&stdin_read); ez_win_close_handle(&stdin_write);
+        ez_win_close_handle(&stdout_read); ez_win_close_handle(&stdout_write);
+        ez_win_close_handle(&stderr_read); ez_win_close_handle(&stderr_write);
+        return (OptProcess){false, {0}};
+    }
+    SetHandleInformation(stdin_write, HANDLE_FLAG_INHERIT, 0);
+    SetHandleInformation(stdout_read, HANDLE_FLAG_INHERIT, 0);
+    SetHandleInformation(stderr_read, HANDLE_FLAG_INHERIT, 0);
+
     STARTUPINFOW startup;
     PROCESS_INFORMATION info;
     memset(&startup, 0, sizeof(startup));
     memset(&info, 0, sizeof(info));
     startup.cb = sizeof(startup);
-    if (!ez_win_create_process(command, &startup, &info)) return (OptProcess){false, {0}};
+    startup.dwFlags = STARTF_USESTDHANDLES;
+    startup.hStdInput = stdin_read;
+    startup.hStdOutput = stdout_write;
+    startup.hStdError = stderr_write;
+    if (!ez_win_create_process(command, &startup, &info)) {
+        ez_win_close_handle(&stdin_read); ez_win_close_handle(&stdin_write);
+        ez_win_close_handle(&stdout_read); ez_win_close_handle(&stdout_write);
+        ez_win_close_handle(&stderr_read); ez_win_close_handle(&stderr_write);
+        return (OptProcess){false, {0}};
+    }
+    ez_win_close_handle(&stdin_read);
+    ez_win_close_handle(&stdout_write);
+    ez_win_close_handle(&stderr_write);
     ez_win_close_handle(&info.hThread);
-    Process proc = {(int64_t)(intptr_t)info.hProcess, (int64_t)info.dwProcessId};
+
+    EzWinSpawnState *state = (EzWinSpawnState *)calloc(1, sizeof(EzWinSpawnState));
+    if (!state) {
+        TerminateProcess(info.hProcess, 1);
+        ez_win_close_handle(&stdin_write);
+        ez_win_close_handle(&stdout_read);
+        ez_win_close_handle(&stderr_read);
+        ez_win_close_handle(&info.hProcess);
+        return (OptProcess){false, {0}};
+    }
+    if (!ez_blob_copy(&state->stdin_data, command ? &command->stdin : NULL)) {
+        TerminateProcess(info.hProcess, 1);
+        ez_win_close_handle(&stdin_write);
+        ez_win_close_handle(&stdout_read);
+        ez_win_close_handle(&stderr_read);
+        ez_win_close_handle(&info.hProcess);
+        free(state);
+        return (OptProcess){false, {0}};
+    }
+    state->process = info.hProcess;
+    state->stdin_write = stdin_write;
+    state->stdout_read = stdout_read;
+    state->stderr_read = stderr_read;
+    state->pid = info.dwProcessId;
+    state->next = ez_win_spawn_states;
+    ez_win_spawn_states = state;
+    Process proc = {(int64_t)(intptr_t)state, (int64_t)info.dwProcessId};
     return (OptProcess){true, proc};
+}
+
+static EzWinSpawnState *ez_win_spawn_state_find(const Process *process) {
+    if (!process || process->handle == 0) return NULL;
+    EzWinSpawnState *target = (EzWinSpawnState *)(intptr_t)process->handle;
+    for (EzWinSpawnState *state = ez_win_spawn_states; state; state = state->next) {
+        if (state == target && (process->pid <= 0 || (DWORD)process->pid == state->pid)) return state;
+    }
+    return NULL;
+}
+
+static OptStream ez_win_detach_stream(HANDLE *handle, int32_t kind) {
+    if (!handle || !*handle) return ez_none_stream();
+    Stream value = {(int64_t)(intptr_t)*handle, kind};
+    *handle = NULL;
+    return (OptStream){true, value};
+}
+
+static OptStream ez_win_process_stream(const Process *process, int32_t kind) {
+    EzWinSpawnState *state = ez_win_spawn_state_find(process);
+    if (!state) return ez_none_stream();
+    if (kind == STREAM_KIND_PROCESS_STDIN) {
+        free(state->stdin_data.data);
+        state->stdin_data = ez_empty_blob();
+        state->stdin_offset = 0;
+        return ez_win_detach_stream(&state->stdin_write, kind);
+    }
+    if (kind == STREAM_KIND_PROCESS_STDOUT) return ez_win_detach_stream(&state->stdout_read, kind);
+    if (kind == STREAM_KIND_PROCESS_STDERR) return ez_win_detach_stream(&state->stderr_read, kind);
+    return ez_none_stream();
+}
+
+static void ez_win_spawn_state_remove(EzWinSpawnState *target) {
+    if (!target) return;
+    EzWinSpawnState **cursor = &ez_win_spawn_states;
+    while (*cursor && *cursor != target) cursor = &(*cursor)->next;
+    if (*cursor == target) *cursor = target->next;
+    ez_win_close_handle(&target->stdin_write);
+    ez_win_close_handle(&target->stdout_read);
+    ez_win_close_handle(&target->stderr_read);
+    ez_win_close_handle(&target->process);
+    free(target->stdin_data.data);
+    free(target->out.data);
+    free(target->err.data);
+    free(target);
+}
+
+static OptProcessResult ez_wait_windows_spawn(const Process *process) {
+    EzWinSpawnState *state = ez_win_spawn_state_find(process);
+    if (!state || !state->process) return (OptProcessResult){false, {0}};
+
+    bool failed = false;
+    if (state->stdin_write) {
+        if (!ez_win_write_blob(state->stdin_write, &state->stdin_data)) failed = true;
+        ez_win_close_handle(&state->stdin_write);
+    }
+
+    bool stdout_open = state->stdout_read != NULL;
+    bool stderr_open = state->stderr_read != NULL;
+    while (stdout_open || stderr_open) {
+        if (stdout_open && !ez_win_read_available(state->stdout_read, &state->out, &stdout_open)) failed = true;
+        if (stderr_open && !ez_win_read_available(state->stderr_read, &state->err, &stderr_open)) failed = true;
+        DWORD wait = WaitForSingleObject(state->process, 10);
+        if (wait == WAIT_OBJECT_0) {
+            if (stdout_open) ez_win_read_available(state->stdout_read, &state->out, &stdout_open);
+            if (stderr_open) ez_win_read_available(state->stderr_read, &state->err, &stderr_open);
+            break;
+        }
+        if (wait == WAIT_FAILED) {
+            failed = true;
+            break;
+        }
+    }
+
+    if (!failed && WaitForSingleObject(state->process, INFINITE) == WAIT_FAILED) failed = true;
+
+    DWORD code = 1;
+    if (!failed && !GetExitCodeProcess(state->process, &code)) failed = true;
+    if (failed) {
+        ez_win_spawn_state_remove(state);
+        return (OptProcessResult){false, {0}};
+    }
+
+    Blob stdout_blob = ez_win_buffer_to_blob(&state->out);
+    Blob stderr_blob = ez_win_buffer_to_blob(&state->err);
+    ProcessResult result = {(int32_t)code, stdout_blob, stderr_blob, code == 0};
+    ez_win_spawn_state_remove(state);
+    return (OptProcessResult){true, result};
+}
+
+static bool ez_terminate_windows_spawn(const Process *process) {
+    EzWinSpawnState *state = ez_win_spawn_state_find(process);
+    return state && state->process ? TerminateProcess(state->process, 1) != 0 : false;
 }
 #endif
 
-#if EZ_PROCESS_SUPPORTED
+#if EZ_PROCESS_POSIX_SUPPORTED
 typedef struct {
     uint8_t *data;
     size_t length;
     size_t capacity;
 } EzBuffer;
+
+typedef struct EzSpawnState {
+    struct EzSpawnState *next;
+    pid_t pid;
+    int stdin_fd;
+    int stdout_fd;
+    int stderr_fd;
+    Blob stdin_data;
+    size_t stdin_offset;
+    EzBuffer out;
+    EzBuffer err;
+} EzSpawnState;
+
+static EzSpawnState *ez_spawn_states = NULL;
 
 static bool ez_buffer_append(EzBuffer *buffer, const uint8_t *data, size_t size) {
     if (!buffer || !data || size == 0) return true;
@@ -517,6 +728,12 @@ static bool ez_set_nonblock(int fd) {
     return fcntl(fd, F_SETFL, flags | O_NONBLOCK) == 0;
 }
 
+static bool ez_set_blocking(int fd) {
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags < 0) return false;
+    return fcntl(fd, F_SETFL, flags & ~O_NONBLOCK) == 0;
+}
+
 static void ez_close_fd(int *fd) {
     if (fd && *fd >= 0) {
         close(*fd);
@@ -550,6 +767,7 @@ static bool ez_read_available(int fd, EzBuffer *buffer, bool *open_flag) {
 }
 
 static bool ez_write_available(int fd, const Blob *input, size_t *offset, bool *open_flag) {
+    if (!ez_blob_valid(input)) return false;
     const uint8_t *data = input && input->data ? input->data : NULL;
     size_t size = input && input->size > 0 ? (size_t)input->size : 0;
     while (*offset < size) {
@@ -683,20 +901,202 @@ static OptProcessResult ez_exec_posix(const Command *command) {
     return (OptProcessResult){true, result};
 }
 
-static char *ez_strdup_safe(const char *src) {
-    if (!src) src = "";
-    size_t len = strlen(src);
-    char *out = (char *)malloc(len + 1);
-    if (!out) return NULL;
-    memcpy(out, src, len + 1);
-    return out;
+static EzSpawnState *ez_spawn_state_find(const Process *process) {
+    if (!process || process->handle == 0 || process->pid <= 0) return NULL;
+    EzSpawnState *target = (EzSpawnState *)(intptr_t)process->handle;
+    for (EzSpawnState *state = ez_spawn_states; state; state = state->next) {
+        if (state == target && state->pid == (pid_t)process->pid) return state;
+    }
+    return NULL;
 }
+
+static OptStream ez_detach_fd_stream(int *fd, int32_t kind) {
+    if (!fd || *fd < 0) return ez_none_stream();
+    if (!ez_set_blocking(*fd)) return ez_none_stream();
+    Stream value = {(int64_t)*fd, kind};
+    *fd = -1;
+    return (OptStream){true, value};
+}
+
+static OptStream ez_process_stream_posix(const Process *process, int32_t kind) {
+    EzSpawnState *state = ez_spawn_state_find(process);
+    if (!state) return ez_none_stream();
+    if (kind == STREAM_KIND_PROCESS_STDIN) {
+        free(state->stdin_data.data);
+        state->stdin_data = ez_empty_blob();
+        state->stdin_offset = 0;
+        return ez_detach_fd_stream(&state->stdin_fd, kind);
+    }
+    if (kind == STREAM_KIND_PROCESS_STDOUT) return ez_detach_fd_stream(&state->stdout_fd, kind);
+    if (kind == STREAM_KIND_PROCESS_STDERR) return ez_detach_fd_stream(&state->stderr_fd, kind);
+    return ez_none_stream();
+}
+
+static void ez_spawn_state_remove(EzSpawnState *target) {
+    if (!target) return;
+    EzSpawnState **cursor = &ez_spawn_states;
+    while (*cursor && *cursor != target) cursor = &(*cursor)->next;
+    if (*cursor == target) *cursor = target->next;
+    ez_close_fd(&target->stdin_fd);
+    ez_close_fd(&target->stdout_fd);
+    ez_close_fd(&target->stderr_fd);
+    free(target->stdin_data.data);
+    free(target->out.data);
+    free(target->err.data);
+    free(target);
+}
+
+static OptProcess ez_spawn_posix(const Command *command) {
+    char **argv = ez_build_argv(command);
+    if (!argv) return (OptProcess){false, {0}};
+
+    EzSpawnState *state = (EzSpawnState *)calloc(1, sizeof(EzSpawnState));
+    if (!state) {
+        free(argv);
+        return (OptProcess){false, {0}};
+    }
+    state->stdin_fd = -1;
+    state->stdout_fd = -1;
+    state->stderr_fd = -1;
+    if (!ez_blob_copy(&state->stdin_data, command ? &command->stdin : NULL)) {
+        free(state);
+        free(argv);
+        return (OptProcess){false, {0}};
+    }
+
+    int in_pipe[2] = {-1, -1};
+    int out_pipe[2] = {-1, -1};
+    int err_pipe[2] = {-1, -1};
+    if (pipe(in_pipe) != 0 || pipe(out_pipe) != 0 || pipe(err_pipe) != 0) {
+        ez_close_fd(&in_pipe[0]); ez_close_fd(&in_pipe[1]);
+        ez_close_fd(&out_pipe[0]); ez_close_fd(&out_pipe[1]);
+        ez_close_fd(&err_pipe[0]); ez_close_fd(&err_pipe[1]);
+        free(state->stdin_data.data);
+        free(state);
+        free(argv);
+        return (OptProcess){false, {0}};
+    }
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        ez_close_fd(&in_pipe[0]); ez_close_fd(&in_pipe[1]);
+        ez_close_fd(&out_pipe[0]); ez_close_fd(&out_pipe[1]);
+        ez_close_fd(&err_pipe[0]); ez_close_fd(&err_pipe[1]);
+        free(state->stdin_data.data);
+        free(state);
+        free(argv);
+        return (OptProcess){false, {0}};
+    }
+
+    if (pid == 0) {
+        dup2(in_pipe[0], STDIN_FILENO);
+        dup2(out_pipe[1], STDOUT_FILENO);
+        dup2(err_pipe[1], STDERR_FILENO);
+        ez_close_fd(&in_pipe[0]); ez_close_fd(&in_pipe[1]);
+        ez_close_fd(&out_pipe[0]); ez_close_fd(&out_pipe[1]);
+        ez_close_fd(&err_pipe[0]); ez_close_fd(&err_pipe[1]);
+        ez_child_exec(command, argv);
+    }
+
+    free(argv);
+    ez_close_fd(&in_pipe[0]);
+    ez_close_fd(&out_pipe[1]);
+    ez_close_fd(&err_pipe[1]);
+    ez_set_nonblock(in_pipe[1]);
+    ez_set_nonblock(out_pipe[0]);
+    ez_set_nonblock(err_pipe[0]);
+
+    state->pid = pid;
+    state->stdin_fd = in_pipe[1];
+    state->stdout_fd = out_pipe[0];
+    state->stderr_fd = err_pipe[0];
+    state->next = ez_spawn_states;
+    ez_spawn_states = state;
+
+    Process proc = {(int64_t)(intptr_t)state, (int64_t)pid};
+    return (OptProcess){true, proc};
+}
+
+static OptProcessResult ez_wait_posix_spawn(const Process *process) {
+    EzSpawnState *state = ez_spawn_state_find(process);
+    if (!state) return (OptProcessResult){false, {0}};
+
+    bool stdin_open = state->stdin_fd >= 0;
+    bool stdout_open = state->stdout_fd >= 0;
+    bool stderr_open = state->stderr_fd >= 0;
+    int status = 0;
+    bool waited = false;
+    bool failed = false;
+
+    if (stdin_open && (!state->stdin_data.data || state->stdin_data.size <= 0)) {
+        stdin_open = false;
+        ez_close_fd(&state->stdin_fd);
+    }
+
+    while (stdout_open || stderr_open || stdin_open || !waited) {
+        if (!waited) {
+            pid_t w = waitpid(state->pid, &status, stdout_open || stderr_open || stdin_open ? WNOHANG : 0);
+            if (w == state->pid) waited = true;
+            else if (w < 0 && errno != EINTR) {
+                failed = true;
+                waited = true;
+            }
+        }
+
+        fd_set readfds;
+        fd_set writefds;
+        FD_ZERO(&readfds);
+        FD_ZERO(&writefds);
+        int maxfd = -1;
+        if (stdout_open) { FD_SET(state->stdout_fd, &readfds); if (state->stdout_fd > maxfd) maxfd = state->stdout_fd; }
+        if (stderr_open) { FD_SET(state->stderr_fd, &readfds); if (state->stderr_fd > maxfd) maxfd = state->stderr_fd; }
+        if (stdin_open) { FD_SET(state->stdin_fd, &writefds); if (state->stdin_fd > maxfd) maxfd = state->stdin_fd; }
+
+        if (maxfd < 0) continue;
+        int ready = select(maxfd + 1, &readfds, &writefds, NULL, NULL);
+        if (ready < 0) {
+            if (errno == EINTR) continue;
+            failed = true;
+            break;
+        }
+
+        if (stdout_open && FD_ISSET(state->stdout_fd, &readfds)) {
+            if (!ez_read_available(state->stdout_fd, &state->out, &stdout_open)) { failed = true; stdout_open = false; }
+            if (!stdout_open) ez_close_fd(&state->stdout_fd);
+        }
+        if (stderr_open && FD_ISSET(state->stderr_fd, &readfds)) {
+            if (!ez_read_available(state->stderr_fd, &state->err, &stderr_open)) { failed = true; stderr_open = false; }
+            if (!stderr_open) ez_close_fd(&state->stderr_fd);
+        }
+        if (stdin_open && FD_ISSET(state->stdin_fd, &writefds)) {
+            if (!ez_write_available(state->stdin_fd, &state->stdin_data, &state->stdin_offset, &stdin_open)) { failed = true; stdin_open = false; }
+            if (!stdin_open) ez_close_fd(&state->stdin_fd);
+        }
+    }
+
+    if (!waited) {
+        while (waitpid(state->pid, &status, 0) < 0 && errno == EINTR) {}
+    }
+    if (failed) {
+        ez_spawn_state_remove(state);
+        return (OptProcessResult){false, {0}};
+    }
+
+    int32_t exit_code = ez_exit_code_from_status(status);
+    Blob stdout_blob = ez_buffer_to_blob(&state->out);
+    Blob stderr_blob = ez_buffer_to_blob(&state->err);
+    ProcessResult result = {exit_code, stdout_blob, stderr_blob, exit_code == 0};
+    ez_spawn_state_remove(state);
+    return (OptProcessResult){true, result};
+}
+
 #endif
 
 OptProcessResult processExec(const Command *command) {
+    if (!ez_command_valid(command)) return (OptProcessResult){false, {0}};
 #if defined(_WIN32)
     return ez_exec_windows(command);
-#elif EZ_PROCESS_SUPPORTED
+#elif EZ_PROCESS_POSIX_SUPPORTED
     return ez_exec_posix(command);
 #else
     (void)command;
@@ -705,20 +1105,11 @@ OptProcessResult processExec(const Command *command) {
 }
 
 OptProcess processSpawn(const Command *command) {
+    if (!ez_command_valid(command)) return (OptProcess){false, {0}};
 #if defined(_WIN32)
     return ez_spawn_windows(command);
-#elif EZ_PROCESS_SUPPORTED
-    char **argv = ez_build_argv(command);
-    if (!argv) return (OptProcess){false, {0}};
-    pid_t pid = fork();
-    if (pid < 0) {
-        free(argv);
-        return (OptProcess){false, {0}};
-    }
-    if (pid == 0) ez_child_exec(command, argv);
-    free(argv);
-    Process proc = {(int64_t)pid, (int64_t)pid};
-    return (OptProcess){true, proc};
+#elif EZ_PROCESS_POSIX_SUPPORTED
+    return ez_spawn_posix(command);
 #else
     (void)command;
     return (OptProcess){false, {0}};
@@ -727,24 +1118,9 @@ OptProcess processSpawn(const Command *command) {
 
 OptProcessResult processWait(const Process *process) {
 #if defined(_WIN32)
-    if (!process || process->handle == 0) return (OptProcessResult){false, {0}};
-    HANDLE handle = (HANDLE)(intptr_t)process->handle;
-    DWORD wait = WaitForSingleObject(handle, INFINITE);
-    if (wait != WAIT_OBJECT_0) return (OptProcessResult){false, {0}};
-    DWORD code = 1;
-    if (!GetExitCodeProcess(handle, &code)) return (OptProcessResult){false, {0}};
-    CloseHandle(handle);
-    return (OptProcessResult){true, ez_process_result_empty((int32_t)code, code == 0)};
-#elif EZ_PROCESS_SUPPORTED
-    if (!process || process->pid <= 0) return (OptProcessResult){false, {0}};
-    int status = 0;
-    pid_t pid = (pid_t)process->pid;
-    while (waitpid(pid, &status, 0) < 0) {
-        if (errno == EINTR) continue;
-        return (OptProcessResult){false, {0}};
-    }
-    int32_t exit_code = ez_exit_code_from_status(status);
-    return (OptProcessResult){true, ez_process_result_empty(exit_code, exit_code == 0)};
+    return ez_wait_windows_spawn(process);
+#elif EZ_PROCESS_POSIX_SUPPORTED
+    return ez_wait_posix_spawn(process);
 #else
     (void)process;
     return (OptProcessResult){false, {0}};
@@ -753,17 +1129,46 @@ OptProcessResult processWait(const Process *process) {
 
 bool processTerminate(const Process *process) {
 #if defined(_WIN32)
-    if (!process || process->handle == 0) return false;
-    HANDLE handle = (HANDLE)(intptr_t)process->handle;
-    bool ok = TerminateProcess(handle, 1) != 0;
-    CloseHandle(handle);
-    return ok;
-#elif EZ_PROCESS_SUPPORTED
-    if (!process || process->pid <= 0) return false;
-    return kill((pid_t)process->pid, SIGTERM) == 0;
+    return ez_terminate_windows_spawn(process);
+#elif EZ_PROCESS_POSIX_SUPPORTED
+    EzSpawnState *state = ez_spawn_state_find(process);
+    return state ? kill(state->pid, SIGTERM) == 0 : false;
 #else
     (void)process;
     return false;
+#endif
+}
+
+OptStream processStdin(const Process *process) {
+#if defined(_WIN32)
+    return ez_win_process_stream(process, STREAM_KIND_PROCESS_STDIN);
+#elif EZ_PROCESS_POSIX_SUPPORTED
+    return ez_process_stream_posix(process, STREAM_KIND_PROCESS_STDIN);
+#else
+    (void)process;
+    return ez_none_stream();
+#endif
+}
+
+OptStream processStdout(const Process *process) {
+#if defined(_WIN32)
+    return ez_win_process_stream(process, STREAM_KIND_PROCESS_STDOUT);
+#elif EZ_PROCESS_POSIX_SUPPORTED
+    return ez_process_stream_posix(process, STREAM_KIND_PROCESS_STDOUT);
+#else
+    (void)process;
+    return ez_none_stream();
+#endif
+}
+
+OptStream processStderr(const Process *process) {
+#if defined(_WIN32)
+    return ez_win_process_stream(process, STREAM_KIND_PROCESS_STDERR);
+#elif EZ_PROCESS_POSIX_SUPPORTED
+    return ez_process_stream_posix(process, STREAM_KIND_PROCESS_STDERR);
+#else
+    (void)process;
+    return ez_none_stream();
 #endif
 }
 
@@ -787,7 +1192,7 @@ OptStr processCurrentPath(void) {
         cap *= 2;
     }
     return (OptStr){false, NULL};
-#elif EZ_PROCESS_SUPPORTED && defined(__linux__)
+#elif EZ_PROCESS_POSIX_SUPPORTED && defined(__linux__)
     size_t cap = 4096;
     while (cap <= 1024 * 1024) {
         char *buf = (char *)malloc(cap + 1);
@@ -805,7 +1210,7 @@ OptStr processCurrentPath(void) {
         cap *= 2;
     }
     return (OptStr){false, NULL};
-#elif EZ_PROCESS_SUPPORTED && defined(__APPLE__)
+#elif EZ_PROCESS_POSIX_SUPPORTED && defined(__APPLE__)
     uint32_t size = 0;
     _NSGetExecutablePath(NULL, &size);
     if (size == 0) size = 4096;

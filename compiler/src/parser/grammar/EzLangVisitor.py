@@ -299,6 +299,11 @@ class EzLangVisitor(ParseTreeVisitor):
         return self.visitChildren(ctx)
 
 
+    # Visit a parse tree produced by EzLangParser#shiftOperator.
+    def visitShiftOperator(self, ctx:EzLangParser.ShiftOperatorContext):
+        return self.visitChildren(ctx)
+
+
     # Visit a parse tree produced by EzLangParser#additiveExpression.
     def visitAdditiveExpression(self, ctx:EzLangParser.AdditiveExpressionContext):
         return self.visitChildren(ctx)

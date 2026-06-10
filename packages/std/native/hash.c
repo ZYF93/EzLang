@@ -10,7 +10,7 @@ typedef struct {
 } Blob;
 
 static const uint8_t *ez_blob_data(const Blob *data, size_t *size) {
-    if (!data || data->size <= 0 || !data->data) {
+    if (!data || data->size <= 0 || !data->data || (uint64_t)data->size > (uint64_t)SIZE_MAX) {
         *size = 0;
         return (const uint8_t *)"";
     }

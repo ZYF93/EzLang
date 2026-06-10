@@ -16,9 +16,14 @@ from codegen.llvm_codegen import compile_source
 
 def function_ir(ir_text: str, name: str) -> str:
     """提取单个 LLVM 函数文本。"""
-    marker = f' @"{name}"'
-    idx = ir_text.index(marker)
-    start = ir_text.rfind('define ', 0, idx)
+    match = re.search(rf'^define\b.* @"{re.escape(name)}"\(', ir_text, re.MULTILINE)
+    if match is not None:
+        start = match.start()
+        idx = start
+    else:
+        marker = f' @"{name}"'
+        idx = ir_text.index(marker)
+        start = ir_text.rfind('define ', 0, idx)
     end = ir_text.index('\n}\n', idx) + 3
     return ir_text[start:end]
 
@@ -39,6 +44,26 @@ def assert_optional_return_bridge(ir_text: str, name: str, value_type: str, arch
     assert f'%"_{name}_ret" = load {internal_type}' in ir_text
 
 
+def assert_regex_compile_return_bridge(ir_text: str, arch: str):
+    """Regex 小结构返回应按 native C ABI 桥接，并还原为 Ez 内部布局。"""
+    if arch == "aarch64":
+        assert 'declare [2 x i64] @"regexCompile"' in ir_text
+    elif arch == "x86_64":
+        assert 'declare {i8*, i64} @"regexCompile"' in ir_text
+    else:
+        assert 'declare %"Regex" @"regexCompile"' in ir_text
+        return
+    assert '%"_regexCompile_abi_ret" = alloca %"Regex"' in ir_text
+    assert '%"_regexCompile_ret" = load %"Regex"' in ir_text
+
+
+def assert_small_struct_return_bridge(ir_text: str, name: str, struct_name: str, abi_return: str):
+    """断言 native 小结构返回按 C ABI 桥接，并还原为 Ez 结构布局。"""
+    assert f'declare {abi_return} @"{name}"' in ir_text
+    assert f'%"_{name}_abi_ret" = alloca %"{struct_name}"' in ir_text
+    assert f'%"_{name}_ret" = load %"{struct_name}"' in ir_text
+
+
 class TestCodegen:
 
     def test_empty_source(self):
@@ -47,10 +72,24 @@ class TestCodegen:
         assert module is not None
         assert len(errors) == 0
 
+    def test_ensure_entrypoint_generates_empty_main_without_top_level_work(self):
+        """入口编译模式下，即使源码只有声明也应生成空宿主 main。"""
+        source = 'const helper = (): I32 => { return 1; };'
+
+        module, errors, _ = compile_source(source, ensure_entrypoint=True)
+
+        assert module is not None
+        assert len(errors) == 0, f'编译错误: {errors}'
+        ir_text = str(module)
+        binding.parse_assembly(ir_text).verify()
+        assert 'define i32 @"helper"' in ir_text
+        assert 'define i32 @"main"' in ir_text
+        assert 'ret i32 0' in function_ir(ir_text, 'main')
+
     def test_global_constant(self):
         """全局常量声明"""
         source = 'const x: I32 = 42;'
-        module, errors, _ = compile_source(source)
+        module, errors, _ = compile_source(source, compile_target='linux', target_arch='x86_64')
         assert module is not None
         # 检查模块中有 x
         gv = module.get_global('x')
@@ -63,6 +102,36 @@ class TestCodegen:
         assert module is not None
         gv = module.get_global('y')
         assert gv is not None
+
+    def test_variable_identifier_can_start_with_dollar(self):
+        """$ 开头变量名可生成全局符号，并由顶层顺序入口执行。"""
+        source = 'let $count: I32 = 1; $count = $count + 1;'
+        module, errors, _ = compile_source(source)
+        assert module is not None
+        assert len(errors) == 0, f'编译错误: {errors}'
+        assert module.get_global('$count') is not None
+        ir_text = str(module)
+        assert 'define i32 @"main"' in ir_text
+        assert '@"$count"' in ir_text
+
+    def test_compile_source_uses_isolated_struct_context(self):
+        """连续编译同名不同布局结构体时，LLVM 类型上下文不能互相污染。"""
+        first = 'struct User { name: Str; age: U32; }; const make = (): User => { return User(name = "A", age = 1); };'
+        second = 'struct User { name: Str; active: Bool; }; const make = (): User => { return User(name = "B", active = true); };'
+
+        first_module, first_errors, _ = compile_source(first)
+        second_module, second_errors, _ = compile_source(second)
+
+        assert first_module is not None
+        assert second_module is not None
+        assert len(first_errors) == 0, f'编译错误: {first_errors}'
+        assert len(second_errors) == 0, f'编译错误: {second_errors}'
+        first_ir = str(first_module)
+        second_ir = str(second_module)
+        binding.parse_assembly(first_ir).verify()
+        binding.parse_assembly(second_ir).verify()
+        assert '%"User" = type {i8*, i32}' in first_ir
+        assert '%"User" = type {i8*, i1}' in second_ir
 
     def test_variable_decl_without_initializer_zero_initializes(self):
         """无初始化器的显式类型变量应写入类型零值。"""
@@ -208,6 +277,10 @@ class TestCodegen:
         assert module is not None
         func = module.get_global('test_bitwise')
         assert func is not None
+        ir_text = str(module)
+        binding.parse_assembly(ir_text).verify()
+        assert 'shl i32' in ir_text
+        assert 'ashr i32' in ir_text
 
     def test_unary_ops(self):
         """一元运算符 ! - ~"""
@@ -799,6 +872,24 @@ class TestCodegen:
         func = module.get_global('callback')
         assert func is not None
 
+    def test_extern_callback_returning_large_struct_uses_c_abi_trampoline(self):
+        """外部 C 回调返回大结构体时，函数指针应使用隐藏 sret ABI。"""
+        source = '''
+        extern "libnative.a";
+        struct Pair { a: I64; b: I64; c: I64; };
+        declare const call_pair: (cb: (x: I32) => Pair) => I32;
+        const make_pair = (x: I32): Pair => {
+            return Pair(a = x, b = x + 1, c = x + 2);
+        };
+        const main = (): I32 => { return call_pair(cb = make_pair); };
+        '''
+        module, errors, _ = compile_source(source, compile_target='macos', target_arch='aarch64')
+        assert module is not None
+        text = str(module)
+        assert 'declare i32 @"call_pair"(void (%"Pair"*, i32)*' in text
+        assert 'define void @"make_pair_cabi_callback"(%"Pair"* sret(%"Pair")' in text
+        assert 'call i32 @"call_pair"(void (%"Pair"*, i32)* @"make_pair_cabi_callback")' in text
+
     def test_struct_spread_decl(self):
         """结构体展开声明 ...Base"""
         source = '''
@@ -864,20 +955,28 @@ class TestCodegen:
     def test_pipeline_expression(self):
         """管道表达式 expr -> fn(x = %)"""
         source = '''
-        const add = (a: I32, b: I32): I32 => {
+        const sub = (a: I32, b: I32): I32 => {
+            return a - b;
+        };
+
+        const with_default = (a: I32, b: I32 = 7): I32 => {
             return a + b;
         };
 
         const run = () => {
-            return 10 -> add(b = 20);
+            let ordered = 10 -> sub(b = %, a = 20);
+            let defaulted = 3 -> with_default();
+            return ordered + defaulted;
         };
         '''
         module, errors, _ = compile_source(source)
         assert module is not None
+        assert len(errors) == 0, f'编译错误: {errors}'
         func = module.get_global('run')
         assert func is not None
         ir_text = str(module)
-        assert 'add' in ir_text
+        assert 'call i32 @"sub"(i32 20, i32 10)' in ir_text
+        assert 'call i32 @"with_default"(i32 3, i32 7)' in ir_text
 
     def test_simd_vector_ops(self):
         """SIMD 向量运算（加/减/乘）"""
@@ -1094,6 +1193,28 @@ class TestCodegen:
         assert '%"Pair_I32_Str" = type {i32, i8*}' in ir_text
         assert '@"run"' in ir_text
 
+    def test_nested_generic_args_close_with_adjacent_angles(self):
+        """嵌套泛型显式实参不需要在连续右尖括号之间加空格。"""
+        source = '''
+        struct Box<T> { value: T; };
+        const unwrap = (box: Box<Box<U32>>): U32 => {
+            return box.value.value;
+        };
+        const run = (): U32 => {
+            const inner = Box<U32>(value = 42);
+            const outer = Box<Box<U32>>(value = inner);
+            return unwrap(box = outer);
+        };
+        '''
+        module, errors, _ = compile_source(source)
+        assert module is not None
+        assert len(errors) == 0, f'编译错误: {errors}'
+        ir_text = str(module)
+        binding.parse_assembly(ir_text).verify()
+        assert '%"Box_U32" = type {i32}' in ir_text
+        assert '%"Box_Box_U32" = type {%"Box_U32"}' in ir_text
+        assert '@"unwrap"' in ir_text
+
     def test_generic_struct_infers_type_args_from_constructor_fields(self):
         """泛型结构体构造可从字段值推导具体布局。"""
         source = '''
@@ -1134,6 +1255,31 @@ class TestCodegen:
         binding.parse_assembly(ir_text).verify()
         assert 'define %"Pair_Str_I32" @"Pair_I32_Str_swap"' in ir_text
         assert 'call %"Pair_Str_I32" @"Pair_I32_Str_swap"' in ir_text
+
+    def test_top_level_static_struct_method_infers_global_type(self):
+        """顶层静态结构体方法调用应把全局变量预声明为方法返回类型。"""
+        source = '''
+        struct Duration {
+            ms: I64;
+            fromSec = (s: I64): Duration => {
+                return Duration(ms = s);
+            };
+            toText = (this: Duration): Str => {
+                return "ok";
+            };
+        };
+        let seconds = Duration.fromSec(s = 2);
+        let text = seconds.toText();
+        '''
+        module, errors, _ = compile_source(source)
+        assert module is not None
+        assert len(errors) == 0, f'编译错误: {errors}'
+        ir_text = str(module)
+        binding.parse_assembly(ir_text).verify()
+        assert '@"seconds" = global %"Duration"' in ir_text
+        assert '@"text" = global i8*' in ir_text
+        assert 'call %"Duration" @"Duration_fromSec"' in ir_text
+        assert 'call i8* @"Duration_toText"' in ir_text
 
     def test_dict_literal(self):
         """字典字面量 { key: Type = value }"""
@@ -1193,6 +1339,47 @@ class TestCodegen:
         assert 'call void @"__ezrt_sleep"' in ir_text
         assert 'call void @"sleep"' not in ir_text
 
+    def test_emcc_flow_sleep_auto_links_time_js(self):
+        """emcc 下 flow sleep 的同步 fallback 需要自动携带 time.js helper。"""
+        source = '''
+        declare const sleep: (ms: I64) => Void;
+
+        const run = (): I32 => {
+            flow {
+                sleep(ms = 1);
+            };
+            return 0;
+        };
+        '''
+        module, errors, libs = compile_source(source, compile_target='emcc')
+        assert module is not None
+        assert len(errors) == 0, f'编译错误: {errors}'
+        ir_text = str(module)
+        binding.parse_assembly(ir_text).verify()
+        assert 'call void @"__ezrt_sleep"' in ir_text
+        assert 'declare void @"__ezrt_emcc_sleep"' in ir_text
+        assert libs == [str(STD_ROOT / 'emcc' / 'time.js')]
+
+    def test_emcc_flow_without_sleep_does_not_link_time_js(self):
+        """普通 flow/parallel 不应生成未使用的 emcc sleep helper。"""
+        source = '''
+        const run = (): I32 => {
+            const result = flow {
+                const p = parallel { return 7; };
+                return p + 1;
+            };
+            return result;
+        };
+        '''
+        module, errors, libs = compile_source(source, compile_target='emcc')
+        assert module is not None
+        assert len(errors) == 0, f'编译错误: {errors}'
+        ir_text = str(module)
+        binding.parse_assembly(ir_text).verify()
+        assert '__ezrt_emcc_sleep' not in ir_text
+        assert '__ezrt_sleep' not in ir_text
+        assert libs == []
+
     def test_flow_race_lowers_to_runtime_stub(self):
         """flow 内 race 应 lowering 到运行时 race stub"""
         source = '''
@@ -1231,6 +1418,288 @@ class TestCodegen:
         assert 'call i32 @"__ezrt_race_i32"' in ir_text
         assert 'call i32 @"__ezrt_race"(i32 2, i32 10)' not in ir_text
         assert 'call i32 @"race"' not in ir_text
+
+    def test_emcc_flow_race_pl_uses_synchronous_fallback(self):
+        """emcc 目标没有 native 线程运行时时，race(pl) 保持同步可运行语义。"""
+        source = '''
+        const run = (): I32 => {
+            const result = flow {
+                return race(pl = [() => { return 1; }, () => { return 2; }], timeout = 10);
+            };
+            return result;
+        };
+        '''
+        module, errors, libs = compile_source(source, compile_target='emcc')
+        assert module is not None
+        assert len(errors) == 0, f'编译错误: {errors}'
+        ir_text = str(module)
+        binding.parse_assembly(ir_text).verify()
+        assert 'call i32 @"__ezrt_race_i32"' not in ir_text
+        assert 'call i32 @"__ezrt_race"' not in ir_text
+        assert 'call i32 @"race"' not in ir_text
+        assert 'define i32 @"__ez_race_branch_' not in ir_text
+        assert not any(str(lib).endswith('packages/std/native/runtime.c') for lib in libs)
+        assert 'pthread' not in {str(lib) for lib in libs}
+
+    def test_flow_race_pl_non_i32_uses_typed_synchronous_fallback(self):
+        """非 I32 race(pl) 应使用分支返回类型，而不是固定成 I32。"""
+        source = '''
+        const run = (): Str => {
+            const result = flow {
+                return race(pl = [() => { return "a"; }, () => { return "b"; }], timeout = 10);
+            };
+            return result;
+        };
+        '''
+        module, errors, libs = compile_source(source)
+        assert module is not None
+        assert len(errors) == 0, f'编译错误: {errors}'
+        ir_text = str(module)
+        binding.parse_assembly(ir_text).verify()
+        assert 'define i8* @"run"' in ir_text
+        assert 'call i32 @"__ezrt_race_i32"' not in ir_text
+        assert 'call i32 @"__ezrt_race"' not in ir_text
+        assert not any(str(lib).endswith('packages/std/native/runtime.c') for lib in libs)
+
+    def test_flow_parallel_nested_return_type_codegen(self):
+        """flow/parallel 返回槽应支持嵌套块里的 return 类型。"""
+        source = '''
+        const run = (): I32 => {
+            const a = flow {
+                (true) ? { return 3; };
+                return 1;
+            };
+            const b = parallel {
+                { return 4; };
+                return 2;
+            };
+            return a + b;
+        };
+        '''
+        module, errors, _ = compile_source(source)
+        assert module is not None
+        assert len(errors) == 0, f'编译错误: {errors}'
+        ir_text = str(module)
+        binding.parse_assembly(ir_text).verify()
+        assert '%"_flow_result" = alloca i32' in ir_text
+        assert '%"_parallel_result" = alloca i32' in ir_text
+
+    def test_flow_parallel_return_local_str_type_codegen(self):
+        """flow/parallel return 本块局部变量时应推断为局部变量类型。"""
+        source = '''
+        const run = (): Str => {
+            return flow {
+                const text = parallel {
+                    const inner = "ok";
+                    return inner;
+                };
+                return text;
+            };
+        };
+        '''
+        module, errors, _ = compile_source(source, compile_target='emcc')
+        assert module is not None
+        assert len(errors) == 0, f'编译错误: {errors}'
+        ir_text = str(module)
+        binding.parse_assembly(ir_text).verify()
+        assert 'define i8* @"run"' in ir_text
+        assert '%"_flow_result" = alloca i8*' in ir_text
+        assert '%"_parallel_result" = alloca i8*' in ir_text
+
+    def test_flow_parallel_combined_initializer_is_not_truncated(self):
+        """只有完整 `parallel {}` 初始化才应启动后台 future，组合表达式必须同步求完整值。"""
+        source = '''
+        const run = (): I32 => {
+            const result = flow {
+                const value = parallel { return 7; } + 1;
+                return value;
+            };
+            return result;
+        };
+        '''
+        module, errors, _ = compile_source(source)
+        assert module is not None
+        assert len(errors) == 0, f'编译错误: {errors}'
+        ir_text = str(module)
+        binding.parse_assembly(ir_text).verify()
+        assert 'call i8* @"__ezrt_task_start_i32"' not in ir_text
+        assert 'add i32' in function_ir(ir_text, 'run')
+
+    def test_top_level_flow_comparison_initializer_infers_bool(self):
+        """顶层 flow 组合表达式不能被误推断为 flow 块内部返回类型。"""
+        source = '''
+        const same = flow { return 7; } == 7;
+        '''
+        module, errors, _ = compile_source(source, ensure_entrypoint=True)
+        assert module is not None
+        assert len(errors) == 0, f'编译错误: {errors}'
+        ir_text = str(module)
+        binding.parse_assembly(ir_text).verify()
+        assert '@"same" = global i1 0' in ir_text
+
+    def test_emcc_flow_parallel_i32_uses_synchronous_fallback(self):
+        """emcc 目标下 flow 内 parallel I32 不链接 native task runtime。"""
+        source = '''
+        const run = (): I32 => {
+            const result = flow {
+                const p = parallel { return 7; };
+                return p + 1;
+            };
+            return result;
+        };
+        '''
+        module, errors, libs = compile_source(source, compile_target='emcc')
+        assert module is not None
+        assert len(errors) == 0, f'编译错误: {errors}'
+        ir_text = str(module)
+        binding.parse_assembly(ir_text).verify()
+        assert 'call i8* @"__ezrt_task_start_i32"' not in ir_text
+        assert 'call i32 @"__ezrt_task_join_i32"' not in ir_text
+        assert 'define i32 @"__ez_race_branch_' not in ir_text
+        assert 'call void @"__ezrt_parallel_enter"()' in ir_text
+        assert not any(str(lib).endswith('packages/std/native/runtime.c') for lib in libs)
+        assert 'pthread' not in {str(lib) for lib in libs}
+
+    def test_flow_parallel_typed_i32_initializer_starts_future(self):
+        """显式 I32 类型的 parallel 初始化也应接入 native 后台任务。"""
+        source = '''
+        declare const sleep: (ms: I64) => Void;
+
+        const run = (): I32 => {
+            const result = flow {
+                const p: I32 = parallel { sleep(ms = 1); return 7; };
+                return p + 1;
+            };
+            return result;
+        };
+        '''
+        module, errors, libs = compile_source(source, compile_target='linux')
+        assert module is not None
+        assert len(errors) == 0, f'编译错误: {errors}'
+        ir_text = str(module)
+        binding.parse_assembly(ir_text).verify()
+        assert 'call i8* @"__ezrt_task_start_i32"' in ir_text
+        assert 'call i32 @"__ezrt_task_join_i32"' in ir_text
+        assert 'define i32 @"__ez_race_branch_' in ir_text
+        assert any(str(lib).endswith('packages/std/native/runtime.c') for lib in libs)
+        assert 'pthread' in {str(lib) for lib in libs}
+
+    def test_flow_parallel_local_capture_uses_synchronous_fallback(self):
+        """捕获外层局部变量的 parallel 不能跨线程引用栈地址，应同步 fallback。"""
+        source = '''
+        const run = (): I32 => {
+            const result = flow {
+                const offset = 5;
+                const p: I32 = parallel { return offset + 2; };
+                return p;
+            };
+            return result;
+        };
+        '''
+        module, errors, libs = compile_source(source, compile_target='linux')
+        assert module is not None
+        assert len(errors) == 0, f'编译错误: {errors}'
+        ir_text = str(module)
+        binding.parse_assembly(ir_text).verify()
+        assert 'call i8* @"__ezrt_task_start_i32"' not in ir_text
+        assert 'call i32 @"__ezrt_task_join_i32"' not in ir_text
+        assert 'call void @"__ezrt_parallel_enter"()' in ir_text
+        assert not any(str(lib).endswith('packages/std/native/runtime.c') for lib in libs)
+
+    def test_flow_parallel_non_i32_explicit_type_uses_synchronous_fallback(self):
+        """当前 native 后台任务 ABI 仅覆盖显式 I32，I64 等类型保持同步 fallback。"""
+        source = '''
+        const run = (): I64 => {
+            const result = flow {
+                const p: I64 = parallel { return 7; };
+                return p;
+            };
+            return result;
+        };
+        '''
+        module, errors, libs = compile_source(source, compile_target='linux')
+        assert module is not None
+        assert len(errors) == 0, f'编译错误: {errors}'
+        ir_text = str(module)
+        binding.parse_assembly(ir_text).verify()
+        assert 'call i8* @"__ezrt_task_start_i32"' not in ir_text
+        assert 'call i32 @"__ezrt_task_join_i32"' not in ir_text
+        assert 'call void @"__ezrt_parallel_enter"()' in ir_text
+        assert not any(str(lib).endswith('packages/std/native/runtime.c') for lib in libs)
+
+    def test_emcc_flow_parallel_typed_i32_uses_synchronous_fallback(self):
+        """emcc 下显式 I32 parallel 同样保持同步协作 fallback。"""
+        source = '''
+        const run = (): I32 => {
+            const result = flow {
+                const p: I32 = parallel { return 7; };
+                return p + 1;
+            };
+            return result;
+        };
+        '''
+        module, errors, libs = compile_source(source, compile_target='emcc')
+        assert module is not None
+        assert len(errors) == 0, f'编译错误: {errors}'
+        ir_text = str(module)
+        binding.parse_assembly(ir_text).verify()
+        assert 'call i8* @"__ezrt_task_start_i32"' not in ir_text
+        assert 'call i32 @"__ezrt_task_join_i32"' not in ir_text
+        assert 'define i32 @"__ez_race_branch_' not in ir_text
+        assert 'call void @"__ezrt_parallel_enter"()' in ir_text
+        assert not any(str(lib).endswith('packages/std/native/runtime.c') for lib in libs)
+        assert 'pthread' not in {str(lib) for lib in libs}
+
+    def test_flow_parallel_and_race_codegen_target_matrix(self):
+        """flow/parallel/race 语法应在所有当前编译目标生成可链接语义。"""
+        source = '''
+        const run = (): I32 => {
+            const result = flow {
+                const p = parallel { return 7; };
+                return p + race(pl = [() => { return 1; }, () => { return 2; }], timeout = 10);
+            };
+            return result;
+        };
+        '''
+        for target in ('linux', 'macos', 'windows', 'android', 'ios', 'emcc'):
+            module, errors, libs = compile_source(source, compile_target=target)
+            assert module is not None, target
+            assert len(errors) == 0, f'{target}: {errors}'
+            ir_text = str(module)
+            binding.parse_assembly(ir_text).verify()
+            lib_names = {str(lib) for lib in libs}
+            uses_native_runtime = any(str(lib).endswith('packages/std/native/runtime.c') for lib in libs)
+            if target == 'emcc':
+                assert 'call i8* @"__ezrt_task_start_i32"' not in ir_text
+                assert 'call i32 @"__ezrt_race_i32"' not in ir_text
+                assert not uses_native_runtime
+                assert 'pthread' not in lib_names
+            else:
+                assert 'call i8* @"__ezrt_task_start_i32"' in ir_text
+                assert 'call i32 @"__ezrt_race_i32"' in ir_text
+                assert uses_native_runtime
+                if target != 'windows':
+                    assert 'pthread' in lib_names
+
+    def test_flow_nested_function_return_does_not_capture_outer_flow_result(self):
+        """flow 内声明的函数应使用独立返回路径，不能跳到外层 flow_exit。"""
+        source = '''
+        const run = (): I32 => {
+            const result = flow {
+                const f = (): I32 => { return 1; };
+                return f();
+            };
+            return result;
+        };
+        '''
+        module, errors, _ = compile_source(source)
+        assert module is not None
+        assert len(errors) == 0, f'编译错误: {errors}'
+        ir_text = str(module)
+        binding.parse_assembly(ir_text).verify()
+        f_ir = function_ir(ir_text, 'f')
+        assert 'flow_exit' not in f_ir
+        assert 'ret i32 1' in f_ir
 
     def test_typeof_expr(self):
         """typeof 表达式（编译时类型查询）"""
@@ -1610,7 +2079,7 @@ class TestCodegen:
     def test_stdlib_import_does_not_enable_default_global_lock_runtime(self):
         """导入模块内部声明不应触发用户源默认全局锁运行时。"""
         source = 'from "./std/os.ez" import { platform };'
-        module, errors, libs = compile_source(source, compile_target='linux')
+        module, errors, libs = compile_source(source, compile_target='linux', target_arch='x86_64')
         assert module is not None
         assert len(errors) == 0, f'编译错误: {errors}'
         assert libs == [str(STD_ROOT / 'native' / 'os.c')]
@@ -1749,7 +2218,7 @@ class TestCodegen:
                      'strTrim', 'strReplace', 'strToLower', 'strToUpper']:
             assert module.get_global(name) is not None
         ir_text = str(module)
-        assert 'declare %"Blob" @"strToBytes"' in ir_text
+        assert_small_struct_return_bridge(ir_text, 'strToBytes', 'Blob', '{i8*, i64}')
         assert 'declare void @"strSplit"({i8***, i64, i64, i64}* sret({i8***, i64, i64, i64})' in ir_text
 
     def test_stdlib_str_target_filter(self):
@@ -1840,7 +2309,8 @@ class TestCodegen:
         source = '''
         from "./std/random.ez" import {
             RandomSource, randomSeed, randomNextU32, randomNextU64, randomRangeI64,
-            randomRangeF64, randomShuffleBytes, randomEntropy, randomSecureBytes, randomSecureU64
+            randomRangeF64, randomShuffleBytes, randomShuffle, randomEntropy,
+            randomSecureBytes, randomSecureU64
         };
 
         const check_random = (): I32 => {
@@ -1850,6 +2320,8 @@ class TestCodegen:
             const ranged_i = randomRangeI64(this = source, minValue = 1, maxValue = 10);
             const ranged_f = randomRangeF64(this = source, minValue = 0.0, maxValue = 1.0);
             const shuffled = randomShuffleBytes(this = source, data = Blob(data = "abcd", size = 4));
+            let nums: List<I32> = [1, 2, 3, 4];
+            let shuffled_nums: List<I32> = randomShuffle<I32>(this = source, list = nums);
             const entropy = randomEntropy(size = 8);
             const secure = randomSecureBytes(size = 8);
             const secure64 = randomSecureU64();
@@ -1866,15 +2338,20 @@ class TestCodegen:
             assert module.get_global(name) is not None
         ir_text = str(module)
         assert '%"RandomSource" = type {i64}' in ir_text
-        assert 'declare %"RandomSource" @"randomSeed"' in ir_text
+        assert_small_struct_return_bridge(ir_text, 'randomSeed', 'RandomSource', 'i64')
         assert 'declare i64 @"randomNextU64"' in ir_text
-        assert 'declare %"Blob" @"randomShuffleBytes"' in ir_text
+        assert_small_struct_return_bridge(ir_text, 'randomShuffleBytes', 'Blob', '{i8*, i64}')
+        assert 'randomShuffle_I32' not in ir_text
+        assert 'random_shuffle_cond' in ir_text
         assert 'declare void @"randomSecureBytes"({i1, %"Blob"}* sret({i1, %"Blob"})' in ir_text
         assert_optional_return_bridge(ir_text, 'randomSecureU64', 'i64', 'x86_64')
 
         aarch64_module, aarch64_errors, _ = compile_source(source, compile_target='linux', target_arch='aarch64')
         assert aarch64_module is not None
         assert len(aarch64_errors) == 0, f'编译错误: {aarch64_errors}'
+        aarch64_ir = str(aarch64_module)
+        assert_small_struct_return_bridge(aarch64_ir, 'randomSeed', 'RandomSource', 'i64')
+        assert_small_struct_return_bridge(aarch64_ir, 'randomShuffleBytes', 'Blob', '[2 x i64]')
         assert_optional_return_bridge(str(aarch64_module), 'randomSecureU64', 'i64', 'aarch64')
 
     def test_stdlib_random_target_filter(self):
@@ -1912,7 +2389,7 @@ class TestCodegen:
             return h32;
         };
         '''
-        module, errors, libs = compile_source(source, compile_target='linux')
+        module, errors, libs = compile_source(source, compile_target='linux', target_arch='x86_64')
         assert module is not None
         assert len(errors) == 0, f'编译错误: {errors}'
         assert libs == [str(STD_ROOT / 'native' / 'hash.c')]
@@ -1961,7 +2438,7 @@ class TestCodegen:
             return ptr;
         };
         '''
-        module, errors, libs = compile_source(source, compile_target='linux')
+        module, errors, libs = compile_source(source, compile_target='linux', target_arch='x86_64')
         assert module is not None
         assert len(errors) == 0, f'编译错误: {errors}'
         assert libs == [str(STD_ROOT / 'native' / 'platform.c')]
@@ -1991,7 +2468,8 @@ class TestCodegen:
         source = '''
         from "./std/process.ez" import {
             Command, Process, ProcessResult, processExec, processSpawn,
-            processWait, processTerminate, processCurrentPath
+            processWait, processTerminate, processStdin, processStdout, processStderr,
+            processCurrentPath
         };
 
         const check_process = (): I32 => {
@@ -2003,6 +2481,9 @@ class TestCodegen:
             const spawned = processSpawn(command = Command(program = "/bin/sh", args = args, cwd = "", env = empty, stdin = Blob(data = "", size = 0)));
             const waited = processWait(process = Process(handle = 0, pid = 0));
             const killed = processTerminate(process = Process(handle = 0, pid = 0));
+            const in_stream = processStdin(process = Process(handle = 0, pid = 0));
+            const out_stream = processStdout(process = Process(handle = 0, pid = 0));
+            const err_stream = processStderr(process = Process(handle = 0, pid = 0));
             const path = processCurrentPath();
             return 0;
         };
@@ -2010,17 +2491,21 @@ class TestCodegen:
         module, errors, libs = compile_source(source, compile_target='linux', target_arch='x86_64')
         assert module is not None
         assert len(errors) == 0, f'编译错误: {errors}'
-        assert libs == [str(STD_ROOT / 'native' / 'process.c')]
-        for name in ['processExec', 'processSpawn', 'processWait', 'processTerminate', 'processCurrentPath']:
+        assert libs == [str(STD_ROOT / 'native' / 'stream.c'), str(STD_ROOT / 'native' / 'process.c')]
+        for name in ['processExec', 'processSpawn', 'processWait', 'processTerminate', 'processStdin', 'processStdout', 'processStderr', 'processCurrentPath']:
             assert module.get_global(name) is not None
         ir_text = str(module)
         assert '%"Command" = type' in ir_text
         assert '%"Process" = type {i64, i64}' in ir_text
         assert '%"ProcessResult" = type' in ir_text
+        assert '%"Stream" = type {i64, i32}' in ir_text
         assert 'declare void @"processExec"({i1, %"ProcessResult"}* sret({i1, %"ProcessResult"})' in ir_text
         assert 'declare void @"processSpawn"({i1, %"Process"}* sret({i1, %"Process"})' in ir_text
         assert 'declare void @"processWait"({i1, %"ProcessResult"}* sret({i1, %"ProcessResult"})' in ir_text
         assert 'declare i1 @"processTerminate"(%"Process"*' in ir_text
+        assert 'declare void @"processStdin"({i1, %"Stream"}* sret({i1, %"Stream"})' in ir_text
+        assert 'declare void @"processStdout"({i1, %"Stream"}* sret({i1, %"Stream"})' in ir_text
+        assert 'declare void @"processStderr"({i1, %"Stream"}* sret({i1, %"Stream"})' in ir_text
         assert_optional_return_bridge(ir_text, 'processCurrentPath', 'i8*', 'x86_64')
 
         aarch64_module, aarch64_errors, _ = compile_source(source, compile_target='linux', target_arch='aarch64')
@@ -2036,14 +2521,39 @@ class TestCodegen:
         _, _, android_libs = compile_source(source, compile_target='android')
         _, _, ios_libs = compile_source(source, compile_target='ios')
         _, _, emcc_libs = compile_source(source, compile_target='emcc')
-        assert linux_libs == [str(STD_ROOT / 'native' / 'process.c')]
-        assert windows_libs == [str(STD_ROOT / 'native' / 'process.c')]
-        assert android_libs == [str(STD_ROOT / 'native' / 'process.c')]
-        assert ios_libs == [str(STD_ROOT / 'native' / 'process.c')]
-        assert emcc_libs == [str(STD_ROOT / 'emcc' / 'process.js')]
+        assert linux_libs == [str(STD_ROOT / 'native' / 'stream.c'), str(STD_ROOT / 'native' / 'process.c')]
+        assert windows_libs == [str(STD_ROOT / 'native' / 'stream.c'), 'ws2_32', str(STD_ROOT / 'native' / 'process.c')]
+        assert android_libs == [str(STD_ROOT / 'native' / 'stream.c'), str(STD_ROOT / 'native' / 'process.c')]
+        assert ios_libs == [str(STD_ROOT / 'native' / 'stream.c'), str(STD_ROOT / 'native' / 'process.c')]
+        assert emcc_libs == [str(STD_ROOT / 'emcc' / 'stream.js'), str(STD_ROOT / 'emcc' / 'process.js')]
         module, errors, _ = compile_source(source + '\nlet path = processCurrentPath();\n', compile_target='emcc')
         assert len(errors) == 0, f'编译错误: {errors}'
         assert 'declare void @"processCurrentPath"({i1, i8*}* sret({i1, i8*})' in str(module)
+
+    def test_imports_resolve_nested_relative_struct_types(self, tmp_path):
+        """导入文件内部的相对导入应按该文件目录解析，供 declare 签名使用。"""
+        lib_dir = tmp_path / "lib"
+        lib_dir.mkdir()
+        (lib_dir / "stream.ez").write_text(
+            "export struct Stream { handle: I64; kind: I32; };\n",
+            encoding="utf-8",
+        )
+        (lib_dir / "process.ez").write_text(
+            'from "./stream.ez" import { Stream };\n'
+            'extern "native.c" for linux;\n'
+            'export declare const pipe: () => Stream?;\n',
+            encoding="utf-8",
+        )
+        (tmp_path / "native.c").write_text("", encoding="utf-8")
+        source = 'from "./lib/process.ez" import { pipe };\nlet s = pipe();\n'
+
+        module, errors, libs = compile_source(source, compile_target="linux", base_dir=tmp_path)
+
+        assert module is not None
+        assert len(errors) == 0, f"编译错误: {errors}"
+        ir_text = str(module)
+        assert '%"Stream" = type {i64, i32}' in ir_text
+        assert 'declare void @"pipe"({i1, %"Stream"}* sret({i1, %"Stream"})' in ir_text
 
     def test_stdlib_uri_import(self):
         """std/uri URL 解析库导入"""
@@ -2145,9 +2655,11 @@ class TestCodegen:
         """std/debug extern 应按目标过滤"""
         source = 'from "./std/debug.ez" import { debugRuntimeInfo };'
         _, _, linux_libs = compile_source(source, compile_target='linux')
+        _, _, windows_libs = compile_source(source, compile_target='windows')
         _, _, ios_libs = compile_source(source, compile_target='ios')
         _, _, emcc_libs = compile_source(source, compile_target='emcc')
         assert linux_libs == [str(STD_ROOT / 'native' / 'debug.c')]
+        assert windows_libs == [str(STD_ROOT / 'native' / 'debug.c'), 'dbghelp']
         assert ios_libs == [str(STD_ROOT / 'native' / 'debug.c')]
         assert emcc_libs == [str(STD_ROOT / 'emcc' / 'debug.js')]
 
@@ -2184,7 +2696,7 @@ class TestCodegen:
             assert module.get_global(name) is not None
         ir_text = str(module)
         assert '%"LogConfig" = type' in ir_text
-        assert 'declare %"LogConfig" @"logDefaultConfig"' in ir_text
+        assert_small_struct_return_bridge(ir_text, 'logDefaultConfig', 'LogConfig', '{i64, i32}')
         assert 'declare void @"logConfigure"(%"LogConfig"*' in ir_text
         assert 'declare i1 @"logSetFile"' in ir_text
         assert 'declare void @"logWriteFields"(i32' in ir_text
@@ -2255,7 +2767,7 @@ class TestCodegen:
             return 0;
         };
         '''
-        module, errors, libs = compile_source(source, compile_target='linux')
+        module, errors, libs = compile_source(source, compile_target='linux', target_arch='x86_64')
         assert module is not None
         assert len(errors) == 0, f'编译错误: {errors}'
         assert libs == [str(STD_ROOT / 'native' / 'regex.c')]
@@ -2264,9 +2776,19 @@ class TestCodegen:
         ir_text = str(module)
         assert '%"Regex" = type' in ir_text
         assert '%"RegexMatch" = type' in ir_text
-        assert 'declare %"Regex" @"regexCompile"' in ir_text
+        assert_regex_compile_return_bridge(ir_text, 'x86_64')
         assert 'declare void @"regexFind"({i1, %"RegexMatch"}* sret({i1, %"RegexMatch"})' in ir_text
         assert 'declare void @"regexFindAll"({i8***, i64, i64, i64}* sret({i8***, i64, i64, i64})' in ir_text
+
+    def test_stdlib_regex_compile_return_bridge_for_aarch64(self):
+        """aarch64 native 下 Regex 小结构返回应按 [2 x i64] 桥接。"""
+        source = 'from "./std/regex.ez" import { regexCompile }; let re = regexCompile(pattern = "a", flags = 0);'
+
+        module, errors, _ = compile_source(source, compile_target='macos', target_arch='aarch64')
+
+        assert module is not None
+        assert len(errors) == 0, f'编译错误: {errors}'
+        assert_regex_compile_return_bridge(str(module), 'aarch64')
 
     def test_stdlib_regex_target_filter(self):
         """std/regex extern 应按目标过滤"""
@@ -2296,10 +2818,10 @@ class TestCodegen:
             return 0;
         };
         '''
-        module, errors, libs = compile_source(source, compile_target='linux')
+        module, errors, libs = compile_source(source, compile_target='linux', target_arch='x86_64')
         assert module is not None
         assert len(errors) == 0, f'编译错误: {errors}'
-        assert libs == [str(STD_ROOT / 'native' / 'crypto.c')]
+        assert libs == [str(STD_ROOT / 'native' / 'crypto.c'), 'dl']
         for name in ['cryptoSha256', 'cryptoSha512', 'cryptoHmacSha256', 'cryptoHmacSha512']:
             assert module.get_global(name) is not None
         ir_text = str(module)
@@ -2310,18 +2832,23 @@ class TestCodegen:
         """std/crypto extern 应按目标过滤"""
         source = 'from "./std/crypto.ez" import { cryptoSha256 };'
         _, _, linux_libs = compile_source(source, compile_target='linux')
+        _, _, windows_libs = compile_source(source, compile_target='windows')
         _, _, ios_libs = compile_source(source, compile_target='ios')
         _, _, emcc_libs = compile_source(source, compile_target='emcc')
-        assert linux_libs == [str(STD_ROOT / 'native' / 'crypto.c')]
+        assert linux_libs == [str(STD_ROOT / 'native' / 'crypto.c'), 'dl']
+        assert windows_libs == [str(STD_ROOT / 'native' / 'crypto.c'), 'bcrypt']
         assert ios_libs == [str(STD_ROOT / 'native' / 'crypto.c')]
         assert emcc_libs == [str(STD_ROOT / 'emcc' / 'crypto.js')]
 
     def test_stdlib_compress_import(self):
         """std/compress 压缩库导入"""
         source = '''
+        from "./std/stream.ez" import { streamFromBlob };
         from "./std/compress.ez" import {
             compressGzip, decompressGzip, compressZlib, decompressZlib,
-            compressDeflate, decompressDeflate
+            compressDeflate, decompressDeflate,
+            compressGzipStream, decompressGzipStream, compressZlibStream, decompressZlibStream,
+            compressDeflateStream, decompressDeflateStream
         };
 
         const check_compress = (): I32 => {
@@ -2332,30 +2859,42 @@ class TestCodegen:
             const raw_z = decompressZlib(data = z.value);
             const d = compressDeflate(data = data);
             const raw_d = decompressDeflate(data = d.value);
+            const src = streamFromBlob(data = data);
+            const dst = streamFromBlob(data = Blob(data = "", size = 0));
+            const streamed = compressGzipStream(dst = dst.value, src = src.value, bufferSize = 2);
             return 0;
         };
         '''
         module, errors, libs = compile_source(source, compile_target='linux')
         assert module is not None
         assert len(errors) == 0, f'编译错误: {errors}'
-        assert libs == [str(STD_ROOT / 'native' / 'compress.c'), 'z']
-        for name in ['compressGzip', 'decompressGzip', 'compressZlib', 'decompressZlib', 'compressDeflate', 'decompressDeflate']:
+        assert libs == [str(STD_ROOT / 'native' / 'stream.c'), str(STD_ROOT / 'native' / 'compress.c'), 'z']
+        for name in [
+            'compressGzip', 'decompressGzip', 'compressZlib', 'decompressZlib', 'compressDeflate', 'decompressDeflate',
+            'compressGzipStream', 'decompressGzipStream', 'compressZlibStream', 'decompressZlibStream',
+            'compressDeflateStream', 'decompressDeflateStream'
+        ]:
             assert module.get_global(name) is not None
         ir_text = str(module)
         assert 'declare void @"compressGzip"({i1, %"Blob"}* sret({i1, %"Blob"})' in ir_text
         assert 'declare void @"decompressDeflate"({i1, %"Blob"}* sret({i1, %"Blob"})' in ir_text
+        assert 'declare i64 @"compressGzipStream"(%"Stream"*' in ir_text
 
     def test_stdlib_compress_target_filter(self):
         """std/compress extern 应按目标过滤"""
         source = 'from "./std/compress.ez" import { compressGzip };'
         _, _, linux_libs = compile_source(source, compile_target='linux')
         _, _, macos_libs = compile_source(source, compile_target='macos')
+        _, _, windows_libs = compile_source(source, compile_target='windows')
         _, _, android_libs = compile_source(source, compile_target='android')
+        _, _, ios_libs = compile_source(source, compile_target='ios')
         _, _, emcc_libs = compile_source(source, compile_target='emcc')
-        assert linux_libs == [str(STD_ROOT / 'native' / 'compress.c'), 'z']
-        assert macos_libs == [str(STD_ROOT / 'native' / 'compress.c'), 'z']
-        assert android_libs == [str(STD_ROOT / 'native' / 'compress.c')]
-        assert emcc_libs == [str(STD_ROOT / 'emcc' / 'compress.js')]
+        assert linux_libs == [str(STD_ROOT / 'native' / 'stream.c'), str(STD_ROOT / 'native' / 'compress.c'), 'z']
+        assert macos_libs == [str(STD_ROOT / 'native' / 'stream.c'), str(STD_ROOT / 'native' / 'compress.c'), 'z']
+        assert windows_libs == [str(STD_ROOT / 'native' / 'stream.c'), 'ws2_32', str(STD_ROOT / 'native' / 'compress.c'), 'z']
+        assert android_libs == [str(STD_ROOT / 'native' / 'stream.c'), str(STD_ROOT / 'native' / 'compress.c'), 'z']
+        assert ios_libs == [str(STD_ROOT / 'native' / 'stream.c'), str(STD_ROOT / 'native' / 'compress.c'), 'z']
+        assert emcc_libs == [str(STD_ROOT / 'emcc' / 'stream.js'), str(STD_ROOT / 'emcc' / 'compress.js')]
 
     def test_stdlib_test_import(self):
         """std/test 测试框架导入"""
@@ -2410,7 +2949,8 @@ class TestCodegen:
         """std/stream 流 ABI 导入"""
         source = '''
         from "./std/stream.ez" import {
-            streamKindMemory, streamKindFileRead, streamKindFileWrite, streamKindTcp, Stream,
+            streamKindMemory, streamKindFileRead, streamKindFileWrite, streamKindTcp,
+            streamKindProcessStdin, streamKindProcessStdout, streamKindProcessStderr, Stream,
             streamFromBlob, streamFromTcpHandle, streamOpenFileRead, streamOpenFileWrite,
             streamRead, streamWrite, streamToBlob, streamCopy, streamFlush, streamClose
         };
@@ -2431,14 +2971,16 @@ class TestCodegen:
             return copied;
         };
         '''
-        module, errors, libs = compile_source(source, compile_target='linux')
+        module, errors, libs = compile_source(source, compile_target='linux', target_arch='x86_64')
         assert module is not None
         assert len(errors) == 0, f'编译错误: {errors}'
         assert libs == [str(STD_ROOT / 'native' / 'stream.c')]
         ir_text = str(module)
         assert '%"Stream" = type {i64, i32}' in ir_text
+        for name in ['streamKindMemory', 'streamKindFileRead', 'streamKindFileWrite', 'streamKindTcp', 'streamKindProcessStdin', 'streamKindProcessStdout', 'streamKindProcessStderr']:
+            assert module.get_global(name) is not None
         assert 'declare void @"streamFromBlob"({i1, %"Stream"}* sret({i1, %"Stream"})' in ir_text
-        assert 'declare %"Stream" @"streamFromTcpHandle"(i64' in ir_text
+        assert_small_struct_return_bridge(ir_text, 'streamFromTcpHandle', 'Stream', '{i64, i32}')
         assert 'declare void @"streamOpenFileRead"({i1, %"Stream"}* sret({i1, %"Stream"})' in ir_text
         assert 'declare void @"streamOpenFileWrite"({i1, %"Stream"}* sret({i1, %"Stream"})' in ir_text
         assert 'declare void @"streamRead"({i1, %"Blob"}* sret({i1, %"Blob"})' in ir_text
@@ -2449,9 +2991,11 @@ class TestCodegen:
         """std/stream extern 应按目标过滤"""
         source = 'from "./std/stream.ez" import { streamFromBlob };'
         _, _, linux_libs = compile_source(source, compile_target='linux')
+        _, _, windows_libs = compile_source(source, compile_target='windows')
         _, _, ios_libs = compile_source(source, compile_target='ios')
         _, _, emcc_libs = compile_source(source, compile_target='emcc')
         assert linux_libs == [str(STD_ROOT / 'native' / 'stream.c')]
+        assert windows_libs == [str(STD_ROOT / 'native' / 'stream.c'), 'ws2_32']
         assert ios_libs == [str(STD_ROOT / 'native' / 'stream.c')]
         assert emcc_libs == [str(STD_ROOT / 'emcc' / 'stream.js')]
 
@@ -2459,11 +3003,16 @@ class TestCodegen:
         """std/time 时间库导入"""
         source = '''
         from "./std/time.ez" import {
+            Duration, durationToString,
             now, timestamp, sleep, getYear, getMonth, getDay, getHour, getMinute, getSecond,
             add, sub, format
         };
 
         const check_time = (): I32 => {
+            const seconds = Duration.fromSec(s = 2);
+            const minutes = Duration.fromMin(m = 1);
+            const duration_text = seconds.toString();
+            const duration_fn_text = durationToString(value = minutes);
             const d = now();
             const ts = timestamp();
             sleep(ms = 1);
@@ -2483,8 +3032,15 @@ class TestCodegen:
         assert module is not None
         assert len(errors) == 0, f'编译错误: {errors}'
         assert libs == [str(STD_ROOT / 'native' / 'time.c')]
-        for name in ['now', 'timestamp', 'sleep', 'getYear', 'getMonth', 'getDay', 'getHour', 'getMinute', 'getSecond', 'add', 'sub', 'format']:
+        for name in ['Duration_fromSec', 'Duration_fromMin', 'Duration_toString', 'durationToString', '__durationToString', 'now', 'timestamp', 'sleep', 'getYear', 'getMonth', 'getDay', 'getHour', 'getMinute', 'getSecond', 'add', 'sub', 'format']:
             assert module.get_global(name) is not None
+        ir_text = str(module)
+        binding.parse_assembly(ir_text).verify()
+        assert 'call %"Duration" @"Duration_fromSec"' in ir_text
+        assert 'call %"Duration" @"Duration_fromMin"' in ir_text
+        assert 'call i8* @"Duration_toString"' in ir_text
+        assert 'call i8* @"durationToString"' in ir_text
+        assert 'declare i8* @"__durationToString"' in ir_text
 
     def test_stdlib_time_target_filter(self):
         """std/time extern 应按桌面目标过滤"""
@@ -2503,7 +3059,7 @@ class TestCodegen:
             dictKeys, dictValues, dictHas, dictDelete, dictLen
         };
         '''
-        module, errors, _ = compile_source(source)
+        module, errors, _ = compile_source(source, compile_target='linux', target_arch='x86_64')
         assert module is not None
         assert len(errors) == 0, f'编译错误: {errors}'
         assert 'listLen_' not in str(module)
@@ -2555,29 +3111,571 @@ class TestCodegen:
         from "./std/fmt.ez" import { toString, jsonStringify, jsonParse, msgpackEncode, msgpackDecode };
 
         const check_msgpack = (): Str => {
+            const i8_text = toString<I8>(value = -128);
+            const u8_text = toString<U8>(value = 255);
+            const ji8 = jsonParse<I8>(s = jsonStringify<I8>(data = -128));
+            const ju8 = jsonParse<U8>(s = jsonStringify<U8>(data = 255));
+            const mi8 = msgpackDecode<I8>(data = msgpackEncode<I8>(data = ji8));
+            const mu8 = msgpackDecode<U8>(data = msgpackEncode<U8>(data = ju8));
+            const u32_text = toString<U32>(value = 4294967295);
+            const u64_text = toString<U64>(value = 123456789);
+            const ju32 = jsonParse<U32>(s = jsonStringify<U32>(data = 4294967295));
+            const ju64 = jsonParse<U64>(s = jsonStringify<U64>(data = 123456789));
+            const mu32 = msgpackDecode<U32>(data = msgpackEncode<U32>(data = ju32));
+            const mu64 = msgpackDecode<U64>(data = msgpackEncode<U64>(data = ju64));
             const b = msgpackDecode<Bool>(data = msgpackEncode<Bool>(data = true));
             const s = msgpackDecode<Str>(data = msgpackEncode<Str>(data = "EzLang"));
+            const jf = jsonParse<F32>(s = jsonStringify<F32>(data = 3.0));
+            const mf = msgpackDecode<F32>(data = msgpackEncode<F32>(data = jf));
             const f = msgpackDecode<F64>(data = msgpackEncode<F64>(data = 3.0));
             return s;
+        };
+        '''
+        module, errors, _ = compile_source(source, compile_target='linux', target_arch='x86_64')
+        assert module is not None
+        assert len(errors) == 0, f'编译错误: {errors}'
+        for name in ['toString_I8', 'toString_U8', 'jsonStringify_I8', 'jsonParse_I8', 'jsonStringify_U8', 'jsonParse_U8', 'msgpackEncode_I8', 'msgpackDecode_I8', 'msgpackEncode_U8', 'msgpackDecode_U8', 'toString_U32', 'toString_U64', 'jsonStringify_U32', 'jsonParse_U32', 'jsonStringify_U64', 'jsonParse_U64', 'msgpackEncode_U32', 'msgpackDecode_U32', 'msgpackEncode_U64', 'msgpackDecode_U64', 'jsonStringify_F32', 'jsonParse_F32', 'msgpackEncode_I1', 'msgpackDecode_I1', 'msgpackEncode_Str', 'msgpackDecode_Str', 'msgpackEncode_F32', 'msgpackDecode_F32', 'msgpackEncode_F64', 'msgpackDecode_F64']:
+            assert module.get_global(name) is not None
+
+    def test_stdlib_fmt_json_stringify_struct_basic_fields(self):
+        """jsonStringify<Struct> 对基础字段生成内部 JSON 编码函数。"""
+        source = '''
+        from "./std/fmt.ez" import { jsonStringify };
+
+        struct User { name: Str; age: U32; active: Bool; score: F64; };
+        struct Empty {};
+
+        const encode = (): Str => {
+            const u = User(name = "Ez", age = 42, active = true, score = 1.5);
+            const empty = Empty();
+            const ignored = jsonStringify<Empty>(data = empty);
+            return jsonStringify<User>(data = u);
         };
         '''
         module, errors, _ = compile_source(source)
         assert module is not None
         assert len(errors) == 0, f'编译错误: {errors}'
-        for name in ['msgpackEncode_I1', 'msgpackDecode_I1', 'msgpackEncode_Str', 'msgpackDecode_Str', 'msgpackEncode_F64', 'msgpackDecode_F64']:
-            assert module.get_global(name) is not None
+        ir_text = str(module)
+        binding.parse_assembly(ir_text).verify()
+        assert 'define i8* @"jsonStringify_User"(%"User"* %"data")' in ir_text
+        assert 'define i8* @"jsonStringify_Empty"(%"Empty"* %"data")' in ir_text
+        assert 'declare i8* @"jsonStringify_User"' not in ir_text
+        start = ir_text.index('define i8* @"jsonStringify_User"')
+        user_ir = ir_text[start:ir_text.index('\n}\n', start) + 3]
+        for name in ['jsonStringify_Str', 'jsonStringify_U32', 'jsonStringify_I1', 'jsonStringify_F64']:
+            assert name in user_ir
 
-    def test_stdlib_fmt_emcc_to_string_f32_declares_wrapper(self):
-        """emcc 平台的 toString<F32> 应有对应 JS 封装符号。"""
+    def test_stdlib_fmt_json_stringify_struct_does_not_treat_blob_data_as_str(self):
+        """Blob.data 是 *U8，不应因 LLVM 同为 i8* 被当作 Str 字段编码。"""
+        source = '''
+        from "./std/fmt.ez" import { jsonStringify };
+
+        const encode = (): Str => {
+            const b = Blob(data = "x", size = 1);
+            return jsonStringify<Blob>(data = b);
+        };
+        '''
+        module, errors, _ = compile_source(source)
+        assert module is not None
+        assert len(errors) == 0, f'编译错误: {errors}'
+        ir_text = str(module)
+        binding.parse_assembly(ir_text).verify()
+        assert 'define i8* @"jsonStringify_Blob"' not in ir_text
+        assert 'declare i8* @"jsonStringify_Blob"(%"Blob"* %"data")' in ir_text
+
+    def test_stdlib_fmt_json_parse_struct_basic_fields(self):
+        """jsonParse<Struct> 对基础字段生成内部 JSON 解析函数。"""
+        source = r'''
+        from "./std/fmt.ez" import { jsonParse };
+
+        struct User { name: Str; age: U32; active: Bool; score: F64; };
+        struct Empty {};
+
+        const decode = (): Str => {
+            const u = jsonParse<User>(s = "{\"name\":\"Ez\",\"age\":42,\"active\":true,\"score\":1.5}");
+            const empty = jsonParse<Empty>(s = "{}");
+            return u.name;
+        };
+        '''
+        module, errors, _ = compile_source(source)
+        assert module is not None
+        assert len(errors) == 0, f'编译错误: {errors}'
+        ir_text = str(module)
+        binding.parse_assembly(ir_text).verify()
+        assert 'define %"User"* @"jsonParse_User"(i8* %"s")' in ir_text
+        assert 'define %"Empty"* @"jsonParse_Empty"(i8* %"s")' in ir_text
+        assert 'declare %"User"* @"jsonParse_User"' not in ir_text
+        user_ir = function_ir(ir_text, 'jsonParse_User')
+        for name in ['__ez_json_valid_object', '__ez_json_object_field_count', '__ez_json_object_field']:
+            assert name in user_ir
+        for name in ['jsonParse_Str', 'jsonParse_U32', 'jsonParse_I1', 'jsonParse_F64']:
+            assert name in user_ir
+
+    def test_stdlib_fmt_json_parse_struct_does_not_treat_blob_data_as_str(self):
+        """Blob.data 是 *U8，不应因 LLVM 同为 i8* 被当作 Str 字段解析。"""
+        source = r'''
+        from "./std/fmt.ez" import { jsonParse };
+
+        const decode = (): Blob => {
+            return jsonParse<Blob>(s = "{\"data\":\"x\",\"size\":1}");
+        };
+        '''
+        module, errors, _ = compile_source(source, compile_target='linux', target_arch='x86_64')
+        assert module is not None
+        assert len(errors) == 0, f'编译错误: {errors}'
+        ir_text = str(module)
+        binding.parse_assembly(ir_text).verify()
+        assert 'define %"Blob"* @"jsonParse_Blob"' not in ir_text
+        assert_small_struct_return_bridge(ir_text, 'jsonParse_Blob', 'Blob', '{i8*, i64}')
+
+    def test_stdlib_fmt_json_struct_nested_fields(self):
+        """jsonStringify/jsonParse 支持字段为用户结构体的嵌套结构。"""
+        source = r'''
+        from "./std/fmt.ez" import { jsonStringify, jsonParse };
+
+        struct Address { city: Str; zip: U32; };
+        struct User { name: Str; address: Address; active: Bool; };
+
+        const roundtrip = (): Str => {
+            const user = User(name = "Ez", address = Address(city = "Shenzhen", zip = 518000), active = true);
+            const json = jsonStringify<User>(data = user);
+            const decoded = jsonParse<User>(s = json);
+            return decoded.address.city;
+        };
+        '''
+        module, errors, _ = compile_source(source)
+        assert module is not None
+        assert len(errors) == 0, f'编译错误: {errors}'
+        ir_text = str(module)
+        binding.parse_assembly(ir_text).verify()
+        assert 'define i8* @"jsonStringify_User"(%"User"* %"data")' in ir_text
+        assert 'define i8* @"jsonStringify_Address"(%"Address"* %"data")' in ir_text
+        assert 'define %"User"* @"jsonParse_User"(i8* %"s")' in ir_text
+        assert 'define %"Address"* @"jsonParse_Address"(i8* %"s")' in ir_text
+        user_encode = function_ir(ir_text, 'jsonStringify_User')
+        user_decode = function_ir(ir_text, 'jsonParse_User')
+        assert 'jsonStringify_Address' in user_encode
+        assert 'jsonParse_Address' in user_decode
+        assert 'declare i8* @"jsonStringify_Address"' not in ir_text
+        assert 'declare %"Address"* @"jsonParse_Address"' not in ir_text
+
+    def test_stdlib_fmt_json_and_msgpack_struct_list_fields(self):
+        """JSON/MessagePack 支持结构体字段中的一层 List<T> / T[]。"""
+        source = r'''
+        from "./std/fmt.ez" import { jsonStringify, jsonParse, msgpackEncode, msgpackDecode };
+
+        struct Payload { nums: List<I32>; names: Str[]; };
+
+        const roundtrip = (): I32 => {
+            const payload = Payload(nums = [1, 2], names = ["a", "b"]);
+            const json = jsonStringify<Payload>(data = payload);
+            const parsed = jsonParse<Payload>(s = json);
+            const packed = msgpackEncode<Payload>(data = parsed);
+            const decoded = msgpackDecode<Payload>(data = packed);
+            return decoded.nums[0];
+        };
+        '''
+        module, errors, _ = compile_source(source)
+        assert module is not None
+        assert len(errors) == 0, f'编译错误: {errors}'
+        ir_text = str(module)
+        binding.parse_assembly(ir_text).verify()
+        for name in [
+            'jsonStringify_Payload',
+            'jsonParse_Payload',
+            'msgpackEncode_Payload',
+            'msgpackDecode_Payload',
+            'jsonStringify_List_I32',
+            'jsonParse_List_I32',
+            'msgpackEncode_List_I32',
+            'msgpackDecode_List_I32',
+            'jsonStringify_StrArray',
+            'jsonParse_StrArray',
+            'msgpackEncode_StrArray',
+            'msgpackDecode_StrArray',
+        ]:
+            assert name in ir_text
+        for helper in ['__ez_json_valid_array', '__ez_json_array_item', '__ez_msgpack_valid_array', '__ez_msgpack_array_item']:
+            assert helper in ir_text
+
+    def test_stdlib_fmt_json_and_msgpack_top_level_list(self):
+        """JSON/MessagePack 泛型入口支持顶层一层 List<T> / T[]。"""
+        source = r'''
+        from "./std/fmt.ez" import { jsonStringify, jsonParse, msgpackEncode, msgpackDecode };
+
+        const roundtrip = (): I32 => {
+            const nums: List<I32> = [1, 2];
+            const json = jsonStringify<List<I32>>(data = nums);
+            const parsed = jsonParse<List<I32>>(s = json);
+            const packed = msgpackEncode<List<I32>>(data = parsed);
+            const decoded = msgpackDecode<List<I32>>(data = packed);
+            return decoded[0];
+        };
+        '''
+        module, errors, _ = compile_source(source)
+        assert module is not None
+        assert len(errors) == 0, f'编译错误: {errors}'
+        ir_text = str(module)
+        binding.parse_assembly(ir_text).verify()
+        for name in ['jsonStringify_List_I32', 'jsonParse_List_I32', 'msgpackEncode_List_I32', 'msgpackDecode_List_I32']:
+            assert function_ir(ir_text, name).startswith('define ')
+            assert re.search(rf'^declare\b.* @"{re.escape(name)}"\(', ir_text, re.MULTILINE) is None
+
+    def test_stdlib_fmt_json_and_msgpack_nested_list(self):
+        """JSON/MessagePack 泛型入口支持递归嵌套 List<T> / T[]。"""
+        source = r'''
+        from "./std/fmt.ez" import { jsonStringify, jsonParse, msgpackEncode, msgpackDecode };
+
+        const roundtrip = (): I32 => {
+            const rows: List<List<I32>> = [[1, 2], [3, 4]];
+            const json = jsonStringify<List<List<I32>>>(data = rows);
+            const parsed = jsonParse<List<List<I32>>>(s = json);
+            const packed = msgpackEncode<List<List<I32>>>(data = parsed);
+            const decoded = msgpackDecode<List<List<I32>>>(data = packed);
+            return decoded[1][0];
+        };
+        '''
+        module, errors, _ = compile_source(source)
+        assert module is not None
+        assert len(errors) == 0, f'编译错误: {errors}'
+        ir_text = str(module)
+        binding.parse_assembly(ir_text).verify()
+        for name in [
+            'jsonStringify_List_List_I32',
+            'jsonParse_List_List_I32',
+            'msgpackEncode_List_List_I32',
+            'msgpackDecode_List_List_I32',
+            'jsonStringify_List_I32',
+            'jsonParse_List_I32',
+            'msgpackEncode_List_I32',
+            'msgpackDecode_List_I32',
+        ]:
+            assert function_ir(ir_text, name).startswith('define ')
+            assert re.search(rf'^declare\b.* @"{re.escape(name)}"\(', ir_text, re.MULTILINE) is None
+
+    def test_stdlib_fmt_json_and_msgpack_struct_nested_list_fields(self):
+        """JSON/MessagePack 支持结构体字段中的递归嵌套 List<T> / T[]。"""
+        source = r'''
+        from "./std/fmt.ez" import { jsonStringify, jsonParse, msgpackEncode, msgpackDecode };
+
+        struct Payload { rows: List<List<I32>>; };
+
+        const roundtrip = (): I32 => {
+            const payload = Payload(rows = [[1, 2], [3, 4]]);
+            const json = jsonStringify<Payload>(data = payload);
+            const parsed = jsonParse<Payload>(s = json);
+            const packed = msgpackEncode<Payload>(data = parsed);
+            const decoded = msgpackDecode<Payload>(data = packed);
+            return decoded.rows[1][0];
+        };
+        '''
+        module, errors, _ = compile_source(source)
+        assert module is not None
+        assert len(errors) == 0, f'编译错误: {errors}'
+        ir_text = str(module)
+        binding.parse_assembly(ir_text).verify()
+        for name in [
+            'jsonStringify_Payload',
+            'jsonParse_Payload',
+            'msgpackEncode_Payload',
+            'msgpackDecode_Payload',
+            'jsonStringify_List_List_I32',
+            'jsonParse_List_List_I32',
+            'msgpackEncode_List_List_I32',
+            'msgpackDecode_List_List_I32',
+            'jsonStringify_List_I32',
+            'jsonParse_List_I32',
+            'msgpackEncode_List_I32',
+            'msgpackDecode_List_I32',
+        ]:
+            assert function_ir(ir_text, name).startswith('define ')
+            assert re.search(rf'^declare\b.* @"{re.escape(name)}"\(', ir_text, re.MULTILINE) is None
+
+    def test_stdlib_fmt_json_and_msgpack_optional(self):
+        """JSON/MessagePack 支持 Optional<T> / T? 及其列表、结构体字段组合。"""
+        source = r'''
+        from "./std/fmt.ez" import { jsonStringify, jsonParse, msgpackEncode, msgpackDecode };
+
+        struct Payload { value: I32?; };
+
+        const roundtrip = (): I32 => {
+            const some: I32? = 42;
+            let none: I32?;
+            const json_some = jsonStringify<I32?>(data = some);
+            const json_none = jsonStringify<I32?>(data = none);
+            const parsed_some = jsonParse<I32?>(s = json_some);
+            const parsed_none = jsonParse<I32?>(s = json_none);
+            const decoded_some = msgpackDecode<I32?>(data = msgpackEncode<I32?>(data = parsed_some));
+            const decoded_none = msgpackDecode<I32?>(data = msgpackEncode<I32?>(data = parsed_none));
+            const payload = Payload(value = decoded_some);
+            const payload_json = jsonStringify<Payload>(data = payload);
+            const payload_parsed = jsonParse<Payload>(s = payload_json);
+            const payload_decoded = msgpackDecode<Payload>(data = msgpackEncode<Payload>(data = payload_parsed));
+            const list: List<I32?> = [decoded_some, decoded_none];
+            const list_parsed = jsonParse<List<I32?>>(s = jsonStringify<List<I32?>>(data = list));
+            const list_decoded = msgpackDecode<List<I32?>>(data = msgpackEncode<List<I32?>>(data = list));
+            if payload_decoded.value.ok && list_parsed[0].ok && !list_parsed[1].ok && list_decoded[0].ok && !list_decoded[1].ok {
+                return payload_decoded.value.value + list_parsed[0].value;
+            }
+            return 0;
+        };
+        '''
+        module, errors, _ = compile_source(source)
+        assert module is not None
+        assert len(errors) == 0, f'编译错误: {errors}'
+        ir_text = str(module)
+        binding.parse_assembly(ir_text).verify()
+        for name in [
+            'jsonStringify_I32Opt',
+            'jsonParse_I32Opt',
+            'msgpackEncode_I32Opt',
+            'msgpackDecode_I32Opt',
+            'jsonStringify_Payload',
+            'jsonParse_Payload',
+            'msgpackEncode_Payload',
+            'msgpackDecode_Payload',
+            'jsonStringify_List_I32Opt',
+            'jsonParse_List_I32Opt',
+            'msgpackEncode_List_I32Opt',
+            'msgpackDecode_List_I32Opt',
+        ]:
+            assert function_ir(ir_text, name).startswith('define ')
+            assert re.search(rf'^declare\b.* @"{re.escape(name)}"\(', ir_text, re.MULTILINE) is None
+        for helper in ['__ez_json_valid_null', '__ez_json_valid_value', '__ez_msgpack_valid_nil', '__ez_msgpack_valid_value']:
+            assert helper in ir_text
+
+    def test_stdlib_fmt_json_and_msgpack_dict_str_keys(self):
+        """JSON/MessagePack 支持 Dict<Str, T>，T 可递归使用已支持的值类型。"""
+        source = r'''
+        from "./std/fmt.ez" import { jsonStringify, jsonParse, msgpackEncode, msgpackDecode };
+
+        const roundtrip = (): I32 => {
+            const scores: Dict<Str, I32> = { a: I32 = 1, b: I32 = 2 };
+            const score_json = jsonStringify<Dict<Str, I32>>(data = scores);
+            const score_parsed = jsonParse<Dict<Str, I32>>(s = score_json);
+            const score_decoded = msgpackDecode<Dict<Str, I32>>(data = msgpackEncode<Dict<Str, I32>>(data = score_parsed));
+            const groups: Dict<Str, List<I32>> = { nums: List<I32> = [3, 4] };
+            const group_decoded = msgpackDecode<Dict<Str, List<I32>>>(data = msgpackEncode<Dict<Str, List<I32>>>(data = jsonParse<Dict<Str, List<I32>>>(s = jsonStringify<Dict<Str, List<I32>>>(data = groups))));
+            return score_decoded["a"] + group_decoded["nums"][1];
+        };
+        '''
+        module, errors, _ = compile_source(source)
+        assert module is not None
+        assert len(errors) == 0, f'编译错误: {errors}'
+        ir_text = str(module)
+        binding.parse_assembly(ir_text).verify()
+        for name in [
+            'jsonStringify_Dict_Str_I32',
+            'jsonParse_Dict_Str_I32',
+            'msgpackEncode_Dict_Str_I32',
+            'msgpackDecode_Dict_Str_I32',
+            'jsonStringify_Dict_Str_List_I32',
+            'jsonParse_Dict_Str_List_I32',
+            'msgpackEncode_Dict_Str_List_I32',
+            'msgpackDecode_Dict_Str_List_I32',
+        ]:
+            assert function_ir(ir_text, name).startswith('define ')
+            assert re.search(rf'^declare\b.* @"{re.escape(name)}"\(', ir_text, re.MULTILINE) is None
+
+    def test_stdlib_fmt_json_and_msgpack_dict_non_str_keys(self):
+        """JSON/MessagePack 支持非字符串键 Dict<K, V>，JSON 使用 key/value 条目数组。"""
+        source = r'''
+        from "./std/fmt.ez" import { jsonStringify, jsonParse, msgpackEncode, msgpackDecode };
+
+        const roundtrip = (): I32 => {
+            const scores: Dict<I32, Str> = { [1]: Str = "one", [2]: Str = "two" };
+            const score_json = jsonStringify<Dict<I32, Str>>(data = scores);
+            const score_parsed = jsonParse<Dict<I32, Str>>(s = score_json);
+            const score_decoded = msgpackDecode<Dict<I32, Str>>(data = msgpackEncode<Dict<I32, Str>>(data = score_parsed));
+            return 1;
+        };
+        '''
+        module, errors, _ = compile_source(source)
+        assert module is not None
+        assert len(errors) == 0, f'编译错误: {errors}'
+        ir_text = str(module)
+        binding.parse_assembly(ir_text).verify()
+        for name in [
+            'jsonStringify_Dict_I32_Str',
+            'jsonParse_Dict_I32_Str',
+            'msgpackEncode_Dict_I32_Str',
+            'msgpackDecode_Dict_I32_Str',
+        ]:
+            assert function_ir(ir_text, name).startswith('define ')
+            assert re.search(rf'^declare\b.* @"{re.escape(name)}"\(', ir_text, re.MULTILINE) is None
+
+    def test_stdlib_fmt_dict_rejects_complex_key_types(self):
+        """复杂 Dict 键没有稳定值比较语义时，不生成 fmt 单态化实现。"""
+        source = r'''
+        from "./std/fmt.ez" import { jsonStringify };
+
+        const render = (scores: Dict<List<I32>, Str>): Str => {
+            return jsonStringify<Dict<List<I32>, Str>>(data = scores);
+        };
+        '''
+        module, errors, _ = compile_source(source)
+        assert module is not None
+        assert len(errors) == 0, f'编译错误: {errors}'
+        ir_text = str(module)
+        binding.parse_assembly(ir_text).verify()
+        assert re.search(r'^declare\b.* @"jsonStringify_Dict_List_I32_Str"\(', ir_text, re.MULTILINE) is not None
+        assert re.search(r'^define\b.* @"jsonStringify_Dict_List_I32_Str"\(', ir_text, re.MULTILINE) is None
+
+    def test_stdlib_fmt_json_and_msgpack_union(self):
+        """JSON/MessagePack 支持 Union，编码为 tag/value 对象或 map。"""
+        source = r'''
+        from "./std/fmt.ez" import { jsonStringify, jsonParse, msgpackEncode, msgpackDecode };
+
+        struct Payload { value: I32 | Str; };
+
+        const roundtrip = (): I32 => {
+            const number: I32 | Str = 42;
+            const text: I32 | Str = "ez";
+            const number_json = jsonStringify<I32 | Str>(data = number);
+            const text_parsed = jsonParse<I32 | Str>(s = "{\"tag\":1,\"value\":\"ok\"}");
+            const text_decoded = msgpackDecode<I32 | Str>(data = msgpackEncode<I32 | Str>(data = text));
+            const payload = Payload(value = text_parsed);
+            const payload_decoded = msgpackDecode<Payload>(data = msgpackEncode<Payload>(data = jsonParse<Payload>(s = jsonStringify<Payload>(data = payload))));
+            const list: List<I32 | Str> = [number, text_decoded];
+            const list_decoded = msgpackDecode<List<I32 | Str>>(data = msgpackEncode<List<I32 | Str>>(data = jsonParse<List<I32 | Str>>(s = jsonStringify<List<I32 | Str>>(data = list))));
+            const number_roundtrip = jsonStringify<I32 | Str>(data = jsonParse<I32 | Str>(s = number_json));
+            if payload_decoded.value.tag == 1 && list_decoded[0].tag == 0 && list_decoded[1].tag == 1 && number_roundtrip == number_json {
+                return 42;
+            }
+            return 0;
+        };
+        '''
+        module, errors, _ = compile_source(source)
+        assert module is not None
+        assert len(errors) == 0, f'编译错误: {errors}'
+        ir_text = str(module)
+        binding.parse_assembly(ir_text).verify()
+        for name in [
+            'jsonStringify_I32_Str',
+            'jsonParse_I32_Str',
+            'msgpackEncode_I32_Str',
+            'msgpackDecode_I32_Str',
+            'jsonStringify_Payload',
+            'jsonParse_Payload',
+            'msgpackEncode_Payload',
+            'msgpackDecode_Payload',
+            'jsonStringify_List_I32_Str',
+            'jsonParse_List_I32_Str',
+            'msgpackEncode_List_I32_Str',
+            'msgpackDecode_List_I32_Str',
+        ]:
+            assert function_ir(ir_text, name).startswith('define ')
+            assert re.search(rf'^declare\b.* @"{re.escape(name)}"\(', ir_text, re.MULTILINE) is None
+        for helper in [
+            '__ez_json_object_field',
+            '__ez_json_object_field_count',
+            '__ez_msgpack_map_field',
+            '__ez_msgpack_map_field_count',
+        ]:
+            assert helper in ir_text
+
+    def test_stdlib_fmt_msgpack_struct_basic_fields(self):
+        """msgpackEncode/Decode<Struct> 对基础字段生成内部 map 编解码函数。"""
+        source = '''
+        from "./std/fmt.ez" import { msgpackEncode, msgpackDecode };
+
+        struct User { name: Str; age: U32; active: Bool; score: F64; };
+        struct Empty {};
+
+        const roundtrip = (): Str => {
+            const u = User(name = "Ez", age = 42, active = true, score = 1.5);
+            const packed = msgpackEncode<User>(data = u);
+            const decoded = msgpackDecode<User>(data = packed);
+            const ignored = msgpackDecode<Empty>(data = msgpackEncode<Empty>(data = Empty()));
+            return decoded.name;
+        };
+        '''
+        module, errors, _ = compile_source(source, compile_target='linux', target_arch='x86_64')
+        assert module is not None
+        assert len(errors) == 0, f'编译错误: {errors}'
+        ir_text = str(module)
+        binding.parse_assembly(ir_text).verify()
+        assert 'define %"Blob" @"msgpackEncode_User"(%"User"* %"data")' in ir_text
+        assert 'define %"User"* @"msgpackDecode_User"(%"Blob"* %"data")' in ir_text
+        assert 'define %"Blob" @"msgpackEncode_Empty"(%"Empty"* %"data")' in ir_text
+        assert 'define %"Empty"* @"msgpackDecode_Empty"(%"Blob"* %"data")' in ir_text
+        encode_ir = function_ir(ir_text, 'msgpackEncode_User')
+        decode_ir = function_ir(ir_text, 'msgpackDecode_User')
+        for name in ['__ez_msgpack_encode_map', 'msgpackEncode_Str', 'msgpackEncode_U32', 'msgpackEncode_I1', 'msgpackEncode_F64']:
+            assert name in encode_ir
+        for name in ['__ez_msgpack_valid_map', '__ez_msgpack_map_field_count', '__ez_msgpack_map_field']:
+            assert name in decode_ir
+        for name in ['msgpackDecode_Str', 'msgpackDecode_U32', 'msgpackDecode_I1', 'msgpackDecode_F64']:
+            assert name in decode_ir
+
+    def test_stdlib_fmt_msgpack_struct_does_not_treat_blob_data_as_str(self):
+        """Blob.data 是 *U8，不应因 LLVM 同为 i8* 被当作 Str 字段编解码。"""
+        source = '''
+        from "./std/fmt.ez" import { msgpackEncode, msgpackDecode };
+
+        const encode = (): Blob => {
+            const b = Blob(data = "x", size = 1);
+            return msgpackEncode<Blob>(data = b);
+        };
+
+        const decode = (data: Blob): Blob => {
+            return msgpackDecode<Blob>(data = data);
+        };
+        '''
+        module, errors, _ = compile_source(source, compile_target='linux', target_arch='x86_64')
+        assert module is not None
+        assert len(errors) == 0, f'编译错误: {errors}'
+        ir_text = str(module)
+        binding.parse_assembly(ir_text).verify()
+        assert 'define %"Blob" @"msgpackEncode_Blob"' not in ir_text
+        assert 'define %"Blob"* @"msgpackDecode_Blob"' not in ir_text
+        assert_small_struct_return_bridge(ir_text, 'msgpackEncode_Blob', 'Blob', '{i8*, i64}')
+        assert_small_struct_return_bridge(ir_text, 'msgpackDecode_Blob', 'Blob', '{i8*, i64}')
+
+    def test_stdlib_fmt_msgpack_struct_nested_fields(self):
+        """msgpackEncode/msgpackDecode 支持字段为用户结构体的嵌套结构。"""
+        source = '''
+        from "./std/fmt.ez" import { msgpackEncode, msgpackDecode };
+
+        struct Address { city: Str; zip: U32; };
+        struct User { name: Str; address: Address; active: Bool; };
+
+        const roundtrip = (): Str => {
+            const user = User(name = "Ez", address = Address(city = "Shenzhen", zip = 518000), active = true);
+            const packed = msgpackEncode<User>(data = user);
+            const decoded = msgpackDecode<User>(data = packed);
+            return decoded.address.city;
+        };
+        '''
+        module, errors, _ = compile_source(source, compile_target='linux', target_arch='x86_64')
+        assert module is not None
+        assert len(errors) == 0, f'编译错误: {errors}'
+        ir_text = str(module)
+        binding.parse_assembly(ir_text).verify()
+        assert 'define %"Blob" @"msgpackEncode_User"(%"User"* %"data")' in ir_text
+        assert 'define %"Blob" @"msgpackEncode_Address"(%"Address"* %"data")' in ir_text
+        assert 'define %"User"* @"msgpackDecode_User"(%"Blob"* %"data")' in ir_text
+        assert 'define %"Address"* @"msgpackDecode_Address"(%"Blob"* %"data")' in ir_text
+        user_encode = function_ir(ir_text, 'msgpackEncode_User')
+        user_decode = function_ir(ir_text, 'msgpackDecode_User')
+        assert 'msgpackEncode_Address' in user_encode
+        assert 'msgpackDecode_Address' in user_decode
+        assert 'declare %"Blob" @"msgpackEncode_Address"' not in ir_text
+        assert 'declare %"Address"* @"msgpackDecode_Address"' not in ir_text
+
+    def test_stdlib_fmt_emcc_to_string_f32_and_bool_declare_wrappers(self):
+        """emcc 平台的 toString<F32/Bool> 应有对应 JS 封装符号。"""
         source = '''
         from "./std/fmt.ez" import { toString };
         let text = toString<F32>(value = 3.5);
+        let flag = toString<Bool>(value = true);
         '''
         module, errors, libs = compile_source(source, compile_target='emcc')
         assert module is not None
         assert len(errors) == 0, f'编译错误: {errors}'
         assert libs == [str(STD_ROOT / 'emcc' / 'fmt.js')]
         assert module.get_global('toString_F32') is not None
+        assert module.get_global('toString_I1') is not None
 
     def test_stdlib_net_http_import(self):
         """std/net/http 导入"""
@@ -2606,9 +3704,11 @@ class TestCodegen:
         """std/net/http extern 应按目标过滤"""
         source = 'from "./std/net/http.ez" import { fetch };'
         _, _, linux_libs = compile_source(source, compile_target='linux')
+        _, _, windows_libs = compile_source(source, compile_target='windows')
         _, _, android_libs = compile_source(source, compile_target='android')
         _, _, emcc_libs = compile_source(source, compile_target='emcc')
         assert linux_libs == [str(STD_ROOT / 'native' / 'net' / 'http.c')]
+        assert windows_libs == [str(STD_ROOT / 'native' / 'net' / 'http.c'), 'ws2_32']
         assert android_libs == [str(STD_ROOT / 'native' / 'net' / 'http.c')]
         assert emcc_libs == [str(STD_ROOT / 'emcc' / 'net' / 'http.js')]
 
@@ -2633,9 +3733,9 @@ class TestCodegen:
         """std/net TCP/UDP API 导入"""
         source = '''
         from "./std/net/tcp.ez" import {
-            TcpConn, TcpListener, UdpSocket, tcpConnect, tcpListen, tcpAccept,
+            TcpConn, TcpListener, UdpSocket, UdpPacket, tcpConnect, tcpListen, tcpAccept,
             tcpRead, tcpWrite, tcpClose, tcpListenerClose, udpBind, udpSend,
-            udpRecv, udpClose
+            udpRecvFrom, udpRecv, udpClose
         };
 
         const open_tcp = (): TcpConn? => {
@@ -2661,9 +3761,14 @@ class TestCodegen:
 
         const use_udp = (socket: UdpSocket): I64 => {
             const sent = udpSend(socket = socket, host = "127.0.0.1", port = 5353, data = Blob(data = "u", size = 1));
+            const packet = udpRecvFrom(socket = socket, maxBytes = 16);
             const received = udpRecv(socket = socket, maxBytes = 16);
             const closed = udpClose(socket = socket);
             return sent;
+        };
+
+        const packet_port = (packet: UdpPacket): I32 => {
+            return packet.port;
         };
         '''
         module, errors, libs = compile_source(source, compile_target='linux')
@@ -2672,7 +3777,7 @@ class TestCodegen:
         assert libs == [str(STD_ROOT / 'native' / 'net' / 'tcp.c')]
         for name in [
             'tcpConnect', 'tcpListen', 'tcpAccept', 'tcpRead', 'tcpWrite', 'tcpClose',
-            'tcpListenerClose', 'udpBind', 'udpSend', 'udpRecv', 'udpClose'
+            'tcpListenerClose', 'udpBind', 'udpSend', 'udpRecvFrom', 'udpRecv', 'udpClose'
         ]:
             assert module.get_global(name) is not None
         ir_text = str(module)
@@ -2680,6 +3785,8 @@ class TestCodegen:
         assert 'TcpConn' in ir_text
         assert 'TcpListener' in ir_text
         assert 'UdpSocket' in ir_text
+        assert 'UdpPacket' in ir_text
+        assert 'sret({i1, %"UdpPacket"})' in ir_text
         assert 'sret({i1, %"Blob"})' in ir_text
 
     def test_stdlib_net_tcp_stream_uses_std_stream_abi(self):
@@ -2706,6 +3813,10 @@ class TestCodegen:
         assert module.get_global('streamFromTcpHandle') is not None
         assert module.get_global('streamRead') is not None
 
+        _, windows_errors, windows_libs = compile_source(source, compile_target='windows')
+        assert len(windows_errors) == 0, f'编译错误: {windows_errors}'
+        assert windows_libs == [str(STD_ROOT / 'native' / 'stream.c'), 'ws2_32', str(STD_ROOT / 'native' / 'net' / 'tcp.c')]
+
     def test_stdlib_net_tcp_udp_target_filter(self):
         """std/net TCP/UDP extern 应按目标过滤"""
         source = 'from "./std/net/tcp.ez" import { tcpConnect, udpBind };'
@@ -2713,7 +3824,7 @@ class TestCodegen:
         _, _, windows_libs = compile_source(source, compile_target='windows')
         _, _, emcc_libs = compile_source(source, compile_target='emcc')
         assert linux_libs == [str(STD_ROOT / 'native' / 'net' / 'tcp.c')]
-        assert windows_libs == [str(STD_ROOT / 'native' / 'net' / 'tcp.c')]
+        assert windows_libs == [str(STD_ROOT / 'native' / 'net' / 'tcp.c'), 'ws2_32']
         assert emcc_libs == [str(STD_ROOT / 'emcc' / 'net' / 'tcp.js')]
 
     def test_stdlib_net_ws_import(self):
@@ -2750,7 +3861,7 @@ class TestCodegen:
         _, _, windows_libs = compile_source(source, compile_target='windows')
         _, _, emcc_libs = compile_source(source, compile_target='emcc')
         assert linux_libs == [str(STD_ROOT / 'native' / 'net' / 'ws.c')]
-        assert windows_libs == [str(STD_ROOT / 'native' / 'net' / 'ws.c')]
+        assert windows_libs == [str(STD_ROOT / 'native' / 'net' / 'ws.c'), 'ws2_32', 'bcrypt']
         assert emcc_libs == [str(STD_ROOT / 'emcc' / 'net' / 'ws.js')]
 
     # ==================== 泛型 declare 单态化测试 ====================

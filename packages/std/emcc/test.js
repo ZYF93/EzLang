@@ -23,17 +23,25 @@
     currentTest = value;
   }
 
+  function i64Value(value) {
+    return typeof value === 'bigint' ? value : BigInt(value);
+  }
+
   mergeInto(LibraryManager.library, {
     testAssert: function (condition, msg) {
       if (!condition) failNow(text(msg));
       passed += 1;
     },
     testEqualI64: function (actual, expected, msg) {
-      if (Number(actual) !== Number(expected)) failNow((text(msg) || 'not equal') + ': expected ' + Number(expected) + ', got ' + Number(actual));
+      var left = i64Value(actual);
+      var right = i64Value(expected);
+      if (left !== right) failNow((text(msg) || 'not equal') + ': expected ' + right.toString() + ', got ' + left.toString());
       passed += 1;
     },
     testNotEqualI64: function (actual, expected, msg) {
-      if (Number(actual) === Number(expected)) failNow((text(msg) || 'equal') + ': unexpected ' + Number(actual));
+      var left = i64Value(actual);
+      var right = i64Value(expected);
+      if (left === right) failNow((text(msg) || 'equal') + ': unexpected ' + left.toString());
       passed += 1;
     },
     testEqualStr: function (actual, expected, msg) {

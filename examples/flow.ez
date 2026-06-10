@@ -1,13 +1,19 @@
-// flow.ez - 验证 Flow 并发语义分析
+from "std/io" import { println };
+from "std/time" import { sleep };
 
-const fetch = (url: Str): Str => { return url; };
-const readFile = (path: Str): Str => { return path; };
-const sleep = (ms: I32): Void => { return; };
+const main = (): I32 => {
+    const value = flow {
+        const p = parallel {
+            sleep(ms = 10);
+            return 7;
+        };
+        const fastest = race(pl = [
+            () => { sleep(ms = 40); return 1; },
+            () => { sleep(ms = 5); return 2; },
+        ], timeout = 200);
+        return p + fastest;
+    };
 
-const data = flow {
-    const a = fetch(url = "https://example.com/a");
-    const b = readFile(path = "input.txt");
-    sleep(ms = 10);
-    const fastest = race(pl = [() => { return 1; }, () => { return 2; }], timeout = 1000);
-    return fastest;
+    println(msg = "flow: parallel and race completed");
+    return value == 9 ? 0 : 1;
 };

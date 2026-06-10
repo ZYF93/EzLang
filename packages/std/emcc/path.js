@@ -37,6 +37,19 @@
     return /^[\\/]/.test(path || '') || /^[A-Za-z]:[\\/]/.test(path || '');
   }
 
+  function trimTrailingSeparators(path) {
+    path = String(path || '');
+    var root = splitRoot(path);
+    var end = path.length;
+    while (end > root.length && end > 1 && /[\\/]/.test(path.charAt(end - 1))) end--;
+    return path.slice(0, end);
+  }
+
+  function isRootPath(path) {
+    path = String(path || '');
+    return path.length > 0 && path.length === splitRoot(path).length;
+  }
+
   function styleSep(path) {
     return path && path.indexOf('\\') >= 0 ? '\\' : '/';
   }
@@ -71,7 +84,7 @@
 
   function dirname(path) {
     if (!path) return '.';
-    var clean = String(path).replace(/[\\/]+$/, '');
+    var clean = trimTrailingSeparators(path);
     var root = splitRoot(clean);
     if (clean.length <= root.length) return root || '.';
     var index = Math.max(clean.lastIndexOf('/'), clean.lastIndexOf('\\'));
@@ -83,9 +96,9 @@
 
   function basename(path) {
     if (!path) return '';
-    var clean = String(path).replace(/[\\/]+$/, '');
+    var clean = trimTrailingSeparators(path);
     var root = splitRoot(clean);
-    if (clean.length <= root.length) return root;
+    if (clean.length <= root.length) return '';
     var index = Math.max(clean.lastIndexOf('/'), clean.lastIndexOf('\\'));
     return index < 0 ? clean : clean.slice(index + 1);
   }
@@ -122,25 +135,98 @@
 
   function encodeFilePath(path) {
     var clean = normalize(path || '').replace(/\\/g, '/');
-    if (!isAbs(clean)) clean = '/' + clean;
-    return 'file://' + clean.split('').map(function (ch) {
-      return /[A-Za-z0-9_.~\-/]/.test(ch) ? ch : encodeURIComponent(ch);
-    }).join('');
+    var driveAbs = /^[A-Za-z]:\//.test(clean);
+    if (driveAbs || !isAbs(clean)) clean = '/' + clean;
+    var out = 'file://';
+    for (var i = 0; i < clean.length; i++) {
+      var cp = clean.codePointAt(i);
+      if (cp > 0xffff) i++;
+      if (cp >= 0xd800 && cp <= 0xdfff) cp = 0xfffd;
+      var bytes = [];
+      appendCodePointUtf8(bytes, cp);
+      for (var j = 0; j < bytes.length; j++) {
+        out += driveAbs && i === 2 && bytes[j] === 58 ? ':' : fileUrlByte(bytes[j]);
+      }
+    }
+    return out;
+  }
+
+  function fileUrlByte(byte) {
+    if ((byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122) || (byte >= 48 && byte <= 57) ||
+        byte === 45 || byte === 95 || byte === 46 || byte === 126 || byte === 47) {
+      return String.fromCharCode(byte);
+    }
+    var hex = '0123456789ABCDEF';
+    return '%' + hex.charAt(byte >> 4) + hex.charAt(byte & 15);
   }
 
   function decodeFileUrl(url) {
     if (String(url || '').slice(0, 7) !== 'file://') return null;
-    try {
-      return decodeURIComponent(String(url).slice(7));
-    } catch (e) {
-      return null;
+    var src = String(url).slice(7);
+    var bytes = [];
+    for (var i = 0; i < src.length; i++) {
+      var ch = src.charAt(i);
+      if (ch === '%') {
+        if (i + 2 >= src.length) return null;
+        var hi = hexValue(src.charAt(i + 1));
+        var lo = hexValue(src.charAt(i + 2));
+        if (hi < 0 || lo < 0) return null;
+        bytes.push((hi << 4) | lo);
+        i += 2;
+      } else {
+        var cp = src.charCodeAt(i);
+        if (cp >= 0xd800 && cp <= 0xdbff && i + 1 < src.length) {
+          var low = src.charCodeAt(i + 1);
+          if (low >= 0xdc00 && low <= 0xdfff) {
+            cp = 0x10000 + ((cp - 0xd800) << 10) + (low - 0xdc00);
+            i++;
+          }
+        }
+        appendCodePointUtf8(bytes, cp);
+      }
     }
+    if (bytes.length >= 3 && bytes[0] === 47 && ((bytes[1] >= 65 && bytes[1] <= 90) || (bytes[1] >= 97 && bytes[1] <= 122)) && bytes[2] === 58) {
+      bytes.shift();
+    }
+    if (bytes.indexOf(0) >= 0) return null;
+    return cStringFromBytes(bytes);
+  }
+
+  function hexValue(ch) {
+    var code = ch.charCodeAt(0);
+    if (code >= 48 && code <= 57) return code - 48;
+    if (code >= 65 && code <= 70) return code - 55;
+    if (code >= 97 && code <= 102) return code - 87;
+    return -1;
+  }
+
+  function appendCodePointUtf8(bytes, cp) {
+    if (cp <= 0x7f) {
+      bytes.push(cp);
+    } else if (cp <= 0x7ff) {
+      bytes.push(0xc0 | (cp >> 6), 0x80 | (cp & 0x3f));
+    } else if (cp <= 0xffff) {
+      bytes.push(0xe0 | (cp >> 12), 0x80 | ((cp >> 6) & 0x3f), 0x80 | (cp & 0x3f));
+    } else {
+      bytes.push(0xf0 | (cp >> 18), 0x80 | ((cp >> 12) & 0x3f), 0x80 | ((cp >> 6) & 0x3f), 0x80 | (cp & 0x3f));
+    }
+  }
+
+  function cStringFromBytes(bytes) {
+    var ptr = _malloc(bytes.length + 1);
+    if (bytes.length > 0) HEAPU8.set(bytes, ptr);
+    HEAPU8[ptr + bytes.length] = 0;
+    return ptr;
   }
 
   function writePathParts(ret, path) {
     var size = ptrSize();
-    var root = splitRoot(path || '');
-    var values = [root, dirname(path || ''), basename(path || ''), nameWithoutExt(path || ''), extname(path || '')];
+    path = path || '';
+    var root = splitRoot(path);
+    var base = basename(path);
+    var values = isRootPath(trimTrailingSeparators(path))
+      ? [root, root, '', '', '']
+      : [root, dirname(path), base, nameWithoutExt(path), extname(path)];
     for (var i = 0; i < values.length; i++) {
       setValue(ret + i * size, stringToNewUTF8(values[i]), '*');
     }
@@ -183,7 +269,7 @@
     pathFromFileUrl: function (ret, url) {
       var value = decodeFileUrl(UTF8ToString(url || 0));
       HEAPU8[ret] = value === null ? 0 : 1;
-      setValue(ret + 8, value === null ? 0 : stringToNewUTF8(value), '*');
+      setValue(ret + 8, value === null ? 0 : value, '*');
     },
   });
 })();

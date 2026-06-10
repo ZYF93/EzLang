@@ -1,9 +1,11 @@
 // std/crypto.ez - 加密哈希与消息认证码标准库
-// 依赖: 成熟平台加密库封装；不自行实现加密算法
+// 依赖: 成熟平台加密库；不可用时返回空可选值
 
 extern "@std/native/crypto.c" for linux;
+extern "dl" for linux;
 extern "@std/native/crypto.c" for macos;
 extern "@std/native/crypto.c" for windows;
+extern "bcrypt" for windows;
 extern "@std/native/crypto.c" for android;
 extern "@std/native/crypto.c" for ios;
 extern "@std/emcc/crypto.js" for emcc;

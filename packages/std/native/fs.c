@@ -2,6 +2,7 @@
 // 这里实现跨桌面、Android、iOS 的最小文件系统适配。
 
 #include <stdbool.h>
+#include <errno.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -67,6 +68,14 @@ static char *ez_fs_copy_str(const char *text) {
     return copy;
 }
 
+static char *ez_fs_copy_range(const char *text, size_t len) {
+    char *copy = (char *)malloc(len + 1);
+    if (!copy) return NULL;
+    if (len > 0 && text) memcpy(copy, text, len);
+    copy[len] = '\0';
+    return copy;
+}
+
 static const char *ez_fs_sandbox_root(void) {
 #if defined(__ANDROID__)
     const char *root = getenv("EZLANG_ANDROID_DATA_DIR");
@@ -110,9 +119,19 @@ static char *ez_fs_path(const char *path) {
 
 static bool ez_fs_mkdir_one(const char *path) {
 #if defined(_WIN32)
-    return _mkdir(path) == 0;
+    if (_mkdir(path) == 0) return true;
+    if (errno == EEXIST) {
+        struct _stat64 st;
+        return _stat64(path, &st) == 0 && (st.st_mode & _S_IFDIR) != 0;
+    }
+    return false;
 #else
-    return mkdirat(AT_FDCWD, path, 0777) == 0;
+    if (mkdirat(AT_FDCWD, path, 0777) == 0) return true;
+    if (errno == EEXIST) {
+        struct stat st;
+        return lstat(path, &st) == 0 && S_ISDIR(st.st_mode);
+    }
+    return false;
 #endif
 }
 
@@ -291,6 +310,91 @@ static void ez_fs_ensure_parent(const char *path) {
     free(copy);
 }
 
+#if !defined(_WIN32)
+static char *ez_fs_abs_lexical_fallback(const char *path) {
+    if (!path || !*path) return NULL;
+    char *combined = NULL;
+    if (ez_fs_is_absolute(path)) {
+        combined = ez_fs_copy_str(path);
+    } else {
+        size_t cap = 256;
+        char *cwd = NULL;
+        while (true) {
+            cwd = (char *)malloc(cap);
+            if (!cwd) return NULL;
+            if (getcwd(cwd, cap)) break;
+            free(cwd);
+            cwd = NULL;
+            if (errno != ERANGE || cap > ((size_t)-1) / 2) return NULL;
+            cap *= 2;
+        }
+        size_t cwd_len = strlen(cwd);
+        size_t path_len = strlen(path);
+        bool need_sep = cwd_len > 0 && cwd[cwd_len - 1] != '/';
+        combined = (char *)malloc(cwd_len + path_len + (need_sep ? 2 : 1));
+        if (combined) {
+            memcpy(combined, cwd, cwd_len);
+            if (need_sep) combined[cwd_len++] = '/';
+            memcpy(combined + cwd_len, path, path_len + 1);
+        }
+        free(cwd);
+    }
+    if (!combined) return NULL;
+
+    size_t part_cap = 16;
+    size_t part_count = 0;
+    char **parts = (char **)calloc(part_cap, sizeof(char *));
+    if (!parts) {
+        free(combined);
+        return NULL;
+    }
+    const char *p = combined;
+    while (*p) {
+        while (*p == '/') p++;
+        const char *start = p;
+        while (*p && *p != '/') p++;
+        size_t len = (size_t)(p - start);
+        if (len == 0 || (len == 1 && start[0] == '.')) continue;
+        if (len == 2 && start[0] == '.' && start[1] == '.') {
+            if (part_count > 0) free(parts[--part_count]);
+            continue;
+        }
+        if (part_count == part_cap) {
+            part_cap *= 2;
+            char **next = (char **)realloc(parts, part_cap * sizeof(char *));
+            if (!next) goto fail;
+            parts = next;
+        }
+        parts[part_count++] = ez_fs_copy_range(start, len);
+        if (!parts[part_count - 1]) goto fail;
+    }
+
+    size_t out_len = 1;
+    for (size_t i = 0; i < part_count; ++i) out_len += strlen(parts[i]) + (i > 0 ? 1 : 0);
+    char *out = (char *)malloc(out_len + 1);
+    if (!out) goto fail;
+    size_t offset = 0;
+    out[offset++] = '/';
+    for (size_t i = 0; i < part_count; ++i) {
+        if (i > 0) out[offset++] = '/';
+        size_t len = strlen(parts[i]);
+        memcpy(out + offset, parts[i], len);
+        offset += len;
+    }
+    out[offset] = '\0';
+    for (size_t i = 0; i < part_count; ++i) free(parts[i]);
+    free(parts);
+    free(combined);
+    return out;
+
+fail:
+    for (size_t i = 0; i < part_count; ++i) free(parts[i]);
+    free(parts);
+    free(combined);
+    return NULL;
+}
+#endif
+
 Blob readFile(const char *path) {
     char *real_path = ez_fs_path(path);
     if (!real_path) return (Blob){0};
@@ -323,6 +427,7 @@ Blob readFile(const char *path) {
 
 static bool ez_fs_write(const char *path, const Blob *content, const char *mode) {
     if (!content) return false;
+    if (content->size < 0 || (content->size > 0 && !content->data)) return false;
     char *real_path = ez_fs_path(path);
     if (!real_path) return false;
     ez_fs_ensure_parent(real_path);
@@ -458,6 +563,11 @@ const char *absPath(const char *path) {
     if (resolved) {
         free(real_path);
         return resolved;
+    }
+    char *fallback = ez_fs_abs_lexical_fallback(real_path);
+    if (fallback) {
+        free(real_path);
+        return fallback;
     }
     return real_path;
 #endif

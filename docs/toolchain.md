@@ -17,7 +17,7 @@ EzLang 提供了开箱即用的命令行工具链（CLI），并采用 `project.
 本机可执行目标会生成 LLVM IR、对象文件和同名可执行文件；链接阶段会编译 `extern "*.c"` 源码，链接对象文件、静态库、动态库、framework 与系统库。配置 `output.sdk` 后，`emcc` 目标会调用 Emscripten `emcc` 并把 `extern "*.js" for emcc` 作为 `--js-library` 传入；Android/iOS 目标会调用 SDK 内的 `clang` 编译 C extern 并链接平台动态库。未配置 `output.sdk` 时仍保留 IR/对象文件输出，便于外部构建系统接手。
 
 ### `ez run`
-构建并立即执行当前项目（仅适用于本地可执行产物）。不适用于 `emcc` / `android` / `ios` 目标。
+构建并立即执行当前项目（仅适用于本地可执行产物）。不适用于 `emcc` / `android` / `ios` 目标。入口文件会优先使用 `[project].main`；未配置时自动查找 `src/main.ez`、`src/index.ez`、`main.ez` 或 `index.ez`。入口文件顶层语句会按源码顺序执行，不要求显式定义 `main` 函数。
 
 `ez run` 会优先选择与宿主机 `os` 和 `arch` 同时匹配的 `[[output]]`，再回退到同 `os` 的输出目标。
 
@@ -43,7 +43,7 @@ EzLang 提供了开箱即用的命令行工具链（CLI），并采用 `project.
 * `name` (字符串)：项目名称。
 * `version` (字符串)：项目的版本号（如 `"0.1.0"`）。
 * `description` (字符串)：项目的简短说明。
-* `main` (字符串)：包的主入口文件路径（如 `"index.ez"`）。
+* `main` (字符串，可选)：包的主入口文件路径（如 `"index.ez"`）。省略时自动查找 `src/main.ez`、`src/index.ez`、`main.ez` 或 `index.ez`。
 * `public` (布尔值)：是否将该包对外公开。为 `true` 时，配合 `ez release` 可发布到远端。
 * `registry` (字符串)：包管理远端服务的具体地址（如 `"https://www.xxx.com"`），指定本包发布的目标中心仓库或拉取依赖的源。
 * `optimize` (数字)：优化等级，0–3，默认值为 2。

@@ -88,6 +88,11 @@ static size_t ez_root_len(const char *path) {
     return ez_is_sep(path[0]) ? 1 : 0;
 }
 
+static size_t ez_trim_trailing_seps(const char *path, size_t len, size_t root_len) {
+    while (len > root_len && len > 1 && ez_is_sep(path[len - 1])) len--;
+    return len;
+}
+
 static bool ez_path_is_abs_raw(const char *path) {
     if (!path || !*path) return false;
     if (ez_is_sep(path[0])) return true;
@@ -256,11 +261,11 @@ static size_t ez_last_sep_index(const char *path, size_t len) {
 
 static const char *ez_base_start(const char *path, size_t *base_len) {
     size_t len = path ? strlen(path) : 0;
-    while (len > 1 && ez_is_sep(path[len - 1])) len--;
     size_t root_len = ez_root_len(path);
-    if (len <= root_len) {
-        *base_len = root_len;
-        return path;
+    len = ez_trim_trailing_seps(path, len, root_len);
+    if (root_len > 0 && len <= root_len) {
+        *base_len = 0;
+        return path + len;
     }
     size_t sep_index = ez_last_sep_index(path, len);
     const char *start = sep_index == (size_t)-1 ? path : path + sep_index + 1;
@@ -302,8 +307,9 @@ const char *pathNormalize(const char *path) {
 const char *pathDir(const char *path) {
     if (!path || !*path) return ez_strdup_safe(".");
     size_t len = strlen(path);
-    while (len > 1 && ez_is_sep(path[len - 1])) len--;
     size_t root_len = ez_root_len(path);
+    len = ez_trim_trailing_seps(path, len, root_len);
+    if (root_len > 0 && len <= root_len) return ez_strdup_range(path, root_len);
     size_t sep_index = ez_last_sep_index(path, len);
     if (sep_index == (size_t)-1) return ez_strdup_safe(".");
     if (sep_index == 0) return ez_strdup_range(path, 1);
@@ -425,10 +431,11 @@ const char *pathToFileUrl(const char *path) {
     }
     strcpy(out, "file://");
     size_t len = strlen(out);
-    if (!ez_path_is_abs_raw(normalized)) out[len++] = '/';
+    bool drive_abs = ez_is_windows_drive(normalized) && ez_is_sep(normalized[2]);
+    if (drive_abs || !ez_path_is_abs_raw(normalized)) out[len++] = '/';
     for (const unsigned char *p = (const unsigned char *)normalized; *p; ++p) {
         unsigned char ch = *p == '\\' ? '/' : *p;
-        if (ez_is_unreserved(ch)) {
+        if ((drive_abs && p == (const unsigned char *)normalized + 1 && ch == ':') || ez_is_unreserved(ch)) {
             out[len++] = (char)ch;
         } else {
             static const char hex[] = "0123456789ABCDEF";
@@ -469,12 +476,24 @@ OptStr pathFromFileUrl(const char *url) {
                 free(out);
                 return (OptStr){false, NULL};
             }
-            out[len++] = (char)((hi << 4) | lo);
+            unsigned char byte = (unsigned char)((hi << 4) | lo);
+            if (byte == 0) {
+                free(out);
+                return (OptStr){false, NULL};
+            }
+            out[len++] = (char)byte;
             i += 2;
         } else {
-            out[len++] = src[i] == '/' ? ez_native_sep() : src[i];
+            out[len++] = src[i];
         }
     }
     out[len] = '\0';
+    if (len >= 3 && out[0] == '/' && ez_is_windows_drive(out + 1)) {
+        memmove(out, out + 1, len);
+    } else {
+        for (size_t i = 0; i < len; ++i) {
+            if (out[i] == '/') out[i] = ez_native_sep();
+        }
+    }
     return (OptStr){true, out};
 }

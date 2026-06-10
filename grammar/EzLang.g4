@@ -59,9 +59,9 @@ FLOAT_LITERAL: DECIMAL '.' DECIMAL EXPONENT? | DECIMAL EXPONENT;
 STRING_LITERAL: '"' (~["\\\r\n] | '\\' .)* '"';
 
 // 标识符（必须在所有关键字和字面量之后）
-// 类型名以大写字母开头（如 User, Point），变量名以小写或下划线开头（如 user, count）
+// 类型名以大写字母开头（如 User, Point），变量名以小写、下划线或 $ 开头（如 user, _count, $state）
 TYPE_IDENTIFIER: [A-Z] [a-zA-Z0-9_]*;
-VAR_IDENTIFIER: [a-z_] [a-zA-Z0-9_]*;
+VAR_IDENTIFIER: [a-z_] [a-zA-Z0-9_]* | '$' [a-zA-Z0-9_]+;
 
 // 标点符号
 LPAREN: '(';
@@ -94,7 +94,6 @@ NE: '!=';
 LE: '<=';
 GE: '>=';
 SHL: '<<';
-SHR: '>>';
 AND: '&&';
 OR: '||';
 PLUS_ASSIGN: '+=';
@@ -289,7 +288,10 @@ bitAndExpression:
     shiftExpression (AMPERSAND shiftExpression)*;
 
 shiftExpression:
-    additiveExpression ((SHL | SHR) additiveExpression)*;
+    additiveExpression (shiftOperator additiveExpression)*;
+
+shiftOperator:
+    SHL | RANGLE RANGLE;
 
 additiveExpression:
     multiplicativeExpression ((PLUS | MINUS) multiplicativeExpression)*;

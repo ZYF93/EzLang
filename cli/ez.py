@@ -12,6 +12,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import urllib.error
 import urllib.request
 import zipfile
@@ -56,6 +57,12 @@ TARGET_TRIPLES = {
 }
 SEMVER_RE = re.compile(r"^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$")
 IMPORT_RE = re.compile(r'\bfrom\s+"([^"]+)"\s+import\s*\{')
+DEFAULT_ENTRY_CANDIDATES = (
+    "src/main.ez",
+    "src/index.ez",
+    "main.ez",
+    "index.ez",
+)
 
 
 @dataclass
@@ -115,6 +122,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("-v", "--verbose", action="count", default=0, help="输出更多诊断")
     subparsers = parser.add_subparsers(dest="command")
 
+    init = subparsers.add_parser("init", help="初始化 EzLang 项目")
+    init.add_argument("path", nargs="?", default=".", help="项目目录，默认当前目录")
+    init.add_argument("--name", help="项目名称，默认使用目录名")
+    init.add_argument("--template", help="从远程 git 仓库拉取模板初始化")
+    init.set_defaults(func=cmd_init)
+
     build = subparsers.add_parser("build", help="编译项目并生成目标产物")
     _add_project_arg(build)
     build.set_defaults(func=cmd_build)
@@ -148,7 +161,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _add_project_arg(parser: argparse.ArgumentParser):
-    parser.add_argument("--project", default="project.toml", help="project.toml 路径")
+    parser.add_argument("--project", help="project.toml 路径；默认从当前目录向上查找")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -207,6 +220,84 @@ def _load_llvm_binding():
     return llvm
 
 
+def cmd_init(args) -> int:
+    target = _resolve_path(Path.cwd(), args.path)
+    if args.template:
+        _init_from_git_template(target, args.template)
+    else:
+        _init_default_project(target, args.name)
+    print(f"initialized {target}")
+    return 0
+
+
+def _init_default_project(target: Path, name: str | None):
+    if target.exists() and not target.is_dir():
+        raise CliError(f"项目路径不是目录: {target}")
+    target.mkdir(parents=True, exist_ok=True)
+    project_file = target / "project.toml"
+    main_file = target / "src" / "main.ez"
+    if project_file.exists():
+        raise CliError(f"project.toml 已存在: {project_file}")
+    if main_file.exists():
+        raise CliError(f"入口文件已存在: {main_file}")
+    project_name = (name or target.name or "ez_project").strip()
+    if not project_name:
+        raise CliError("项目名称不能为空")
+    main_file.parent.mkdir(parents=True, exist_ok=True)
+    project_file.write_text(
+        f"""
+[project]
+name = "{project_name}"
+version = "0.1.0"
+main = "src/main.ez"
+public = false
+optimize = 2
+
+[[output]]
+arch = "{_native_arch()}"
+os = "{_native_os()}"
+dir = "dist/{_native_os()}-{_native_arch()}"
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    main_file.write_text(
+        'from "std/io" import { println };\n\n'
+        f'println(msg = "Hello from {project_name}");\n',
+        encoding="utf-8",
+    )
+
+
+def _init_from_git_template(target: Path, template: str):
+    if target.exists() and not target.is_dir():
+        raise CliError(f"项目路径不是目录: {target}")
+    target.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="ez-init-") as temp_dir:
+        clone_dir = Path(temp_dir) / "template"
+        completed = subprocess.run(
+            ["git", "clone", "--depth", "1", template, str(clone_dir)],
+            text=True,
+            capture_output=True,
+        )
+        if completed.returncode != 0:
+            detail = completed.stderr.strip() or completed.stdout.strip()
+            raise CliError(f"模板拉取失败: {detail}")
+        _copy_template_contents(clone_dir, target)
+
+
+def _copy_template_contents(source: Path, target: Path):
+    for child in source.iterdir():
+        if child.name == ".git":
+            continue
+        destination = target / child.name
+        if destination.exists():
+            raise CliError(f"目标路径已存在，无法写入模板文件: {destination}")
+        if child.is_dir():
+            shutil.copytree(child, destination)
+        else:
+            shutil.copy2(child, destination)
+
+
 def cmd_build(args) -> int:
     config = load_project(args.project, require_main=True)
     for warning in config.warnings:
@@ -216,7 +307,7 @@ def cmd_build(args) -> int:
     for output in config.outputs:
         context = _plugin_context(config, output, source_plan)
         _run_plugin_hook(plugins, "before_build", context)
-        module, libs = _compile_project(config, output.os, source_plan, target_arch=output.arch)
+        module, libs = _compile_project(config, output.os, source_plan, target_arch=output.arch, ensure_entrypoint=True)
         output.dir.mkdir(parents=True, exist_ok=True)
         _apply_target_triple(module, output.triple)
         out_file = output.dir / f"{config.name}.ll"
@@ -265,7 +356,7 @@ def cmd_run(args) -> int:
         print(f"error: ez run only supports native target {_native_os()}/{_native_arch()}, got {output.os}/{output.arch}", file=sys.stderr)
         return 1
     source_plan = discover_sources(config)
-    module, libs = _compile_project(config, output.os, source_plan, target_arch=output.arch)
+    module, libs = _compile_project(config, output.os, source_plan, target_arch=output.arch, ensure_entrypoint=True)
     _apply_target_triple(module, output.triple)
     output.dir.mkdir(parents=True, exist_ok=True)
     obj_file = output.dir / f"{config.name}.o"
@@ -286,26 +377,33 @@ def _load_run_config(path: str | None, project_path: str | Path) -> ProjectConfi
     if source.suffix != ".ez":
         raise CliError(f"ez run 只支持 .ez 文件: {source}")
 
-    project_file = Path(project_path).expanduser()
-    if not project_file.is_absolute():
-        project_file = Path.cwd() / project_file
-    project_file = project_file.resolve()
-    if project_file.exists():
+    project_file = _optional_project_file(project_path, source)
+    if project_file is None:
+        config = _single_file_run_config(source)
+    else:
         config = load_project(project_file, require_main=False)
-        config.main = source
-        config.outputs = [_native_run_output(config.root, source)]
-        return config
+    config.main = source
+    config.outputs = [_native_run_output(config.root, source)]
+    return config
 
-    root = source.parent
+
+def _optional_project_file(project_path: str | Path | None, source: Path) -> Path | None:
+    if project_path is not None:
+        return _resolve_project_file(project_path)
+    return find_project(source.parent)
+
+
+def _single_file_run_config(source: Path) -> ProjectConfig:
+    name = _run_module_name(source)
     return ProjectConfig(
         path=source,
-        root=root,
-        name=_run_module_name(source),
+        root=source.parent,
+        name=name,
         version="0.0.0",
         main=source,
-        optimize=2,
+        optimize=0,
         public=False,
-        outputs=[_native_run_output(root, source)],
+        outputs=[],
     )
 
 
@@ -407,7 +505,7 @@ def cmd_fmt(args) -> int:
     changed: list[Path] = []
     for file in files:
         source = file.read_text(encoding="utf-8")
-        _, errors, _ = compile_source(source, module_name=file.stem)
+        _, errors, _ = compile_source(source, module_name=file.stem, base_dir=file.parent)
         if errors:
             raise CliError(f"{file}: {'; '.join(errors)}")
         formatted = _format_ez_source(source)
@@ -441,10 +539,37 @@ def cmd_release(args) -> int:
     return 0
 
 
-def load_project(path: str | Path, *, require_main: bool) -> ProjectConfig:
+def find_project(start: str | Path | None = None) -> Path | None:
+    start_path = Path.cwd() if start is None else Path(start).expanduser()
+    start_path = start_path.resolve()
+    if start_path.is_file():
+        start_path = start_path.parent
+    for directory in (start_path, *start_path.parents):
+        candidate = directory / "project.toml"
+        if candidate.exists():
+            return candidate.resolve()
+    return None
+
+
+def _resolve_project_file(path: str | Path | None) -> Path:
+    if path is None:
+        project_path = find_project()
+        if project_path is None:
+            raise CliError("未找到 project.toml，请先执行 ez init")
+        return project_path
+    project_path = Path(path).expanduser()
+    if not project_path.is_absolute():
+        project_path = Path.cwd() / project_path
+    project_path = project_path.resolve()
+    if project_path.is_dir():
+        project_path = project_path / "project.toml"
+    return project_path
+
+
+def load_project(path: str | Path | None, *, require_main: bool) -> ProjectConfig:
     if tomllib is None:
         raise CliError("当前 Python 缺少 tomllib，请使用 Python 3.11+ 或安装 tomli")
-    project_path = Path(path).expanduser().resolve()
+    project_path = _resolve_project_file(path)
     if not project_path.exists():
         raise CliError(f"project.toml 不存在: {project_path}")
     with project_path.open("rb") as f:
@@ -463,9 +588,11 @@ def load_project(path: str | Path, *, require_main: bool) -> ProjectConfig:
     registry = project.get("registry")
     main_value = project.get("main")
     main = _resolve_path(root, main_value) if isinstance(main_value, str) else None
+    if main is None and require_main:
+        main = _discover_default_main(root)
     if require_main:
         if main is None:
-            raise CliError("build/run 需要 [project].main")
+            raise CliError("未找到入口文件；请添加 src/main.ez、src/index.ez，或在 [project].main 中指定入口")
         if not main.exists():
             raise CliError(f"入口文件不存在: {main}")
     outputs = _parse_outputs(data.get("output"), root)
@@ -488,6 +615,14 @@ def load_project(path: str | Path, *, require_main: bool) -> ProjectConfig:
         log_compile_min_level=log_compile_min_level,
         warnings=outputs[1],
     )
+
+
+def _discover_default_main(root: Path) -> Path | None:
+    matches = [_resolve_path(root, candidate) for candidate in DEFAULT_ENTRY_CANDIDATES if _resolve_path(root, candidate).exists()]
+    if len(matches) > 1:
+        names = ", ".join(str(path.relative_to(root)) for path in matches)
+        raise CliError(f"发现多个默认入口文件: {names}；请在 [project].main 中指定一个")
+    return matches[0] if matches else None
 
 
 def _parse_log_config(raw_log) -> int | None:
@@ -611,10 +746,15 @@ def _discover_sources_from(config: ProjectConfig, entry: Path) -> list[Path]:
 
 
 def _compile_source_plan(config: ProjectConfig, compile_target: str, source_plan: list[Path], base_dir: Path,
-                         target_arch: str | None = None):
+                         target_arch: str | None = None, ensure_entrypoint: bool = False):
     analyze, compile_source = _load_compiler_modules()
     source = "\n".join(_strip_imports(path.read_text(encoding="utf-8")) for path in source_plan)
-    analyzer = analyze(source, base_dir=base_dir, compile_target=compile_target)
+    analyzer = analyze(
+        source,
+        base_dir=base_dir,
+        compile_target=compile_target,
+        allow_top_level_return=ensure_entrypoint,
+    )
     if analyzer.symbols.has_errors():
         resolved_errors = _resolve_extern_errors(analyzer.symbols.errors, config, compile_target, base_dir)
         if resolved_errors:
@@ -625,6 +765,8 @@ def _compile_source_plan(config: ProjectConfig, compile_target: str, source_plan
         compile_target=compile_target,
         target_arch=target_arch,
         log_compile_min_level=config.log_compile_min_level,
+        ensure_entrypoint=ensure_entrypoint,
+        base_dir=base_dir,
     )
     errors = _resolve_extern_errors(errors, config, compile_target, base_dir)
     if errors:
@@ -722,10 +864,17 @@ def _run_plugin_hook(plugins: list[LoadedPlugin], hook_name: str, context: dict[
 
 
 def _compile_project(config: ProjectConfig, compile_target: str, source_plan: list[Path] | None = None,
-                     target_arch: str | None = None):
+                     target_arch: str | None = None, ensure_entrypoint: bool = False):
     source_plan = source_plan or discover_sources(config)
     base_dir = config.main.parent if config.main is not None else config.root
-    return _compile_source_plan(config, compile_target, source_plan, base_dir, target_arch=target_arch)
+    return _compile_source_plan(
+        config,
+        compile_target,
+        source_plan,
+        base_dir,
+        target_arch=target_arch,
+        ensure_entrypoint=ensure_entrypoint,
+    )
 
 
 def _can_emit_native_object(output: OutputConfig) -> bool:
@@ -1317,7 +1466,7 @@ def _format_ez_source(source: str) -> str:
 
 def _tokenize_format_source(source: str) -> list[str]:
     pattern = re.compile(
-        r'"(?:[^"\\\r\n]|\\.)*"|//[^\n]*|/\*.*?\*/|\.\.\.|==|!=|<=|>=|<<=|>>=|&&|\|\||\+=|-=|\*=|/=|%=|&=|\|=|\^=|<<|>>|=>|->|[A-Za-z_][A-Za-z0-9_]*|\d+(?:\.\d+)?(?:[eE][+-]?\d+)?|0x[0-9A-Fa-f_]+|0b[01_]+|0o[0-7_]+|.',
+        r'"(?:[^"\\\r\n]|\\.)*"|//[^\n]*|/\*.*?\*/|\.\.\.|==|!=|<=|>=|<<=|>>=|&&|\|\||\+=|-=|\*=|/=|%=|&=|\|=|\^=|<<|>>|=>|->|(?:[A-Za-z_][A-Za-z0-9_]*|\$[A-Za-z0-9_]+)|\d+(?:\.\d+)?(?:[eE][+-]?\d+)?|0x[0-9A-Fa-f_]+|0b[01_]+|0o[0-7_]+|.',
         re.DOTALL,
     )
     tokens: list[str] = []

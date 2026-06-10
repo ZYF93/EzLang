@@ -52,6 +52,9 @@ API：
 - `streamKindFileRead: I32`
 - `streamKindFileWrite: I32`
 - `streamKindTcp: I32`
+- `streamKindProcessStdin: I32`
+- `streamKindProcessStdout: I32`
+- `streamKindProcessStderr: I32`
 - `streamFromBlob(data: Blob) -> Stream?`
 - `streamFromTcpHandle(handle: I64) -> Stream`
 - `streamOpenFileRead(path: Str) -> Stream?`
@@ -63,7 +66,7 @@ API：
 - `streamFlush(stream: Stream) -> Bool`
 - `streamClose(stream: Stream) -> Bool`
 
-当前提供内存/Blob 流、文件读写流与 TCP 连接流，作为进程管道和压缩流后续接入的稳定 ABI。`streamCopy` 从源流当前游标开始复制到目标流，返回复制字节数；失败返回 `-1`。
+当前提供内存/Blob 流、文件读写流、TCP 连接流与进程管道流；`std/compress` 的 `*Stream` 压缩/解压 API 复用该结构。进程管道流由 `std/process` 的 `processStdin`、`processStdout` 和 `processStderr` 创建；stdin 流可写，stdout/stderr 流可读。`streamWrite` 对非法 `Blob` 输入返回 `-1`，合法空 `Blob` 写入返回 `0`；`streamCopy` 从源流当前游标开始复制到目标流，返回复制字节数，失败返回 `-1`。
 
 ## std/io
 
@@ -71,6 +74,10 @@ API：
 - `println(msg: Str) -> Void`
 - `error(msg: Str) -> Void`
 - `readLine() -> Str?`
+
+原生桌面目标从 stdin 同步读取一行；Android/iOS 返回空可选值。emcc 在 Node 风格同步运行时读取 fd 0，浏览器/Worker 无同步 stdin 时返回空可选值。
+
+`print` 不追加换行，`println` 追加换行；emcc Node 风格运行时优先写入 `process.stdout.write`，无 stdout 时会暂存连续 `print` 内容并在下一次 `println` 统一输出。
 
 ## std/fs
 
@@ -88,6 +95,7 @@ API：
 
 平台说明：
 
+- 空路径或非法 `Blob` 输入按接口签名返回失败值：读文件返回空 `Blob`，写入/追加返回 `false`，状态查询返回空可选值或 `false`。
 - Android/iOS 相对路径映射到沙盒目录。
 - emcc 默认使用 MEMFS，并在可用时挂载 `/ezdata` 到 IDBFS。
 
@@ -102,7 +110,7 @@ API：
 - `platform() -> Str`
 - `arch() -> Str`
 
-平台说明：emcc 目标在 Node 风格运行时读取 `Module.arguments` / `process.env` / `process.pid`；浏览器缺少对应能力时按签名返回空列表、空可选值、`false` 或 `-1`。
+平台说明：native `cwd` 不可探测时返回空字符串；emcc 目标在 Node 风格运行时读取 `Module.arguments` / `process.env` / `process.cwd()` / `process.pid`；浏览器缺少对应能力时按签名返回空列表、空可选值、`false`、`/` 或 `-1`。
 
 ## std/path
 
@@ -123,6 +131,8 @@ API：
 - `std/path` 不访问文件系统，只按目标平台规则进行词法处理。
 - Windows 目标默认使用 `\` 并识别盘符/UNC 路径；其它目标默认使用 `/`。
 - emcc 使用类 POSIX 路径规则。
+- `pathToFileUrl` / `pathFromFileUrl` 只做 `file://` 与路径字节的百分号编码互转；POSIX 绝对路径输出为 `file:///tmp/a`，Windows 盘符路径输出为 `file:///C:/a`。解码结果包含 NUL 字节时返回空可选值，因为 Ez `Str` 与文件路径 ABI 均不能安全表达内嵌 NUL。
+- 根路径拆分保持根本身：`pathDir("/")` 返回 `/`，`pathBase("/")` 返回空字符串；Windows 盘符根 `C:/` 与 UNC 根 `//server/share` 同样保留为 `dir/root`，`base/name/ext` 为空。
 
 ## std/str
 
@@ -150,8 +160,9 @@ API：
 平台说明：
 
 - 字节索引以 UTF-8 字节为单位，字符索引按 Unicode 标量值边界遍历。
-- `strFromBytes` 会校验 UTF-8，失败返回空可选值。
-- 原生 `strToLower` / `strToUpper` 当前保证 ASCII 大小写映射；非 ASCII 字节保持不变。
+- `strFromBytes` 会校验 UTF-8；非法 `Blob`、非法 UTF-8 或包含 NUL 字节时返回空可选值。
+- `strTrim` 裁剪首尾 Unicode White_Space 空白字符。
+- `strToLower` / `strToUpper` 使用确定性的 Unicode simple case 映射，覆盖 ASCII、Latin-1、Latin Extended-A、Greek 和 Cyrillic 常见大小写；不执行 locale 相关规则或全文 case folding。
 
 ## std/math
 
@@ -188,7 +199,9 @@ API：
 
 - Linux 原生目标会额外链接系统数学库 `libm`。
 - WebAssembly 目标使用 JavaScript `Math` 与 `BigInt` 封装。
+- `mathRound` 的 `.5` 按远离 0 方向取整，匹配 C `round` 语义。
 - checked 运算在溢出、除零或非法转换时返回空可选值。
+- `mathF64ToI32` / `mathF64ToI64` 只接受有限数，且按 C/JS 规则截断后的整数必须位于目标整数范围内。
 
 ## std/random
 
@@ -204,6 +217,7 @@ API：
 - `randomRangeI64(this: RandomSource, minValue: I64, maxValue: I64) -> I64`
 - `randomRangeF64(this: RandomSource, minValue: F64, maxValue: F64) -> F64`
 - `randomShuffleBytes(this: RandomSource, data: Blob) -> Blob`
+- `randomShuffle<T>(this: RandomSource, list: List<T>) -> List<T>`
 - `randomEntropy(size: I64) -> Blob?`
 - `randomSecureBytes(size: I64) -> Blob?`
 - `randomSecureU64() -> U64?`
@@ -212,7 +226,7 @@ API：
 
 - 确定性随机源使用稳定算法，同种子跨平台序列一致。
 - 安全随机接口只使用系统/浏览器熵源，失败返回空可选值。
-- 当前提供 `Blob` 字节洗牌；泛型数组洗牌等待集合/泛型 ABI 完善后补齐。
+- `randomShuffleBytes` 与 `randomShuffle<T>` 返回新值，不修改传入数据或列表。
 
 ## std/hash
 
@@ -228,6 +242,7 @@ API：
 
 - FNV-1a 与 CRC32 均为非加密算法，不可用于安全场景。
 - `hashStr*` 与 `crc32Str` 按字符串 UTF-8 字节计算。
+- `hashFnv1a32` / `hashFnv1a64` / `crc32` 是非可选返回值接口；可判定的非法 `Blob` 元数据（如 `NULL`、负长度或缺少 `data`；emcc 还包括 HEAP 越界）按空输入计算。原生目标要求非空 `data` 指针对应 `size` 字节可读。
 
 ## std/platform
 
@@ -248,7 +263,7 @@ API：
 平台说明：
 
 - `platformMemoryLimit` 与 `platformPageSize` 不可探测时返回 `-1`。
-- WebAssembly 目标按当前 JS 环境检测 DOM、网络、加密、线程等能力。
+- WebAssembly 目标按当前 JS 环境检测 DOM、网络、加密、线程和子进程能力；Node 环境下 CPU 数、内存上限、加密和子进程能力优先读取 `os` / `crypto` / `child_process`。
 
 ## std/process
 
@@ -264,12 +279,17 @@ API：
 - `processSpawn(command: Command) -> Process?`
 - `processWait(process: Process) -> ProcessResult?`
 - `processTerminate(process: Process) -> Bool`
+- `processStdin(process: Process) -> Stream?`
+- `processStdout(process: Process) -> Stream?`
+- `processStderr(process: Process) -> Stream?`
 - `processCurrentPath() -> Str?`
 
 平台说明：
 
 - `std/process` 只用于外部程序调用，不暴露线程、线程池、互斥锁、条件变量等底层并发接口。
-- Linux/macOS/Windows native 目标实现子进程调用；Android、iOS、WebAssembly 当前返回空可选值或 `false`。
+- `Command.stdin` 必须是合法 `Blob`；非法 `Blob` 输入会让 `processExec` / `processSpawn` 返回空可选值。
+- Linux/macOS/Windows native 目标实现子进程调用；emcc 的 Node 风格同步运行时使用 `child_process.spawnSync`；Android、iOS 与浏览器 WebAssembly 当前返回空可选值或 `false`。
+- `processExec` 会同步写入 `stdin` 并捕获 `stdout`/`stderr`；`processSpawn` 默认保留旧语义，由后续 `processWait` 写入 `Command.stdin` 并返回捕获的 `stdout`/`stderr`。调用 `processStdin`、`processStdout` 或 `processStderr` 会把对应管道转交给 `Stream`，转交后 `processWait` 不再自动写该 stdin 或捕获该 stdout/stderr；对应结果 Blob 为空。`Process.handle` 是标准库内部不透明句柄。emcc 的 `processSpawn` 在同步 ABI 下保存已完成的 `spawnSync` 结果，`processStdout`/`processStderr` 可把已完成输出转成可读流，`processStdin` 返回空可选值。
 - `Command.env` 使用 `KEY=VALUE` 字符串数组表示环境覆盖；`ProcessResult.ok` 表示退出码是否为 `0`。
 - `flow` 调度状态机完成前，进程等待仍是同步阻塞调用。
 
@@ -300,9 +320,10 @@ API：
 平台说明：
 
 - `std/uri` 只做词法解析和百分号编解码，不访问网络。
-- `uriQueryGet/Set` 操作不带前导 `?` 的裸 query；传入的 `key`/`value` 是未编码文本，接口会按 query 规则解码匹配、编码写回。
+- `uriNormalize` 会小写 scheme/host、折叠 path 中的 `.`/`..`，并保留显式 `//` authority 与无 authority 空 path。
+- `uriQueryGet/Set` 操作不带前导 `?` 的裸 query；传入的 `key`/`value` 是未编码文本，接口会按 query 规则解码匹配、编码写回；开头、连续或尾随 `&` 产生的空项会被忽略，显式 `=` 可表示空 key 或空 value。
 - 查询参数接口使用裸 query 字符串，不包含前导 `?`。
-- 非法百分号转义会让解码函数返回空可选值。
+- 非法百分号转义、解码后非法 UTF-8 或包含 NUL 字节会让解码函数返回空可选值。
 
 ## std/debug
 
@@ -352,11 +373,11 @@ API：
 - `logWarnMsg(msg: Str) -> Void`
 - `logErrorMsg(msg: Str) -> Void`
 
-原生平台支持 stderr/stdout/file 目标；Android/iOS 非文件目标同时写入系统日志入口；emcc 输出到 console，`logSetFile` 返回 `false`。
+原生平台支持 stderr/stdout/file 目标；Android/iOS 非文件目标同时写入系统日志入口；emcc 默认输出到 console，文件目标使用 Emscripten FS 或 Node 同步文件系统；缺少同步文件系统时 `logSetFile` 返回 `false`。
 
 平台说明：
 
-- 原生平台当前输出到 stdout/stderr；WebAssembly 输出到 console。
+- 原生平台当前输出到 stdout/stderr/file；WebAssembly 输出到 console，或在 Emscripten FS/Node 环境追加写文件。
 - `fields` 使用偶数位 `key, value` 字符串数组，末尾孤立 key 会被忽略。
 - 运行时级别由 `LogConfig.minLevel` 或 `logSetLevel` 控制。
 - 项目配置 `[log].compile_min_level` 可启用编译期级别过滤，范围为 `0..4`。
@@ -387,8 +408,10 @@ API：
 
 平台说明：
 
-- POSIX 原生平台使用扩展正则，WebAssembly 使用 JavaScript `RegExp`。
-- Windows 原生目标当前返回不可用结果，不静默伪装成功。
+- POSIX 原生平台使用扩展正则，Windows 原生目标使用内置同步轻量正则 fallback，WebAssembly 使用 JavaScript `RegExp`。
+- `RegexMatch.start/end` 使用 UTF-8 字节偏移；`regexReplace` 的 replacement 按字面字符串处理。
+- `regexMultiline` 让 `^`/`$` 匹配每行的开始/结束；未设置时只匹配整个输入的开始/结束。`.` 默认不匹配换行符。
+- Windows 内置 fallback 支持字面量、`.`、`^`/`$`、分组、`|`、字符类/范围、常用 POSIX 字符类、`?`/`*`/`+` 量词、捕获组、全局查找/替换和分割。
 - 当前不是完整 PCRE 实现，复杂语法是否可用取决于底层引擎。
 
 ## std/crypto
@@ -400,9 +423,9 @@ API：
 
 平台说明：
 
-- 只封装成熟平台加密库，不自行实现加密算法。
-- macOS/iOS native 使用 CommonCrypto；其它 native 目标当前返回空可选值。
-- emcc 同步 ABI 下优先使用 Node `crypto`；浏览器 WebCrypto 暂待 flow/async ABI 完善后接入。
+- 优先封装成熟平台加密库；平台库不可用时使用同步 SHA-2/HMAC 回退。
+- Linux native 运行时动态加载 OpenSSL `libcrypto`，不要求 OpenSSL 开发头或构建时 `-lcrypto`；macOS/iOS native 优先使用 CommonCrypto；Windows native 优先使用 BCrypt；没有可用平台库或定义 `EZ_CRYPTO_FORCE_PORTABLE` 时使用内置同步回退。
+- emcc 同步 ABI 下优先使用 Node `crypto`；不可用时使用同步 JS SHA-2/HMAC 回退。
 
 ## std/compress
 
@@ -412,12 +435,18 @@ API：
 - `decompressZlib(data: Blob) -> Blob?`
 - `compressDeflate(data: Blob) -> Blob?`
 - `decompressDeflate(data: Blob) -> Blob?`
+- `compressGzipStream(dst: Stream, src: Stream, bufferSize: I64) -> I64`
+- `decompressGzipStream(dst: Stream, src: Stream, bufferSize: I64) -> I64`
+- `compressZlibStream(dst: Stream, src: Stream, bufferSize: I64) -> I64`
+- `decompressZlibStream(dst: Stream, src: Stream, bufferSize: I64) -> I64`
+- `compressDeflateStream(dst: Stream, src: Stream, bufferSize: I64) -> I64`
+- `decompressDeflateStream(dst: Stream, src: Stream, bufferSize: I64) -> I64`
 
 平台说明：
 
-- Linux/macOS native 使用系统 zlib；Windows、Android、iOS native 当前返回空可选值。
-- emcc 同步 ABI 下优先使用 Node `zlib`；浏览器同步环境当前返回空可选值。
-- 当前接口一次性处理完整 `Blob`；流式压缩接口等待流式 IO 抽象落地后补充。
+- native 目标使用系统 zlib；对应工具链需要提供 zlib 开发库。
+- emcc 同步 ABI 下优先使用 Node `zlib`；浏览器同步环境当前没有同步压缩 API，一次性 API 返回空可选值，流式 API 返回 `-1`。
+- 一次性 API 处理完整 `Blob`；`*Stream` API 从 `src` 当前游标读到 EOF，压缩或解压后写入 `dst`，返回写入字节数，失败返回 `-1`。
 
 ## std/time
 
@@ -425,6 +454,10 @@ API：
 
 - `Duration { ms: I64 }`
 
+- `Duration.fromSec(s: I64) -> Duration`
+- `Duration.fromMin(m: I64) -> Duration`
+- `Duration.toString(this: Duration) -> Str`
+- `durationToString(value: Duration) -> Str`
 - `now() -> Date`
 - `timestamp() -> I64`
 - `sleep(ms: I64) -> Void`
@@ -438,7 +471,9 @@ API：
 - `sub(this: Date, year: I32?, month: I32?, day: I32?, hour: I32?, minute: I32?, second: I32?) -> Void`
 - `format(this: Date, fmt: Str) -> Str`
 
-`format` 支持 `YYYY`、`MM`、`DD`、`HH`、`SS` 命名占位符，以及 `%Y`、`%m`、`%d`、`%H`、`%M`、`%S`。分钟使用 `%M`，月份使用 `MM` 或 `%m`。
+`add` / `sub` 原地修改传入的 `Date`，不会返回新 `Date`。
+
+`format` 支持 `YYYY`、`MM`、`DD`、`HH`、`mm`、`SS` 命名占位符，以及 `%Y`、`%m`、`%d`、`%H`、`%M`、`%S`。分钟使用 `mm` 或 `%M`，月份使用 `MM` 或 `%m`。
 
 ## std/net/http
 
@@ -454,7 +489,7 @@ API：
 - `RouteHandler`
 - `HttpServer`
 
-原生桌面平台支持明文 `http://` 客户端请求；HTTPS、Android/iOS、emcc 同步 fetch 返回空可选值。HTTP 服务端当前明确不支持，`createServer` 返回 `handle = 0`，`HttpServer.on/start/stop` 为空操作。
+原生桌面平台支持明文 `http://` 客户端请求、合法端口、userinfo 剥离、IPv6 字面量、基础请求/响应头和 `Transfer-Encoding: chunked` 响应体解码，也支持基础阻塞式 HTTP 服务端：`createServer` 创建句柄，`HttpServer.on` 注册精确路径路由，`start` 监听并处理连接，`stop` 关闭服务端。emcc 在浏览器/Worker 环境使用同步 `XMLHttpRequest` 支持客户端请求，服务端仍返回空句柄；`HttpResponse.text()` 仅在响应体是不含空字节的合法 UTF-8 时返回文本，否则返回空字符串。HTTPS、Android/iOS、Node emcc 无同步 XHR 时返回空可选值。
 
 ## std/net/tcp
 
@@ -467,10 +502,11 @@ API：
 - `tcpListenerClose(listener: TcpListener) -> Bool`
 - `udpBind(host: Str, port: I32) -> UdpSocket?`
 - `udpSend(socket: UdpSocket, host: Str, port: I32, data: Blob) -> I64`
+- `udpRecvFrom(socket: UdpSocket, maxBytes: I64) -> UdpPacket?`
 - `udpRecv(socket: UdpSocket, maxBytes: I64) -> Blob?`
 - `udpClose(socket: UdpSocket) -> Bool`
 
-原生目标提供阻塞式 TCP/UDP socket 基础能力；TCP 连接句柄可通过 `std/stream.streamFromTcpHandle` 交给通用读写和拷贝函数。emcc 当前明确不支持 TCP/UDP，返回空可选值、`-1` 或 `false`。当前接口不提供超时、TLS 或异步 flow 挂起。
+`UdpPacket` 包含 `data: Blob`、`host: Str` 和 `port: I32`；`udpRecv` 保留为只返回数据的兼容接口。原生目标提供阻塞式 TCP/UDP socket 基础能力；TCP 连接句柄可通过 `std/stream.streamFromTcpHandle` 交给通用读写和拷贝函数。端口必须在 `0..65535` 范围内，非法连接、监听或绑定端口返回空可选值，非法发送端口返回 `-1`。emcc 当前明确不支持 TCP/UDP，返回空可选值、`-1` 或 `false`。当前接口不提供超时、TLS 或异步 flow 挂起。
 
 ## std/net/ws
 
@@ -479,7 +515,7 @@ API：
 - `wsRecv(conn: WsConn, maxBytes: I64) -> Blob?`
 - `wsClose(conn: WsConn) -> Bool`
 
-原生目标仅支持 `ws://` 握手和基础单帧消息收发；`wss://`、分片帧、ping/pong 自动处理和 emcc 同步 WebSocket 明确不支持，失败时返回空可选值或 `-1`。
+原生目标支持 `ws://` 握手校验、合法端口、userinfo 剥离、IPv6 字面量、客户端掩码、文本/二进制消息、分片帧重组和 ping/pong 自动处理；`wss://` 与 emcc 同步 WebSocket 明确不支持，失败时返回空可选值或 `-1`。
 
 ## std/fmt
 
@@ -488,6 +524,11 @@ API：
 - `parseI64(s: Str) -> I64?`
 - `parseF64(s: Str) -> F64?`
 - `format(template: Str, args: Str[]) -> Str`
+
+`format` 按顺序替换 `{}` 占位符，`{{` 和 `}}` 分别输出字面 `{`、`}`；为了兼容旧代码，`%s`、`%d`、`%f` 也按顺序消费字符串参数，`%%` 输出字面 `%`。
+
+`parseInt` / `parseI64` 只接受可选 `+`/`-` 加 ASCII 十进制数字，超出目标整数范围或包含小数、指数、十六进制前缀时返回空可选值。`parseF64` 只接受 ASCII 十进制浮点语法（可选符号、小数点、指数），拒绝 `NaN`、`Infinity` 和十六进制浮点。三者会裁剪 Unicode `White_Space` 集合中的首尾空白；`U+FEFF` 不属于该集合，不会被裁剪。
+
 - `b64Encode(data: Blob) -> Str`
 - `b64Decode(s: Str) -> Blob?`
 - `jsonStringify<T>(data: T) -> Str`
@@ -496,6 +537,8 @@ API：
 - `msgpackDecode<T>(data: Blob) -> T`
 - `urlEncode(s: Str) -> Str`
 - `urlDecode(s: Str) -> Str?`
+
+JSON 与 MessagePack 当前覆盖 `I8`、`I32`、`I64`、`U8`、`U32`、`U64`、`F32`、`F64`、`Bool`、`Str` 基础类型；`jsonStringify<T>` / `jsonParse<T>` 和 `msgpackEncode<T>` / `msgpackDecode<T>` 额外支持普通用户结构体，以及顶层或结构体字段中的 `Optional<T>` / `T?`、`List<T>` / `T[]`、`Dict<K, V>`、联合类型 `A | B`。`Optional<T>` 的空值编码为 JSON `null` 或 MessagePack `nil`，非空值按内部 `T` 递归编码。`List` 可递归嵌套。`Dict<K, V>` 的键 `K` 必须是 `Str` 或基础标量类型，值类型 `V` 可递归使用这些已支持类型；`Dict<Str, V>` 的 JSON 编码为对象，非字符串键 `Dict<K, V>` 的 JSON 编码为无损条目数组 `[{"key":K,"value":V}]`；MessagePack 字典统一编码为 map，键和值都按各自类型递归编码。联合类型编码为包含 `tag` 与 `value` 两个字段的 JSON 对象或 MessagePack map；`tag` 是联合声明顺序下标，`value` 按对应分支类型递归编码，解析时要求 tag 合法且 value 符合对应分支类型。结构体字段可为这些基础类型、可选值、其它普通用户结构体、上述列表、字典或联合类型。JSON 按字段声明顺序或字典插入顺序输出对象/条目数组；MessagePack 按字段声明顺序或字典插入顺序输出 map，列表编码为 array。结构体解析要求输入字段集合与结构体声明完全一致，字段顺序可不同，缺字段、未知字段、重复字段、字段类型不合法、数组元素类型不合法或嵌套结构体不匹配都会抛 `Error(code = errIO)`；字典解析按输入对象、条目数组或 map 顺序插入，重复键以后出现的值为准。字符串解码结果包含 NUL 字节时不能作为 Ez `Str` 返回：`jsonParse<Str>` 视为解析失败，`msgpackDecode<Str>` 返回空字符串，`urlDecode` 返回空可选值。
 
 ## std/collections
 
@@ -523,4 +566,4 @@ API：
 
 ## std/net
 
-`std/net/http`、`std/net/tcp`、`std/net/ws` 的接口声明和 ABI 已可编译链接。原生目标当前支持明文 `http://` 客户端请求、基础字符串请求/响应头、阻塞式 TCP/UDP 基础收发，以及 `ws://` WebSocket 握手和单帧消息收发。HTTPS、HTTP 服务端、WebSocket `wss://`、分片帧、超时配置和异步 flow 挂起仍待后续运行时接入；不支持的入口返回空可选值、失败值或零句柄。
+`std/net/http`、`std/net/tcp`、`std/net/ws` 的接口声明和 ABI 已可编译链接。原生目标当前支持明文 `http://` 客户端请求、基础字符串请求/响应头、chunked 响应体解码、基础阻塞式 HTTP 服务端、阻塞式 TCP/UDP 基础收发，以及 `ws://` WebSocket 握手、合法端口、userinfo 剥离、IPv6 字面量、客户端掩码、分片重组和 ping/pong 自动处理。HTTPS、HTTP 服务端并发 worker、WebSocket `wss://`、超时配置和异步 flow 挂起仍待后续运行时接入；不支持的入口返回空可选值、失败值或零句柄。

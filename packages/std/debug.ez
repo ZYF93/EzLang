@@ -4,6 +4,7 @@
 extern "@std/native/debug.c" for linux;
 extern "@std/native/debug.c" for macos;
 extern "@std/native/debug.c" for windows;
+extern "dbghelp" for windows;
 extern "@std/native/debug.c" for android;
 extern "@std/native/debug.c" for ios;
 extern "@std/emcc/debug.js" for emcc;

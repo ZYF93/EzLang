@@ -1,62 +1,27 @@
-// EzLang 类型系统示例
+from "std/fmt" import { format, toString };
+from "std/io" import { println };
 
-// 基本类型
-let a: I32 = 42;
-let b: I64 = 1000000000;
-let c: Bool = true;
-let d: F32 = 3.14;
-let e: Str = "Hello EzLang";
-let byte_val: I8 = -127;
-let ubyte_val: U8 = 255;
-let uint_val: U32 = 4294967295;
-let ulong_val: U64 = 18446744073709551615;
-let double_val: F64 = 2.71828;
-
-// 可选类型
-let maybe_value: I32? = 42;
-
-// 联合类型
-let union_val: I32 | Str = "hello";
-
-// 数组类型
-let numbers: I32[] = [1, 2, 3, 4, 5];
-let empty_arr: Str[] = [];
-
-// List 类型 (与 Type[] 等价)
-let list: List<I32> = [10, 20, 30];
-
-// SIMD 向量类型
-let vec4: Vec<I32>[4] = Vec[1, 2, 3, 4];
-
-// typeof 表达式
-let type_of_num = typeof 42;
-let type_of_arr = typeof I32[];
-
-// 类型别名
-type Point = {
-    x: I32;
-    y: I32;
-};
-
-type Named = {
+struct User {
     name: Str;
-};
-
-// 类型扩展
-type UserShape = {
-    ...Named;
     age: I32;
 };
 
-// 动态键类型
-type DynamicShape = {
-    name: Str;
-    [key: Str]: Str;
-};
+const main = (): I32 => {
+    const numbers: I32[] = [1, 2, 3, 4];
+    const maybe: I32? = 42;
+    const user = User(name = "Ada", age = 36);
+    const vec: Vec<I32>[4] = Vec[1, 2, 3, 4];
+    const shifted = vec + 1;
+    const lenArgs: Str[] = [toString<I64>(value = numbers.length)];
+    const maybeArgs: Str[] = [toString<Bool>(value = maybe.ok)];
+    const userArgs: Str[] = [user.name, toString<I32>(value = user.age)];
 
-// 字典字面量
-let dict = {
-    prop1: I32 = 100,
-    prop2: Str = "value"
+    println(msg = "types: arrays, optional, struct, SIMD");
+    println(msg = format(template = "numbers.length = {}", args = lenArgs));
+    println(msg = format(template = "maybe.ok = {}", args = maybeArgs));
+    println(msg = format(template = "user = {}, age {}", args = userArgs));
+    (numbers.length != 4) ? { return 1; };
+    (!maybe.ok) ? { return 2; };
+    (maybe.value != 42) ? { return 3; };
+    return 0;
 };
-

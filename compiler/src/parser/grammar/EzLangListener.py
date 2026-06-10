@@ -530,6 +530,15 @@ class EzLangListener(ParseTreeListener):
         pass
 
 
+    # Enter a parse tree produced by EzLangParser#shiftOperator.
+    def enterShiftOperator(self, ctx:EzLangParser.ShiftOperatorContext):
+        pass
+
+    # Exit a parse tree produced by EzLangParser#shiftOperator.
+    def exitShiftOperator(self, ctx:EzLangParser.ShiftOperatorContext):
+        pass
+
+
     # Enter a parse tree produced by EzLangParser#additiveExpression.
     def enterAdditiveExpression(self, ctx:EzLangParser.AdditiveExpressionContext):
         pass

@@ -4,18 +4,25 @@
   var STREAM_KIND_FILE_READ = 2;
   var STREAM_KIND_FILE_WRITE = 3;
   var STREAM_KIND_TCP = 4;
+  var STREAM_KIND_PROCESS_STDIN = 5;
+  var STREAM_KIND_PROCESS_STDOUT = 6;
+  var STREAM_KIND_PROCESS_STDERR = 7;
   var nextHandle = 1;
   var streams = Object.create(null);
+  var root = typeof Module !== 'undefined' && Module ? Module : (typeof globalThis !== 'undefined' ? globalThis : this);
+  var bridge = root.__ez_stream_bridge || (root.__ez_stream_bridge = {});
 
   function pathText(path) {
     return UTF8ToString(path || 0);
   }
 
   function readBlob(blobPtr) {
-    if (!blobPtr) return new Uint8Array(0);
+    if (!blobPtr) return null;
     var dataPtr = getValue(blobPtr, '*');
     var size = Number(getValue(blobPtr + 8, 'i64'));
-    if (!dataPtr || size <= 0) return new Uint8Array(0);
+    if (!Number.isFinite(size) || size < 0 || Math.floor(size) !== size) return null;
+    if (size === 0) return new Uint8Array(0);
+    if (!dataPtr || dataPtr < 0 || dataPtr > HEAPU8.length || size > HEAPU8.length - dataPtr) return null;
     return HEAPU8.slice(dataPtr, dataPtr + size);
   }
 
@@ -56,10 +63,40 @@
     return bytes.length;
   }
 
+  function createByteStream(bytes, kind) {
+    if (!(bytes instanceof Uint8Array)) bytes = new Uint8Array(bytes || 0);
+    var handle = nextHandle++;
+    streams[handle] = { kind: kind, data: bytes.slice(0), cursor: 0, closed: false };
+    return { handle: handle, kind: kind };
+  }
+
+  bridge.fromBytes = function (bytes, kind) {
+    kind = kind | 0;
+    if (kind !== STREAM_KIND_MEMORY && kind !== STREAM_KIND_PROCESS_STDOUT && kind !== STREAM_KIND_PROCESS_STDERR) return null;
+    return createByteStream(bytes, kind);
+  };
+
+  function flushFileStream(stream) {
+    if (!stream || stream.closed || !stream.file || typeof FS === 'undefined') return 0;
+    try {
+      if (typeof FS.fsync === 'function') FS.fsync(stream.file);
+      if (typeof FS.syncfs === 'function') FS.syncfs(false, function () {});
+      return 1;
+    } catch (e) {
+      return 0;
+    }
+  }
+
   mergeInto(LibraryManager.library, {
     streamFromBlob: function (ret, dataPtr) {
+      var data = readBlob(dataPtr);
+      if (data === null) {
+        HEAPU8[ret] = 0;
+        writeStream(ret + 8, 0, 0);
+        return;
+      }
       var handle = nextHandle++;
-      streams[handle] = { kind: STREAM_KIND_MEMORY, data: readBlob(dataPtr), cursor: 0, closed: false };
+      streams[handle] = { kind: STREAM_KIND_MEMORY, data: data, cursor: 0, closed: false };
       HEAPU8[ret] = 1;
       writeStream(ret + 8, handle, STREAM_KIND_MEMORY);
     },
@@ -107,12 +144,14 @@
       var max = Number(maxBytes);
       var stream = readStream(streamPtr, STREAM_KIND_MEMORY);
       if (!stream) stream = readStream(streamPtr, STREAM_KIND_FILE_READ);
+      if (!stream) stream = readStream(streamPtr, STREAM_KIND_PROCESS_STDOUT);
+      if (!stream) stream = readStream(streamPtr, STREAM_KIND_PROCESS_STDERR);
       if (!stream && streamPtr && (getValue(streamPtr + 8, 'i32') | 0) === STREAM_KIND_TCP) {
         return writeOptBlob(ret, false, new Uint8Array(0));
       }
       if (!stream || stream.closed || max < 0) return writeOptBlob(ret, false, new Uint8Array(0));
       if (max === 0) return writeOptBlob(ret, true, new Uint8Array(0));
-      if (stream.kind === STREAM_KIND_MEMORY) {
+      if (stream.kind === STREAM_KIND_MEMORY || stream.kind === STREAM_KIND_PROCESS_STDOUT || stream.kind === STREAM_KIND_PROCESS_STDERR) {
         var remaining = stream.data.length - stream.cursor;
         var count = Math.min(remaining, max);
         if (count <= 0) return writeOptBlob(ret, true, new Uint8Array(0));
@@ -134,6 +173,7 @@
       if (!stream && streamPtr && (getValue(streamPtr + 8, 'i32') | 0) === STREAM_KIND_TCP) return -1;
       if (!stream || stream.closed) return -1;
       var bytes = readBlob(dataPtr);
+      if (bytes === null) return -1;
       if (bytes.length === 0) return 0;
       if (stream.kind === STREAM_KIND_MEMORY) return appendBytes(stream, bytes);
       try {
@@ -179,8 +219,12 @@
       var stream = readStream(streamPtr, STREAM_KIND_MEMORY);
       if (stream) return stream.closed ? 0 : 1;
       stream = readStream(streamPtr, STREAM_KIND_FILE_WRITE);
+      if (!stream) stream = readStream(streamPtr, STREAM_KIND_PROCESS_STDIN);
+      if (!stream) stream = readStream(streamPtr, STREAM_KIND_PROCESS_STDOUT);
+      if (!stream) stream = readStream(streamPtr, STREAM_KIND_PROCESS_STDERR);
+      if (stream && (stream.kind === STREAM_KIND_PROCESS_STDIN || stream.kind === STREAM_KIND_PROCESS_STDOUT || stream.kind === STREAM_KIND_PROCESS_STDERR)) return stream.closed ? 0 : 1;
       if (!stream && streamPtr && (getValue(streamPtr + 8, 'i32') | 0) === STREAM_KIND_TCP) return 0;
-      return stream && !stream.closed ? 1 : 0;
+      return flushFileStream(stream);
     },
     streamClose: function (streamPtr) {
       var handle = streamPtr ? Number(getValue(streamPtr, 'i64')) : 0;

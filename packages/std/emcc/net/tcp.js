@@ -34,6 +34,13 @@ mergeInto(LibraryManager.library, {
   udpSend: function (socket, host, port, data) {
     return -1;
   },
+  udpRecvFrom: function (ret, socket, maxBytes) {
+    HEAPU8[ret] = 0;
+    setValue(ret + 8, 0, '*');
+    setValue(ret + 16, 0, 'i64');
+    setValue(ret + 24, 0, '*');
+    setValue(ret + 32, 0, 'i32');
+  },
   udpRecv: function (ret, socket, maxBytes) {
     HEAPU8[ret] = 0;
     setValue(ret + 8, 0, '*');

@@ -23,9 +23,9 @@ Flow 并发相关 hook：
 - `__ezrt_sleep(ms)`：flow 内 sleep suspend point。
 - `__ezrt_race(task, timeout)`：race 调度入口。
 - `__ezrt_race_i32(branches, count, timeout, timed_out)`：并发运行零捕获 `() => I32` 分支并返回首个完成值。
-- `__ezrt_task_start_i32(branch)` / `__ezrt_task_join_i32(handle)`：flow 内 `parallel { ... return I32 }` 的后台任务启动与依赖读取等待。
+- `__ezrt_task_start_i32(branch)` / `__ezrt_task_join_i32(handle)`：flow 内零捕获 `parallel { ... return I32 }` 初始化的后台任务启动与依赖读取等待，覆盖推断类型和显式 `I32` 声明。
 
-当前 codegen 保持这些 hook 的 ABI 稳定。原生目标通过 `packages/std/native/runtime.c` 提供 `race` 和 `parallel` 的最小任务运行时；其它阻塞 I/O 后续可替换为 epoll、kqueue、IOCP、WASI 或浏览器事件循环。
+当前 codegen 保持这些 hook 的 ABI 稳定。原生目标通过 `packages/std/native/runtime.c` 提供 `race` 和 `parallel` 的最小任务运行时；emcc 目标不链接 native 线程运行时，`race(pl)` 与 flow 内零捕获 `I32` `parallel` 使用同步协作 fallback，保证语法和顺序语义可用。emcc 当前保持同步 C/LLVM ABI，不把 `parallel` 返回值改成 JS `Promise`；后续可通过 Asyncify、JSPI 或 wasm pthread 替换运行时 backend。其它阻塞 I/O 后续可替换为 epoll、kqueue、IOCP、WASI 或浏览器事件循环。
 
 ## 阻塞调用与 suspend point
 

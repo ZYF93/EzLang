@@ -6,8 +6,22 @@
 #include <stdlib.h>
 #include <string.h>
 
-#if !defined(_WIN32)
+#if defined(__APPLE__)
+#include <TargetConditionals.h>
+#endif
+
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#include <dbghelp.h>
+#define EZ_DEBUG_HAS_WINDOWS_STACK 1
+#elif defined(__ANDROID__) || (defined(__APPLE__) && TARGET_OS_IPHONE)
+#define EZ_DEBUG_HAS_EXECINFO 0
+#else
 #include <execinfo.h>
+#define EZ_DEBUG_HAS_EXECINFO 1
 #endif
 
 typedef struct {
@@ -54,8 +68,10 @@ const char *debugRuntimeInfo(void) {
     return ez_strdup_safe("ezlang native/windows");
 #elif defined(__ANDROID__)
     return ez_strdup_safe("ezlang native/android");
+#elif defined(__APPLE__) && TARGET_OS_IPHONE
+    return ez_strdup_safe("ezlang native/ios");
 #elif defined(__APPLE__)
-    return ez_strdup_safe("ezlang native/apple");
+    return ez_strdup_safe("ezlang native/macos");
 #elif defined(__linux__)
     return ez_strdup_safe("ezlang native/linux");
 #else
@@ -78,9 +94,63 @@ const char *debugHex(const Blob *data) {
 }
 
 OptStr debugStack(void) {
-#if defined(_WIN32)
-    return (OptStr){false, NULL};
-#else
+#if defined(EZ_DEBUG_HAS_WINDOWS_STACK)
+    void *frames[32];
+    USHORT count = CaptureStackBackTrace(0, 32, frames, NULL);
+    if (count == 0) return (OptStr){false, NULL};
+
+    HANDLE process = GetCurrentProcess();
+    if (!SymInitialize(process, NULL, TRUE)) return (OptStr){false, NULL};
+
+    const size_t symbol_size = sizeof(SYMBOL_INFO) + (MAX_SYM_NAME * sizeof(char));
+    SYMBOL_INFO *symbol = (SYMBOL_INFO *)calloc(1, symbol_size);
+    if (!symbol) {
+        SymCleanup(process);
+        return (OptStr){false, NULL};
+    }
+    symbol->MaxNameLen = MAX_SYM_NAME;
+    symbol->SizeOfStruct = sizeof(SYMBOL_INFO);
+
+    size_t cap = 1024;
+    size_t len = 0;
+    char *out = (char *)malloc(cap);
+    if (!out) {
+        free(symbol);
+        SymCleanup(process);
+        return (OptStr){false, NULL};
+    }
+    out[0] = '\0';
+
+    for (USHORT i = 0; i < count; ++i) {
+        DWORD64 addr = (DWORD64)(uintptr_t)frames[i];
+        char line[512];
+        if (SymFromAddr(process, addr, NULL, symbol)) {
+            snprintf(line, sizeof(line), "%u: %s + 0x%llx\n", (unsigned)i, symbol->Name,
+                     (unsigned long long)(addr - symbol->Address));
+        } else {
+            snprintf(line, sizeof(line), "%u: 0x%llx\n", (unsigned)i, (unsigned long long)addr);
+        }
+        size_t line_len = strlen(line);
+        if (len + line_len + 1 > cap) {
+            size_t new_cap = cap * 2;
+            while (len + line_len + 1 > new_cap) new_cap *= 2;
+            char *grown = (char *)realloc(out, new_cap);
+            if (!grown) {
+                free(out);
+                free(symbol);
+                SymCleanup(process);
+                return (OptStr){false, NULL};
+            }
+            out = grown;
+            cap = new_cap;
+        }
+        memcpy(out + len, line, line_len + 1);
+        len += line_len;
+    }
+    free(symbol);
+    SymCleanup(process);
+    return (OptStr){true, out};
+#elif EZ_DEBUG_HAS_EXECINFO
     void *frames[32];
     int count = backtrace(frames, 32);
     if (count <= 0) return (OptStr){false, NULL};
@@ -100,5 +170,7 @@ OptStr debugStack(void) {
     }
     free(symbols);
     return (OptStr){true, out};
+#else
+    return (OptStr){false, NULL};
 #endif
 }

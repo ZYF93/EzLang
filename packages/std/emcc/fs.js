@@ -60,10 +60,12 @@
   }
 
   function blobBytes(blobPtr) {
-    if (!blobPtr) return new Uint8Array(0);
+    if (!blobPtr) return null;
     var dataPtr = getValue(blobPtr, '*');
     var size = Number(getValue(blobPtr + 8, 'i64'));
-    if (!dataPtr || size <= 0) return new Uint8Array(0);
+    if (!Number.isFinite(size) || size < 0 || Math.floor(size) !== size) return null;
+    if (size === 0) return new Uint8Array(0);
+    if (!dataPtr || dataPtr < 0 || dataPtr > HEAPU8.length || size > HEAPU8.length - dataPtr) return null;
     return HEAPU8.slice(dataPtr, dataPtr + size);
   }
 
@@ -101,6 +103,7 @@
       ensureIdbfs();
       ensureParent(path);
       var data = blobBytes(blobPtr);
+      if (data === null) throw new Error('invalid blob');
       if (append) {
         var oldData = new Uint8Array(0);
         try { oldData = FS.readFile(path, { encoding: 'binary' }); } catch (e) {}
@@ -124,6 +127,21 @@
       else FS.unlink(child);
     }
     FS.rmdir(path);
+  }
+
+  function lexicalAbsPath(path) {
+    if (!path) return '';
+    var raw = path.charAt(0) === '/' ? path : '/' + path;
+    var parts = [];
+    raw.split('/').forEach(function (part) {
+      if (!part || part === '.') return;
+      if (part === '..') {
+        if (parts.length > 0) parts.pop();
+      } else {
+        parts.push(part);
+      }
+    });
+    return '/' + parts.join('/');
   }
 
   mergeInto(LibraryManager.library, {
@@ -201,7 +219,7 @@
     absPath: function (path) {
       var raw = pathValue(path);
       if (raw === null) return stringToNewUTF8('');
-      return raw.charAt(0) === '/' ? path : stringToNewUTF8('/' + raw);
+      return stringToNewUTF8(lexicalAbsPath(raw));
     },
     __ez_fs_sync: function () {
       ensureIdbfs();

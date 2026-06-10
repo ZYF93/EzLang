@@ -30,6 +30,12 @@ typedef struct {
 
 static int64_t ez_time_timestamp_ms(void);
 
+static time_t ez_time_seconds_floor(int64_t timestamp_ms) {
+    int64_t seconds = timestamp_ms / 1000;
+    if (timestamp_ms < 0 && (timestamp_ms % 1000) != 0) seconds--;
+    return (time_t)seconds;
+}
+
 Date now(void) {
     return (Date){ .timestamp = ez_time_timestamp_ms() };
 }
@@ -65,7 +71,8 @@ void ez_std_sleep(int64_t ms) {
 }
 
 static struct tm ez_time_tm(const Date *value) {
-    time_t seconds = (time_t)((value ? value->timestamp : ez_time_timestamp_ms()) / 1000);
+    int64_t timestamp_ms = value ? value->timestamp : ez_time_timestamp_ms();
+    time_t seconds = ez_time_seconds_floor(timestamp_ms);
     struct tm tm_value;
 #if defined(_WIN32)
     gmtime_s(&tm_value, &seconds);
@@ -143,105 +150,139 @@ void sub(Date *value, const OptI32 *year, const OptI32 *month, const OptI32 *day
     ez_time_shift(value, year, month, day, hour, minute, second, -1);
 }
 
-static void ez_append_padded(char *out, size_t out_size, size_t *used, int value, int width) {
-    if (*used >= out_size) return;
-    int written = snprintf(out + *used, out_size - *used, "%0*d", width, value);
-    if (written < 0) return;
-    *used += (size_t)written;
-    if (*used >= out_size) {
-        out[out_size - 1] = '\0';
-        *used = out_size - 1;
+static bool ez_reserve(char **out, size_t *cap, size_t needed) {
+    if (needed < *cap) return true;
+    size_t next = *cap ? *cap : 32;
+    while (needed >= next) {
+        if (next > ((size_t)-1) / 2) {
+            next = needed + 1;
+            break;
+        }
+        next *= 2;
     }
+    char *grown = (char *)realloc(*out, next);
+    if (!grown) return false;
+    *out = grown;
+    *cap = next;
+    return true;
 }
 
-static void ez_append_text(char *out, size_t out_size, size_t *used, const char *text, size_t len) {
-    if (*used >= out_size) return;
-    size_t remaining = out_size - *used - 1;
-    if (len > remaining) len = remaining;
-    memcpy(out + *used, text, len);
+static bool ez_append_text(char **out, size_t *cap, size_t *used, const char *text, size_t len) {
+    if (!text) len = 0;
+    if (len > ((size_t)-1) - *used - 1) return false;
+    if (!ez_reserve(out, cap, *used + len + 1)) return false;
+    if (len > 0) memcpy(*out + *used, text, len);
     *used += len;
-    out[*used] = '\0';
+    (*out)[*used] = '\0';
+    return true;
 }
 
-static const char *ez_format_named_token(char *out, size_t out_size, size_t *used,
-                                         const char *cursor, const struct tm *tm_value) {
+static bool ez_append_padded(char **out, size_t *cap, size_t *used, int value, int width) {
+    char buffer[32];
+    int written = snprintf(buffer, sizeof(buffer), "%0*d", width, value);
+    if (written < 0) return false;
+    return ez_append_text(out, cap, used, buffer, (size_t)written);
+}
+
+static const char *ez_format_named_token(char **out, size_t *cap, size_t *used,
+                                         const char *cursor, const struct tm *tm_value, bool *ok) {
     if (strncmp(cursor, "YYYY", 4) == 0) {
-        ez_append_padded(out, out_size, used, tm_value->tm_year + 1900, 4);
+        *ok = ez_append_padded(out, cap, used, tm_value->tm_year + 1900, 4);
         return cursor + 4;
     }
     if (strncmp(cursor, "MM", 2) == 0) {
-        ez_append_padded(out, out_size, used, tm_value->tm_mon + 1, 2);
+        *ok = ez_append_padded(out, cap, used, tm_value->tm_mon + 1, 2);
+        return cursor + 2;
+    }
+    if (strncmp(cursor, "mm", 2) == 0) {
+        *ok = ez_append_padded(out, cap, used, tm_value->tm_min, 2);
         return cursor + 2;
     }
     if (strncmp(cursor, "DD", 2) == 0) {
-        ez_append_padded(out, out_size, used, tm_value->tm_mday, 2);
+        *ok = ez_append_padded(out, cap, used, tm_value->tm_mday, 2);
         return cursor + 2;
     }
     if (strncmp(cursor, "HH", 2) == 0) {
-        ez_append_padded(out, out_size, used, tm_value->tm_hour, 2);
+        *ok = ez_append_padded(out, cap, used, tm_value->tm_hour, 2);
         return cursor + 2;
     }
     if (strncmp(cursor, "SS", 2) == 0) {
-        ez_append_padded(out, out_size, used, tm_value->tm_sec, 2);
+        *ok = ez_append_padded(out, cap, used, tm_value->tm_sec, 2);
         return cursor + 2;
     }
-    ez_append_text(out, out_size, used, cursor, 1);
+    *ok = ez_append_text(out, cap, used, cursor, 1);
     return cursor + 1;
 }
 
-static const char *ez_format_percent_token(char *out, size_t out_size, size_t *used,
-                                           const char *cursor, const struct tm *tm_value) {
+static const char *ez_format_percent_token(char **out, size_t *cap, size_t *used,
+                                           const char *cursor, const struct tm *tm_value, bool *ok) {
     char buffer[16];
     if (cursor[0] != '%' || cursor[1] == '\0') {
-        ez_append_text(out, out_size, used, cursor, 1);
+        *ok = ez_append_text(out, cap, used, cursor, 1);
         return cursor + 1;
     }
     switch (cursor[1]) {
         case 'Y':
-            ez_append_padded(out, out_size, used, tm_value->tm_year + 1900, 4);
+            *ok = ez_append_padded(out, cap, used, tm_value->tm_year + 1900, 4);
             break;
         case 'm':
-            ez_append_padded(out, out_size, used, tm_value->tm_mon + 1, 2);
+            *ok = ez_append_padded(out, cap, used, tm_value->tm_mon + 1, 2);
             break;
         case 'd':
-            ez_append_padded(out, out_size, used, tm_value->tm_mday, 2);
+            *ok = ez_append_padded(out, cap, used, tm_value->tm_mday, 2);
             break;
         case 'H':
-            ez_append_padded(out, out_size, used, tm_value->tm_hour, 2);
+            *ok = ez_append_padded(out, cap, used, tm_value->tm_hour, 2);
             break;
         case 'M':
-            ez_append_padded(out, out_size, used, tm_value->tm_min, 2);
+            *ok = ez_append_padded(out, cap, used, tm_value->tm_min, 2);
             break;
         case 'S':
-            ez_append_padded(out, out_size, used, tm_value->tm_sec, 2);
+            *ok = ez_append_padded(out, cap, used, tm_value->tm_sec, 2);
             break;
         case '%':
-            ez_append_text(out, out_size, used, "%", 1);
+            *ok = ez_append_text(out, cap, used, "%", 1);
             break;
         default:
             buffer[0] = '%';
             buffer[1] = cursor[1];
             buffer[2] = '\0';
-            ez_append_text(out, out_size, used, buffer, 2);
+            *ok = ez_append_text(out, cap, used, buffer, 2);
             break;
     }
     return cursor + 2;
 }
 
+const char *__durationToString(int64_t ms) {
+    char buffer[32];
+    int written = snprintf(buffer, sizeof(buffer), "%lldms", (long long)ms);
+    if (written < 0) return NULL;
+    char *out = (char *)malloc((size_t)written + 1);
+    if (!out) return NULL;
+    memcpy(out, buffer, (size_t)written + 1);
+    return out;
+}
+
 const char *format(const Date *value, const char *fmt) {
     struct tm tm_value = ez_time_tm(value);
     const char *pattern = fmt ? fmt : "%Y-%m-%dT%H:%M:%SZ";
-    char *result = (char *)malloc(128);
+    size_t cap = strlen(pattern) + 32;
+    char *result = (char *)malloc(cap);
     if (!result) return NULL;
     size_t used = 0;
     result[0] = '\0';
     const char *cursor = pattern;
-    while (*cursor != '\0' && used < 127) {
+    bool ok = true;
+    while (*cursor != '\0' && ok) {
         if (*cursor == '%') {
-            cursor = ez_format_percent_token(result, 128, &used, cursor, &tm_value);
+            cursor = ez_format_percent_token(&result, &cap, &used, cursor, &tm_value, &ok);
         } else {
-            cursor = ez_format_named_token(result, 128, &used, cursor, &tm_value);
+            cursor = ez_format_named_token(&result, &cap, &used, cursor, &tm_value, &ok);
         }
+    }
+    if (!ok) {
+        free(result);
+        return NULL;
     }
     return result;
 }

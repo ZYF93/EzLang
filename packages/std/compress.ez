@@ -1,13 +1,26 @@
 // std/compress.ez - 压缩与解压缩标准库
-// 依赖: zlib/JS zlib 封装；流式接口等待 std/stream 落地后补充
+// 依赖: native 系统 zlib / Node zlib 封装；流式接口复用 std/stream ABI
+
+from "./stream.ez" import { Stream };
+
+extern "@std/native/stream.c" for linux;
+extern "@std/native/stream.c" for macos;
+extern "@std/native/stream.c" for windows;
+extern "ws2_32" for windows;
+extern "@std/native/stream.c" for android;
+extern "@std/native/stream.c" for ios;
+extern "@std/emcc/stream.js" for emcc;
 
 extern "@std/native/compress.c" for linux;
 extern "z" for linux;
 extern "@std/native/compress.c" for macos;
 extern "z" for macos;
 extern "@std/native/compress.c" for windows;
+extern "z" for windows;
 extern "@std/native/compress.c" for android;
+extern "z" for android;
 extern "@std/native/compress.c" for ios;
+extern "z" for ios;
 extern "@std/emcc/compress.js" for emcc;
 
 // === gzip ===
@@ -21,3 +34,11 @@ export declare const decompressZlib: (data: Blob) => Blob?;
 // === raw deflate ===
 export declare const compressDeflate: (data: Blob) => Blob?;
 export declare const decompressDeflate: (data: Blob) => Blob?;
+
+// === 流式压缩 / 解压缩 ===
+export declare const compressGzipStream: (dst: Stream, src: Stream, bufferSize: I64) => I64;
+export declare const decompressGzipStream: (dst: Stream, src: Stream, bufferSize: I64) => I64;
+export declare const compressZlibStream: (dst: Stream, src: Stream, bufferSize: I64) => I64;
+export declare const decompressZlibStream: (dst: Stream, src: Stream, bufferSize: I64) => I64;
+export declare const compressDeflateStream: (dst: Stream, src: Stream, bufferSize: I64) => I64;
+export declare const decompressDeflateStream: (dst: Stream, src: Stream, bufferSize: I64) => I64;

@@ -7,18 +7,24 @@ from typing import Optional
 
 from parser.EzLangParser import EzLangParser
 from parser.EzLangVisitor import EzLangVisitor
+from parser.string_literals import decode_string_literal_token
 from .symbols import (
     SymbolTable, Symbol, SymbolKind, Type, TypeKind, Scope, builtin_type
 )
 
 
+_EZ_VAR_IDENTIFIER_RE = re.compile(r'(?:[A-Za-z_][A-Za-z0-9_]*|\$[A-Za-z0-9_]+)')
+
+
 class SemanticAnalyzer(EzLangVisitor):
     """语义分析访问器"""
 
-    def __init__(self, base_dir: Optional[os.PathLike | str] = None, compile_target: Optional[str] = None):
+    def __init__(self, base_dir: Optional[os.PathLike | str] = None, compile_target: Optional[str] = None,
+                 allow_top_level_return: bool = False):
         self.symbols = SymbolTable()
         self.base_dir = Path(base_dir).resolve() if base_dir is not None else Path.cwd()
         self.compile_target = compile_target
+        self.allow_top_level_return = allow_top_level_return
         self.current_struct = None  # Optional[str]
         self.current_function_return: Optional[Type] = None  # 当前函数声明的返回类型
         self.in_function = False  # 是否在函数内部
@@ -38,7 +44,7 @@ class SemanticAnalyzer(EzLangVisitor):
         self._catch_throw_stack: list[list[Type]] = []
         self._blocking_calls = {
             "fetch", "fetchEx", "readFile", "writeFile", "appendFile", "sleep", "start",
-            "tcpConnect", "tcpListen", "udpBind", "accept", "read", "write", "recv", "send",
+            "tcpConnect", "tcpListen", "udpBind", "udpRecvFrom", "accept", "read", "write", "recv", "send",
             "wsConnect",
         }
         self._last_suspend_call: Optional[dict] = None
@@ -274,10 +280,10 @@ class SemanticAnalyzer(EzLangVisitor):
         if ctx.FLOAT_LITERAL() is not None:
             return Type(name="F64", kind=TypeKind.BASIC)
         if ctx.STRING_LITERAL() is not None:
-            text = ctx.STRING_LITERAL().getText()[1:-1]
+            text = decode_string_literal_token(ctx.STRING_LITERAL().getText())
             for match in re.finditer(r"\{\{(.+?)\}\}", text):
                 expr_text = match.group(1).strip()
-                if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", expr_text) and self.symbols.resolve(expr_text) is None:
+                if _EZ_VAR_IDENTIFIER_RE.fullmatch(expr_text) and self.symbols.resolve(expr_text) is None:
                     self.symbols.add_error(f"行 {ctx.start.line}: 未定义的变量 '{expr_text}'")
             return Type(name="Str", kind=TypeKind.BASIC)
         if ctx.BOOL_LITERAL() is not None:
@@ -316,6 +322,21 @@ class SemanticAnalyzer(EzLangVisitor):
             )
             return False
         return True
+
+    def _check_return_type_set(self, return_types: list[Optional[Type]], ctx, label: str) -> None:
+        """检查表达式块内多个 return 的类型是否一致。"""
+        concrete = [t for t in return_types if t is not None and t.name != "unknown"]
+        if not concrete:
+            return
+        expected = concrete[0]
+        for actual in concrete[1:]:
+            if expected.compatible_with(actual) or actual.compatible_with(expected):
+                continue
+            line = ctx.start.line if hasattr(ctx, 'start') else 0
+            self.symbols.add_error(
+                f"行 {line}: {label} 返回类型不一致：期望 '{expected}'，实际 '{actual}'"
+            )
+            return
 
     def _check_binary_op(self, left_type: Optional[Type], right_type: Optional[Type],
                          ctx, op_name: str) -> Optional[Type]:
@@ -439,6 +460,13 @@ class SemanticAnalyzer(EzLangVisitor):
         if type_.kind == TypeKind.VEC and type_.element_type is not None:
             return type_.element_type.name in {"U8", "U32", "U64"}
         return type_.is_integer() and type_.name in {"U8", "U32", "U64"}
+
+    def _is_shift_lhs_type(self, type_: Optional[Type]) -> bool:
+        if type_ is None or type_.name == "unknown":
+            return True
+        if type_.kind == TypeKind.VEC:
+            return self._is_integer_vec(type_)
+        return type_.is_integer()
 
     def _get_lvalue_name(self, ctx) -> Optional[str]:
         """从赋值表达式左侧的 pipelineExpression 获取被赋值的变量名"""
@@ -640,6 +668,18 @@ class SemanticAnalyzer(EzLangVisitor):
         inferred.default_param_names = set(target_type.default_param_names)
         return inferred
 
+    def _curried_function_type(self, target_type: Type, placeholder_names: set[str]) -> Type:
+        """根据占位参数生成柯里化后的函数类型。"""
+        result = Type(name="function", kind=TypeKind.FUNCTION)
+        result.return_type = target_type.return_type
+        for index, pname in enumerate(target_type.param_names):
+            if pname not in placeholder_names:
+                continue
+            result.param_names.append(pname)
+            if index < len(target_type.param_types):
+                result.param_types.append(target_type.param_types[index])
+        return result
+
     # ==================== 声明访问 ====================
 
     def visitVariableDecl(self, ctx: EzLangParser.VariableDeclContext):
@@ -753,15 +793,11 @@ class SemanticAnalyzer(EzLangVisitor):
         if self.current_struct and fn_like is not None:
             self.struct_method_types.setdefault(self.current_struct, {})[name] = self._function_type_from_fn_like(fn_like)
         if fn_like is not None:
-            # 验证 this 参数：首个参数应为 this: StructType
+            # 首参名为 this 时按实例方法校验；没有 this 的结构体方法视为类型级方法。
             params = fn_like.paramList()
             if params is not None and len(params.param()) > 0:
                 first_param = params.param(0)
                 pname = first_param.VAR_IDENTIFIER().getText()
-                if pname != 'this' and self.current_struct:
-                    self.symbols.add_warning(
-                        f"行 {ctx.start.line}: 方法 '{name}' 的第一个参数应为 'this'，当前为 '{pname}'"
-                    )
                 # 验证 this 的类型匹配当前结构体
                 if pname == 'this' and self.current_struct and first_param.type_() is not None:
                     param_type = self._get_type_from_ctx(first_param.type_())
@@ -778,12 +814,15 @@ class SemanticAnalyzer(EzLangVisitor):
                     param.accept(self)
             prev_return = self.current_function_return
             prev_in_func = self.in_function
+            prev_parallel_return_stack = self._parallel_return_stack
             self.current_function_return = self._get_type_from_ctx(fn_like.type_()) if fn_like.type_() is not None else None
             self.in_function = True
+            self._parallel_return_stack = []
             if fn is not None and fn.expression() is not None:
                 fn.expression().accept(self)
             elif fn is not None and fn.block() is not None:
                 fn.block().accept(self)
+            self._parallel_return_stack = prev_parallel_return_stack
             self.in_function = prev_in_func
             self.current_function_return = prev_return
             self.symbols.pop_scope()
@@ -862,8 +901,12 @@ class SemanticAnalyzer(EzLangVisitor):
         # 分析函数体
         if fn is not None:
             self.symbols.push_scope(name)
+            prev_return = self.current_function_return
+            prev_in_func = self.in_function
+            prev_parallel_return_stack = self._parallel_return_stack
             self.current_function_return = ret_type
             self.in_function = True
+            self._parallel_return_stack = []
             params = fn.paramList()
             if params is not None:
                 for param in params.param():
@@ -872,8 +915,9 @@ class SemanticAnalyzer(EzLangVisitor):
                 fn.expression().accept(self)
             elif fn.block() is not None:
                 fn.block().accept(self)
-            self.in_function = False
-            self.current_function_return = None
+            self._parallel_return_stack = prev_parallel_return_stack
+            self.in_function = prev_in_func
+            self.current_function_return = prev_return
             self.symbols.pop_scope()
         return None
 
@@ -967,7 +1011,7 @@ class SemanticAnalyzer(EzLangVisitor):
             self._has_token(ctx, 'EQ') or
             self._has_token(ctx, 'NE') or
             (self._has_token(ctx, 'LANGLE') and not self._has_token(ctx, 'SHL')) or
-            (self._has_token(ctx, 'RANGLE') and not self._has_token(ctx, 'SHR')) or
+            self._has_token(ctx, 'RANGLE') or
             self._has_token(ctx, 'LE') or
             self._has_token(ctx, 'GE')
         )
@@ -1000,15 +1044,20 @@ class SemanticAnalyzer(EzLangVisitor):
         return ctx.getChild(0).accept(self) if ctx.getChildCount() > 0 else None
 
     def visitShiftExpression(self, ctx: EzLangParser.ShiftExpressionContext) -> Optional[Type]:
-        if self._has_token(ctx, 'SHL') or self._has_token(ctx, 'SHR'):
+        if hasattr(ctx, 'shiftOperator') and ctx.shiftOperator():
             exprs = list(ctx.additiveExpression())
+            result_type = exprs[0].accept(self) if exprs else None
+            if not self._is_shift_lhs_type(result_type):
+                self.symbols.add_error(
+                    f"行 {ctx.start.line}: 移位左操作数必须是整数或整数 SIMD 向量类型，实际为 '{result_type}'"
+                )
             for rhs in exprs[1:]:
                 rhs_type = rhs.accept(self)
                 if not self._is_unsigned_shift_rhs_type(rhs_type):
                     self.symbols.add_error(
                         f"行 {ctx.start.line}: 移位右操作数必须是无符号整数类型，实际为 '{rhs_type}'"
                     )
-            return self._binop_type(ctx)
+            return result_type
         return ctx.getChild(0).accept(self) if ctx.getChildCount() > 0 else None
 
     def visitRelationalExpression(self, ctx: EzLangParser.RelationalExpressionContext) -> Optional[Type]:
@@ -1077,11 +1126,16 @@ class SemanticAnalyzer(EzLangVisitor):
 
     def visitMemberAccess(self, ctx: EzLangParser.MemberAccessContext) -> Optional[Type]:
         """成员访问：expr.field — 返回字段类型"""
+        field_name = ctx.VAR_IDENTIFIER().getText()
+        static_struct_name = self._static_struct_member_owner(ctx.postfixExpression())
+        if static_struct_name is not None:
+            method_type = self._method_type_for_struct(Type(name=static_struct_name, kind=TypeKind.STRUCT), field_name)
+            if method_type is not None:
+                return method_type
+
         target_type = None
         if ctx.postfixExpression() is not None:
             target_type = ctx.postfixExpression().accept(self)
-
-        field_name = ctx.VAR_IDENTIFIER().getText()
 
         if isinstance(ctx.postfixExpression(), EzLangParser.OptionalUnwrapContext) and target_type is not None:
             field_type = None
@@ -1127,22 +1181,45 @@ class SemanticAnalyzer(EzLangVisitor):
 
         return None
 
+    def _static_struct_member_owner(self, ctx) -> Optional[str]:
+        """识别 StructName.method 这种类型级结构体成员访问。"""
+        primary = ctx.primaryExpression() if hasattr(ctx, 'primaryExpression') else None
+        if primary is None:
+            return None
+        if not isinstance(primary, EzLangParser.IdentifierExprContext):
+            return None
+        token = primary.TYPE_IDENTIFIER()
+        if token is None:
+            return None
+        name = token.getText()
+        symbol = self.symbols.resolve(name)
+        if symbol is not None and symbol.kind == SymbolKind.STRUCT:
+            return name
+        return None
+
     def visitCall(self, ctx: EzLangParser.CallContext) -> Optional[Type]:
         """函数调用：获取函数返回类型，检查参数类型"""
         target = ctx.postfixExpression()
         if target is not None:
             call_name = self._get_call_name(target)
             target_type = target.accept(self)
-            implicit_this = isinstance(target, EzLangParser.MemberAccessContext)
+            implicit_this = isinstance(target, EzLangParser.MemberAccessContext) and not self._is_static_struct_member_access(target)
 
             # 收集调用时提供的命名参数及其类型
             named_args: dict[str, Optional[Type]] = {}
+            placeholder_names: set[str] = set()
             if ctx.namedArgList() is not None:
                 for arg in ctx.namedArgList().namedArg():
-                    arg_type = Type(name="unknown", kind=TypeKind.BASIC) if self._is_placeholder_argument(arg.expression()) else (
-                        arg.expression().accept(self) if arg.expression() is not None else None
-                    )
                     arg_name = arg.VAR_IDENTIFIER().getText()
+                    is_placeholder = self._is_placeholder_argument(arg.expression())
+                    if is_placeholder:
+                        placeholder_names.add(arg_name)
+                    if call_name == "race" and arg_name == "pl":
+                        arg_type = Type(name="array", kind=TypeKind.ARRAY)
+                    else:
+                        arg_type = Type(name="unknown", kind=TypeKind.BASIC) if is_placeholder else (
+                            arg.expression().accept(self) if arg.expression() is not None else None
+                        )
                     named_args[arg_name] = arg_type
 
             target_type = self._infer_generic_function_type(call_name, target_type, named_args)
@@ -1152,6 +1229,13 @@ class SemanticAnalyzer(EzLangVisitor):
                     self.symbols.add_error(f"行 {ctx.start.line}: race() 只能在 flow 块内使用")
                 else:
                     self.race_calls.append({"name": call_name, "line": ctx.start.line})
+                    race_result = self._race_pl_return_type(ctx)
+                    if race_result is not None:
+                        target_type = Type(name="function", kind=TypeKind.FUNCTION)
+                        target_type.return_type = race_result
+                        target_type.param_names = ["pl", "timeout"]
+                        target_type.param_types = [Type(name="array", kind=TypeKind.ARRAY), Type(name="I32", kind=TypeKind.BASIC)]
+                        target_type.default_param_names = {"timeout"}
             elif self._is_in_flow() and call_name in self._blocking_calls:
                 point = {"name": call_name, "line": ctx.start.line}
                 self.suspend_points.append(point)
@@ -1198,7 +1282,94 @@ class SemanticAnalyzer(EzLangVisitor):
                 collection_type = self._collection_call_return_type(call_name, ctx)
                 if collection_type is not None:
                     return collection_type
+                if placeholder_names:
+                    return self._curried_function_type(target_type, placeholder_names)
                 return target_type.return_type
+        return None
+
+    def _race_pl_return_type(self, ctx) -> Optional[Type]:
+        """从 race(pl = [() => T, ...]) 分支推断返回类型。"""
+        if ctx.namedArgList() is None:
+            return None
+        pl_expr = None
+        for arg in ctx.namedArgList().namedArg():
+            if arg.VAR_IDENTIFIER() is not None and arg.VAR_IDENTIFIER().getText() == 'pl':
+                pl_expr = arg.expression()
+                break
+        array_lit = self._find_array_literal_ctx(pl_expr)
+        if array_lit is None or array_lit.expressionList() is None:
+            return None
+
+        result_type = None
+        for branch_expr in array_lit.expressionList().expression():
+            fn = self._find_function_literal_ctx(branch_expr)
+            if fn is None:
+                return None
+            branch_type = self._function_literal_return_type(fn)
+            if branch_type is None:
+                continue
+            if result_type is None:
+                result_type = branch_type
+            elif not result_type.compatible_with(branch_type) and not branch_type.compatible_with(result_type):
+                self.symbols.add_error(
+                    f"行 {branch_expr.start.line}: race(pl) 分支返回类型不一致："
+                    f"期望 '{result_type}'，实际 '{branch_type}'"
+                )
+        return result_type
+
+    def _function_literal_return_type(self, fn) -> Optional[Type]:
+        if fn is None:
+            return None
+        if fn.type_() is not None:
+            return self._get_type_from_ctx(fn.type_())
+        prev_return_stack = self._parallel_return_stack
+        prev_return = self.current_function_return
+        prev_in_func = self.in_function
+        self._parallel_return_stack = [[]]
+        self.current_function_return = None
+        self.in_function = True
+        self.symbols.push_scope("race")
+        params = fn.paramList()
+        if params is not None:
+            for param in params.param():
+                param.accept(self)
+        if fn.expression() is not None:
+            expr_type = fn.expression().accept(self)
+        elif fn.block() is not None:
+            fn.block().accept(self)
+            expr_type = None
+        else:
+            expr_type = None
+        return_types = self._parallel_return_stack.pop()
+        self._check_return_type_set(return_types, fn, "race(pl) 分支")
+        self._parallel_return_stack = prev_return_stack
+        self.current_function_return = prev_return
+        self.in_function = prev_in_func
+        self.symbols.pop_scope()
+        return return_types[-1] if return_types else (expr_type or Type(name="Void", kind=TypeKind.BASIC))
+
+    def _find_array_literal_ctx(self, ctx):
+        if ctx is None:
+            return None
+        if hasattr(ctx, 'arrayLiteral') and ctx.arrayLiteral() is not None:
+            return ctx.arrayLiteral()
+        if hasattr(ctx, 'getChildCount'):
+            for i in range(ctx.getChildCount()):
+                found = self._find_array_literal_ctx(ctx.getChild(i))
+                if found is not None:
+                    return found
+        return None
+
+    def _find_function_literal_ctx(self, ctx):
+        if ctx is None:
+            return None
+        if hasattr(ctx, 'functionLiteral') and ctx.functionLiteral() is not None:
+            return ctx.functionLiteral()
+        if hasattr(ctx, 'getChildCount'):
+            for i in range(ctx.getChildCount()):
+                found = self._find_function_literal_ctx(ctx.getChild(i))
+                if found is not None:
+                    return found
         return None
 
     def _collection_call_return_type(self, call_name: Optional[str], ctx) -> Optional[Type]:
@@ -1219,7 +1390,7 @@ class SemanticAnalyzer(EzLangVisitor):
             result = Type(kind=TypeKind.OPTIONAL, name=f"{first.name}?")
             result.element_type = first
             return result
-        if call_name == 'listSlice' or call_name == 'listFilter':
+        if call_name in {'listSlice', 'listFilter', 'randomShuffle'}:
             result = Type(kind=TypeKind.LIST, name=f"List<{first.name}>")
             result.element_type = first
             return result
@@ -1238,6 +1409,11 @@ class SemanticAnalyzer(EzLangVisitor):
             result.element_type = second
             return result
         return None
+
+    def _is_static_struct_member_access(self, ctx) -> bool:
+        if not isinstance(ctx, EzLangParser.MemberAccessContext):
+            return False
+        return self._static_struct_member_owner(ctx.postfixExpression()) is not None
 
     def _leftmost_identifier_ctx(self, ctx):
         if isinstance(ctx, EzLangParser.IdentifierExprContext):
@@ -1493,12 +1669,15 @@ class SemanticAnalyzer(EzLangVisitor):
                     param.accept(self)
             prev_return = self.current_function_return
             prev_in_func = self.in_function
+            prev_parallel_return_stack = self._parallel_return_stack
             self.current_function_return = ret_type
             self.in_function = True
+            self._parallel_return_stack = []
             if fn.expression() is not None:
                 fn.expression().accept(self)
             elif fn.block() is not None:
                 fn.block().accept(self)
+            self._parallel_return_stack = prev_parallel_return_stack
             self.in_function = prev_in_func
             self.current_function_return = prev_return
             self.symbols.pop_scope()
@@ -1682,7 +1861,7 @@ class SemanticAnalyzer(EzLangVisitor):
 
     def visitFlowBlockExpr(self, ctx: EzLangParser.FlowBlockExprContext) -> Optional[Type]:
         if ctx.flowBlock() is not None:
-            ctx.flowBlock().accept(self)
+            return ctx.flowBlock().accept(self)
         return None
 
     def visitParallelBlockExpr(self, ctx: EzLangParser.ParallelBlockExprContext) -> Optional[Type]:
@@ -1713,18 +1892,76 @@ class SemanticAnalyzer(EzLangVisitor):
 
     def visitPipeline(self, ctx: EzLangParser.PipelineContext) -> Optional[Type]:
         """管道表达式：expr -> fn(x = %)"""
-        # 先求值左侧表达式，其类型作为管道输入类型
-        input_type = None
-        if ctx.postfixExpression() is not None:
-            input_type = ctx.postfixExpression().accept(self)
-        return input_type
+        input_type = ctx.postfixExpression().accept(self) if ctx.postfixExpression() is not None else None
+        func_name = ctx.VAR_IDENTIFIER().getText() if ctx.VAR_IDENTIFIER() is not None else None
+        return self._check_pipeline_call(func_name, input_type, ctx.pipelineArgList(), ctx)
+
+    def visitPipelineExpression(self, ctx: EzLangParser.PipelineExpressionContext) -> Optional[Type]:
+        """顶层管道表达式：expr -> fn(args)。"""
+        input_type = ctx.conditionalExpression().accept(self) if ctx.conditionalExpression() is not None else None
+        if ctx.THIN_ARROW() is None:
+            return input_type
+        func_name = ctx.VAR_IDENTIFIER().getText() if ctx.VAR_IDENTIFIER() is not None else None
+        return self._check_pipeline_call(func_name, input_type, ctx.pipelineArgList(), ctx)
+
+    def _check_pipeline_call(self, func_name: Optional[str], input_type: Optional[Type], arg_list, ctx) -> Optional[Type]:
+        """管道调用语义检查：管道值默认绑定到首个形参，% 绑定到对应具名形参。"""
+        if not func_name:
+            return input_type
+        symbol = self.symbols.resolve(func_name)
+        if symbol is None or symbol.type is None or symbol.type.kind != TypeKind.FUNCTION:
+            if symbol is None:
+                self.symbols.add_error(f"行 {ctx.start.line}: 未定义的变量 '{func_name}'")
+            return Type(name="unknown", kind=TypeKind.BASIC)
+
+        func_type = symbol.type
+        provided: dict[str, Optional[Type]] = {}
+        seen_names: set[str] = set()
+        has_percent = False
+        if arg_list is not None:
+            for arg in arg_list.pipelineArg():
+                if arg.VAR_IDENTIFIER() is None:
+                    continue
+                arg_name = arg.VAR_IDENTIFIER().getText()
+                if arg_name in seen_names:
+                    self.symbols.add_error(f"行 {ctx.start.line}: 重复提供参数 '{arg_name}'")
+                seen_names.add(arg_name)
+                if func_type.param_names and arg_name not in func_type.param_names:
+                    self.symbols.add_error(f"行 {ctx.start.line}: 未知参数 '{arg_name}'")
+                if arg.PERCENT() is not None:
+                    provided[arg_name] = input_type
+                    has_percent = True
+                elif arg.expression() is not None:
+                    provided[arg_name] = arg.expression().accept(self)
+
+        if func_type.param_names and not has_percent:
+            first_param = func_type.param_names[0]
+            if first_param not in provided:
+                provided[first_param] = input_type
+
+        for pname in func_type.param_names:
+            if pname not in provided and pname not in func_type.default_param_names:
+                self.symbols.add_error(f"行 {ctx.start.line}: 缺少必填参数 '{pname}'")
+
+        for index, pname in enumerate(func_type.param_names):
+            if pname not in provided:
+                continue
+            expected = func_type.param_types[index] if index < len(func_type.param_types) else None
+            actual = provided[pname]
+            if expected and actual and expected.name != "unknown" and actual.name != "unknown":
+                if not expected.compatible_with(actual):
+                    self.symbols.add_error(
+                        f"行 {ctx.start.line}: 参数 '{pname}' 类型不匹配：期望 '{expected}'，实际 '{actual}'"
+                    )
+
+        return func_type.return_type
 
     # ==================== 语句访问 ====================
 
     def visitReturnStatement(self, ctx: EzLangParser.ReturnStatementContext):
         """return 语句 — 检查位置和返回值类型"""
         # 检查是否在函数或 flow 块内
-        if not self.in_function and not self._is_in_flow() and not self._is_in_parallel():
+        if not self.in_function and not self._is_in_flow() and not self._is_in_parallel() and not self.allow_top_level_return:
             self.symbols.add_error(
                 f"行 {ctx.start.line}: return 语句只能出现在函数内部"
             )
@@ -1735,7 +1972,7 @@ class SemanticAnalyzer(EzLangVisitor):
             actual_type = expr.accept(self)
             if self._parallel_return_stack:
                 self._parallel_return_stack[-1].append(actual_type)
-            if actual_type is not None and self.current_function_return is not None:
+            elif actual_type is not None and self.current_function_return is not None:
                 self._check_type_compat(self.current_function_return, actual_type,
                                        ctx, "函数返回类型")
         return None
@@ -1761,14 +1998,17 @@ class SemanticAnalyzer(EzLangVisitor):
         if self.flow_depth == 0:
             self._flow_suspend_values = {}
         self.flow_depth += 1
+        self._parallel_return_stack.append([])
         self.symbols.push_scope("flow")
         if ctx.block() is not None:
             ctx.block().accept(self)
         self.symbols.pop_scope()
+        return_types = self._parallel_return_stack.pop()
+        self._check_return_type_set(return_types, ctx, "flow 块")
         self.flow_depth -= 1
         if self.flow_depth == 0:
             self._flow_suspend_values = prev_values
-        return None
+        return return_types[-1] if return_types else Type(name="Void", kind=TypeKind.BASIC)
 
     def visitParallelBlock(self, ctx: EzLangParser.ParallelBlockContext):
         block_info = {
@@ -1789,6 +2029,7 @@ class SemanticAnalyzer(EzLangVisitor):
             ctx.block().accept(self)
         self.symbols.pop_scope()
         return_types = self._parallel_return_stack.pop()
+        self._check_return_type_set(return_types, ctx, "parallel 块")
         self.parallel_depth -= 1
         return return_types[-1] if return_types else Type(name="Void", kind=TypeKind.BASIC)
 
@@ -1856,7 +2097,7 @@ class SemanticAnalyzer(EzLangVisitor):
         return None
 
     def visitExternDecl(self, ctx: EzLangParser.ExternDeclContext):
-        raw_path = ctx.STRING_LITERAL().getText()[1:-1]
+        raw_path = decode_string_literal_token(ctx.STRING_LITERAL().getText())
         builtin_path = self._resolve_extern_path(raw_path)
         path = Path(raw_path)
         resolved_path = builtin_path or (path if path.is_absolute() else self.base_dir / path)
@@ -1927,7 +2168,8 @@ class SemanticAnalyzer(EzLangVisitor):
 
 
 def analyze(source: str, base_dir: Optional[os.PathLike | str] = None,
-            compile_target: Optional[str] = None) -> SemanticAnalyzer:
+            compile_target: Optional[str] = None,
+            allow_top_level_return: bool = False) -> SemanticAnalyzer:
     """分析 EzLang 源码，返回分析器实例（包含符号表和错误）"""
     from antlr4 import InputStream, CommonTokenStream
     from parser.EzLangLexer import EzLangLexer
@@ -1939,6 +2181,10 @@ def analyze(source: str, base_dir: Optional[os.PathLike | str] = None,
     parser.removeErrorListeners()
     tree = parser.compilationUnit()
 
-    analyzer = SemanticAnalyzer(base_dir=base_dir, compile_target=compile_target)
+    analyzer = SemanticAnalyzer(
+        base_dir=base_dir,
+        compile_target=compile_target,
+        allow_top_level_return=allow_top_level_return,
+    )
     tree.accept(analyzer)
     return analyzer

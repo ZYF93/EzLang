@@ -1,4 +1,9 @@
 // EzLang std/platform Emscripten JS 封装层
+function requireNodeModule(name) {
+  if (typeof require !== 'function') return null;
+  try { return require(name); } catch (e) { return null; }
+}
+
 mergeInto(LibraryManager.library, {
   platformOS: function () {
     return stringToNewUTF8('emcc');
@@ -16,12 +21,26 @@ mergeInto(LibraryManager.library, {
     return 65536n;
   },
   platformCpuCount: function () {
-    if (typeof navigator !== 'undefined' && navigator.hardwareConcurrency) return navigator.hardwareConcurrency | 0;
+    var os = requireNodeModule('os');
+    if (os && typeof os.cpus === 'function') {
+      try {
+        var cpus = os.cpus();
+        if (Array.isArray(cpus) && cpus.length > 0) return Math.min(cpus.length, 2147483647);
+      } catch (e) {}
+    }
+    if (typeof navigator !== 'undefined') {
+      var concurrency = Number(navigator.hardwareConcurrency);
+      if (Number.isFinite(concurrency) && concurrency > 0) return Math.min(Math.floor(concurrency), 2147483647);
+    }
     return 1;
   },
   platformMemoryLimit: function () {
     if (typeof performance !== 'undefined' && performance.memory && performance.memory.jsHeapSizeLimit) {
       return BigInt(performance.memory.jsHeapSizeLimit);
+    }
+    var os = requireNodeModule('os');
+    if (os && typeof os.totalmem === 'function') {
+      try { return BigInt(os.totalmem()); } catch (e) {}
     }
     return -1n;
   },
@@ -36,12 +55,15 @@ mergeInto(LibraryManager.library, {
   },
   platformHasCrypto: function () {
     var cryptoObj = typeof crypto !== 'undefined' ? crypto : (typeof globalThis !== 'undefined' ? globalThis.crypto : null);
-    return cryptoObj && typeof cryptoObj.getRandomValues === 'function' ? 1 : 0;
+    if (cryptoObj && typeof cryptoObj.getRandomValues === 'function') return 1;
+    var nodeCrypto = requireNodeModule('crypto');
+    return nodeCrypto && (typeof nodeCrypto.randomBytes === 'function' || typeof nodeCrypto.createHash === 'function') ? 1 : 0;
   },
   platformHasDom: function () {
     return typeof document !== 'undefined' ? 1 : 0;
   },
   platformHasSubprocess: function () {
-    return 0;
+    var childProcess = requireNodeModule('child_process');
+    return childProcess && typeof childProcess.spawnSync === 'function' ? 1 : 0;
   },
 });

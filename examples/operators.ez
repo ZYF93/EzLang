@@ -1,16 +1,15 @@
-// operators.ez - 验证运算符
-let a = 10 + 5 * 2;
-let b = (a > 10) && (a < 30);
-let shift: U32 = 2;
-let c = 100 >> shift;
-let e = 0b1010 & 0b1100;
-let f = 0b1010 | 0b0101;
-let g = 0b1010 ^ 0b1100;
-let h = 1 << shift;
-let i = (a == 20) || false;
-let d = 0;
-d += 10;
-d *= 2;
+from "std/fmt" import { format, toString };
+from "std/io" import { println };
 
-// 负面用例：逻辑运算要求 Bool（未来语义分析应报错）
-// let bad = 1 && 2;
+const main = (): I32 => {
+    let value = 10 + 5 * 2;
+    value += 4;
+    value /= 3;
+    const shift: U32 = 1;
+    const bits = (0b1010 & 0b1100) | (1 << shift);
+    const ok = value == 8 && bits == 10;
+    const args: Str[] = [toString<I32>(value = value), toString<I32>(value = bits), toString<Bool>(value = ok)];
+
+    println(msg = format(template = "operators: value={}, bits={}, ok={}", args = args));
+    return ok ? 0 : 1;
+};

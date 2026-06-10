@@ -36,10 +36,12 @@
   }
 
   function blobBytes(blobPtr) {
-    if (!blobPtr) return new Uint8Array(0);
+    if (!blobPtr) return null;
     var dataPtr = getValue(blobPtr, '*');
     var size = Number(getValue(blobPtr + 8, 'i64'));
-    if (!dataPtr || size <= 0) return new Uint8Array(0);
+    if (!Number.isFinite(size) || size < 0 || Math.floor(size) !== size) return null;
+    if (size === 0) return new Uint8Array(0);
+    if (!dataPtr || dataPtr < 0 || dataPtr > HEAPU8.length || size > HEAPU8.length - dataPtr) return null;
     return HEAPU8.slice(dataPtr, dataPtr + size);
   }
 
@@ -73,11 +75,11 @@
     }
     var span = maxValue - minValue + 1n;
     if (span >= MOD64) return i64(next(sourcePtr));
-    var limit = MOD64 - (MOD64 % span);
+    var threshold = (MOD64 - span) % span;
     var value = 0n;
     do {
       value = next(sourcePtr);
-    } while (value >= limit);
+    } while (value < threshold);
     return i64(minValue + (value % span));
   }
 
@@ -128,6 +130,10 @@
     },
     randomShuffleBytes: function (ret, sourcePtr, dataPtr) {
       var bytes = blobBytes(dataPtr);
+      if (bytes === null) {
+        writeBlob(ret, new Uint8Array(0));
+        return;
+      }
       var out = new Uint8Array(bytes);
       for (var i = out.length - 1; i > 0; i--) {
         var j = Number(rangeI64(sourcePtr, 0n, BigInt(i)));

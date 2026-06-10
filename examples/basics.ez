@@ -1,45 +1,19 @@
-// EzLang 基础语法示例
+from "std/fmt" import { format, toString };
+from "std/io" import { println };
 
-// 单行注释
-/* 块注释 */
+const main = (): I32 => {
+    let count: I32 = 40;
+    count += 2;
+    const pi: F64 = 3.14159;
+    const ready: Bool = true;
+    const text: Str = "basic values";
+    const countArgs: Str[] = [toString<I32>(value = count)];
+    const piArgs: Str[] = [toString<F64>(value = pi)];
+    const readyArgs: Str[] = [toString<Bool>(value = ready)];
 
-// 变量声明
-let x: I32 = 42;
-const pi: F64 = 3.14159;
-static message: Str = "Hello, EzLang!";
-
-// 类型推断
-let inferred = 100;  // 自动推断为 I32
-
-// 基本类型
-let byte_val: I8 = -127;
-let int_val: I32 = 2147483647;
-let long_val: I64 = 9223372036854775807;
-let ubyte_val: U8 = 255;
-let uint_val: U32 = 4294967295;
-let ulong_val: U64 = 18446744073709551615;
-let float_val: F32 = 1.0;
-let double_val: F64 = 2.71828;
-let string_val: Str = "This is a string";
-let bool_val: Bool = true;
-
-// 不同进制的整数字面量
-let binary = 0b101010;
-let octal = 0o52;
-let hex = 0x2A;
-
-// 赋值
-x = 100;
-x += 5;
-x -= 3;
-x *= 2;
-x /= 4;
-x %= 7;
-
-// 位运算赋值
-let shift: U32 = 1;
-x &= 0xF0;
-x |= 0x0F;
-x ^= 0xFF;
-x <<= shift;
-x >>= shift;
+    println(msg = text);
+    println(msg = format(template = "count = {}", args = countArgs));
+    println(msg = format(template = "pi = {}", args = piArgs));
+    println(msg = format(template = "ready = {}", args = readyArgs));
+    return count == 42 ? 0 : 1;
+};

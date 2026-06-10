@@ -15,7 +15,7 @@ let a = 1; // 语句由 ; 分隔，表达式可以直接作为语句使用
 * **区分大小写**。
 * 标识符、关键字、类型名不允许包含空白字符。
 * **关键字**：`let`, `const`, `static`, `struct`, `type`, `declare`, `loop`, `break`, `continue`, `import`, `export`, `from`, `match`, `catch`, `throw`, `flow`, `parallel`, `rp`, `wp`, `typeof`, `return`, `in`, `for`, `as`, `extern`
-* **命名规范**：类型名应以大写字母开头（如 `User`, `Result`），变量名应以小写字母开头（如 `user`, `count`）。
+* **命名规范**：类型名应以大写字母开头（如 `User`, `Result`）；变量名可由小写字母、下划线或 `$` 开头（如 `user`, `_count`, `$state`）。
 
 ### LLVM 映射
 * 基础语法、词法解析与命名检查在编译前端完成，无直接运行时的 LLVM 映射。
@@ -284,18 +284,18 @@ const ret = flow {
 
 ### 语义说明与规范
 * **flow**：`flow { ... }` 为并发调度作用域。flow 不改变程序的顺序语义。flow 内代码在语义上严格按源码顺序执行，但 runtime 可对无依赖阻塞操作进行调度优化，且调度不得改变可观察行为。
-* **当前实现**：编译器会记录 flow/parallel/suspend point 元数据，并在 LLVM IR 中生成可链接的 `__ezrt_flow_*`、`__ezrt_parallel_*`、`__ezrt_sleep`、`__ezrt_race` hook。`__ezrt_sleep` 会真实挂起当前执行线程；`race(pl = [...], timeout = ...)` 对零捕获 `() => I32` 分支使用原生任务运行时并发执行，返回首个完成值并取消其余分支。`flow` / `parallel` 块内的 `return` 会被捕获为表达式结果，不会提前退出外层函数。
+* **当前实现**：编译器会记录 flow/parallel/suspend point 元数据，并在 LLVM IR 中生成可链接的 `__ezrt_flow_*`、`__ezrt_parallel_*`、`__ezrt_sleep`、`__ezrt_race` hook。`__ezrt_sleep` 会真实挂起当前执行线程；`race(pl = [...], timeout = ...)` 对零捕获 `() => I32` 分支在 native 目标使用任务运行时并发执行，返回首个完成值并取消其余分支；emcc 目标当前保持同步 C/LLVM ABI，不把 `parallel` 降级为 JS Promise 或浏览器协程，而是使用同步协作 fallback，保持源码顺序语义和可构建性。`flow` / `parallel` 块内的 `return` 会被捕获为表达式结果，不会提前退出外层函数；嵌套控制流中的 `return` 也参与表达式返回类型推断。
 * **阻塞操作**：flow 外部如 `fetch()` 为同步阻塞。flow 内部的 `sleep` 与 `race(pl)` 已接入运行时调度；其它阻塞 I/O 仍保留稳定同步 ABI，后续可替换为平台等待源。
-* **parallel 块**：`const ret = parallel { code... return... }` 在 flow 内、零捕获且返回 `I32` 时会启动后台任务；读取 `ret` 会等待任务完成，flow 退出前会 join 未读取任务，确保副作用提交。其它返回类型或捕获场景保持同步 lowering。
-* **自动依赖等待**：读取 flow 内未完成的 `parallel` 结果会自动 join；当前依赖等待覆盖零捕获 `I32` 任务，其它阻塞结果仍按同步 ABI 执行。
+* **parallel 块**：`const ret = parallel { code... return... }` 或 `const ret: I32 = parallel { code... return... }` 在 native 目标的 flow 内、初始化表达式本身就是 `parallel` 块、零捕获且返回 `I32` 时会启动后台任务；读取 `ret` 会等待任务完成，flow 退出前会 join 未读取任务，确保副作用提交。emcc、组合表达式、其它返回类型或捕获外层局部变量的场景保持同步协作 lowering。
+* **自动依赖等待**：读取 flow 内未完成的 `parallel` 结果会自动 join；当前依赖等待覆盖 native 零捕获 `I32` 任务，包括推断类型和显式 `I32` 声明，其它目标和其它阻塞结果仍按同步 ABI 执行。
 * **flow 返回**：flow 返回前必须保证所有前序语义操作完成，且所有副作用已提交。
-* **race 函数**：并发运行 `pl` 中的零捕获 `() => I32` 分支，返回首个完成值并取消其它分支；`timeout` 到期时返回零值并标记超时槽。异常通过运行时异常槽传回外层 `catch`。暂不支持捕获闭包和非 `I32` 返回值的异步 race，相关场景回退到同步 lowering。
+* **race 函数**：native 目标并发运行 `pl` 中的零捕获 `() => I32` 分支，返回首个完成值并取消其它分支；`timeout` 到期时返回零值并标记超时槽。异常通过运行时异常槽传回外层 `catch`。emcc、捕获闭包和非 `I32` 返回值使用同步协作 fallback。
 * **cancel**：取消不会立即终止同步代码。取消仅中断 IO、sleep、timer、wait 等 suspend source。底层 suspend source 被取消时，`throw Error(code = errCancel, message = "操作已取消")` 并沿同步调用栈传播；可在 `catch {}` 中通过 `err.code == errCancel` 判断并特殊处理。
 * **非阻塞同步代码**：普通同步 CPU 代码不会被中断。
 * **副作用一致性**：runtime 不允许改变副作用顺序、锁语义、可观察行为。
 
 ### LLVM 映射
-* **当前**：lowering 为 runtime hook + flow/parallel 返回值槽；`sleep`、`race(pl)` 和 flow 内零捕获 `I32` `parallel` 已接入原生任务运行时。
+* **当前**：lowering 为 runtime hook + flow/parallel 返回值槽；`sleep`、`race(pl)` 和 flow 内零捕获 `I32` `parallel` 已接入原生任务运行时；emcc 使用同步协作 fallback 保持语法完整可用。emcc 若后续启用 Asyncify、JSPI 或 wasm pthread，可在不改变 EzLang 语法的前提下替换运行时 backend。
 * **目标**：后续可继续把其它阻塞 I/O 替换为状态机、平台等待源（epoll、io_uring、kqueue、timerfd 等）、结果存储、等待唤醒与更完整的捕获闭包调度。
 
 ---
@@ -434,7 +434,7 @@ declare static version: Str
   * 可声明函数、全局变量、静态变量。
   * 声明的符号必须在至少一个 `extern` 库中存在，否则链接失败。
   * 所有外部符号必须显式声明，支持 C ABI 兼容的外部库调用。
-* EzLang 不存在隐式入口函数，文件内定义的任意函数均需显式调用。
+* EzLang 按入口文件的顶层语句顺序执行；不要求用户显式定义 `main` 函数。若源码中已定义 `main`，宿主入口沿用该函数，文件内其它函数仍需显式调用。
 
 ### LLVM 映射
 * EzLang 模块导入通过编译时符号解析与合并实现。

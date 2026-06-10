@@ -31,6 +31,10 @@ typedef struct {
 typedef struct { bool ok; Blob value; } OptBlob;
 typedef struct { bool ok; uint64_t value; } OptU64;
 
+static bool ez_blob_valid_size(const Blob *data) {
+    return data && data->size >= 0 && (data->size == 0 || data->data) && (uint64_t)data->size <= (uint64_t)SIZE_MAX;
+}
+
 static uint64_t ez_random_mix_seed(uint64_t seed) {
     uint64_t z = seed + 0x9E3779B97F4A7C15ULL;
     z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
@@ -71,11 +75,11 @@ int64_t randomRangeI64(RandomSource *source, int64_t min_value, int64_t max_valu
     }
     uint64_t span = (uint64_t)max_value - (uint64_t)min_value + 1ULL;
     if (span == 0) return (int64_t)ez_random_next(source);
-    uint64_t limit = UINT64_MAX - (UINT64_MAX % span);
+    uint64_t threshold = (uint64_t)(0ULL - span) % span;
     uint64_t value = 0;
     do {
         value = ez_random_next(source);
-    } while (value >= limit);
+    } while (value < threshold);
     return (int64_t)((uint64_t)min_value + (value % span));
 }
 
@@ -91,7 +95,8 @@ double randomRangeF64(RandomSource *source, double min_value, double max_value) 
 }
 
 Blob randomShuffleBytes(RandomSource *source, const Blob *data) {
-    if (!data || data->size <= 0 || !data->data) return (Blob){NULL, 0};
+    if (!ez_blob_valid_size(data)) return (Blob){NULL, 0};
+    if (data->size == 0) return (Blob){NULL, 0};
     uint8_t *out = (uint8_t *)malloc((size_t)data->size);
     if (!out) return (Blob){NULL, 0};
     for (int64_t i = 0; i < data->size; ++i) out[i] = data->data[i];
@@ -110,9 +115,17 @@ static bool ez_random_read_system(uint8_t *data, size_t size) {
 #if defined(_WIN32)
     HCRYPTPROV provider = 0;
     if (!CryptAcquireContext(&provider, NULL, NULL, PROV_RSA_FULL, CRYPT_VERIFYCONTEXT)) return false;
-    BOOL ok = CryptGenRandom(provider, (DWORD)size, data);
+    size_t offset = 0;
+    BOOL ok = TRUE;
+    while (offset < size) {
+        size_t remaining = size - offset;
+        DWORD chunk = remaining > (size_t)UINT32_MAX ? (DWORD)UINT32_MAX : (DWORD)remaining;
+        ok = CryptGenRandom(provider, chunk, (BYTE *)(data + offset));
+        if (!ok) break;
+        offset += (size_t)chunk;
+    }
     CryptReleaseContext(provider, 0);
-    return ok != 0;
+    return ok != 0 && offset == size;
 #elif defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__)
     arc4random_buf(data, size);
     return true;
@@ -150,11 +163,18 @@ static bool ez_random_read_system(uint8_t *data, size_t size) {
 #endif
 }
 
+static bool ez_random_size(int64_t requested, size_t *out) {
+    if (!out || requested < 0 || (uint64_t)requested > (uint64_t)SIZE_MAX) return false;
+    *out = (size_t)requested;
+    return true;
+}
+
 OptBlob randomSecureBytes(int64_t size) {
-    if (size < 0) return (OptBlob){false, {0}};
-    uint8_t *data = size == 0 ? NULL : (uint8_t *)malloc((size_t)size);
-    if (size > 0 && !data) return (OptBlob){false, {0}};
-    if (!ez_random_read_system(data, (size_t)size)) {
+    size_t byte_count = 0;
+    if (!ez_random_size(size, &byte_count)) return (OptBlob){false, {0}};
+    uint8_t *data = byte_count == 0 ? NULL : (uint8_t *)malloc(byte_count);
+    if (byte_count > 0 && !data) return (OptBlob){false, {0}};
+    if (!ez_random_read_system(data, byte_count)) {
         free(data);
         return (OptBlob){false, {0}};
     }

@@ -72,6 +72,32 @@ class TestParser:
         assert len(errors) == 0, f'解析错误: {errors}'
         assert tree is not None
 
+    def test_variable_identifier_can_start_with_dollar(self):
+        """变量名允许以 $ 开头。"""
+        tree, errors = parse_source('let $count: I32 = 1; const $next = (value: I32): I32 => { return value + $count; };')
+        assert len(errors) == 0, f'解析错误: {errors}'
+        assert tree is not None
+
+    def test_bare_dollar_is_not_variable_identifier(self):
+        """裸 $ 不是完整变量名，$ 后必须带名称。"""
+        _, errors = parse_source('let $: I32 = 1;')
+        assert errors
+
+    def test_nested_generic_args_can_close_with_adjacent_angles(self):
+        """嵌套泛型参数允许直接写连续右尖括号。"""
+        source = 'struct Box<T> { value: T; }; let box = Box<Box<U32>>(value = Box<U32>(value = 1));'
+
+        tree, errors = parse_source(source)
+
+        assert len(errors) == 0, f'解析错误: {errors}'
+        assert tree is not None
+
+    def test_shift_expression_still_accepts_adjacent_right_angles(self):
+        """>> 仍应作为右移运算被语法接受。"""
+        tree, errors = parse_source('let shift: U32 = 1; let value: U32 = 8 >> shift;')
+        assert len(errors) == 0, f'解析错误: {errors}'
+        assert tree is not None
+
     def test_hello(self):
         """测试 hello.ez"""
         tree, errors = parse_file(

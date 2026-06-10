@@ -1,67 +1,27 @@
-// control.ez - 验证控制流
+from "std/fmt" import { format, toString };
+from "std/io" import { println };
 
-struct Error {
-    code: I32;
-    message: Str;
-};
+const main = (): I32 => {
+    let total = 0;
 
-const print = (msg: Str): Void => {
-    return;
-};
+    loop i in 0...6 {
+        (i == 2) ? continue;
+        total += i;
+        (total > 8) ? break;
+    }
 
-const printInt = (msg: I32): Void => {
-    return;
-};
+    let label = "small";
+    match {
+        (total > 10) ? { label = "large"; },
+        (total > 5) ? { label = "medium"; },
+        (true) ? { label = "small"; }
+    };
 
-const fetchData = (url: Str): I32 => {
-    return 1;
-};
+    const err = catch {
+        throw Error(code = 7, message = "control example");
+    };
 
-let x = 10;
-
-// 条件语句
-(x > 5) ? {
-    x = x + 1;
-} : {
-    x = x - 1;
-};
-
-// 单行条件
-(x > 0) ? print(msg = "positive");
-
-// 条件表达式
-let y = (x > 5) ? 100 : 200;
-
-// 循环
-loop i in 0...10 {
-    (i == 5) ? break;
-    (i == 3) ? continue;
-    printInt(msg = i);
-}
-
-// 无限循环
-let counter = 0;
-loop {
-    counter = counter + 1;
-    (counter >= 10) ? break;
-}
-
-// match 模式匹配
-let result = 0;
-match {
-    (x == 10) ? { result = 1; },
-    (x == 20) ? { result = 2; },
-    (true) ? { result = 3; }
-}
-
-// throw / catch 异常处理
-const caught = catch {
-    throw Error(code = 404, message = "Not Found");
-};
-
-// flow 并发块
-const flow_result = flow {
-    const a = fetchData(url = "a");
-    const b = fetchData(url = "b");
-    return a + b;
+    const args: Str[] = [toString<I32>(value = total), label, toString<I32>(value = err.code)];
+    println(msg = format(template = "control: total={}, label={}, caught={}", args = args));
+    return err.code == 7 ? 0 : 1;
 };

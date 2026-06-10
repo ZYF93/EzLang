@@ -1,68 +1,17 @@
-// type_checks.ez - 类型检查测试用例
+from "std/fmt" import { format, toString };
+from "std/io" import { println };
 
-// === 基本类型推导 ===
-let inferred_int = 42;          // → I32
-let inferred_float = 3.14;     // → F64
-let inferred_bool = true;      // → Bool
-let inferred_str = "hello";    // → Str
-let inferred_neg = -100;       // → I32
-
-// === 基本类型标注与检查 ===
-let typed_int: I32 = 42;
-let typed_float: F64 = 3.14;
-let typed_bool: Bool = true;
-let typed_str: Str = "hello";
-
-// === 类型不匹配（以下每行应报错，注释掉避免解析失败）===
-// let bad_int: I32 = "hello";
-// let bad_float: F64 = true;
-// let bad_str: Str = 42;
-
-// === 二元运算类型检查 ===
-let add_int = 1 + 2;              // I32 + I32 → I32
-let sub_int = 10 - 3;             // I32 - I32 → I32
-let mul_int = 4 * 5;              // I32 * I32 → I32
-let div_int = 10 / 3;             // I32 / I32 → I32
-let cmp_int = 1 == 2;             // I32 == I32 → Bool
-
-// === 浮点运算 ===
-let add_float = 1.5 + 2.5;        // F64 + F64 → F64
-let cmp_float = 1.5 == 2.5;       // F64 == F64 → Bool
-
-// === 比较运算 ===
-let lt = 1 < 2;                   // I32 < I32 → Bool
-let gt = 1 > 2;                   // I32 > I32 → Bool
-let le = 1 <= 2;                  // I32 <= I32 → Bool
-let ge = 1 >= 2;                  // I32 >= I32 → Bool
-let ne = 1 != 2;                  // I32 != I32 → Bool
-
-// === 逻辑运算 ===
-let and_res = true && false;      // Bool && Bool → Bool
-let or_res = true || false;       // Bool || Bool → Bool
-let not_res = !true;              // !Bool → Bool
-
-// === 类型不匹配运算（应报错）===
-// let bad_add = 1 + "hello";
-// let bad_cmp = 1 == "hello";
-
-// === 函数返回类型检查 ===
 const add = (a: I32, b: I32): I32 => {
     return a + b;
 };
 
-const get_str = (): Str => {
-    return "hello";
+const main = (): I32 => {
+    const typedInt: I32 = add(a = 20, b = 22);
+    const typedFloat: F64 = 3.14;
+    const typedBool: Bool = typedInt == 42 && typedFloat > 3.0;
+    const typedStr: Str = "type checks passed";
+    const args: Str[] = [typedStr, toString<I32>(value = typedInt), toString<Bool>(value = typedBool)];
+
+    println(msg = format(template = "type_checks: {}, value={}, ok={}", args = args));
+    return typedBool ? 0 : 1;
 };
-
-// === 函数返回类型不匹配（应报错）===
-// const bad_return = (): I32 => {
-//     return "hello";
-// };
-
-// === 常量赋值检查 ===
-const fixed: I32 = 100;
-// fixed = 200;  // 应报错：不能修改常量
-
-// === 变量重新赋值为错误类型（应报错）===
-// let mutable_val: I32 = 42;
-// mutable_val = "hello";

@@ -2,6 +2,8 @@
 (function () {
   var I64_MIN = -(1n << 63n);
   var I64_MAX = (1n << 63n) - 1n;
+  var I64_MIN_F64 = -9223372036854775808;
+  var I64_LIMIT_F64 = 9223372036854775808;
   var I32_MIN = -2147483648;
   var I32_MAX = 2147483647;
 
@@ -30,9 +32,14 @@
     return value < 0n ? -value : value;
   }
 
+  function magnitudeI64(value) {
+    value = asBigInt(value);
+    return value < 0n ? -value : value;
+  }
+
   function gcdI64(a, b) {
-    var x = absI64(a);
-    var y = absI64(b);
+    var x = magnitudeI64(a);
+    var y = magnitudeI64(b);
     while (y !== 0n) {
       var r = x % y;
       x = y;
@@ -85,7 +92,7 @@
     mathExp: function (value) { return Math.exp(value); },
     mathFloor: function (value) { return Math.floor(value); },
     mathCeil: function (value) { return Math.ceil(value); },
-    mathRound: function (value) { return Math.round(value); },
+    mathRound: function (value) { return value < 0 ? -Math.floor(-value + 0.5) : Math.floor(value + 0.5); },
     mathIsNaN: function (value) { return Number.isNaN(value) ? 1 : 0; },
     mathIsInf: function (value) { return !Number.isNaN(value) && !Number.isFinite(value) ? 1 : 0; },
     mathAddI64Checked: function (ret, a, b) {
@@ -107,10 +114,11 @@
       }
     },
     mathF64ToI32: function (ret, value) {
-      writeOptI32(ret, Number.isFinite(value) && value >= I32_MIN && value <= I32_MAX, value | 0);
+      var ok = Number.isFinite(value) && value > I32_MIN - 1 && value < I32_MAX + 1;
+      writeOptI32(ret, ok, ok ? Math.trunc(value) : 0);
     },
     mathF64ToI64: function (ret, value) {
-      var ok = Number.isFinite(value) && value >= Number(I64_MIN) && value <= Number(I64_MAX);
+      var ok = Number.isFinite(value) && value >= I64_MIN_F64 && value < I64_LIMIT_F64;
       writeOptI64(ret, ok, ok ? BigInt(Math.trunc(value)) : 0n);
     },
     mathI64ToF64: function (value) {

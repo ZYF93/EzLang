@@ -1,10 +1,15 @@
-// vars.ez - 验证变量声明与值语义
-let count = 10;
-const pi = 3.14;
-static global_val = 100;
+from "std/fmt" import { format, toString };
+from "std/io" import { println };
 
-let copy = count; // 值语义拷贝
-count = 20;
+static globalVal = 100;
 
-// 负面用例：const 修改（未来语义分析应拦截）
-// pi = 3.15;
+const main = (): I32 => {
+    let count = 10;
+    const copy = count;
+    count = 20;
+    globalVal += 1;
+    const args: Str[] = [toString<I32>(value = copy), toString<I32>(value = count), toString<I32>(value = globalVal)];
+
+    println(msg = format(template = "vars: copy={}, count={}, global={}", args = args));
+    return copy == 10 && count == 20 && globalVal == 101 ? 0 : 1;
+};

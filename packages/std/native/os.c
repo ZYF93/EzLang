@@ -13,6 +13,7 @@
 #include <windows.h>
 #define getcwd _getcwd
 #else
+#include <errno.h>
 #include <unistd.h>
 #endif
 
@@ -156,11 +157,16 @@ StrList args(void) {
 }
 
 OptStr env(const char *key) {
+    if (!key || key[0] == '\0') return (OptStr){false, NULL};
     const char *value = getenv(key);
-    return value ? (OptStr){true, value} : (OptStr){false, NULL};
+    if (!value) return (OptStr){false, NULL};
+    char *copy = ez_strdup_safe(value);
+    return copy ? (OptStr){true, copy} : (OptStr){false, NULL};
 }
 
 bool setEnv(const char *key, const char *value) {
+    if (!key || key[0] == '\0') return false;
+    if (!value) value = "";
 #if defined(_WIN32)
     return _putenv_s(key, value) == 0;
 #else
@@ -169,13 +175,24 @@ bool setEnv(const char *key, const char *value) {
 }
 
 const char *cwd(void) {
-    char *buffer = (char *)malloc(4096);
-    if (!buffer) return NULL;
-    if (getcwd(buffer, 4096) == NULL) {
+#if !defined(_WIN32)
+    char *dynamic = getcwd(NULL, 0);
+    if (dynamic) return dynamic;
+#endif
+    size_t cap = 256;
+    while (cap <= 1024 * 1024) {
+        char *buffer = (char *)malloc(cap);
+        if (!buffer) return ez_strdup_safe("");
+        if (getcwd(buffer, cap) != NULL) return buffer;
         free(buffer);
-        return NULL;
+#if defined(_WIN32)
+        cap *= 2;
+#else
+        if (errno != ERANGE) break;
+        cap *= 2;
+#endif
     }
-    return buffer;
+    return ez_strdup_safe("");
 }
 
 void exit(int32_t code) {

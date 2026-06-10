@@ -6,17 +6,25 @@ import re
 from llvmlite import ir
 from parser.EzLangParser import EzLangParser
 from parser.EzLangVisitor import EzLangVisitor
+from parser.string_literals import decode_string_literal_token
+
+
+_EZ_VAR_IDENTIFIER_RE = re.compile(r'(?:[A-Za-z_][A-Za-z0-9_]*|\$[A-Za-z0-9_]+)')
 
 
 class LLVMCodeGenerator(EzLangVisitor):
     """LLVM IR 代码生成访问器"""
 
     def __init__(self, module_name: str = "ezlang", compile_target: Optional[str] = None,
-                 target_arch: Optional[str] = None, log_compile_min_level: Optional[int] = None):
-        self.module = ir.Module(name=module_name)
+                 target_arch: Optional[str] = None, log_compile_min_level: Optional[int] = None,
+                 ensure_entrypoint: bool = False, base_dir: Optional[Path | str] = None):
+        self.context = ir.Context()
+        self.module = ir.Module(name=module_name, context=self.context)
         self.compile_target = compile_target
         self.target_arch = target_arch
         self.log_compile_min_level = log_compile_min_level
+        self.ensure_entrypoint = ensure_entrypoint
+        self.base_dir = Path(base_dir).resolve() if base_dir is not None else Path.cwd()
         self.builder: ir.IRBuilder = None
         self.current_function: ir.Function = None
         self._method_this: ir.Value = None
@@ -35,6 +43,7 @@ class LLVMCodeGenerator(EzLangVisitor):
         self._function_return_type_ctx_stack: list[object] = []
         self.structs: dict[str, ir.IdentifiedStructType] = {}
         self.struct_fields: dict[str, list[str]] = {}
+        self._struct_field_type_names: dict[str, list[str]] = {}
         self.struct_defaults: dict[str, dict[str, any]] = {}  # struct_name → {field_name: expression_ctx}
         self.struct_methods: dict[str, dict[str, str]] = {}
         self.struct_generic_params: dict[str, list[str]] = {}
@@ -47,7 +56,7 @@ class LLVMCodeGenerator(EzLangVisitor):
         self.func_return_dict_types: dict[str, tuple[ir.Type, ir.Type]] = {}
         self.generic_templates: dict[str, tuple] = {}
         self._monomorphized: set[str] = set()
-        self._generic_type_map_stack: list[dict[str, ir.Type]] = []
+        self._generic_type_map_stack: list[tuple[dict[str, ir.Type], dict[str, bool], dict[str, str]]] = []
         self._mapping_with_map = False
         self.extern_libs: list[tuple[str, Optional[str]]] = []  # (lib_path, target)
         self.active_extern_libs: list[str] = []
@@ -55,10 +64,13 @@ class LLVMCodeGenerator(EzLangVisitor):
         self._declare_names: list[str] = []
         self._sret_functions: dict[str, ir.Type] = {}
         self._c_abi_return_bridges: dict[str, tuple[ir.Type, ir.Type]] = {}
+        self._c_abi_callback_trampolines: dict[tuple[str, str], ir.Function] = {}
+        self._fmt_generation_stack: set[str] = set()
         self._non_extern_decls_seen = 0
         self._list_collection_builtins = {
             'listPush', 'listPop', 'listShift', 'listUnshift', 'listSort',
             'listFilter', 'listMap', 'listFind', 'listLen', 'listSlice',
+            'randomShuffle',
         }
         self._dict_collection_builtins = {
             'dictKeys', 'dictValues', 'dictHas', 'dictDelete', 'dictLen',
@@ -80,6 +92,7 @@ class LLVMCodeGenerator(EzLangVisitor):
         self._flow_future_stack: list[dict[str, dict[str, ir.Value]]] = []
         self._flow_depth = 0
         self._import_depth = 0
+        self._source_dir_stack: list[Path] = [self.base_dir]
         self._parallel_result_stack: list[ir.AllocaInstr] = []
         self._parallel_exit_stack: list[ir.Block] = []
         self._parallel_arena_depth_stack: list[int] = []
@@ -112,7 +125,7 @@ class LLVMCodeGenerator(EzLangVisitor):
         flow_hook_type = ir.FunctionType(void, [])
         self._flow_enter = self._define_runtime_void_hook('__ezrt_flow_enter', flow_hook_type)
         self._flow_exit = self._define_runtime_void_hook('__ezrt_flow_exit', flow_hook_type)
-        self._flow_sleep = self._define_sleep_hook('__ezrt_sleep', ir.FunctionType(void, [i64]))
+        self._flow_sleep = None
         self._flow_race = self._define_runtime_race_hook('__ezrt_race', ir.FunctionType(i32, [i32, i32]))
         self._parallel_enter = self._define_runtime_void_hook('__ezrt_parallel_enter', flow_hook_type)
         self._parallel_exit = self._define_runtime_void_hook('__ezrt_parallel_exit', flow_hook_type)
@@ -123,29 +136,32 @@ class LLVMCodeGenerator(EzLangVisitor):
         self._lock_write_release = self._get_or_declare_function('__ezrt_lock_write_release', ir.FunctionType(void, [i8_ptr]))
 
         # 内置结构体: Error = { i32 code, i8* message }
-        err_type = ir.global_context.get_identified_type('Error')
+        err_type = self.context.get_identified_type('Error')
         if err_type.is_opaque:
             err_type.set_body(i32, i8_ptr)
         self.structs['Error'] = err_type
         self.struct_fields['Error'] = ['code', 'message']
+        self._struct_field_type_names['Error'] = ['I32', 'Str']
         self._declare_throw_state(err_type)
 
         # 内置结构体: Date = { i64 timestamp }
-        date_type = ir.global_context.get_identified_type('Date')
+        date_type = self.context.get_identified_type('Date')
         if date_type.is_opaque:
             date_type.set_body(i64)
         self.structs['Date'] = date_type
         self.struct_fields['Date'] = ['timestamp']
+        self._struct_field_type_names['Date'] = ['I64']
 
         # 内置结构体: Blob = { i8* data, i64 size }
-        blob_type = ir.global_context.get_identified_type('Blob')
+        blob_type = self.context.get_identified_type('Blob')
         if blob_type.is_opaque:
             blob_type.set_body(i8_ptr, i64)
         self.structs['Blob'] = blob_type
         self.struct_fields['Blob'] = ['data', 'size']
+        self._struct_field_type_names['Blob'] = ['*U8', 'I64']
 
         # 内置结构体: Dict = { i8*** key_pages, i8*** value_pages, i32 count, i32 capacity, i32 page_count }
-        dict_type = ir.global_context.get_identified_type('Dict')
+        dict_type = self.context.get_identified_type('Dict')
         if dict_type.is_opaque:
             dict_page_table = ir.PointerType(ir.PointerType(i8_ptr))
             dict_type.set_body(
@@ -157,6 +173,7 @@ class LLVMCodeGenerator(EzLangVisitor):
             )
         self.structs['Dict'] = dict_type
         self.struct_fields['Dict'] = ['key_pages', 'value_pages', 'count', 'capacity', 'page_count']
+        self._struct_field_type_names['Dict'] = ['Ptr', 'Ptr', 'I32', 'I32', 'I32']
 
     def _define_runtime_void_hook(self, name: str, func_type: ir.FunctionType) -> ir.Function:
         """定义最小运行时 hook，避免本机链接时遗留未定义符号。"""
@@ -179,6 +196,11 @@ class LLVMCodeGenerator(EzLangVisitor):
         func = ir.Function(self.module, func_type, name)
         entry = func.append_basic_block('entry')
         builder = ir.IRBuilder(entry)
+        if self.compile_target == 'emcc':
+            sleep_fn = self._get_or_declare_function('__ezrt_emcc_sleep', ir.FunctionType(ir.VoidType(), [ir.IntType(64)]))
+            builder.call(sleep_fn, [func.args[0]])
+            builder.ret_void()
+            return func
         usleep_fn = self._get_or_declare_function('usleep', ir.FunctionType(ir.IntType(32), [ir.IntType(32)]))
         ms = func.args[0]
         ms32 = builder.trunc(ms, ir.IntType(32)) if isinstance(ms.type, ir.IntType) and ms.type.width > 32 else ms
@@ -191,18 +213,33 @@ class LLVMCodeGenerator(EzLangVisitor):
         root = Path(__file__).resolve().parents[3]
         return str((root / 'packages' / 'std' / 'native' / 'runtime.c').resolve())
 
+    def _add_active_extern_lib(self, lib_path: str) -> None:
+        """按声明顺序收集当前目标需要链接的库，并避免重复传参。"""
+        if lib_path not in self.active_extern_libs:
+            self.active_extern_libs.append(lib_path)
+
     def _require_runtime(self) -> None:
         """标记需要链接语言运行时 C helper。"""
+        if self.compile_target == 'emcc':
+            return
         self._runtime_required = True
         path = self._runtime_lib_path()
-        if path not in self.active_extern_libs:
-            self.active_extern_libs.append(path)
-        if self.compile_target != 'windows' and 'pthread' not in self.active_extern_libs:
-            self.active_extern_libs.append('pthread')
+        self._add_active_extern_lib(path)
+        if self.compile_target != 'windows':
+            self._add_active_extern_lib('pthread')
         if (path, None) not in self.extern_libs:
             self.extern_libs.append((path, None))
         if ('pthread', None) not in self.extern_libs and self.compile_target != 'windows':
             self.extern_libs.append(('pthread', None))
+
+    def _require_flow_sleep(self) -> ir.Function:
+        """按需生成 flow sleep hook；emcc 同步 fallback 需要 time.js 提供 JS helper。"""
+        if self._flow_sleep is None:
+            self._flow_sleep = self._define_sleep_hook('__ezrt_sleep', ir.FunctionType(ir.VoidType(), [ir.IntType(64)]))
+        if self.compile_target == 'emcc':
+            root = Path(__file__).resolve().parents[3]
+            self._add_active_extern_lib(str((root / 'packages' / 'std' / 'emcc' / 'time.js').resolve()))
+        return self._flow_sleep
 
     def _get_or_declare_function(self, name: str, func_type: ir.FunctionType) -> ir.Function:
         existing = self.module.globals.get(name)
@@ -285,6 +322,15 @@ class LLVMCodeGenerator(EzLangVisitor):
         self.builder.position_at_start(throw_bb)
         self._branch_to_throw_exit_or_abort()
         self.builder.position_at_start(cont_bb)
+
+    def _raise_error(self, code: int, message: str):
+        """写入 Error 异常槽并跳转到当前异常出口。"""
+        msg = self._make_global_string(message, prefix="_err_msg")
+        error = ir.Constant(self.structs['Error'], ir.Undefined)
+        error = self.builder.insert_value(error, ir.Constant(ir.IntType(32), code), 0)
+        error = self.builder.insert_value(error, msg, 1)
+        self._store_throw_value(error)
+        self._branch_to_throw_exit_or_abort()
 
     def _finish_function_with_throw_exit(self, ret_type: ir.Type, result: ir.Value | None = None):
         """补全普通出口和异常出口；异常出口返回零值，由调用边界继续传播。"""
@@ -633,6 +679,64 @@ class LLVMCodeGenerator(EzLangVisitor):
         text = ctx.getText() if hasattr(ctx, 'getText') else ""
         return text or "unknown"
 
+    def _type_ctx_name_with_map(self, ctx, type_map: dict[str, ir.Type], unsigned_map: dict[str, bool],
+                                type_name_map: dict[str, str] | None = None) -> str:
+        """把泛型结构体字段类型名替换成实例化后的源类型名。"""
+        if ctx is None:
+            return "unknown"
+        if isinstance(ctx, EzLangParser.OptionalTypeContext):
+            return f"{self._type_ctx_name_with_map(ctx.type_(), type_map, unsigned_map, type_name_map)}?"
+        if isinstance(ctx, EzLangParser.ArrayTypeContext):
+            return f"{self._type_ctx_name_with_map(ctx.type_(), type_map, unsigned_map, type_name_map)}[]"
+        if isinstance(ctx, EzLangParser.ListTypeContext):
+            return f"List<{self._type_ctx_name_with_map(ctx.type_(), type_map, unsigned_map, type_name_map)}>"
+        if isinstance(ctx, EzLangParser.VecTypeContext):
+            return f"Vec<{self._type_ctx_name_with_map(ctx.type_(), type_map, unsigned_map, type_name_map)}>[{ctx.INTEGER_LITERAL().getText()}]"
+        if isinstance(ctx, EzLangParser.PointerTypeContext):
+            return f"*{self._type_ctx_name_with_map(ctx.type_(), type_map, unsigned_map, type_name_map)}"
+        if isinstance(ctx, EzLangParser.ParenTypeContext):
+            return self._type_ctx_name_with_map(ctx.type_(), type_map, unsigned_map, type_name_map)
+        if isinstance(ctx, EzLangParser.UnionTypeContext):
+            return " | ".join(self._type_ctx_name_with_map(t, type_map, unsigned_map, type_name_map) for t in ctx.type_())
+        if isinstance(ctx, EzLangParser.TypeShapeTypeContext):
+            return "Dict" if self._type_shape_is_dynamic(ctx.typeShape()) else "shape"
+        if isinstance(ctx, EzLangParser.TypeofTypeContext):
+            return "I32"
+        if hasattr(ctx, 'baseType') and ctx.baseType() is not None:
+            bt = ctx.baseType()
+            if bt.TYPE_IDENTIFIER() is not None:
+                name = bt.TYPE_IDENTIFIER().getText()
+                if name in type_map and bt.genericArgs() is None:
+                    if type_name_map is not None and name in type_name_map:
+                        return type_name_map[name]
+                    return self._type_name_from_ir_type_with_unsigned(type_map[name], unsigned_map.get(name, False))
+                if bt.genericArgs() is not None:
+                    args = ", ".join(self._type_ctx_name_with_map(t, type_map, unsigned_map, type_name_map) for t in bt.genericArgs().type_())
+                    return f"{name}<{args}>"
+            return self._base_type_name(bt)
+        text = ctx.getText() if hasattr(ctx, 'getText') else ""
+        return text or "unknown"
+
+    def _type_ctx_suffix(self, ctx) -> str:
+        """把显式泛型参数转换为单态化后缀，保留 U32/U64 这类无符号名称。"""
+        name = self._type_ctx_name(ctx)
+        if name and name != "unknown":
+            return self._type_suffix_from_name(name)
+        return self._type_name(self._map_type(ctx))
+
+    @staticmethod
+    def _type_suffix_from_name(name: str) -> str:
+        if name == "Bool":
+            return "I1"
+        name = name.replace("[]", "Array").replace("?", "Opt").replace("*", "Ptr")
+        return re.sub(r'[^A-Za-z0-9_]+', '_', name).strip('_') or "T"
+
+    def _type_ctx_is_unsigned_with_map(self, ctx, unsigned_map: dict[str, bool]) -> bool:
+        """判断可能引用泛型参数的类型上下文是否为无符号整数。"""
+        if self._type_ctx_is_generic_name(ctx, unsigned_map):
+            return unsigned_map.get(ctx.baseType().TYPE_IDENTIFIER().getText(), False)
+        return self._type_ctx_is_unsigned(ctx)
+
     def _base_type_name(self, bt) -> str:
         if bt.I8() is not None: return "I8"
         if bt.I32() is not None: return "I32"
@@ -769,6 +873,65 @@ class LLVMCodeGenerator(EzLangVisitor):
         dict_type = dict_value.type.pointee if isinstance(dict_value.type, ir.PointerType) else dict_value.type
         return self._dict_item_types.get(id(dict_type), (i8_ptr, i8_ptr))
 
+    def _dict_literal_item_types(self, ctx) -> tuple[ir.Type, ir.Type] | None:
+        """从字典字面量语法推导键和值类型，供全局声明阶段使用。"""
+        literal = ctx.dictLiteral() if isinstance(ctx, EzLangParser.DictExprContext) else ctx
+        if not isinstance(literal, EzLangParser.DictLiteralContext) and hasattr(ctx, 'getChildCount') and ctx.getChildCount() == 1:
+            return self._dict_literal_item_types(ctx.getChild(0))
+        if not isinstance(literal, EzLangParser.DictLiteralContext):
+            return None
+        i8_ptr = ir.PointerType(ir.IntType(8))
+        key_type = i8_ptr
+        value_type = i8_ptr
+        saw_value_type = False
+        for field in literal.dictField() if literal.dictField() else []:
+            key_ctx = field.dictKey()
+            if key_ctx is not None and key_ctx.expression() is not None:
+                inferred_key_type = self._infer_global_initializer_type(key_ctx.expression())
+                if inferred_key_type != i8_ptr:
+                    key_type = inferred_key_type
+            type_ctx = field.type_()
+            if type_ctx is not None:
+                value_type = self._map_type(type_ctx)
+                saw_value_type = True
+                continue
+            inferred_value_type = self._infer_global_initializer_type(field.expression())
+            if not saw_value_type and inferred_value_type is not None:
+                value_type = inferred_value_type
+                saw_value_type = True
+        return key_type, value_type
+
+    def _dict_item_types_for_name(self, name: str | None) -> tuple[ir.Type, ir.Type] | None:
+        if not name:
+            return None
+        storage = self.locals.get(name) or self.globals.get(name)
+        if storage is None:
+            return None
+        storage_type = storage.type.pointee if isinstance(storage.type, ir.PointerType) else storage.type
+        if storage_type != self.structs.get('Dict'):
+            return None
+        return self._dict_item_types_for_value(storage)
+
+    def _dict_item_types_from_decl(self, type_ctx, initializer) -> tuple[ir.Type, ir.Type] | None:
+        item_types = self._dict_types_from_type_ctx(type_ctx)
+        if item_types is not None:
+            return item_types
+        return self._dict_literal_item_types(initializer)
+
+    def _infer_dict_index_value_type(self, ctx) -> ir.Type | None:
+        """在全局变量声明期推断 headers[key] 这类 Dict 索引的值类型。"""
+        if isinstance(ctx, EzLangParser.IndexContext):
+            name = self._leftmost_identifier_name(ctx.postfixExpression())
+            item_types = self._dict_item_types_for_name(name)
+            if item_types is not None:
+                return item_types[1]
+        if hasattr(ctx, 'getChildCount') and ctx.getChildCount() == 1:
+            for i in range(ctx.getChildCount()):
+                result = self._infer_dict_index_value_type(ctx.getChild(i))
+                if result is not None:
+                    return result
+        return None
+
     def _dict_types_from_type_ctx(self, ctx) -> tuple[ir.Type, ir.Type] | None:
         if ctx is None:
             return None
@@ -823,17 +986,33 @@ class LLVMCodeGenerator(EzLangVisitor):
                 return self._dict_types_from_type_ctx_with_map(inner, type_map)
         return None
 
-    def _struct_mono_name(self, base_name: str, type_args: list[ir.Type]) -> str:
-        suffix = '_'.join(self._type_name(t) for t in type_args)
+    def _struct_mono_name(self, base_name: str, type_args: list[ir.Type],
+                          type_arg_unsigned: list[bool] | None = None,
+                          type_arg_names: list[str] | None = None) -> str:
+        if type_arg_names is not None and len(type_arg_names) == len(type_args):
+            suffix = '_'.join(self._type_suffix_from_name(name) for name in type_arg_names)
+        else:
+            unsigned = type_arg_unsigned or [False] * len(type_args)
+            suffix = '_'.join(
+                self._type_suffix_from_name(self._type_name_from_ir_type_with_unsigned(t, unsigned[i] if i < len(unsigned) else False))
+                for i, t in enumerate(type_args)
+            )
         return f"{base_name}_{suffix}" if suffix else base_name
 
     def _struct_name_from_generic_args(self, base_name: str, generic_args_ctx) -> str:
         if generic_args_ctx is None or base_name not in self.struct_generic_templates:
             return base_name
         type_arg_ctxs = list(generic_args_ctx.type_())
-        type_args = [self._map_type(t) for t in type_arg_ctxs]
-        type_arg_unsigned = [self._type_ctx_is_unsigned(t) for t in type_arg_ctxs]
-        return self._monomorphize_struct(base_name, type_args, type_arg_unsigned)
+        if self._generic_type_map_stack:
+            type_map, unsigned_map, type_name_map = self._generic_type_map_stack[-1]
+            type_args = [self._map_type_with_map(t, type_map, unsigned_map, type_name_map) for t in type_arg_ctxs]
+            type_arg_unsigned = [self._type_ctx_is_unsigned_with_map(t, unsigned_map) for t in type_arg_ctxs]
+            type_arg_names = [self._type_ctx_name_with_map(t, type_map, unsigned_map, type_name_map) for t in type_arg_ctxs]
+        else:
+            type_args = [self._map_type(t) for t in type_arg_ctxs]
+            type_arg_unsigned = [self._type_ctx_is_unsigned(t) for t in type_arg_ctxs]
+            type_arg_names = [self._type_ctx_name(t) for t in type_arg_ctxs]
+        return self._monomorphize_struct(base_name, type_args, type_arg_unsigned, type_arg_names)
 
     def _struct_name_from_literal(self, ctx) -> str:
         base_name = ctx.TYPE_IDENTIFIER().getText()
@@ -868,13 +1047,14 @@ class LLVMCodeGenerator(EzLangVisitor):
         return [type_map[name] for name in generic_names], [unsigned_map.get(name, False) for name in generic_names]
 
     def _monomorphize_struct(self, base_name: str, type_args: list[ir.Type],
-                             type_arg_unsigned: list[bool] | None = None) -> str:
+                             type_arg_unsigned: list[bool] | None = None,
+                             type_arg_names: list[str] | None = None) -> str:
         """为显式泛型结构体实参生成独立 LLVM 布局。"""
         generic_names = self.struct_generic_params.get(base_name, [])
         if not generic_names or len(generic_names) != len(type_args):
             return base_name
 
-        mono_name = self._struct_mono_name(base_name, type_args)
+        mono_name = self._struct_mono_name(base_name, type_args, type_arg_unsigned, type_arg_names)
         if mono_name in self._struct_monomorphized:
             return mono_name
         template_ctx = self.struct_generic_templates.get(base_name)
@@ -884,12 +1064,14 @@ class LLVMCodeGenerator(EzLangVisitor):
         self._struct_monomorphized.add(mono_name)
         type_map = dict(zip(generic_names, type_args))
         unsigned_map = dict(zip(generic_names, type_arg_unsigned or [False] * len(generic_names)))
+        type_name_map = dict(zip(generic_names, type_arg_names or []))
 
-        struct_type = ir.global_context.get_identified_type(mono_name)
+        struct_type = self.context.get_identified_type(mono_name)
         self.structs[mono_name] = struct_type
         field_names: list[str] = []
         field_types: list[ir.Type] = []
         field_unsigned: list[bool] = []
+        field_type_names: list[str] = []
         defaults: dict[str, object] = {}
         methods: list[tuple[str, object, object]] = []
 
@@ -897,9 +1079,10 @@ class LLVMCodeGenerator(EzLangVisitor):
             field_ctx = member_ctx.structField()
             if field_ctx is not None:
                 fname = field_ctx.VAR_IDENTIFIER().getText()
-                ftype = self._map_type_with_map(field_ctx.type_(), type_map)
+                ftype = self._map_type_with_map(field_ctx.type_(), type_map, unsigned_map, type_name_map)
                 field_names.append(fname)
                 field_types.append(ftype)
+                field_type_names.append(self._type_ctx_name_with_map(field_ctx.type_(), type_map, unsigned_map, type_name_map))
                 if self._type_ctx_is_generic_name(field_ctx.type_(), unsigned_map):
                     field_unsigned.append(unsigned_map.get(field_ctx.type_().baseType().TYPE_IDENTIFIER().getText(), False))
                 else:
@@ -909,7 +1092,7 @@ class LLVMCodeGenerator(EzLangVisitor):
 
             spread_ctx = member_ctx.structSpread()
             if spread_ctx is not None:
-                base_type = self._map_type_with_map(spread_ctx.type_(), type_map)
+                base_type = self._map_type_with_map(spread_ctx.type_(), type_map, unsigned_map, type_name_map)
                 spread_name = base_type.name if isinstance(base_type, ir.IdentifiedStructType) else None
                 if spread_name in self.struct_fields:
                     for bf in self.struct_fields[spread_name]:
@@ -920,6 +1103,8 @@ class LLVMCodeGenerator(EzLangVisitor):
                         field_types.append(base_type.elements[bf_idx])
                         base_unsigned = self._struct_field_unsigned.get(spread_name, [])
                         field_unsigned.append(base_unsigned[bf_idx] if bf_idx < len(base_unsigned) else False)
+                        base_type_names = self._struct_field_type_names.get(spread_name, [])
+                        field_type_names.append(base_type_names[bf_idx] if bf_idx < len(base_type_names) else self._type_name_from_ir_type(base_type.elements[bf_idx]))
 
             method_ctx = member_ctx.structMethod()
             if method_ctx is not None:
@@ -929,20 +1114,22 @@ class LLVMCodeGenerator(EzLangVisitor):
             struct_type.set_body(*field_types)
         self.struct_fields[mono_name] = field_names
         self._struct_field_unsigned[mono_name] = field_unsigned
+        self._struct_field_type_names[mono_name] = field_type_names
         self.struct_defaults[mono_name] = defaults
         if methods:
             self.struct_methods[mono_name] = {}
-            self._generic_type_map_stack.append(type_map)
-            try:
-                for mname, fn_lit, sig in methods:
-                    func_name = f"{mono_name}_{mname}"
-                    self.struct_methods[mono_name][mname] = func_name
-                    if fn_lit is not None:
-                        self._gen_method_func(func_name, fn_lit, mono_name)
-                    elif sig is not None:
+            method_context = (type_map, unsigned_map, type_name_map)
+            for mname, fn_lit, sig in methods:
+                func_name = f"{mono_name}_{mname}"
+                self.struct_methods[mono_name][mname] = func_name
+                if fn_lit is not None:
+                    self._gen_method_func(func_name, fn_lit, mono_name, generic_context=method_context)
+                elif sig is not None:
+                    self._generic_type_map_stack.append(method_context)
+                    try:
                         self._declare_method_signature(func_name, sig)
-            finally:
-                self._generic_type_map_stack.pop()
+                    finally:
+                        self._generic_type_map_stack.pop()
         return mono_name
 
     def _type_ctx_is_generic_name(self, ctx, unsigned_map: dict[str, bool]) -> bool:
@@ -957,6 +1144,68 @@ class LLVMCodeGenerator(EzLangVisitor):
 
     def _restore_unsigned_state(self, state) -> None:
         self._ptr_unsigned, self._value_unsigned = state
+
+    def _enter_function_codegen_state(self, builder: ir.IRBuilder, func: ir.Function) -> dict:
+        """进入独立函数体生成上下文，避免继承外层 flow/loop/catch 状态。"""
+        state = {
+            'builder': self.builder,
+            'current_function': self.current_function,
+            'method_this': self._method_this,
+            'locals': self.locals,
+            'locals_type_names': self._locals_type_names,
+            'loop_exit_blocks': self.loop_exit_blocks,
+            'loop_continue_blocks': self.loop_continue_blocks,
+            'catch_exit_blocks': self.catch_exit_blocks,
+            'catch_error_allocas': self.catch_error_allocas,
+            'catch_result_allocas': self.catch_result_allocas,
+            'function_throw_exit_stack': self._function_throw_exit_stack,
+            'function_return_type_ctx_stack': self._function_return_type_ctx_stack,
+            'flow_future_stack': self._flow_future_stack,
+            'flow_depth': self._flow_depth,
+            'parallel_result_stack': self._parallel_result_stack,
+            'parallel_exit_stack': self._parallel_exit_stack,
+            'parallel_arena_depth_stack': self._parallel_arena_depth_stack,
+            'arena_scope_stack': self._arena_scope_stack,
+        }
+        self.builder = builder
+        self.current_function = func
+        self._method_this = None
+        self.locals = {}
+        self._locals_type_names = {}
+        self.loop_exit_blocks = []
+        self.loop_continue_blocks = []
+        self.catch_exit_blocks = []
+        self.catch_error_allocas = []
+        self.catch_result_allocas = []
+        self._function_throw_exit_stack = []
+        self._function_return_type_ctx_stack = []
+        self._flow_future_stack = []
+        self._flow_depth = 0
+        self._parallel_result_stack = []
+        self._parallel_exit_stack = []
+        self._parallel_arena_depth_stack = []
+        self._arena_scope_stack = []
+        return state
+
+    def _restore_function_codegen_state(self, state: dict) -> None:
+        self.builder = state['builder']
+        self.current_function = state['current_function']
+        self._method_this = state['method_this']
+        self.locals = state['locals']
+        self._locals_type_names = state['locals_type_names']
+        self.loop_exit_blocks = state['loop_exit_blocks']
+        self.loop_continue_blocks = state['loop_continue_blocks']
+        self.catch_exit_blocks = state['catch_exit_blocks']
+        self.catch_error_allocas = state['catch_error_allocas']
+        self.catch_result_allocas = state['catch_result_allocas']
+        self._function_throw_exit_stack = state['function_throw_exit_stack']
+        self._function_return_type_ctx_stack = state['function_return_type_ctx_stack']
+        self._flow_future_stack = state['flow_future_stack']
+        self._flow_depth = state['flow_depth']
+        self._parallel_result_stack = state['parallel_result_stack']
+        self._parallel_exit_stack = state['parallel_exit_stack']
+        self._parallel_arena_depth_stack = state['parallel_arena_depth_stack']
+        self._arena_scope_stack = state['arena_scope_stack']
 
     def _arena_allocate(self, llvm_type: ir.Type, name: str = "") -> ir.Value:
         """在 Arena 中分配内存，返回指向分配区域的指针"""
@@ -982,7 +1231,8 @@ class LLVMCodeGenerator(EzLangVisitor):
         if ctx is None:
             return ir.IntType(32)
         if self._generic_type_map_stack and not self._mapping_with_map:
-            return self._map_type_with_map(ctx, self._generic_type_map_stack[-1])
+            type_map, unsigned_map, type_name_map = self._generic_type_map_stack[-1]
+            return self._map_type_with_map(ctx, type_map, unsigned_map, type_name_map)
 
         P = EzLangParser
 
@@ -1129,9 +1379,16 @@ class LLVMCodeGenerator(EzLangVisitor):
             name = bt.TYPE_IDENTIFIER().getText()
             if name in self.struct_generic_templates and bt.genericArgs() is not None:
                 type_arg_ctxs = list(bt.genericArgs().type_())
-                type_args = [self._map_type(t) for t in type_arg_ctxs]
-                type_arg_unsigned = [self._type_ctx_is_unsigned(t) for t in type_arg_ctxs]
-                mono_name = self._monomorphize_struct(name, type_args, type_arg_unsigned)
+                if self._generic_type_map_stack:
+                    type_map, unsigned_map, type_name_map = self._generic_type_map_stack[-1]
+                    type_args = [self._map_type_with_map(t, type_map, unsigned_map, type_name_map) for t in type_arg_ctxs]
+                    type_arg_unsigned = [self._type_ctx_is_unsigned_with_map(t, unsigned_map) for t in type_arg_ctxs]
+                    type_arg_names = [self._type_ctx_name_with_map(t, type_map, unsigned_map, type_name_map) for t in type_arg_ctxs]
+                else:
+                    type_args = [self._map_type(t) for t in type_arg_ctxs]
+                    type_arg_unsigned = [self._type_ctx_is_unsigned(t) for t in type_arg_ctxs]
+                    type_arg_names = [self._type_ctx_name(t) for t in type_arg_ctxs]
+                mono_name = self._monomorphize_struct(name, type_args, type_arg_unsigned, type_arg_names)
                 return self.structs.get(mono_name, self.structs.get(name, ir.IntType(32)))
             if name == 'List' and bt.genericArgs() is not None:
                 args = list(bt.genericArgs().type_())
@@ -1153,7 +1410,7 @@ class LLVMCodeGenerator(EzLangVisitor):
     def _get_meta_type(self, value_type: ir.Type) -> ir.IdentifiedStructType:
         type_name = str(value_type).replace('%"', '').replace('"', '').replace('*', 'ptr').replace(' ', '_')
         meta_name = f"Meta_{type_name}"
-        meta_type = ir.global_context.get_identified_type(meta_name)
+        meta_type = self.context.get_identified_type(meta_name)
         if meta_type.is_opaque:
             i8_ptr = ir.PointerType(ir.IntType(8))
             func_ptr = ir.PointerType(ir.FunctionType(value_type, [ir.PointerType(meta_type)]))
@@ -1272,27 +1529,90 @@ class LLVMCodeGenerator(EzLangVisitor):
         """native C ABI 中的小可选聚合会按目标 ABI 重新分类返回值。"""
         if self.compile_target not in {'linux', 'macos', 'windows', 'android', 'ios'}:
             return ret_type
-        if not (
+        is_optional = (
             isinstance(ret_type, ir.LiteralStructType)
             and len(ret_type.elements) == 2
             and ret_type.elements[0] == ir.IntType(1)
-        ):
-            return ret_type
+        )
+        if is_optional:
+            value_type = ret_type.elements[1]
+            if value_type == ir.IntType(32) or isinstance(value_type, ir.FloatType):
+                return ir.IntType(64)
+            if (
+                value_type == ir.IntType(64)
+                or isinstance(value_type, ir.DoubleType)
+                or isinstance(value_type, ir.PointerType)
+            ):
+                if self.target_arch in {'aarch64', 'arm64'}:
+                    return ir.ArrayType(ir.IntType(64), 2)
+                if self.target_arch in {'x86_64', 'amd64'}:
+                    ok_type = ir.IntType(8)
+                    return ir.LiteralStructType([ok_type, value_type])
+        bridged = self._c_abi_small_aggregate_return_type(ret_type)
+        return bridged if bridged is not None else ret_type
 
-        value_type = ret_type.elements[1]
-        if value_type == ir.IntType(32) or isinstance(value_type, ir.FloatType):
-            return ir.IntType(64)
-        if (
-            value_type == ir.IntType(64)
-            or isinstance(value_type, ir.DoubleType)
-            or isinstance(value_type, ir.PointerType)
-        ):
-            if self.target_arch in {'aarch64', 'arm64'}:
-                return ir.ArrayType(ir.IntType(64), 2)
-            if self.target_arch in {'x86_64', 'amd64'}:
-                ok_type = ir.IntType(8)
-                return ir.LiteralStructType([ok_type, value_type])
-        return ret_type
+    def _c_abi_small_aggregate_return_type(self, ret_type: ir.Type) -> ir.Type | None:
+        """按常见 native C ABI 桥接 16 字节内的整型/指针小聚合返回。"""
+        if not isinstance(ret_type, (ir.LiteralStructType, ir.IdentifiedStructType)):
+            return None
+        width = self._type_width(ret_type)
+        if width <= 0 or width > 16:
+            return None
+        arch = self.target_arch
+        if arch in {'aarch64', 'arm64'}:
+            if width <= 8:
+                return ir.IntType(width * 8)
+            return ir.ArrayType(ir.IntType(64), 2)
+        if arch not in {'x86_64', 'amd64'}:
+            return None
+
+        layout = self._c_abi_aggregate_field_layout(ret_type)
+        if layout is None:
+            return None
+        chunks: list[ir.Type] = []
+        for start in range(0, width, 8):
+            end = min(start + 8, width)
+            fields = [(offset, field_type, field_width) for offset, field_type, field_width in layout if offset < end and offset + field_width > start]
+            if not fields:
+                continue
+            if len(fields) == 1 and fields[0][0] == start:
+                scalar = self._c_abi_x86_64_scalar_return_type(fields[0][1])
+                if scalar is not None:
+                    chunks.append(scalar)
+                    continue
+            if not all(self._c_abi_integer_like_field(field_type) for _, field_type, _ in fields):
+                return None
+            chunks.append(ir.IntType((end - start) * 8))
+        if not chunks:
+            return None
+        if len(chunks) == 1:
+            return chunks[0]
+        return ir.LiteralStructType(chunks)
+
+    def _c_abi_aggregate_field_layout(self, ret_type: ir.Type) -> list[tuple[int, ir.Type, int]] | None:
+        layout: list[tuple[int, ir.Type, int]] = []
+        offset = 0
+        for elem in ret_type.elements:
+            if isinstance(elem, (ir.LiteralStructType, ir.IdentifiedStructType, ir.ArrayType, ir.VectorType)):
+                return None
+            align = self._type_align(elem)
+            offset = self._align_to(offset, align)
+            width = self._type_width(elem)
+            layout.append((offset, elem, width))
+            offset += width
+        return layout
+
+    def _c_abi_integer_like_field(self, field_type: ir.Type) -> bool:
+        return isinstance(field_type, (ir.IntType, ir.PointerType))
+
+    def _c_abi_x86_64_scalar_return_type(self, field_type: ir.Type) -> ir.Type | None:
+        if isinstance(field_type, ir.IntType):
+            return ir.IntType(8) if field_type.width == 1 else field_type
+        if isinstance(field_type, ir.PointerType):
+            return field_type
+        if isinstance(field_type, (ir.FloatType, ir.DoubleType)):
+            return field_type
+        return None
 
     def _restore_c_abi_return(self, func_name: str, value: ir.Value) -> ir.Value:
         bridge = self._c_abi_return_bridges.get(func_name)
@@ -1303,6 +1623,131 @@ class LLVMCodeGenerator(EzLangVisitor):
         raw_slot = self.builder.bitcast(slot, ir.PointerType(abi_ret_type))
         self.builder.store(value, raw_slot)
         return self.builder.load(slot, name=f"_{func_name}_ret")
+
+    def _c_abi_param_type(self, param_type: ir.Type) -> ir.Type:
+        """外部 C ABI 参数类型：聚合按指针传递，函数指针递归按 C ABI 降低。"""
+        if isinstance(param_type, ir.PointerType) and isinstance(param_type.pointee, ir.FunctionType):
+            return self._c_abi_function_pointer_type(param_type)
+        if isinstance(param_type, (ir.LiteralStructType, ir.IdentifiedStructType)):
+            return ir.PointerType(param_type)
+        return param_type
+
+    def _c_abi_function_pointer_type(self, fn_ptr_type: ir.PointerType) -> ir.PointerType:
+        func_type = fn_ptr_type.pointee
+        ret_type = func_type.return_type
+        uses_sret = self._uses_c_sret(ret_type)
+        abi_ret_type = ir.VoidType() if uses_sret else self._c_abi_return_type(ret_type)
+        abi_param_types = ([ir.PointerType(ret_type)] if uses_sret else []) + [
+            self._c_abi_param_type(param_type) for param_type in func_type.args
+        ]
+        return ir.PointerType(ir.FunctionType(abi_ret_type, abi_param_types))
+
+    def _to_c_abi_return(self, value: ir.Value, ret_type: ir.Type, abi_ret_type: ir.Type) -> ir.Value:
+        if value.type == abi_ret_type:
+            return value
+        if self._is_aggregate_ptr(value):
+            value = self.builder.load(value)
+        if value.type != ret_type:
+            value = self._coerce_return_value(value, ret_type)
+        if abi_ret_type == ret_type:
+            return value
+        slot = self.builder.alloca(ret_type, name="_callback_ret_bridge")
+        self.builder.store(value, slot)
+        raw_slot = self.builder.bitcast(slot, ir.PointerType(abi_ret_type))
+        return self.builder.load(raw_slot, name="_callback_abi_ret")
+
+    def _coerce_call_arg(self, arg: ir.Value, target_type: ir.Type) -> ir.Value:
+        callback = self._coerce_c_abi_callback_arg(arg, target_type)
+        if callback is not None:
+            return callback
+        return self._coerce_value(arg, target_type)
+
+    def _coerce_c_abi_callback_arg(self, arg: ir.Value, target_type: ir.Type) -> ir.Value | None:
+        if not (isinstance(target_type, ir.PointerType) and isinstance(target_type.pointee, ir.FunctionType)):
+            return None
+        if isinstance(arg, ir.Function):
+            source_ptr_type = arg.type
+        elif isinstance(arg, ir.Value) and isinstance(arg.type, ir.PointerType) and isinstance(arg.type.pointee, ir.FunctionType):
+            if arg.type == target_type:
+                return arg
+            # 没有上下文指针时，动态函数指针不能安全桥接成另一种 C ABI。
+            return None
+        else:
+            return None
+        expected_type = self._c_abi_function_pointer_type(source_ptr_type)
+        if expected_type != target_type:
+            return None
+        return self._get_c_abi_callback_trampoline(arg, target_type)
+
+    def _get_c_abi_callback_trampoline(self, func: ir.Function, target_type: ir.PointerType) -> ir.Function:
+        key = (func.name, str(target_type))
+        cached = self._c_abi_callback_trampolines.get(key)
+        if cached is not None:
+            return cached
+
+        base_name = re.sub(r'[^0-9A-Za-z_]', '_', func.name)
+        tramp_name = f"{base_name}_cabi_callback"
+        counter = 0
+        while tramp_name in self.module.globals:
+            counter += 1
+            tramp_name = f"{base_name}_cabi_callback_{counter}"
+
+        source_type = func.function_type
+        abi_type = target_type.pointee
+        trampoline = ir.Function(self.module, abi_type, tramp_name)
+        self._c_abi_callback_trampolines[key] = trampoline
+        ret_type = source_type.return_type
+        uses_sret = self._uses_c_sret(ret_type)
+        if uses_sret and trampoline.args:
+            trampoline.args[0].add_attribute('sret')
+
+        old_builder = self.builder
+        old_func = self.current_function
+        old_locals = self.locals
+        old_unsigned = self._save_unsigned_state()
+        old_type_names = self._locals_type_names
+
+        entry = trampoline.append_basic_block('entry')
+        self.builder = ir.IRBuilder(entry)
+        self.current_function = trampoline
+        self.locals = {}
+        self._locals_type_names = {}
+
+        abi_index = 1 if uses_sret else 0
+        source_args = []
+        for param_type in source_type.args:
+            abi_arg = trampoline.args[abi_index]
+            abi_index += 1
+            if isinstance(param_type, (ir.LiteralStructType, ir.IdentifiedStructType)) and isinstance(abi_arg.type, ir.PointerType):
+                source_args.append(self.builder.load(abi_arg))
+            elif abi_arg.type != param_type:
+                source_args.append(self._coerce_value(abi_arg, param_type))
+            else:
+                source_args.append(abi_arg)
+
+        if isinstance(ret_type, ir.VoidType):
+            self.builder.call(func, source_args)
+            self.builder.ret_void()
+        else:
+            result = self.builder.call(func, source_args)
+            if uses_sret:
+                out_ptr = trampoline.args[0]
+                if self._is_aggregate_ptr(result):
+                    result = self.builder.load(result)
+                if result.type != ret_type:
+                    result = self._coerce_return_value(result, ret_type)
+                self.builder.store(result, out_ptr)
+                self.builder.ret_void()
+            else:
+                abi_ret_type = abi_type.return_type
+                self.builder.ret(self._to_c_abi_return(result, ret_type, abi_ret_type))
+
+        self.builder = old_builder
+        self.current_function = old_func
+        self.locals = old_locals
+        self._locals_type_names = old_type_names
+        self._restore_unsigned_state(old_unsigned)
+        return trampoline
 
     def _zero_constant(self, t: ir.Type) -> ir.Constant:
         """为任意 LLVM 类型生成零值常量，并缓存纯常量构造。"""
@@ -1435,7 +1880,7 @@ class LLVMCodeGenerator(EzLangVisitor):
         undef = ir.Constant(target_type, ir.Undefined)
         result = self.builder.insert_value(undef, ir.Constant(ir.IntType(32), tag), 0)
         variant_type = target_type.elements[1]
-        if self._is_aggregate_ptr(val) and val.type.pointee == variant_type:
+        if self._is_aggregate_ptr(val) and self._type_width(val.type.pointee) <= self._type_width(variant_type):
             val = self.builder.load(val)
         if val.type != variant_type:
             if isinstance(val.type, ir.IntType) and isinstance(variant_type, ir.IntType):
@@ -1444,6 +1889,21 @@ class LLVMCodeGenerator(EzLangVisitor):
                 val = self.builder.inttoptr(val, variant_type)
             elif isinstance(val.type, ir.PointerType) and isinstance(variant_type, ir.IntType):
                 val = self.builder.ptrtoint(val, variant_type)
+            elif isinstance(val.type, ir.PointerType) and isinstance(variant_type, ir.PointerType):
+                val = self.builder.bitcast(val, variant_type)
+            elif isinstance(val.type, ir.FloatType) and isinstance(variant_type, ir.DoubleType):
+                val = self.builder.fpext(val, variant_type)
+            elif isinstance(val.type, ir.DoubleType) and isinstance(variant_type, ir.FloatType):
+                val = self.builder.fptrunc(val, variant_type)
+            elif self.builder is not None and self._type_width(val.type) <= self._type_width(variant_type):
+                tmp = self.builder.alloca(target_type, name='_union_pack')
+                self.builder.store(self._zero_constant(target_type), tmp)
+                tag_ptr = self.builder.gep(tmp, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)], inbounds=True)
+                payload_ptr = self.builder.gep(tmp, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 1)], inbounds=True)
+                self.builder.store(ir.Constant(ir.IntType(32), tag), tag_ptr)
+                typed_payload_ptr = self.builder.bitcast(payload_ptr, ir.PointerType(val.type), name='_union_pack_payload')
+                self.builder.store(val, typed_payload_ptr)
+                return self.builder.load(tmp, name='_union_packed')
             else:
                 return val
         return self.builder.insert_value(result, val, 1)
@@ -1524,7 +1984,7 @@ class LLVMCodeGenerator(EzLangVisitor):
             call_args.append(this_ptr)
             call_args.extend(provided.values())
         call_args = [
-            self._coerce_value(arg, abi_arg_types[i]) if i < len(abi_arg_types) and arg.type != abi_arg_types[i] else arg
+            self._coerce_call_arg(arg, abi_arg_types[i]) if i < len(abi_arg_types) and arg.type != abi_arg_types[i] else arg
             for i, arg in enumerate(call_args)
         ]
         ret_val = self.builder.call(func, call_args)
@@ -1585,7 +2045,7 @@ class LLVMCodeGenerator(EzLangVisitor):
         if key_ctx.VAR_IDENTIFIER() is not None:
             return key_ctx.VAR_IDENTIFIER().getText()
         if key_ctx.STRING_LITERAL() is not None:
-            return key_ctx.STRING_LITERAL().getText()[1:-1]
+            return decode_string_literal_token(key_ctx.STRING_LITERAL().getText())
         return None
 
     def _dict_key_value(self, field_ctx) -> ir.Value:
@@ -1652,7 +2112,7 @@ class LLVMCodeGenerator(EzLangVisitor):
         if ctx is None:
             return None
         text = ctx.getText() if hasattr(ctx, 'getText') else ''
-        if re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', text):
+        if _EZ_VAR_IDENTIFIER_RE.fullmatch(text):
             return text
         return None
 
@@ -1869,6 +2329,11 @@ class LLVMCodeGenerator(EzLangVisitor):
             return "unknown"
         return self._type_name_from_ir_type(value.type)
 
+    def _type_name_from_ir_type_with_unsigned(self, typ: ir.Type | None, unsigned: bool) -> str:
+        if isinstance(typ, ir.IntType) and typ.width in {8, 32, 64}:
+            return f"U{typ.width}" if unsigned else f"I{typ.width}"
+        return self._type_name_from_ir_type(typ)
+
     def _type_name_from_ir_type(self, typ: ir.Type | None) -> str:
         if typ is None:
             return "unknown"
@@ -1889,6 +2354,8 @@ class LLVMCodeGenerator(EzLangVisitor):
         if self._is_list_type(typ):
             elem_type = typ.elements[0].pointee.pointee
             return f"{self._type_name_from_ir_type(elem_type)}[]"
+        if self._is_optional_type(typ):
+            return f"{self._type_name_from_ir_type(typ.elements[1])}?"
         if isinstance(typ, ir.IdentifiedStructType):
             return typ.name or "Struct"
         if isinstance(typ, ir.LiteralStructType):
@@ -1970,7 +2437,7 @@ class LLVMCodeGenerator(EzLangVisitor):
                 ):
                     top_level_work.append(child)
 
-        if top_level_work:
+        if top_level_work or self.ensure_entrypoint:
             self._gen_entrypoint(top_level_work)
 
         if not self.active_extern_libs and self._non_extern_decls_seen == 0:
@@ -2037,22 +2504,37 @@ class LLVMCodeGenerator(EzLangVisitor):
         val = self._eval_expr(initializer)
         if val is None:
             return None
+        source_dict_types = None
+        if isinstance(getattr(val, 'type', None), ir.PointerType) and val.type.pointee == self.structs.get('Dict'):
+            source_dict_types = self._dict_item_types_for_value(val)
         if self._is_aggregate_ptr(val):
             val = self.builder.load(val)
         val = self._coerce_value(val, gv.type.pointee)
         if val.type != gv.type.pointee:
             return None
         self._emit_lock_access(name, "write", lambda: self.builder.store(val, gv))
+        if gv.type.pointee == self.structs.get('Dict'):
+            item_types = self._dict_item_types_from_decl(ctx.type_(), initializer) or source_dict_types
+            if item_types is not None:
+                self._mark_dict_item_types(gv, item_types[0], item_types[1])
+        self.locals[name] = gv
+        type_name = self._globals_type_names.get(name) or self._type_name_from_ir_type(gv.type.pointee)
+        self._locals_type_names[name] = type_name
         return None
 
-    def _infer_global_initializer_type(self, initializer) -> ir.Type:
+    def _infer_global_initializer_type(self, initializer, local_types: dict[str, ir.Type] | None = None) -> ir.Type:
         text = initializer.getText()
         if text.startswith('typeof'):
             return ir.IntType(32)
-        if text.startswith('parallel'):
+        if self._is_exact_flow_block_expr(initializer):
+            return self._infer_flow_result_type(initializer)
+        if self._is_exact_parallel_block_expr(initializer):
             return self._infer_parallel_result_type(initializer)
+        bool_type = self._infer_boolean_expression_type(initializer)
+        if bool_type is not None:
+            return bool_type
         if text.startswith('race('):
-            return ir.IntType(32)
+            return self._infer_race_result_type(initializer)
         if text.startswith('"'):
             return ir.PointerType(ir.IntType(8))
         if text.startswith('{'):
@@ -2064,10 +2546,37 @@ class LLVMCodeGenerator(EzLangVisitor):
         if re.fullmatch(r'[-+]?\d+\.\d+(?:[eE][-+]?\d+)?', text):
             return ir.DoubleType()
 
+        if _EZ_VAR_IDENTIFIER_RE.fullmatch(text):
+            if local_types is not None and text in local_types:
+                return local_types[text]
+            storage = self.locals.get(text) or self.globals.get(text)
+            if storage is not None and not isinstance(storage, ir.Function):
+                return storage.type.pointee if isinstance(storage.type, ir.PointerType) else storage.type
+
+        dict_index_type = self._infer_dict_index_value_type(initializer)
+        if dict_index_type is not None:
+            return dict_index_type
+
+        method_call_name = self._expr_method_call_name(initializer)
+        if method_call_name is not None and method_call_name in self.module.globals:
+            if method_call_name in self._sret_functions:
+                return self._sret_functions[method_call_name]
+            callee = self.module.globals[method_call_name]
+            func_type = callee.type.pointee if isinstance(callee.type, ir.PointerType) else None
+            if isinstance(func_type, ir.FunctionType):
+                return func_type.return_type
+
         call_name = self._expr_call_name(initializer)
-        generic_args = self._expr_call_generic_args(initializer)
+        generic_arg_ctxs = self._expr_call_generic_arg_ctxs(initializer)
+        generic_args = [self._map_type(t) for t in generic_arg_ctxs]
         if call_name is not None and generic_args:
-            call_name = self._monomorphize(call_name, generic_args)
+            call_name = self._monomorphize(
+                call_name,
+                generic_args,
+                [self._type_ctx_suffix(t) for t in generic_arg_ctxs],
+                [self._type_ctx_is_unsigned(t) for t in generic_arg_ctxs],
+                [self._type_ctx_name(t) for t in generic_arg_ctxs],
+            )
         if call_name is not None:
             list_builtin = self._list_builtin_base(call_name)
             elem_type = generic_args[0] if generic_args else ir.IntType(32)
@@ -2080,6 +2589,13 @@ class LLVMCodeGenerator(EzLangVisitor):
             if list_builtin == 'listFind':
                 return ir.LiteralStructType([ir.IntType(1), elem_type])
             if list_builtin in {'listSlice', 'listFilter'}:
+                return ir.LiteralStructType([
+                    ir.PointerType(ir.PointerType(elem_type)),
+                    ir.IntType(64),
+                    ir.IntType(64),
+                    ir.IntType(64),
+                ])
+            if list_builtin == 'randomShuffle':
                 return ir.LiteralStructType([
                     ir.PointerType(ir.PointerType(elem_type)),
                     ir.IntType(64),
@@ -2131,6 +2647,31 @@ class LLVMCodeGenerator(EzLangVisitor):
 
         return ir.IntType(32)
 
+    def _is_exact_flow_block_expr(self, ctx) -> bool:
+        """判断初始化表达式是否完整就是 `flow { ... }`。"""
+        if ctx is None:
+            return False
+        if isinstance(ctx, EzLangParser.FlowBlockExprContext):
+            return True
+        if hasattr(ctx, 'flowBlock') and ctx.flowBlock() is not None and ctx.getChildCount() == 1:
+            return True
+        if hasattr(ctx, 'getChildCount') and ctx.getChildCount() == 1:
+            return self._is_exact_flow_block_expr(ctx.getChild(0))
+        return False
+
+    def _infer_flow_result_type(self, ctx) -> ir.Type:
+        """从 flow 块中的 return 推断表达式结果类型。"""
+        if isinstance(ctx, EzLangParser.FlowBlockExprContext):
+            return self._infer_block_return_type(ctx.flowBlock().block())
+        if hasattr(ctx, 'flowBlock') and ctx.flowBlock() is not None:
+            return self._infer_block_return_type(ctx.flowBlock().block())
+        if hasattr(ctx, 'getChildCount'):
+            for i in range(ctx.getChildCount()):
+                result = self._infer_flow_result_type(ctx.getChild(i))
+                if not isinstance(result, ir.IntType) or result.width != 32:
+                    return result
+        return ir.IntType(32)
+
     def _infer_parallel_result_type(self, ctx) -> ir.Type:
         """从 parallel 块中的首个 return 粗略推断结果类型。"""
         if isinstance(ctx, EzLangParser.ParallelBlockExprContext):
@@ -2144,14 +2685,101 @@ class LLVMCodeGenerator(EzLangVisitor):
                     return result
         return ir.IntType(32)
 
+    def _is_exact_parallel_block_expr(self, ctx) -> bool:
+        """判断初始化表达式是否完整就是 `parallel { ... }`，避免截断组合表达式。"""
+        if ctx is None:
+            return False
+        if isinstance(ctx, EzLangParser.ParallelBlockExprContext):
+            return True
+        if hasattr(ctx, 'parallelBlock') and ctx.parallelBlock() is not None and ctx.getChildCount() == 1:
+            return True
+        if hasattr(ctx, 'getChildCount') and ctx.getChildCount() == 1:
+            return self._is_exact_parallel_block_expr(ctx.getChild(0))
+        return False
+
+    def _infer_boolean_expression_type(self, ctx) -> ir.Type | None:
+        """识别当前表达式本身会产生 Bool 的常见运算。"""
+        node = ctx
+        while hasattr(node, 'getChildCount') and node.getChildCount() == 1:
+            child = node.getChild(0)
+            if not hasattr(child, 'getChildCount'):
+                break
+            node = child
+
+        i1 = ir.IntType(1)
+        if isinstance(node, EzLangParser.OrExpressionContext) and len(node.andExpression()) > 1:
+            return i1
+        if isinstance(node, EzLangParser.AndExpressionContext) and len(node.equalityExpression()) > 1:
+            return i1
+        if isinstance(node, EzLangParser.EqualityExpressionContext) and len(node.relationalExpression()) > 1:
+            return i1
+        if isinstance(node, EzLangParser.RelationalExpressionContext) and len(node.bitOrExpression()) > 1:
+            return i1
+        if isinstance(node, EzLangParser.UnaryExpressionContext) and node.BANG() is not None:
+            return i1
+        return None
+
+    def _infer_race_result_type(self, ctx) -> ir.Type:
+        """从 race(pl = [() => T, ...]) 分支推断同步 fallback 的结果类型。"""
+        array_lit = self._find_array_literal_ctx(ctx)
+        first_branch = self._first_function_literal_in_array(array_lit)
+        if first_branch is None:
+            return ir.IntType(32)
+        branch_type = self._infer_function_literal_return_type(first_branch)
+        return ir.IntType(32) if isinstance(branch_type, ir.VoidType) else branch_type
+
     def _infer_block_return_type(self, block_ctx) -> ir.Type:
         if block_ctx is None:
             return ir.VoidType()
-        for stmt in block_ctx.statement():
-            ret = stmt.returnStatement()
-            if ret is not None and ret.expression() is not None:
-                return self._infer_global_initializer_type(ret.expression())
+        return_types = self._collect_block_return_types(block_ctx)
+        if return_types:
+            return return_types[0]
         return ir.VoidType()
+
+    def _collect_block_return_types(self, block_ctx) -> list[ir.Type]:
+        """收集当前 flow/parallel/race 函数体内的 return 类型，不跨越嵌套函数或并发块。"""
+        result: list[ir.Type] = []
+        local_types: dict[str, ir.Type] = {}
+
+        def walk(node) -> None:
+            if node is None:
+                return
+            if node is not block_ctx and isinstance(node, (
+                EzLangParser.FunctionLiteralContext,
+                EzLangParser.FlowBlockContext,
+                EzLangParser.ParallelBlockContext,
+                EzLangParser.CatchBlockContext,
+            )):
+                return
+            ret = node.returnStatement() if hasattr(node, 'returnStatement') else None
+            if ret is not None:
+                if ret.expression() is not None:
+                    result.append(self._infer_global_initializer_type(ret.expression(), local_types))
+                else:
+                    result.append(ir.VoidType())
+                return
+            if isinstance(node, EzLangParser.ReturnStatementContext):
+                if node.expression() is not None:
+                    result.append(self._infer_global_initializer_type(node.expression(), local_types))
+                else:
+                    result.append(ir.VoidType())
+                return
+            decl = node.declaration() if hasattr(node, 'declaration') else None
+            var_decl = decl.variableDecl() if decl is not None and hasattr(decl, 'variableDecl') else None
+            if var_decl is not None:
+                qname = var_decl.qualifiedVarName()
+                if qname is not None and len(qname.VAR_IDENTIFIER()) == 1:
+                    name = qname.VAR_IDENTIFIER(0).getText()
+                    if var_decl.type_() is not None:
+                        local_types[name] = self._map_type(var_decl.type_())
+                    elif var_decl.expression() is not None:
+                        local_types[name] = self._infer_global_initializer_type(var_decl.expression(), local_types)
+            if hasattr(node, 'getChildCount'):
+                for i in range(node.getChildCount()):
+                    walk(node.getChild(i))
+
+        walk(block_ctx)
+        return result
 
     def _infer_function_literal_return_type(self, fn_lit) -> ir.Type:
         if fn_lit is None:
@@ -2214,6 +2842,54 @@ class LLVMCodeGenerator(EzLangVisitor):
                     return result
         return None
 
+    def _expr_method_call_name(self, ctx) -> str | None:
+        if isinstance(ctx, EzLangParser.CallContext):
+            return self._method_call_function_name(ctx.postfixExpression())
+        if hasattr(ctx, 'getChildCount'):
+            for i in range(ctx.getChildCount()):
+                result = self._expr_method_call_name(ctx.getChild(i))
+                if result is not None:
+                    return result
+        return None
+
+    def _method_call_function_name(self, target) -> str | None:
+        if not isinstance(target, EzLangParser.MemberAccessContext):
+            return None
+        method_name = target.VAR_IDENTIFIER().getText()
+        static_owner = self._static_struct_member_owner(target.postfixExpression())
+        if static_owner is not None:
+            return self.struct_methods.get(static_owner, {}).get(method_name)
+
+        receiver_type = self._method_receiver_struct_name(target.postfixExpression())
+        if receiver_type is None:
+            return None
+        return self.struct_methods.get(receiver_type, {}).get(method_name)
+
+    def _method_receiver_struct_name(self, ctx) -> str | None:
+        if isinstance(ctx, EzLangParser.CallContext):
+            inferred = self._infer_global_initializer_type(ctx)
+            if isinstance(inferred, ir.IdentifiedStructType) and inferred.name in self.struct_methods:
+                return inferred.name
+        struct_name = self._expr_struct_literal_name(ctx)
+        if struct_name is not None and struct_name in self.struct_methods:
+            return struct_name
+        ident = self._leftmost_identifier_ctx(ctx)
+        if ident is None or ident.getText() != (ctx.getText() if hasattr(ctx, 'getText') else ''):
+            return None
+        token = ident.VAR_IDENTIFIER() or ident.TYPE_IDENTIFIER()
+        name = token.getText() if token is not None else None
+        if name is None:
+            return None
+        type_name = self._locals_type_names.get(name) or self._globals_type_names.get(name)
+        if type_name in self.struct_methods:
+            return type_name
+        value = self.locals.get(name) or self.globals.get(name)
+        if value is not None:
+            value_type = value.type.pointee if isinstance(value.type, ir.PointerType) else value.type
+            if isinstance(value_type, ir.IdentifiedStructType) and value_type.name in self.struct_methods:
+                return value_type.name
+        return None
+
     def _leftmost_identifier_name(self, ctx) -> str | None:
         if isinstance(ctx, EzLangParser.IdentifierExprContext):
             token = ctx.VAR_IDENTIFIER() or ctx.TYPE_IDENTIFIER()
@@ -2229,18 +2905,21 @@ class LLVMCodeGenerator(EzLangVisitor):
                     return result
         return None
 
-    def _expr_call_generic_args(self, ctx) -> list[ir.Type]:
+    def _expr_call_generic_arg_ctxs(self, ctx) -> list:
         if isinstance(ctx, EzLangParser.CallContext):
             ident = self._leftmost_identifier_ctx(ctx.postfixExpression())
             if ident is not None and ident.genericArgs() is not None:
-                return [self._map_type(t) for t in ident.genericArgs().type_()]
+                return list(ident.genericArgs().type_())
             return []
         if hasattr(ctx, 'getChildCount'):
             for i in range(ctx.getChildCount()):
-                result = self._expr_call_generic_args(ctx.getChild(i))
+                result = self._expr_call_generic_arg_ctxs(ctx.getChild(i))
                 if result:
                     return result
         return []
+
+    def _expr_call_generic_args(self, ctx) -> list[ir.Type]:
+        return [self._map_type(t) for t in self._expr_call_generic_arg_ctxs(ctx)]
 
     def _leftmost_identifier_ctx(self, ctx):
         if isinstance(ctx, EzLangParser.IdentifierExprContext):
@@ -2307,9 +2986,7 @@ class LLVMCodeGenerator(EzLangVisitor):
             if params is not None:
                 for p in params.paramType():
                     pt = self._map_type(p.type_())
-                    if isinstance(pt, (ir.LiteralStructType, ir.IdentifiedStructType)):
-                        pt = ir.PointerType(pt)
-                    param_types.append(pt)
+                    param_types.append(self._c_abi_param_type(pt))
             uses_sret = self._uses_c_sret(ret_type)
             bridged_ret_type = self._c_abi_return_type(ret_type)
             abi_ret_type = ir.VoidType() if uses_sret else bridged_ret_type
@@ -2351,7 +3028,7 @@ class LLVMCodeGenerator(EzLangVisitor):
 
     def visitExternDecl(self, ctx: EzLangParser.ExternDeclContext):
         """extern 库引用：记录库路径和目标平台，供链接阶段使用"""
-        raw_lib_path = ctx.STRING_LITERAL().getText()[1:-1]  # 去掉引号
+        raw_lib_path = decode_string_literal_token(ctx.STRING_LITERAL().getText())
         lib_path = self._resolve_extern_path(raw_lib_path)
         target = None
         tp_ctx = ctx.targetPlatform()
@@ -2362,31 +3039,33 @@ class LLVMCodeGenerator(EzLangVisitor):
         if suffix and suffix not in self._supported_extern_exts:
             self._extern_diagnostics.append(f"extern 路径格式不支持：'{raw_lib_path}'")
         if target is None or self.compile_target is None or target == self.compile_target:
-            self.active_extern_libs.append(lib_path)
+            self._add_active_extern_lib(lib_path)
             if suffix == '.js' and (target == 'emcc' or self.compile_target == 'emcc'):
                 self._emcc_js_libs.append(lib_path)
         return None
 
     def visitImportDecl(self, ctx: EzLangParser.ImportDeclContext):
         """import 模块导入：编译被导入文件，合并符号到当前模块"""
-        import os as _os
-        path = ctx.STRING_LITERAL().getText()[1:-1]
+        path = decode_string_literal_token(ctx.STRING_LITERAL().getText())
 
-        # 解析路径（相对于当前源码目录 / examples/）
-        base_dirs = [
-            _os.path.join(_os.path.dirname(__file__), '..', '..', '..', 'examples'),
-            _os.path.join(_os.path.dirname(__file__), '..', '..', '..', 'packages'),
-        ]
+        # 解析路径：优先相对当前源码文件目录，保留旧的 examples/packages fallback。
+        search_dirs = []
+        current_dir = self._source_dir_stack[-1] if self._source_dir_stack else self.base_dir
+        search_dirs.append(current_dir)
+        search_dirs.extend([
+            Path(__file__).resolve().parents[3] / 'examples',
+            Path(__file__).resolve().parents[3] / 'packages',
+        ])
         source = None
-        for d in base_dirs:
-            raw = _os.path.join(d, path)
+        resolved_file: Path | None = None
+        for d in search_dirs:
+            raw = (Path(d) / path).resolve() if not Path(path).is_absolute() else Path(path).resolve()
             candidates = [raw]
-            if not raw.endswith('.ez'):
-                candidates.extend([raw + '.ez', _os.path.join(raw, 'index.ez')])
-            p = next((candidate for candidate in candidates if _os.path.isfile(candidate)), None)
-            if p is not None:
-                with open(p) as f:
-                    source = f.read()
+            if raw.suffix != '.ez':
+                candidates.extend([Path(str(raw) + '.ez'), raw / 'index.ez'])
+            resolved_file = next((candidate for candidate in candidates if candidate.is_file()), None)
+            if resolved_file is not None:
+                source = resolved_file.read_text(encoding='utf-8')
                 break
 
         if source is None:
@@ -2395,9 +3074,10 @@ class LLVMCodeGenerator(EzLangVisitor):
         # 编译导入文件到同一个模块（避免循环导入）
         if not hasattr(self, '_imported'):
             self._imported = set()
-        if path in self._imported:
+        import_key = str(resolved_file.resolve()) if resolved_file is not None else path
+        if import_key in self._imported:
             return None
-        self._imported.add(path)
+        self._imported.add(import_key)
 
         # 解析并访问
         from antlr4 import InputStream, CommonTokenStream
@@ -2424,12 +3104,16 @@ class LLVMCodeGenerator(EzLangVisitor):
 
         # 访问被导入文件的 AST（符号会注册到当前模块）
         self._import_depth += 1
+        if resolved_file is not None:
+            self._source_dir_stack.append(resolved_file.parent)
         try:
             for i in range(tree.getChildCount()):
                 child = tree.getChild(i)
                 if hasattr(child, 'accept') and child.getChildCount() > 0:
                     child.accept(self)
         finally:
+            if resolved_file is not None:
+                self._source_dir_stack.pop()
             self._import_depth -= 1
 
         # 处理重命名：为被导入符号创建别名
@@ -2467,6 +3151,9 @@ class LLVMCodeGenerator(EzLangVisitor):
             gv.initializer = const_initializer if const_initializer is not None else self._zero_constant(llvm_type)
             self.globals[name] = gv
             self._remember_type_name(name, llvm_type, type_ctx, global_scope=True)
+            dict_item_types = self._dict_item_types_from_decl(type_ctx, initializer)
+            if dict_item_types is not None:
+                self._mark_dict_item_types(gv, dict_item_types[0], dict_item_types[1])
             self._mark_unsigned(gv, self._type_ctx_is_unsigned(type_ctx))
             if type_ctx is not None:
                 self._mark_list_elem_unsigned(gv, self._type_ctx_is_unsigned(type_ctx))
@@ -2474,6 +3161,17 @@ class LLVMCodeGenerator(EzLangVisitor):
             # 局部变量
             if type_ctx is not None:
                 llvm_type = self._map_type(type_ctx)
+                parallel_block = self._parallel_block_from_initializer(initializer) if self._is_exact_parallel_block_expr(initializer) else None
+                if parallel_block is not None and self._flow_depth > 0 and self._type_ctx_name(type_ctx) == 'I32':
+                    future_handle = self._start_flow_parallel_i32_future(name, parallel_block)
+                    if future_handle is not None:
+                        alloca = self.builder.alloca(llvm_type, name=name)
+                        self.builder.store(self._zero_constant(llvm_type), alloca)
+                        self.locals[name] = alloca
+                        self._remember_type_name(name, llvm_type, type_ctx)
+                        self._mark_unsigned(alloca, self._type_ctx_is_unsigned(type_ctx))
+                        self._mark_list_elem_unsigned(alloca, self._type_ctx_is_unsigned(type_ctx))
+                        return None
                 alloca = self.builder.alloca(llvm_type, name=name)
                 self.locals[name] = alloca
                 self._remember_type_name(name, llvm_type, type_ctx)
@@ -2497,7 +3195,7 @@ class LLVMCodeGenerator(EzLangVisitor):
                     self._emit_lock_access(name, "write", lambda: self.builder.store(self._zero_constant(llvm_type), alloca))
             elif initializer is not None:
                 # 类型推断：先求值，根据结果确定类型
-                parallel_block = self._parallel_block_from_initializer(initializer)
+                parallel_block = self._parallel_block_from_initializer(initializer) if self._is_exact_parallel_block_expr(initializer) else None
                 if parallel_block is not None and self._flow_depth > 0:
                     future_handle = self._start_flow_parallel_i32_future(name, parallel_block)
                     if future_handle is not None:
@@ -2552,6 +3250,7 @@ class LLVMCodeGenerator(EzLangVisitor):
             field_names = []
             alias_field_types = []
             alias_field_unsigned = []
+            alias_field_type_names = []
             for member in members:
                 if member.VAR_IDENTIFIER() is None:
                     continue
@@ -2562,12 +3261,14 @@ class LLVMCodeGenerator(EzLangVisitor):
                 field_type = self._map_type(member_types[-1]) if member_types else ir.IntType(32)
                 alias_field_types.append(field_type)
                 alias_field_unsigned.append(self._type_ctx_is_unsigned(member_types[-1]) if member_types else False)
-            alias_struct = ir.global_context.get_identified_type(name)
-            if not alias_struct.elements:
+                alias_field_type_names.append(self._type_ctx_name(member_types[-1]) if member_types else "I32")
+            alias_struct = self.context.get_identified_type(name)
+            if alias_struct.is_opaque:
                 alias_struct.set_body(*alias_field_types)
             self.structs[name] = alias_struct
             self.struct_fields[name] = field_names
             self._struct_field_unsigned[name] = alias_field_unsigned
+            self._struct_field_type_names[name] = alias_field_type_names
             self.type_aliases[name] = alias_struct
             return None
 
@@ -2586,11 +3287,12 @@ class LLVMCodeGenerator(EzLangVisitor):
             self.struct_generic_templates[name] = ctx
             return None
 
-        struct_type = ir.global_context.get_identified_type(name)
+        struct_type = self.context.get_identified_type(name)
         self.structs[name] = struct_type
         field_names = []
         field_types = []
         field_unsigned = []
+        field_type_names = []
 
         defaults = {}
         methods = []
@@ -2603,6 +3305,7 @@ class LLVMCodeGenerator(EzLangVisitor):
                 field_names.append(fname)
                 field_types.append(ftype)
                 field_unsigned.append(self._type_ctx_is_unsigned(field_ctx.type_()))
+                field_type_names.append(self._type_ctx_name(field_ctx.type_()))
                 # 收集默认值表达式（AST 上下文），实例化时求值
                 if field_ctx.expression() is not None:
                     defaults[fname] = field_ctx.expression()
@@ -2621,6 +3324,8 @@ class LLVMCodeGenerator(EzLangVisitor):
                                 field_types.append(base_struct.elements[bf_idx])
                                 base_unsigned = self._struct_field_unsigned.get(base_name, [])
                                 field_unsigned.append(base_unsigned[bf_idx] if bf_idx < len(base_unsigned) else False)
+                                base_type_names = self._struct_field_type_names.get(base_name, [])
+                                field_type_names.append(base_type_names[bf_idx] if bf_idx < len(base_type_names) else self._type_name_from_ir_type(base_struct.elements[bf_idx]))
             # 方法: methodName = (this: Type, ...) => body
             method_ctx = member_ctx.structMethod()
             if method_ctx is not None:
@@ -2630,11 +3335,12 @@ class LLVMCodeGenerator(EzLangVisitor):
                 self.struct_methods[name][mname] = f"{name}_{mname}"
                 methods.append((mname, method_ctx.functionLiteral(), method_ctx.functionSignature()))
 
-        if not struct_type.elements:
+        if struct_type.is_opaque:
             struct_type.set_body(*field_types)
         self.structs[name] = struct_type
         self.struct_fields[name] = field_names
         self._struct_field_unsigned[name] = field_unsigned
+        self._struct_field_type_names[name] = field_type_names
         self.struct_defaults[name] = defaults
         for mname, fn_lit, sig in methods:
             func_name = f"{name}_{mname}"
@@ -2660,6 +3366,8 @@ class LLVMCodeGenerator(EzLangVisitor):
                 ptype = self._map_type(p.type_())
                 if index == 0 and pname == 'this' and isinstance(ptype, (ir.LiteralStructType, ir.IdentifiedStructType)):
                     ptype = ir.PointerType(ptype)
+                else:
+                    ptype = self._c_abi_param_type(ptype)
                 param_types.append(ptype)
                 param_names.append(pname)
         if func_name in self.module.globals:
@@ -2670,50 +3378,52 @@ class LLVMCodeGenerator(EzLangVisitor):
         self.func_param_names[func_name] = param_names
         return func
 
-    def _gen_method_func(self, func_name: str, fn_lit_ctx, struct_name: str):
+    def _gen_method_func(self, func_name: str, fn_lit_ctx, struct_name: str,
+                         generic_context: tuple[dict[str, ir.Type], dict[str, bool], dict[str, str]] | None = None):
         """生成结构体方法对应的 LLVM 函数"""
-        ret_type = self._map_type(fn_lit_ctx.type_())
-        self.func_return_unsigned[func_name] = self._type_ctx_is_unsigned(fn_lit_ctx.type_())
-        ret_dict_types = self._dict_types_from_type_ctx(fn_lit_ctx.type_())
-        if ret_dict_types is not None:
-            self.func_return_dict_types[func_name] = ret_dict_types
-        param_types = []
-        param_names = []
-        params = fn_lit_ctx.paramList()
-        if params is not None:
-            for index, p in enumerate(params.param()):
-                pname = p.VAR_IDENTIFIER().getText()
-                ptype = self._map_type(p.type_())
-                if index == 0 and pname == 'this' and isinstance(ptype, (ir.LiteralStructType, ir.IdentifiedStructType)):
-                    ptype = ir.PointerType(ptype)
-                param_types.append(ptype)
-                param_names.append(pname)
+        pushed_context = generic_context is not None
+        if pushed_context:
+            self._generic_type_map_stack.append(generic_context)
+        try:
+            ret_type = self._map_type(fn_lit_ctx.type_())
+            self.func_return_unsigned[func_name] = self._type_ctx_is_unsigned(fn_lit_ctx.type_())
+            ret_dict_types = self._dict_types_from_type_ctx(fn_lit_ctx.type_())
+            if ret_dict_types is not None:
+                self.func_return_dict_types[func_name] = ret_dict_types
+            param_types = []
+            param_names = []
+            params = fn_lit_ctx.paramList()
+            if params is not None:
+                for index, p in enumerate(params.param()):
+                    pname = p.VAR_IDENTIFIER().getText()
+                    ptype = self._map_type(p.type_())
+                    if index == 0 and pname == 'this' and isinstance(ptype, (ir.LiteralStructType, ir.IdentifiedStructType)):
+                        ptype = ir.PointerType(ptype)
+                    param_types.append(ptype)
+                    param_names.append(pname)
 
-        func_type = ir.FunctionType(ret_type, param_types)
-        func = ir.Function(self.module, func_type, func_name)
-        for i, pn in enumerate(param_names):
-            func.args[i].name = pn
+            func_type = ir.FunctionType(ret_type, param_types)
+            func = ir.Function(self.module, func_type, func_name)
+            for i, pn in enumerate(param_names):
+                func.args[i].name = pn
 
-        self.func_param_names[func_name] = param_names
-        self.func_defaults[func_name] = {}
+            self.func_param_names[func_name] = param_names
+            self.func_defaults[func_name] = {}
+        finally:
+            if pushed_context:
+                self._generic_type_map_stack.pop()
 
         # 生成函数体
         body = fn_lit_ctx.block() or fn_lit_ctx.expression()
         if body is not None:
             entry = func.append_basic_block('entry')
-            prev_builder = self.builder
-            prev_func = self.current_function
-            prev_locals = self.locals
             prev_unsigned = self._save_unsigned_state()
-            prev_type_names = self._locals_type_names
-
-            self.builder = ir.IRBuilder(entry)
-            self.current_function = func
-            self.locals = {}
+            prev_codegen_state = self._enter_function_codegen_state(ir.IRBuilder(entry), func)
+            if pushed_context:
+                self._generic_type_map_stack.append(generic_context)
             throw_exit = func.append_basic_block('throw_exit')
             self._function_throw_exit_stack.append(throw_exit)
             self._function_return_type_ctx_stack.append(fn_lit_ctx.type_())
-            self._locals_type_names = {}
 
             for i, pn in enumerate(param_names):
                 alloca = self._bind_function_param(pn, param_types[i], func.args[i], this_ref=(i == 0 and pn == 'this'))
@@ -2726,11 +3436,10 @@ class LLVMCodeGenerator(EzLangVisitor):
             val = self._eval(body)
             self._finish_function_with_throw_exit(ret_type, val)
             self._function_return_type_ctx_stack.pop()
+            if pushed_context:
+                self._generic_type_map_stack.pop()
 
-            self.builder = prev_builder
-            self.current_function = prev_func
-            self.locals = prev_locals
-            self._locals_type_names = prev_type_names
+            self._restore_function_codegen_state(prev_codegen_state)
             self._restore_unsigned_state(prev_unsigned)
 
     # ==================== 函数声明 ====================
@@ -2787,15 +3496,8 @@ class LLVMCodeGenerator(EzLangVisitor):
 
         # 生成函数体
         block = func.append_basic_block(name="entry")
-        old_builder = self.builder
-        old_func = self.current_function
-        old_locals = self.locals
         old_unsigned = self._save_unsigned_state()
-        old_type_names = self._locals_type_names
-        self.builder = ir.IRBuilder(block)
-        self.current_function = func
-        self.locals = {}
-        self._locals_type_names = {}
+        old_codegen_state = self._enter_function_codegen_state(ir.IRBuilder(block), func)
         throw_exit = func.append_basic_block('throw_exit')
         self._function_throw_exit_stack.append(throw_exit)
         self._function_return_type_ctx_stack.append(fn_lit_ctx.type_())
@@ -2820,10 +3522,7 @@ class LLVMCodeGenerator(EzLangVisitor):
         self._finish_function_with_throw_exit(ret_type, val)
         self._function_return_type_ctx_stack.pop()
 
-        self.builder = old_builder
-        self.current_function = old_func
-        self.locals = old_locals
-        self._locals_type_names = old_type_names
+        self._restore_function_codegen_state(old_codegen_state)
         self._restore_unsigned_state(old_unsigned)
         return func
 
@@ -2944,6 +3643,2794 @@ class LLVMCodeGenerator(EzLangVisitor):
         builder.ret(index)
         return func
 
+    def _fmt_struct_serializable(self, typ: ir.Type, seen: set[str] | None = None) -> bool:
+        """JSON/MessagePack 只递归支持普通用户结构体，跳过运行时 ABI 结构体。"""
+        if not isinstance(typ, ir.IdentifiedStructType):
+            return False
+        struct_name = typ.name
+        if struct_name in {'Blob', 'Dict', 'Error', 'Date'}:
+            return False
+        fields = self.struct_fields.get(struct_name, [])
+        if len(fields) != len(typ.elements):
+            return False
+        seen = set(seen or set())
+        if struct_name in seen:
+            return False
+        seen.add(struct_name)
+        return all(
+            self._fmt_field_serializable(field_type, struct_name, index, seen)
+            for index, field_type in enumerate(typ.elements)
+        )
+
+    def _fmt_field_serializable(self, field_type: ir.Type, struct_name: str, index: int, seen: set[str]) -> bool:
+        source_name = self._fmt_source_type_name(field_type, struct_name, index)
+        return self._fmt_value_serializable(field_type, source_name, seen)
+
+    def _fmt_value_serializable(self, value_type: ir.Type, source_name: str, seen: set[str]) -> bool:
+        if source_name in {'Bool', 'I8', 'I32', 'I64', 'U8', 'U32', 'U64', 'F32', 'F64', 'Str'}:
+            return True
+        if self._is_optional_type(value_type):
+            return self._fmt_optional_serializable(value_type, source_name, seen)
+        if self._is_list_type(value_type):
+            return self._fmt_list_serializable(value_type, source_name, seen)
+        if self._is_dict_type(value_type):
+            return self._fmt_dict_serializable(value_type, source_name, seen)
+        if self._is_union_type(value_type):
+            return self._fmt_union_serializable(value_type, source_name, seen)
+        return self._fmt_struct_serializable(value_type, set(seen))
+
+    def _fmt_list_serializable(self, list_type: ir.Type, source_name: str, seen: set[str]) -> bool:
+        if not self._is_list_type(list_type):
+            return False
+        elem_type = list_type.elements[0].pointee.pointee
+        elem_source = self._fmt_list_elem_source_name(source_name, elem_type)
+        return self._fmt_value_serializable(elem_type, elem_source, set(seen))
+
+    def _fmt_optional_serializable(self, opt_type: ir.Type, source_name: str, seen: set[str]) -> bool:
+        if not self._is_optional_type(opt_type):
+            return False
+        inner_type = opt_type.elements[1]
+        inner_source = self._fmt_optional_inner_source_name(source_name, inner_type)
+        return self._fmt_value_serializable(inner_type, inner_source, set(seen))
+
+    def _is_dict_type(self, typ: ir.Type) -> bool:
+        return typ == self.structs.get('Dict')
+
+    @staticmethod
+    def _fmt_split_top_level(text: str, delimiter: str) -> list[str]:
+        parts: list[str] = []
+        start = 0
+        angle_depth = 0
+        paren_depth = 0
+        bracket_depth = 0
+        for index, ch in enumerate(text):
+            if ch == '<':
+                angle_depth += 1
+            elif ch == '>' and angle_depth > 0:
+                angle_depth -= 1
+            elif ch == '(':
+                paren_depth += 1
+            elif ch == ')' and paren_depth > 0:
+                paren_depth -= 1
+            elif ch == '[':
+                bracket_depth += 1
+            elif ch == ']' and bracket_depth > 0:
+                bracket_depth -= 1
+            elif ch == delimiter and angle_depth == 0 and paren_depth == 0 and bracket_depth == 0:
+                parts.append(text[start:index].strip())
+                start = index + 1
+        parts.append(text[start:].strip())
+        return parts
+
+    def _fmt_union_parts(self, source_name: str) -> list[str] | None:
+        name = (source_name or '').strip()
+        if not name:
+            return None
+        parts = self._fmt_split_top_level(name, '|')
+        if len(parts) < 2 or any(not part for part in parts):
+            return None
+        return parts
+
+    def _fmt_union_variant_types_from_source_name(self, source_name: str) -> tuple[list[str], list[ir.Type]] | None:
+        parts = self._fmt_union_parts(source_name)
+        if parts is None:
+            return None
+        return parts, [self._fmt_type_from_source_name(part) for part in parts]
+
+    def _fmt_union_variant_packable(self, union_type: ir.Type, variant_type: ir.Type) -> bool:
+        if not self._is_union_type(union_type):
+            return False
+        payload_type = union_type.elements[1]
+        if payload_type == variant_type:
+            return True
+        if isinstance(payload_type, ir.IntType) and isinstance(variant_type, ir.IntType):
+            return True
+        if isinstance(payload_type, ir.PointerType) and isinstance(variant_type, (ir.IntType, ir.PointerType)):
+            return True
+        if isinstance(payload_type, ir.IntType) and isinstance(variant_type, ir.PointerType):
+            return True
+        if isinstance(payload_type, (ir.FloatType, ir.DoubleType)) and isinstance(variant_type, (ir.FloatType, ir.DoubleType)):
+            return True
+        if self._type_width(variant_type) <= self._type_width(payload_type):
+            return True
+        return False
+
+    def _fmt_union_serializable(self, union_type: ir.Type, source_name: str, seen: set[str]) -> bool:
+        if not self._is_union_type(union_type):
+            return False
+        variants = self._fmt_union_variant_types_from_source_name(source_name)
+        if variants is None:
+            return False
+        variant_sources, variant_types = variants
+        return all(
+            self._fmt_union_variant_packable(union_type, variant_type)
+            and self._fmt_value_serializable(variant_type, variant_source, set(seen))
+            for variant_source, variant_type in zip(variant_sources, variant_types)
+        )
+
+    def _fmt_dict_parts(self, source_name: str) -> tuple[str, str] | None:
+        name = (source_name or '').strip()
+        if not name.startswith('Dict<') or not name.endswith('>'):
+            return None
+        parts = self._fmt_split_top_level(name[5:-1], ',')
+        if len(parts) != 2:
+            return None
+        return parts[0], parts[1]
+
+    def _fmt_dict_value_source_name(self, dict_source_name: str, value_type: ir.Type) -> str:
+        parts = self._fmt_dict_parts(dict_source_name)
+        if parts is not None:
+            return parts[1]
+        return self._type_name_from_ir_type(value_type)
+
+    def _fmt_dict_key_source_name(self, dict_source_name: str, key_type: ir.Type) -> str:
+        parts = self._fmt_dict_parts(dict_source_name)
+        if parts is not None:
+            return parts[0]
+        return self._type_name_from_ir_type(key_type)
+
+    def _fmt_dict_key_serializable(self, key_type: ir.Type, source_name: str) -> bool:
+        """Dict 键只承诺语言字典已有稳定值比较语义的类型。"""
+        return source_name in {'Bool', 'I8', 'I32', 'I64', 'U8', 'U32', 'U64', 'F32', 'F64', 'Str'}
+
+    def _fmt_dict_serializable(self, dict_type: ir.Type, source_name: str, seen: set[str]) -> bool:
+        if not self._is_dict_type(dict_type):
+            return False
+        parts = self._fmt_dict_parts(source_name)
+        if parts is None:
+            return False
+        key_type, value_type = self._fmt_dict_item_types_from_source_name(source_name)
+        return (
+            self._fmt_dict_key_serializable(key_type, parts[0])
+            and self._fmt_value_serializable(value_type, parts[1], set(seen))
+        )
+
+    def _fmt_dict_has_string_key(self, source_name: str) -> bool:
+        parts = self._fmt_dict_parts(source_name)
+        return parts is not None and parts[0] == 'Str'
+
+    def _fmt_dict_item_types_from_source_name(self, source_name: str) -> tuple[ir.Type, ir.Type]:
+        parts = self._fmt_dict_parts(source_name)
+        if parts is None:
+            return ir.PointerType(ir.IntType(8)), ir.PointerType(ir.IntType(8))
+        key_type = self._fmt_type_from_source_name(parts[0])
+        value_type = self._fmt_type_from_source_name(parts[1])
+        return key_type, value_type
+
+    def _fmt_type_from_source_name(self, source_name: str) -> ir.Type:
+        name = (source_name or '').strip()
+        if name == 'Bool':
+            return ir.IntType(1)
+        if name in {'I8', 'U8'}:
+            return ir.IntType(8)
+        if name in {'I32', 'U32'}:
+            return ir.IntType(32)
+        if name in {'I64', 'U64'}:
+            return ir.IntType(64)
+        if name == 'F32':
+            return ir.FloatType()
+        if name == 'F64':
+            return ir.DoubleType()
+        if name == 'Str':
+            return ir.PointerType(ir.IntType(8))
+        union_parts = self._fmt_union_parts(name)
+        if union_parts is not None:
+            variant_types = [self._fmt_type_from_source_name(part) for part in union_parts]
+            max_type = max(variant_types, key=lambda t: self._type_width(t))
+            return ir.LiteralStructType([ir.IntType(32), max_type])
+        if name.endswith('?'):
+            inner = self._fmt_type_from_source_name(name[:-1])
+            return ir.LiteralStructType([ir.IntType(1), inner])
+        if name.endswith('[]'):
+            inner = self._fmt_type_from_source_name(name[:-2])
+            return ir.LiteralStructType([ir.PointerType(ir.PointerType(inner)), ir.IntType(64), ir.IntType(64), ir.IntType(64)])
+        list_match = re.fullmatch(r'List<(.+)>', name)
+        if list_match:
+            inner = self._fmt_type_from_source_name(list_match.group(1).strip())
+            return ir.LiteralStructType([ir.PointerType(ir.PointerType(inner)), ir.IntType(64), ir.IntType(64), ir.IntType(64)])
+        if name.startswith('Dict<'):
+            return self.structs['Dict']
+        if name in self.structs:
+            return self.structs[name]
+        return ir.IntType(32)
+
+    def _fmt_list_elem_source_name(self, list_source_name: str, elem_type: ir.Type) -> str:
+        if list_source_name.endswith('[]'):
+            return list_source_name[:-2]
+        match = re.fullmatch(r'List<(.+)>', list_source_name)
+        if match:
+            return match.group(1)
+        return self._type_name_from_ir_type(elem_type)
+
+    def _fmt_optional_inner_source_name(self, opt_source_name: str, inner_type: ir.Type) -> str:
+        if opt_source_name.endswith('?'):
+            return opt_source_name[:-1]
+        return self._type_name_from_ir_type(inner_type)
+
+    def _fmt_list_function_suffix(self, list_type: ir.Type, source_name: str) -> str:
+        return self._type_suffix_from_name(source_name if source_name and source_name != 'unknown' else self._type_name(list_type))
+
+    def _fmt_optional_function_suffix(self, opt_type: ir.Type, source_name: str) -> str:
+        fallback = self._type_name_from_ir_type(opt_type)
+        return self._type_suffix_from_name(source_name if source_name and source_name != 'unknown' else fallback)
+
+    def _fmt_dict_function_suffix(self, dict_type: ir.Type, source_name: str) -> str:
+        return self._type_suffix_from_name(source_name if source_name and source_name != 'unknown' else self._type_name(dict_type))
+
+    def _fmt_union_function_suffix(self, union_type: ir.Type, source_name: str) -> str:
+        fallback = self._type_name_from_ir_type(union_type)
+        return self._type_suffix_from_name(source_name if source_name and source_name != 'unknown' else fallback)
+
+    def _fmt_union_value_for_variant(self, union_value: ir.Value, union_type: ir.Type, variant_type: ir.Type) -> ir.Value:
+        payload = self.builder.extract_value(union_value, 1, name='_fmt_union_payload')
+        if payload.type == variant_type:
+            return payload
+        if isinstance(payload.type, ir.IntType) and isinstance(variant_type, ir.IntType):
+            return self._coerce_integer_value(payload, variant_type)
+        if isinstance(payload.type, ir.IntType) and isinstance(variant_type, ir.PointerType):
+            return self.builder.inttoptr(payload, variant_type)
+        if isinstance(payload.type, ir.PointerType) and isinstance(variant_type, ir.IntType):
+            return self.builder.ptrtoint(payload, variant_type)
+        if isinstance(payload.type, ir.PointerType) and isinstance(variant_type, ir.PointerType):
+            return self.builder.bitcast(payload, variant_type)
+        if isinstance(payload.type, ir.FloatType) and isinstance(variant_type, ir.DoubleType):
+            return self.builder.fpext(payload, variant_type)
+        if isinstance(payload.type, ir.DoubleType) and isinstance(variant_type, ir.FloatType):
+            return self.builder.fptrunc(payload, variant_type)
+        if self._type_width(variant_type) <= self._type_width(payload.type):
+            payload_ptr = self.builder.alloca(payload.type, name='_fmt_union_payload_ptr')
+            self.builder.store(payload, payload_ptr)
+            variant_ptr = self.builder.bitcast(payload_ptr, ir.PointerType(variant_type), name='_fmt_union_variant_ptr')
+            return self.builder.load(variant_ptr, name='_fmt_union_variant')
+        return payload
+
+    def _fmt_arg_for_wrapper(self, value: ir.Value, wrapper_arg_type: ir.Type) -> ir.Value:
+        arg = value
+        if arg.type == wrapper_arg_type:
+            return arg
+        if isinstance(wrapper_arg_type, ir.PointerType) and arg.type == wrapper_arg_type.pointee:
+            ptr = self._arena_allocate(arg.type, name='_fmt_wrapper_arg_ptr')
+            self.builder.store(arg, ptr)
+            return ptr
+        if isinstance(arg.type, ir.PointerType) and arg.type.pointee == wrapper_arg_type:
+            return self.builder.load(arg, name='_fmt_wrapper_arg_value')
+        return self._coerce_value(arg, wrapper_arg_type)
+
+    def _fmt_join_json_key_value_entry(self, key_text: ir.Value, value_text: ir.Value, name_prefix: str) -> ir.Value:
+        strlen = self._get_or_define_strlen()
+        segments: list[tuple[ir.Value, ir.Value]] = []
+        self._append_json_literal_segment(segments, '{"key":')
+        segments.append((key_text, self.builder.call(strlen, [key_text], name=f'{name_prefix}_key_len')))
+        self._append_json_literal_segment(segments, ',"value":')
+        segments.append((value_text, self.builder.call(strlen, [value_text], name=f'{name_prefix}_value_len')))
+        self._append_json_literal_segment(segments, '}')
+        return self._join_c_string_segments(segments, name_prefix=name_prefix)
+
+    def _fmt_generate_json_stringify_wrapper(self, wrapper_name: str, value_type: ir.Type, source_name: str) -> ir.Function | None:
+        if self._is_optional_type(value_type) and self._fmt_optional_serializable(value_type, source_name, set()):
+            return self._gen_json_stringify_optional_function(wrapper_name, value_type, source_name)
+        if self._is_list_type(value_type) and self._fmt_list_serializable(value_type, source_name, set()):
+            return self._gen_json_stringify_list_function(wrapper_name, value_type, source_name)
+        if self._is_dict_type(value_type) and self._fmt_dict_serializable(value_type, source_name, set()):
+            return self._gen_json_stringify_dict_function(wrapper_name, value_type, source_name)
+        if self._is_union_type(value_type) and self._fmt_union_serializable(value_type, source_name, set()):
+            return self._gen_json_stringify_union_function(wrapper_name, value_type, source_name)
+        if isinstance(value_type, ir.IdentifiedStructType) and self._fmt_struct_serializable(value_type):
+            return self._gen_json_stringify_struct_function(wrapper_name, value_type)
+        return None
+
+    def _fmt_generate_json_parse_wrapper(self, wrapper_name: str, value_type: ir.Type, source_name: str) -> ir.Function | None:
+        if self._is_optional_type(value_type) and self._fmt_optional_serializable(value_type, source_name, set()):
+            return self._gen_json_parse_optional_function(wrapper_name, value_type, source_name)
+        if self._is_list_type(value_type) and self._fmt_list_serializable(value_type, source_name, set()):
+            return self._gen_json_parse_list_function(wrapper_name, value_type, source_name)
+        if self._is_dict_type(value_type) and self._fmt_dict_serializable(value_type, source_name, set()):
+            return self._gen_json_parse_dict_function(wrapper_name, value_type, source_name)
+        if self._is_union_type(value_type) and self._fmt_union_serializable(value_type, source_name, set()):
+            return self._gen_json_parse_union_function(wrapper_name, value_type, source_name)
+        if isinstance(value_type, ir.IdentifiedStructType) and self._fmt_struct_serializable(value_type):
+            return self._gen_json_parse_struct_function(wrapper_name, value_type)
+        return None
+
+    def _fmt_generate_msgpack_encode_wrapper(self, wrapper_name: str, value_type: ir.Type, source_name: str) -> ir.Function | None:
+        if self._is_optional_type(value_type) and self._fmt_optional_serializable(value_type, source_name, set()):
+            return self._gen_msgpack_encode_optional_function(wrapper_name, value_type, source_name)
+        if self._is_list_type(value_type) and self._fmt_list_serializable(value_type, source_name, set()):
+            return self._gen_msgpack_encode_list_function(wrapper_name, value_type, source_name)
+        if self._is_dict_type(value_type) and self._fmt_dict_serializable(value_type, source_name, set()):
+            return self._gen_msgpack_encode_dict_function(wrapper_name, value_type, source_name)
+        if self._is_union_type(value_type) and self._fmt_union_serializable(value_type, source_name, set()):
+            return self._gen_msgpack_encode_union_function(wrapper_name, value_type, source_name)
+        if isinstance(value_type, ir.IdentifiedStructType) and self._fmt_struct_serializable(value_type):
+            return self._gen_msgpack_encode_struct_function(wrapper_name, value_type)
+        return None
+
+    def _fmt_generate_msgpack_decode_wrapper(self, wrapper_name: str, value_type: ir.Type, source_name: str) -> ir.Function | None:
+        if self._is_optional_type(value_type) and self._fmt_optional_serializable(value_type, source_name, set()):
+            return self._gen_msgpack_decode_optional_function(wrapper_name, value_type, source_name)
+        if self._is_list_type(value_type) and self._fmt_list_serializable(value_type, source_name, set()):
+            return self._gen_msgpack_decode_list_function(wrapper_name, value_type, source_name)
+        if self._is_dict_type(value_type) and self._fmt_dict_serializable(value_type, source_name, set()):
+            return self._gen_msgpack_decode_dict_function(wrapper_name, value_type, source_name)
+        if self._is_union_type(value_type) and self._fmt_union_serializable(value_type, source_name, set()):
+            return self._gen_msgpack_decode_union_function(wrapper_name, value_type, source_name)
+        if isinstance(value_type, ir.IdentifiedStructType) and self._fmt_struct_serializable(value_type):
+            return self._gen_msgpack_decode_struct_function(wrapper_name, value_type)
+        return None
+
+    def _fmt_value_from_raw_ptr(self, raw: ir.Value, value_type: ir.Type, wrapper_arg_type: ir.Type) -> ir.Value:
+        if isinstance(value_type, ir.PointerType) and value_type == wrapper_arg_type:
+            return raw
+        value_ptr = self.builder.bitcast(raw, ir.PointerType(value_type), name='_fmt_raw_value_ptr')
+        if value_ptr.type == wrapper_arg_type:
+            return value_ptr
+        value = self.builder.load(value_ptr, name='_fmt_raw_value')
+        if value.type != wrapper_arg_type:
+            return self._coerce_value(value, wrapper_arg_type)
+        return value
+
+    def _fmt_source_type_name(self, field_type: ir.Type, struct_name: str, index: int) -> str:
+        field_type_names = self._struct_field_type_names.get(struct_name, [])
+        if index < len(field_type_names):
+            return field_type_names[index]
+        field_unsigned = self._struct_field_unsigned.get(struct_name, [])
+        return self._type_name_from_ir_type_with_unsigned(
+            field_type,
+            index < len(field_unsigned) and field_unsigned[index],
+        )
+
+    def _json_stringify_struct_supported(self, typ: ir.Type) -> bool:
+        """当前编译期 JSON 结构体编码覆盖基础字段与嵌套用户结构体。"""
+        return self._fmt_struct_serializable(typ)
+
+    def _json_stringify_field_function_name(self, field_type: ir.Type, struct_name: str, index: int) -> str | None:
+        source_name = self._fmt_source_type_name(field_type, struct_name, index)
+        if source_name == 'Bool':
+            return 'jsonStringify_I1'
+        if source_name in {'I8', 'I32', 'I64', 'U8', 'U32', 'U64', 'F32', 'F64', 'Str'}:
+            return f"jsonStringify_{source_name}"
+        if self._is_optional_type(field_type) and self._fmt_optional_serializable(field_type, source_name, set()):
+            return f"jsonStringify_{self._fmt_optional_function_suffix(field_type, source_name)}"
+        if self._is_list_type(field_type) and self._fmt_list_serializable(field_type, source_name, set()):
+            return f"jsonStringify_{self._fmt_list_function_suffix(field_type, source_name)}"
+        if self._is_dict_type(field_type) and self._fmt_dict_serializable(field_type, source_name, set()):
+            return f"jsonStringify_{self._fmt_dict_function_suffix(field_type, source_name)}"
+        if self._is_union_type(field_type) and self._fmt_union_serializable(field_type, source_name, set()):
+            return f"jsonStringify_{self._fmt_union_function_suffix(field_type, source_name)}"
+        if self._fmt_struct_serializable(field_type):
+            return f"jsonStringify_{field_type.name}"
+        return None
+
+    def _json_parse_struct_supported(self, typ: ir.Type) -> bool:
+        """当前编译期 JSON 结构体解析覆盖基础字段与嵌套用户结构体。"""
+        return self._fmt_struct_serializable(typ)
+
+    def _json_parse_field_function_name(self, field_type: ir.Type, struct_name: str, index: int) -> str | None:
+        source_name = self._fmt_source_type_name(field_type, struct_name, index)
+        if source_name == 'Bool':
+            return 'jsonParse_I1'
+        if source_name in {'I8', 'I32', 'I64', 'U8', 'U32', 'U64', 'F32', 'F64', 'Str'}:
+            return f"jsonParse_{source_name}"
+        if self._is_optional_type(field_type) and self._fmt_optional_serializable(field_type, source_name, set()):
+            return f"jsonParse_{self._fmt_optional_function_suffix(field_type, source_name)}"
+        if self._is_list_type(field_type) and self._fmt_list_serializable(field_type, source_name, set()):
+            return f"jsonParse_{self._fmt_list_function_suffix(field_type, source_name)}"
+        if self._is_dict_type(field_type) and self._fmt_dict_serializable(field_type, source_name, set()):
+            return f"jsonParse_{self._fmt_dict_function_suffix(field_type, source_name)}"
+        if self._is_union_type(field_type) and self._fmt_union_serializable(field_type, source_name, set()):
+            return f"jsonParse_{self._fmt_union_function_suffix(field_type, source_name)}"
+        if self._fmt_struct_serializable(field_type):
+            return f"jsonParse_{field_type.name}"
+        return None
+
+    def _json_stringify_function_type(self, func_name: str, arg_type: ir.Type) -> ir.FunctionType:
+        if func_name == 'jsonStringify_I1':
+            arg_type = ir.IntType(1)
+        elif isinstance(arg_type, ir.IdentifiedStructType) or self._is_list_type(arg_type) or self._is_optional_type(arg_type) or self._is_dict_type(arg_type) or self._is_union_type(arg_type):
+            arg_type = ir.PointerType(arg_type)
+        return ir.FunctionType(ir.PointerType(ir.IntType(8)), [arg_type])
+
+    def _json_parse_function_type(self, func_name: str, ret_type: ir.Type) -> ir.FunctionType:
+        if func_name == 'jsonParse_I1':
+            ret_type = ir.IntType(1)
+        elif isinstance(ret_type, ir.IdentifiedStructType) or self._is_list_type(ret_type) or self._is_optional_type(ret_type) or self._is_dict_type(ret_type) or self._is_union_type(ret_type):
+            ret_type = ir.PointerType(ret_type)
+        return ir.FunctionType(ret_type, [ir.PointerType(ir.IntType(8))])
+
+    def _json_value_stringify_wrapper(self, value_type: ir.Type, source_name: str) -> tuple[str, ir.FunctionType, ir.Function | None]:
+        if source_name == 'Bool':
+            wrapper_name = 'jsonStringify_I1'
+        elif source_name in {'I8', 'I32', 'I64', 'U8', 'U32', 'U64', 'F32', 'F64', 'Str'}:
+            wrapper_name = f'jsonStringify_{source_name}'
+        elif self._is_optional_type(value_type) and self._fmt_optional_serializable(value_type, source_name, set()):
+            wrapper_name = f'jsonStringify_{self._fmt_optional_function_suffix(value_type, source_name)}'
+        elif self._is_list_type(value_type) and self._fmt_list_serializable(value_type, source_name, set()):
+            wrapper_name = f'jsonStringify_{self._fmt_list_function_suffix(value_type, source_name)}'
+        elif self._is_dict_type(value_type) and self._fmt_dict_serializable(value_type, source_name, set()):
+            wrapper_name = f'jsonStringify_{self._fmt_dict_function_suffix(value_type, source_name)}'
+        elif self._is_union_type(value_type) and self._fmt_union_serializable(value_type, source_name, set()):
+            wrapper_name = f'jsonStringify_{self._fmt_union_function_suffix(value_type, source_name)}'
+        elif isinstance(value_type, ir.IdentifiedStructType) and self._fmt_struct_serializable(value_type):
+            wrapper_name = f'jsonStringify_{value_type.name}'
+        else:
+            wrapper_name = ''
+        wrapper_type = self._json_stringify_function_type(wrapper_name, value_type)
+        wrapper = self._fmt_generate_json_stringify_wrapper(wrapper_name, value_type, source_name)
+        return wrapper_name, wrapper_type, wrapper
+
+    def _json_value_parse_wrapper(self, value_type: ir.Type, source_name: str) -> tuple[str, ir.FunctionType, ir.Function | None]:
+        if source_name == 'Bool':
+            wrapper_name = 'jsonParse_I1'
+        elif source_name in {'I8', 'I32', 'I64', 'U8', 'U32', 'U64', 'F32', 'F64', 'Str'}:
+            wrapper_name = f'jsonParse_{source_name}'
+        elif self._is_optional_type(value_type) and self._fmt_optional_serializable(value_type, source_name, set()):
+            wrapper_name = f'jsonParse_{self._fmt_optional_function_suffix(value_type, source_name)}'
+        elif self._is_list_type(value_type) and self._fmt_list_serializable(value_type, source_name, set()):
+            wrapper_name = f'jsonParse_{self._fmt_list_function_suffix(value_type, source_name)}'
+        elif self._is_dict_type(value_type) and self._fmt_dict_serializable(value_type, source_name, set()):
+            wrapper_name = f'jsonParse_{self._fmt_dict_function_suffix(value_type, source_name)}'
+        elif self._is_union_type(value_type) and self._fmt_union_serializable(value_type, source_name, set()):
+            wrapper_name = f'jsonParse_{self._fmt_union_function_suffix(value_type, source_name)}'
+        elif isinstance(value_type, ir.IdentifiedStructType) and self._fmt_struct_serializable(value_type):
+            wrapper_name = f'jsonParse_{value_type.name}'
+        else:
+            wrapper_name = ''
+        wrapper_type = self._json_parse_function_type(wrapper_name, value_type)
+        wrapper = self._fmt_generate_json_parse_wrapper(wrapper_name, value_type, source_name)
+        return wrapper_name, wrapper_type, wrapper
+
+    def _json_parse_validator_for_value(self, wrapper_name: str, value_type: ir.Type) -> str | None:
+        validator_name = self._json_parse_validator_name(wrapper_name)
+        if validator_name is None and self._is_optional_type(value_type) and self._fmt_optional_serializable(value_type, '', set()):
+            return '__ez_json_valid_value'
+        if validator_name is None and self._is_list_type(value_type) and self._fmt_list_serializable(value_type, '', set()):
+            return '__ez_json_valid_array'
+        if validator_name is None and self._is_dict_type(value_type):
+            return '__ez_json_valid_object'
+        if validator_name is None and self._is_union_type(value_type):
+            return '__ez_json_valid_object'
+        if validator_name is None and isinstance(value_type, ir.IdentifiedStructType) and self._fmt_struct_serializable(value_type):
+            return '__ez_json_valid_object'
+        return validator_name
+
+    def _fmt_parse_wrapper_may_throw(self, value_type: ir.Type) -> bool:
+        return (
+            self._is_optional_type(value_type)
+            or self._is_list_type(value_type)
+            or self._is_dict_type(value_type)
+            or self._is_union_type(value_type)
+            or (isinstance(value_type, ir.IdentifiedStructType) and self._fmt_struct_serializable(value_type))
+        )
+
+    def _gen_json_stringify_optional_function(self, func_name: str, opt_type: ir.LiteralStructType, source_name: str) -> ir.Function:
+        existing = self.module.globals.get(func_name)
+        if isinstance(existing, ir.Function):
+            if len(existing.blocks) > 0:
+                return existing
+            func = existing
+        else:
+            func = ir.Function(self.module, ir.FunctionType(ir.PointerType(ir.IntType(8)), [ir.PointerType(opt_type)]), func_name)
+        if func_name in self._fmt_generation_stack:
+            return func
+        self._fmt_generation_stack.add(func_name)
+
+        i32 = ir.IntType(32)
+        inner_type = opt_type.elements[1]
+        inner_source = self._fmt_optional_inner_source_name(source_name, inner_type)
+        func.args[0].name = 'data'
+
+        old_builder = self.builder
+        old_func = self.current_function
+        old_locals = self.locals
+        old_type_names = self._locals_type_names
+
+        entry = func.append_basic_block('entry')
+        value_block = func.append_basic_block('json_optional_value')
+        null_block = func.append_basic_block('json_optional_null')
+        self.builder = ir.IRBuilder(entry)
+        self.current_function = func
+        self.locals = {}
+        self._locals_type_names = {}
+
+        ok_ptr = self.builder.gep(func.args[0], [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        ok = self.builder.load(ok_ptr, name='_json_optional_ok')
+        self.builder.cbranch(ok, value_block, null_block)
+
+        self.builder.position_at_start(null_block)
+        self.builder.ret(self._make_global_string('null', prefix='_json_null'))
+
+        self.builder.position_at_start(value_block)
+        value_ptr = self.builder.gep(func.args[0], [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        wrapper_name, wrapper_type, wrapper = self._json_value_stringify_wrapper(inner_type, inner_source)
+        if wrapper is None:
+            wrapper = self._get_or_declare_function(wrapper_name, wrapper_type)
+        value_arg = value_ptr if value_ptr.type == wrapper_type.args[0] else self.builder.load(value_ptr, name='_json_optional_value')
+        if value_arg.type != wrapper_type.args[0]:
+            value_arg = self._coerce_value(value_arg, wrapper_type.args[0])
+        text = self.builder.call(wrapper, [value_arg], name='_json_optional_text')
+        self.builder.ret(text)
+
+        self.builder = old_builder
+        self.current_function = old_func
+        self.locals = old_locals
+        self._locals_type_names = old_type_names
+        self._fmt_generation_stack.discard(func_name)
+        return func
+
+    def _gen_json_parse_optional_function(self, func_name: str, opt_type: ir.LiteralStructType, source_name: str) -> ir.Function:
+        existing = self.module.globals.get(func_name)
+        if isinstance(existing, ir.Function):
+            if len(existing.blocks) > 0:
+                return existing
+            func = existing
+        else:
+            func = ir.Function(self.module, ir.FunctionType(ir.PointerType(opt_type), [ir.PointerType(ir.IntType(8))]), func_name)
+        if func_name in self._fmt_generation_stack:
+            return func
+        self._fmt_generation_stack.add(func_name)
+
+        i1 = ir.IntType(1)
+        i8_ptr = ir.PointerType(ir.IntType(8))
+        result_type = ir.PointerType(opt_type)
+        inner_type = opt_type.elements[1]
+        inner_source = self._fmt_optional_inner_source_name(source_name, inner_type)
+        func.args[0].name = 's'
+
+        old_builder = self.builder
+        old_func = self.current_function
+        old_locals = self.locals
+        old_type_names = self._locals_type_names
+        old_unsigned = self._save_unsigned_state()
+
+        entry = func.append_basic_block('entry')
+        null_block = func.append_basic_block('json_optional_null')
+        value_block = func.append_basic_block('json_optional_value')
+        throw_exit = func.append_basic_block('throw_exit')
+        self.builder = ir.IRBuilder(entry)
+        self.current_function = func
+        self.locals = {}
+        self._locals_type_names = {}
+        self._function_throw_exit_stack.append(throw_exit)
+
+        def require_json_ok(ok: ir.Value) -> None:
+            fail_bb = self.builder.append_basic_block('json_optional_parse_invalid')
+            cont_bb = self.builder.append_basic_block('json_optional_parse_valid')
+            self.builder.cbranch(ok, cont_bb, fail_bb)
+            self.builder.position_at_start(fail_bb)
+            self._raise_error(4, 'json parse failed')
+            self.builder.position_at_start(cont_bb)
+
+        result = self._arena_allocate(opt_type, name='_json_optional_value_ptr')
+        self.builder.store(self._zero_constant(opt_type), result)
+        valid_value = self._get_or_declare_function('__ez_json_valid_value', ir.FunctionType(i1, [i8_ptr]))
+        valid_ok = self.builder.call(valid_value, [func.args[0]], name='_json_optional_valid')
+        require_json_ok(valid_ok)
+        valid_null = self._get_or_declare_function('__ez_json_valid_null', ir.FunctionType(i1, [i8_ptr]))
+        is_null = self.builder.call(valid_null, [func.args[0]], name='_json_optional_is_null')
+        self.builder.cbranch(is_null, null_block, value_block)
+
+        self.builder.position_at_start(null_block)
+        self.builder.ret(result)
+
+        self.builder.position_at_start(value_block)
+        wrapper_name, wrapper_type, wrapper = self._json_value_parse_wrapper(inner_type, inner_source)
+        validator_name = self._json_parse_validator_for_value(wrapper_name, inner_type)
+        validator = self._get_or_declare_function(validator_name, ir.FunctionType(i1, [i8_ptr]))
+        value_ok = self.builder.call(validator, [func.args[0]], name='_json_optional_inner_ok')
+        require_json_ok(value_ok)
+        if wrapper is None:
+            wrapper = self._get_or_declare_function(wrapper_name, wrapper_type)
+        value = self.builder.call(wrapper, [func.args[0]], name='_json_optional_inner')
+        if self._fmt_parse_wrapper_may_throw(inner_type):
+            self._emit_throw_check_after_call()
+        if self.builder is not None and not self.builder.block.is_terminated:
+            if value.type != inner_type:
+                value = self._coerce_value(value, inner_type)
+            self.builder.store(self._optional_value(inner_type, True, value), result)
+            self.builder.ret(result)
+
+        popped_throw_exit = self._function_throw_exit_stack.pop()
+        if not popped_throw_exit.is_terminated:
+            self.builder.position_at_start(popped_throw_exit)
+            self.builder.ret(ir.Constant(result_type, None))
+
+        self.builder = old_builder
+        self.current_function = old_func
+        self.locals = old_locals
+        self._locals_type_names = old_type_names
+        self._restore_unsigned_state(old_unsigned)
+        self._fmt_generation_stack.discard(func_name)
+        return func
+
+    def _gen_json_stringify_union_function(self, func_name: str, union_type: ir.LiteralStructType, source_name: str) -> ir.Function:
+        existing = self.module.globals.get(func_name)
+        if isinstance(existing, ir.Function):
+            if len(existing.blocks) > 0:
+                return existing
+            func = existing
+        else:
+            func = ir.Function(self.module, ir.FunctionType(ir.PointerType(ir.IntType(8)), [ir.PointerType(union_type)]), func_name)
+        if func_name in self._fmt_generation_stack:
+            return func
+        self._fmt_generation_stack.add(func_name)
+
+        i8 = ir.IntType(8)
+        i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
+        i8_ptr = ir.PointerType(i8)
+        variants = self._fmt_union_variant_types_from_source_name(source_name)
+        if variants is None:
+            return func
+        variant_sources, variant_types = variants
+        func.args[0].name = 'data'
+
+        old_builder = self.builder
+        old_func = self.current_function
+        old_locals = self.locals
+        old_type_names = self._locals_type_names
+
+        entry = func.append_basic_block('entry')
+        invalid_block = func.append_basic_block('json_union_invalid')
+        self.builder = ir.IRBuilder(entry)
+        self.current_function = func
+        self.locals = {}
+        self._locals_type_names = {}
+
+        tag_ptr = self.builder.gep(func.args[0], [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        tag = self.builder.load(tag_ptr, name='_json_union_tag')
+        for index, (variant_source, variant_type) in enumerate(zip(variant_sources, variant_types)):
+            is_tag = self.builder.icmp_signed('==', tag, ir.Constant(i32, index), name='_json_union_tag_match')
+            match_block = func.append_basic_block(f'json_union_tag_{index}')
+            next_block = invalid_block if index == len(variant_types) - 1 else func.append_basic_block(f'json_union_next_{index}')
+            self.builder.cbranch(is_tag, match_block, next_block)
+
+            self.builder.position_at_start(match_block)
+            union_value = self.builder.load(func.args[0], name='_json_union_value')
+            variant_value = self._fmt_union_value_for_variant(union_value, union_type, variant_type)
+            wrapper_name, wrapper_type, wrapper = self._json_value_stringify_wrapper(variant_type, variant_source)
+            if wrapper is None:
+                wrapper = self._get_or_declare_function(wrapper_name, wrapper_type)
+            variant_arg = self._fmt_arg_for_wrapper(variant_value, wrapper_type.args[0])
+            value_text = self.builder.call(wrapper, [variant_arg], name='_json_union_value_text')
+            tag_text = self.builder.call(
+                self._get_or_declare_function('jsonStringify_I32', ir.FunctionType(i8_ptr, [i32])),
+                [ir.Constant(i32, index)],
+                name='_json_union_tag_text',
+            )
+            strlen = self._get_or_define_strlen()
+            segments: list[tuple[ir.Value, ir.Value]] = []
+            self._append_json_literal_segment(segments, '{"tag":')
+            segments.append((tag_text, self.builder.call(strlen, [tag_text], name='_json_union_tag_len')))
+            self._append_json_literal_segment(segments, ',"value":')
+            segments.append((value_text, self.builder.call(strlen, [value_text], name='_json_union_value_len')))
+            self._append_json_literal_segment(segments, '}')
+            self.builder.ret(self._join_c_string_segments(segments, name_prefix='_json_union'))
+
+            if next_block is not invalid_block:
+                self.builder.position_at_start(next_block)
+
+        self.builder.position_at_start(invalid_block)
+        self.builder.ret(self._make_global_string('{"tag":-1,"value":null}', prefix='_json_union_invalid'))
+
+        self.builder = old_builder
+        self.current_function = old_func
+        self.locals = old_locals
+        self._locals_type_names = old_type_names
+        self._fmt_generation_stack.discard(func_name)
+        return func
+
+    def _gen_json_parse_union_function(self, func_name: str, union_type: ir.LiteralStructType, source_name: str) -> ir.Function:
+        existing = self.module.globals.get(func_name)
+        if isinstance(existing, ir.Function):
+            if len(existing.blocks) > 0:
+                return existing
+            func = existing
+        else:
+            func = ir.Function(self.module, ir.FunctionType(ir.PointerType(union_type), [ir.PointerType(ir.IntType(8))]), func_name)
+        if func_name in self._fmt_generation_stack:
+            return func
+        self._fmt_generation_stack.add(func_name)
+
+        i1 = ir.IntType(1)
+        i8 = ir.IntType(8)
+        i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
+        i8_ptr = ir.PointerType(i8)
+        result_type = ir.PointerType(union_type)
+        variants = self._fmt_union_variant_types_from_source_name(source_name)
+        if variants is None:
+            return func
+        variant_sources, variant_types = variants
+        func.args[0].name = 's'
+
+        old_builder = self.builder
+        old_func = self.current_function
+        old_locals = self.locals
+        old_type_names = self._locals_type_names
+        old_unsigned = self._save_unsigned_state()
+
+        entry = func.append_basic_block('entry')
+        invalid_block = func.append_basic_block('json_union_invalid')
+        throw_exit = func.append_basic_block('throw_exit')
+        self.builder = ir.IRBuilder(entry)
+        self.current_function = func
+        self.locals = {}
+        self._locals_type_names = {}
+        self._function_throw_exit_stack.append(throw_exit)
+
+        def require_json_ok(ok: ir.Value) -> None:
+            if self.builder is None or self.builder.block.is_terminated:
+                return
+            fail_bb = self.builder.append_basic_block('json_union_parse_invalid')
+            cont_bb = self.builder.append_basic_block('json_union_parse_valid')
+            self.builder.cbranch(ok, cont_bb, fail_bb)
+            self.builder.position_at_start(fail_bb)
+            self._raise_error(4, 'json parse failed')
+            self.builder.position_at_start(cont_bb)
+
+        result = self._arena_allocate(union_type, name='_json_union_value_ptr')
+        self.builder.store(self._zero_constant(union_type), result)
+        valid_object = self._get_or_declare_function('__ez_json_valid_object', ir.FunctionType(i1, [i8_ptr]))
+        require_json_ok(self.builder.call(valid_object, [func.args[0]], name='_json_union_object_ok'))
+        field_count_fn = self._get_or_declare_function('__ez_json_object_field_count', ir.FunctionType(i64, [i8_ptr]))
+        field_count = self.builder.call(field_count_fn, [func.args[0]], name='_json_union_field_count')
+        require_json_ok(self.builder.icmp_signed('==', field_count, ir.Constant(i64, 2), name='_json_union_field_count_ok'))
+        field_fn = self._get_or_declare_function('__ez_json_object_field', ir.FunctionType(i8_ptr, [i8_ptr, i8_ptr]))
+        null_str = ir.Constant(i8_ptr, None)
+        tag_raw = self.builder.call(field_fn, [func.args[0], self._make_global_string('tag', prefix='_json_union_key')], name='_json_union_tag_raw')
+        value_raw = self.builder.call(field_fn, [func.args[0], self._make_global_string('value', prefix='_json_union_key')], name='_json_union_value_raw')
+        require_json_ok(self.builder.icmp_unsigned('!=', tag_raw, null_str, name='_json_union_tag_found'))
+        require_json_ok(self.builder.icmp_unsigned('!=', value_raw, null_str, name='_json_union_value_found'))
+        tag_validator = self._get_or_declare_function('__ez_json_valid_I32', ir.FunctionType(i1, [i8_ptr]))
+        require_json_ok(self.builder.call(tag_validator, [tag_raw], name='_json_union_tag_ok'))
+        tag_parser = self._get_or_declare_function('jsonParse_I32', ir.FunctionType(i32, [i8_ptr]))
+        tag = self.builder.call(tag_parser, [tag_raw], name='_json_union_tag')
+
+        for index, (variant_source, variant_type) in enumerate(zip(variant_sources, variant_types)):
+            is_tag = self.builder.icmp_signed('==', tag, ir.Constant(i32, index), name='_json_union_tag_match')
+            match_block = func.append_basic_block(f'json_union_parse_tag_{index}')
+            next_block = invalid_block if index == len(variant_types) - 1 else func.append_basic_block(f'json_union_parse_next_{index}')
+            self.builder.cbranch(is_tag, match_block, next_block)
+
+            self.builder.position_at_start(match_block)
+            wrapper_name, wrapper_type, wrapper = self._json_value_parse_wrapper(variant_type, variant_source)
+            validator_name = self._json_parse_validator_for_value(wrapper_name, variant_type)
+            validator = self._get_or_declare_function(validator_name, ir.FunctionType(i1, [i8_ptr]))
+            require_json_ok(self.builder.call(validator, [value_raw], name='_json_union_value_ok'))
+            if wrapper is None:
+                wrapper = self._get_or_declare_function(wrapper_name, wrapper_type)
+            value = self.builder.call(wrapper, [value_raw], name='_json_union_variant_value')
+            if self._fmt_parse_wrapper_may_throw(variant_type):
+                self._emit_throw_check_after_call()
+            if self.builder is not None and not self.builder.block.is_terminated:
+                if value.type != variant_type:
+                    value = self._coerce_value(value, variant_type)
+                union_value = self._coerce_union_value(value, union_type, index)
+                self.builder.store(union_value, result)
+                self.builder.ret(result)
+
+            if next_block is not invalid_block:
+                self.builder.position_at_start(next_block)
+
+        self.builder.position_at_start(invalid_block)
+        self._raise_error(4, 'json parse failed')
+
+        popped_throw_exit = self._function_throw_exit_stack.pop()
+        if not popped_throw_exit.is_terminated:
+            self.builder.position_at_start(popped_throw_exit)
+            self.builder.ret(ir.Constant(result_type, None))
+
+        self.builder = old_builder
+        self.current_function = old_func
+        self.locals = old_locals
+        self._locals_type_names = old_type_names
+        self._restore_unsigned_state(old_unsigned)
+        self._fmt_generation_stack.discard(func_name)
+        return func
+
+    def _gen_json_stringify_list_function(self, func_name: str, list_type: ir.LiteralStructType, source_name: str) -> ir.Function:
+        existing = self.module.globals.get(func_name)
+        if isinstance(existing, ir.Function):
+            if len(existing.blocks) > 0:
+                return existing
+            func = existing
+        else:
+            func = ir.Function(self.module, ir.FunctionType(ir.PointerType(ir.IntType(8)), [ir.PointerType(list_type)]), func_name)
+        if func_name in self._fmt_generation_stack:
+            return func
+        self._fmt_generation_stack.add(func_name)
+
+        i1 = ir.IntType(1)
+        i8 = ir.IntType(8)
+        i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
+        i8_ptr = ir.PointerType(i8)
+        i8_ptr_ptr = ir.PointerType(i8_ptr)
+        elem_type = list_type.elements[0].pointee.pointee
+        elem_source = self._fmt_list_elem_source_name(source_name, elem_type)
+        func.args[0].name = 'data'
+
+        old_builder = self.builder
+        old_func = self.current_function
+        old_locals = self.locals
+        old_type_names = self._locals_type_names
+
+        entry = func.append_basic_block('entry')
+        self.builder = ir.IRBuilder(entry)
+        self.current_function = func
+        self.locals = {}
+        self._locals_type_names = {}
+
+        strlen = self._get_or_define_strlen()
+        memcpy = self.module.get_global('llvm.memcpy.p0.p0.i64')
+        length = self._list_length(func.args[0])
+        table_bytes = self.builder.mul(length, ir.Constant(i64, 8), name='_json_list_table_bytes')
+        has_items = self.builder.icmp_unsigned('>', length, ir.Constant(i64, 0), name='_json_list_has_items')
+        table_alloc_bytes = self.builder.select(has_items, table_bytes, ir.Constant(i64, 8), name='_json_list_table_alloc_bytes')
+        table_raw = self.builder.call(self._arena_alloc, [table_alloc_bytes, ir.Constant(i64, 8)], name='_json_list_table_raw')
+        text_table = self.builder.bitcast(table_raw, i8_ptr_ptr, name='_json_list_texts')
+        total_ptr = self.builder.alloca(i64, name='_json_list_total_ptr')
+        self.builder.store(ir.Constant(i64, 2), total_ptr)
+        index_ptr = self.builder.alloca(i64, name='_json_list_i')
+        self.builder.store(ir.Constant(i64, 0), index_ptr)
+
+        loop_cond = self.builder.append_basic_block('json_list_len_cond')
+        loop_body = self.builder.append_basic_block('json_list_len_body')
+        loop_done = self.builder.append_basic_block('json_list_len_done')
+        self.builder.branch(loop_cond)
+        self.builder.position_at_start(loop_cond)
+        index = self.builder.load(index_ptr, name='_json_list_i_val')
+        more = self.builder.icmp_unsigned('<', index, length, name='_json_list_more')
+        self.builder.cbranch(more, loop_body, loop_done)
+
+        self.builder.position_at_start(loop_body)
+        elem_ptr = self._list_element_ptr(func.args[0], index)
+        wrapper_name, wrapper_type, wrapper = self._json_value_stringify_wrapper(elem_type, elem_source)
+        if wrapper is None:
+            wrapper = self._get_or_declare_function(wrapper_name, wrapper_type)
+        elem_arg = elem_ptr if elem_ptr.type == wrapper_type.args[0] else self.builder.load(elem_ptr, name='_json_list_item')
+        if elem_arg.type != wrapper_type.args[0]:
+            elem_arg = self._coerce_value(elem_arg, wrapper_type.args[0])
+        text = self.builder.call(wrapper, [elem_arg], name='_json_list_text')
+        text_slot = self.builder.gep(text_table, [index], inbounds=True)
+        self.builder.store(text, text_slot)
+        text_len = self.builder.call(strlen, [text], name='_json_list_text_len')
+        current_total = self.builder.load(total_ptr, name='_json_list_total')
+        with_text = self.builder.add(current_total, text_len, name='_json_list_total_text')
+        self.builder.store(with_text, total_ptr)
+        self.builder.store(self.builder.add(index, ir.Constant(i64, 1)), index_ptr)
+        self.builder.branch(loop_cond)
+
+        self.builder.position_at_start(loop_done)
+        comma_count = self.builder.select(has_items, self.builder.sub(length, ir.Constant(i64, 1)), ir.Constant(i64, 0), name='_json_list_commas')
+        total = self.builder.add(self.builder.load(total_ptr), comma_count, name='_json_list_total_with_commas')
+        alloc_len = self.builder.add(total, ir.Constant(i64, 1), name='_json_list_alloc_len')
+        result = self.builder.call(self._arena_alloc, [alloc_len, ir.Constant(i64, 1)], name='_json_list_buf')
+        pos_ptr = self.builder.alloca(i64, name='_json_list_pos')
+        self.builder.store(ir.Constant(i8, ord('[')), result)
+        self.builder.store(ir.Constant(i64, 1), pos_ptr)
+        self.builder.store(ir.Constant(i64, 0), index_ptr)
+
+        copy_cond = self.builder.append_basic_block('json_list_copy_cond')
+        copy_body = self.builder.append_basic_block('json_list_copy_body')
+        copy_done = self.builder.append_basic_block('json_list_copy_done')
+        self.builder.branch(copy_cond)
+        self.builder.position_at_start(copy_cond)
+        copy_index = self.builder.load(index_ptr, name='_json_list_copy_i')
+        copy_more = self.builder.icmp_unsigned('<', copy_index, length, name='_json_list_copy_more')
+        self.builder.cbranch(copy_more, copy_body, copy_done)
+
+        self.builder.position_at_start(copy_body)
+        non_first = self.builder.icmp_unsigned('>', copy_index, ir.Constant(i64, 0), name='_json_list_non_first')
+        comma_bb = self.builder.append_basic_block('json_list_comma')
+        item_bb = self.builder.append_basic_block('json_list_item')
+        self.builder.cbranch(non_first, comma_bb, item_bb)
+        self.builder.position_at_start(comma_bb)
+        comma_pos = self.builder.load(pos_ptr, name='_json_list_comma_pos')
+        comma_ptr = self.builder.gep(result, [comma_pos], inbounds=True)
+        self.builder.store(ir.Constant(i8, ord(',')), comma_ptr)
+        self.builder.store(self.builder.add(comma_pos, ir.Constant(i64, 1)), pos_ptr)
+        self.builder.branch(item_bb)
+        self.builder.position_at_start(item_bb)
+        item_text = self.builder.load(self.builder.gep(text_table, [copy_index], inbounds=True), name='_json_list_item_text')
+        item_len = self.builder.call(strlen, [item_text], name='_json_list_item_len')
+        item_pos = self.builder.load(pos_ptr, name='_json_list_item_pos')
+        dst = self.builder.gep(result, [item_pos], inbounds=True)
+        self.builder.call(memcpy, [dst, item_text, item_len, ir.Constant(i1, 0)])
+        self.builder.store(self.builder.add(item_pos, item_len), pos_ptr)
+        self.builder.store(self.builder.add(copy_index, ir.Constant(i64, 1)), index_ptr)
+        self.builder.branch(copy_cond)
+
+        self.builder.position_at_start(copy_done)
+        end_pos = self.builder.load(pos_ptr, name='_json_list_end_pos')
+        end_ptr = self.builder.gep(result, [end_pos], inbounds=True)
+        self.builder.store(ir.Constant(i8, ord(']')), end_ptr)
+        null_ptr = self.builder.gep(result, [self.builder.add(end_pos, ir.Constant(i64, 1))], inbounds=True)
+        self.builder.store(ir.Constant(i8, 0), null_ptr)
+        self.builder.ret(result)
+
+        self.builder = old_builder
+        self.current_function = old_func
+        self.locals = old_locals
+        self._locals_type_names = old_type_names
+        self._fmt_generation_stack.discard(func_name)
+        return func
+
+    def _gen_json_parse_list_function(self, func_name: str, list_type: ir.LiteralStructType, source_name: str) -> ir.Function:
+        existing = self.module.globals.get(func_name)
+        if isinstance(existing, ir.Function):
+            if len(existing.blocks) > 0:
+                return existing
+            func = existing
+        else:
+            func = ir.Function(self.module, ir.FunctionType(ir.PointerType(list_type), [ir.PointerType(ir.IntType(8))]), func_name)
+        if func_name in self._fmt_generation_stack:
+            return func
+        self._fmt_generation_stack.add(func_name)
+
+        i1 = ir.IntType(1)
+        i8 = ir.IntType(8)
+        i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
+        i8_ptr = ir.PointerType(i8)
+        result_type = ir.PointerType(list_type)
+        elem_type = list_type.elements[0].pointee.pointee
+        elem_source = self._fmt_list_elem_source_name(source_name, elem_type)
+        func.args[0].name = 's'
+
+        old_builder = self.builder
+        old_func = self.current_function
+        old_locals = self.locals
+        old_type_names = self._locals_type_names
+        old_unsigned = self._save_unsigned_state()
+
+        entry = func.append_basic_block('entry')
+        throw_exit = func.append_basic_block('throw_exit')
+        self.builder = ir.IRBuilder(entry)
+        self.current_function = func
+        self.locals = {}
+        self._locals_type_names = {}
+        self._function_throw_exit_stack.append(throw_exit)
+
+        def require_json_ok(ok: ir.Value) -> None:
+            fail_bb = self.builder.append_basic_block('json_list_parse_invalid')
+            cont_bb = self.builder.append_basic_block('json_list_parse_valid')
+            self.builder.cbranch(ok, cont_bb, fail_bb)
+            self.builder.position_at_start(fail_bb)
+            self._raise_error(4, 'json parse failed')
+            self.builder.position_at_start(cont_bb)
+
+        valid_array = self._get_or_declare_function('__ez_json_valid_array', ir.FunctionType(i1, [i8_ptr]))
+        array_ok = self.builder.call(valid_array, [func.args[0]], name='_json_list_ok')
+        require_json_ok(array_ok)
+        length_fn = self._get_or_declare_function('__ez_json_array_length', ir.FunctionType(i64, [i8_ptr]))
+        length = self.builder.call(length_fn, [func.args[0]], name='_json_list_len')
+        len_ok = self.builder.icmp_signed('>=', length, ir.Constant(i64, 0), name='_json_list_len_ok')
+        require_json_ok(len_ok)
+        result = self._list_new(elem_type, length)
+        self._mark_list_elem_unsigned(result, elem_source in {'U8', 'U32', 'U64'})
+        item_fn = self._get_or_declare_function('__ez_json_array_item', ir.FunctionType(i8_ptr, [i8_ptr, i64]))
+        null_str = ir.Constant(i8_ptr, None)
+        index_ptr = self.builder.alloca(i64, name='_json_list_parse_i')
+        self.builder.store(ir.Constant(i64, 0), index_ptr)
+        loop_cond = self.builder.append_basic_block('json_list_parse_cond')
+        loop_body = self.builder.append_basic_block('json_list_parse_body')
+        loop_done = self.builder.append_basic_block('json_list_parse_done')
+        self.builder.branch(loop_cond)
+        self.builder.position_at_start(loop_cond)
+        index = self.builder.load(index_ptr, name='_json_list_parse_i_val')
+        more = self.builder.icmp_unsigned('<', index, length, name='_json_list_parse_more')
+        self.builder.cbranch(more, loop_body, loop_done)
+
+        self.builder.position_at_start(loop_body)
+        raw = self.builder.call(item_fn, [func.args[0], index], name='_json_list_raw')
+        found = self.builder.icmp_unsigned('!=', raw, null_str, name='_json_list_item_found')
+        require_json_ok(found)
+        wrapper_name, wrapper_type, wrapper = self._json_value_parse_wrapper(elem_type, elem_source)
+        validator_name = self._json_parse_validator_for_value(wrapper_name, elem_type)
+        validator = self._get_or_declare_function(validator_name, ir.FunctionType(i1, [i8_ptr]))
+        value_ok = self.builder.call(validator, [raw], name='_json_list_item_ok')
+        require_json_ok(value_ok)
+        if wrapper is None:
+            wrapper = self._get_or_declare_function(wrapper_name, wrapper_type)
+        value = self.builder.call(wrapper, [raw], name='_json_list_item_value')
+        if self._fmt_parse_wrapper_may_throw(elem_type):
+            self._emit_throw_check_after_call()
+        if self.builder is not None and not self.builder.block.is_terminated:
+            if value.type != elem_type:
+                value = self._coerce_value(value, elem_type)
+            self.builder.store(value, self._list_element_ptr(result, index))
+            self.builder.store(self.builder.add(index, ir.Constant(i64, 1)), index_ptr)
+            self.builder.branch(loop_cond)
+
+        self.builder.position_at_start(loop_done)
+        self.builder.ret(result)
+        popped_throw_exit = self._function_throw_exit_stack.pop()
+        if not popped_throw_exit.is_terminated:
+            self.builder.position_at_start(popped_throw_exit)
+            self.builder.ret(ir.Constant(result_type, None))
+
+        self.builder = old_builder
+        self.current_function = old_func
+        self.locals = old_locals
+        self._locals_type_names = old_type_names
+        self._restore_unsigned_state(old_unsigned)
+        self._fmt_generation_stack.discard(func_name)
+        return func
+
+    def _gen_json_stringify_dict_function(self, func_name: str, dict_type: ir.IdentifiedStructType, source_name: str) -> ir.Function:
+        existing = self.module.globals.get(func_name)
+        if isinstance(existing, ir.Function):
+            if len(existing.blocks) > 0:
+                return existing
+            func = existing
+        else:
+            func = ir.Function(self.module, ir.FunctionType(ir.PointerType(ir.IntType(8)), [ir.PointerType(dict_type)]), func_name)
+        if func_name in self._fmt_generation_stack:
+            return func
+        self._fmt_generation_stack.add(func_name)
+
+        i1 = ir.IntType(1)
+        i8 = ir.IntType(8)
+        i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
+        i8_ptr = ir.PointerType(i8)
+        i8_ptr_ptr = ir.PointerType(i8_ptr)
+        key_type, value_type = self._fmt_dict_item_types_from_source_name(source_name)
+        key_source = self._fmt_dict_key_source_name(source_name, key_type)
+        value_source = self._fmt_dict_value_source_name(source_name, value_type)
+        string_key = self._fmt_dict_has_string_key(source_name)
+        func.args[0].name = 'data'
+
+        old_builder = self.builder
+        old_func = self.current_function
+        old_locals = self.locals
+        old_type_names = self._locals_type_names
+
+        entry = func.append_basic_block('entry')
+        self.builder = ir.IRBuilder(entry)
+        self.current_function = func
+        self.locals = {}
+        self._locals_type_names = {}
+
+        strlen = self._get_or_define_strlen()
+        memcpy = self.module.get_global('llvm.memcpy.p0.p0.i64')
+        count32 = self._dict_count(func.args[0])
+        count = self.builder.zext(count32, i64, name='_json_dict_count')
+        key_bytes = self.builder.mul(count, ir.Constant(i64, 8), name='_json_dict_key_bytes')
+        has_items = self.builder.icmp_unsigned('>', count, ir.Constant(i64, 0), name='_json_dict_has_items')
+        table_bytes = self.builder.select(has_items, key_bytes, ir.Constant(i64, 8), name='_json_dict_table_bytes')
+        keys_raw = self.builder.call(self._arena_alloc, [table_bytes, ir.Constant(i64, 8)], name='_json_dict_keys_raw')
+        values_raw = self.builder.call(self._arena_alloc, [table_bytes, ir.Constant(i64, 8)], name='_json_dict_values_raw')
+        key_texts = self.builder.bitcast(keys_raw, i8_ptr_ptr, name='_json_dict_keys')
+        value_texts = self.builder.bitcast(values_raw, i8_ptr_ptr, name='_json_dict_values')
+        total_ptr = self.builder.alloca(i64, name='_json_dict_total_ptr')
+        self.builder.store(ir.Constant(i64, 2), total_ptr)
+        index_ptr = self.builder.alloca(i32, name='_json_dict_i')
+        self.builder.store(ir.Constant(i32, 0), index_ptr)
+
+        loop_cond = self.builder.append_basic_block('json_dict_len_cond')
+        loop_body = self.builder.append_basic_block('json_dict_len_body')
+        loop_done = self.builder.append_basic_block('json_dict_len_done')
+        self.builder.branch(loop_cond)
+        self.builder.position_at_start(loop_cond)
+        index = self.builder.load(index_ptr, name='_json_dict_i_val')
+        more = self.builder.icmp_unsigned('<', index, count32, name='_json_dict_more')
+        self.builder.cbranch(more, loop_body, loop_done)
+
+        self.builder.position_at_start(loop_body)
+        raw_key = self.builder.load(self._dict_key_slot_ptr(func.args[0], index), name='_json_dict_key_raw')
+        key_value = self._dict_from_i8_ptr(raw_key, key_type)
+        key_wrapper_name, key_wrapper_type, key_wrapper = self._json_value_stringify_wrapper(key_type, key_source)
+        if key_wrapper is None:
+            key_wrapper = self._get_or_declare_function(key_wrapper_name, key_wrapper_type)
+        key_arg = self._fmt_arg_for_wrapper(key_value, key_wrapper_type.args[0])
+        key_text = self.builder.call(key_wrapper, [key_arg], name='_json_dict_key_text')
+        raw_value = self.builder.load(self._dict_value_slot_ptr(func.args[0], index), name='_json_dict_value_raw')
+        wrapper_name, wrapper_type, wrapper = self._json_value_stringify_wrapper(value_type, value_source)
+        if wrapper is None:
+            wrapper = self._get_or_declare_function(wrapper_name, wrapper_type)
+        value_arg = self._fmt_value_from_raw_ptr(raw_value, value_type, wrapper_type.args[0])
+        raw_value_text = self.builder.call(wrapper, [value_arg], name='_json_dict_raw_value_text')
+        value_text = raw_value_text
+        if not string_key:
+            value_text = self._fmt_join_json_key_value_entry(key_text, raw_value_text, '_json_dict_entry')
+        index64 = self.builder.zext(index, i64, name='_json_dict_i64')
+        self.builder.store(key_text, self.builder.gep(key_texts, [index64], inbounds=True))
+        self.builder.store(value_text, self.builder.gep(value_texts, [index64], inbounds=True))
+        key_len = self.builder.call(strlen, [key_text], name='_json_dict_key_len')
+        value_len = self.builder.call(strlen, [value_text], name='_json_dict_value_len')
+        current_total = self.builder.load(total_ptr, name='_json_dict_total')
+        object_entry_len = self.builder.add(self.builder.add(key_len, value_len), ir.Constant(i64, 1), name='_json_dict_object_entry_len')
+        entry_len = value_len if not string_key else object_entry_len
+        self.builder.store(self.builder.add(current_total, entry_len), total_ptr)
+        self.builder.store(self.builder.add(index, ir.Constant(i32, 1)), index_ptr)
+        self.builder.branch(loop_cond)
+
+        self.builder.position_at_start(loop_done)
+        comma_count = self.builder.select(has_items, self.builder.sub(count, ir.Constant(i64, 1)), ir.Constant(i64, 0), name='_json_dict_commas')
+        total = self.builder.add(self.builder.load(total_ptr), comma_count, name='_json_dict_total_with_commas')
+        result = self.builder.call(self._arena_alloc, [self.builder.add(total, ir.Constant(i64, 1)), ir.Constant(i64, 1)], name='_json_dict_buf')
+        pos_ptr = self.builder.alloca(i64, name='_json_dict_pos')
+        start_ch = ord('{') if string_key else ord('[')
+        self.builder.store(ir.Constant(i8, start_ch), result)
+        self.builder.store(ir.Constant(i64, 1), pos_ptr)
+        self.builder.store(ir.Constant(i32, 0), index_ptr)
+
+        copy_cond = self.builder.append_basic_block('json_dict_copy_cond')
+        copy_body = self.builder.append_basic_block('json_dict_copy_body')
+        copy_done = self.builder.append_basic_block('json_dict_copy_done')
+        self.builder.branch(copy_cond)
+        self.builder.position_at_start(copy_cond)
+        copy_index = self.builder.load(index_ptr, name='_json_dict_copy_i')
+        copy_more = self.builder.icmp_unsigned('<', copy_index, count32, name='_json_dict_copy_more')
+        self.builder.cbranch(copy_more, copy_body, copy_done)
+
+        self.builder.position_at_start(copy_body)
+        copy_index64 = self.builder.zext(copy_index, i64, name='_json_dict_copy_i64')
+        non_first = self.builder.icmp_unsigned('>', copy_index, ir.Constant(i32, 0), name='_json_dict_non_first')
+        comma_bb = self.builder.append_basic_block('json_dict_comma')
+        item_bb = self.builder.append_basic_block('json_dict_item')
+        self.builder.cbranch(non_first, comma_bb, item_bb)
+        self.builder.position_at_start(comma_bb)
+        comma_pos = self.builder.load(pos_ptr, name='_json_dict_comma_pos')
+        self.builder.store(ir.Constant(i8, ord(',')), self.builder.gep(result, [comma_pos], inbounds=True))
+        self.builder.store(self.builder.add(comma_pos, ir.Constant(i64, 1)), pos_ptr)
+        self.builder.branch(item_bb)
+        self.builder.position_at_start(item_bb)
+
+        key_item = self.builder.load(self.builder.gep(key_texts, [copy_index64], inbounds=True), name='_json_dict_key_item')
+        key_len_copy = self.builder.call(strlen, [key_item], name='_json_dict_key_item_len')
+        key_pos = self.builder.load(pos_ptr, name='_json_dict_key_pos')
+        value_item = self.builder.load(self.builder.gep(value_texts, [copy_index64], inbounds=True), name='_json_dict_value_item')
+        value_len_copy = self.builder.call(strlen, [value_item], name='_json_dict_value_item_len')
+        if string_key:
+            self.builder.call(memcpy, [self.builder.gep(result, [key_pos], inbounds=True), key_item, key_len_copy, ir.Constant(i1, 0)])
+            after_key = self.builder.add(key_pos, key_len_copy, name='_json_dict_after_key')
+            self.builder.store(ir.Constant(i8, ord(':')), self.builder.gep(result, [after_key], inbounds=True))
+            after_colon = self.builder.add(after_key, ir.Constant(i64, 1), name='_json_dict_after_colon')
+            self.builder.call(memcpy, [self.builder.gep(result, [after_colon], inbounds=True), value_item, value_len_copy, ir.Constant(i1, 0)])
+            self.builder.store(self.builder.add(after_colon, value_len_copy), pos_ptr)
+        else:
+            self.builder.call(memcpy, [self.builder.gep(result, [key_pos], inbounds=True), value_item, value_len_copy, ir.Constant(i1, 0)])
+            self.builder.store(self.builder.add(key_pos, value_len_copy), pos_ptr)
+        self.builder.store(self.builder.add(copy_index, ir.Constant(i32, 1)), index_ptr)
+        self.builder.branch(copy_cond)
+
+        self.builder.position_at_start(copy_done)
+        end_pos = self.builder.load(pos_ptr, name='_json_dict_end_pos')
+        end_ch = ord('}') if string_key else ord(']')
+        self.builder.store(ir.Constant(i8, end_ch), self.builder.gep(result, [end_pos], inbounds=True))
+        self.builder.store(ir.Constant(i8, 0), self.builder.gep(result, [self.builder.add(end_pos, ir.Constant(i64, 1))], inbounds=True))
+        self.builder.ret(result)
+
+        self.builder = old_builder
+        self.current_function = old_func
+        self.locals = old_locals
+        self._locals_type_names = old_type_names
+        self._fmt_generation_stack.discard(func_name)
+        return func
+
+    def _gen_json_parse_dict_function(self, func_name: str, dict_type: ir.IdentifiedStructType, source_name: str) -> ir.Function:
+        existing = self.module.globals.get(func_name)
+        if isinstance(existing, ir.Function):
+            if len(existing.blocks) > 0:
+                return existing
+            func = existing
+        else:
+            func = ir.Function(self.module, ir.FunctionType(ir.PointerType(dict_type), [ir.PointerType(ir.IntType(8))]), func_name)
+        if func_name in self._fmt_generation_stack:
+            return func
+        self._fmt_generation_stack.add(func_name)
+
+        i1 = ir.IntType(1)
+        i8 = ir.IntType(8)
+        i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
+        i8_ptr = ir.PointerType(i8)
+        result_type = ir.PointerType(dict_type)
+        key_type, value_type = self._fmt_dict_item_types_from_source_name(source_name)
+        key_source = self._fmt_dict_key_source_name(source_name, key_type)
+        value_source = self._fmt_dict_value_source_name(source_name, value_type)
+        string_key = self._fmt_dict_has_string_key(source_name)
+        func.args[0].name = 's'
+
+        old_builder = self.builder
+        old_func = self.current_function
+        old_locals = self.locals
+        old_type_names = self._locals_type_names
+        old_unsigned = self._save_unsigned_state()
+
+        entry = func.append_basic_block('entry')
+        throw_exit = func.append_basic_block('throw_exit')
+        self.builder = ir.IRBuilder(entry)
+        self.current_function = func
+        self.locals = {}
+        self._locals_type_names = {}
+        self._function_throw_exit_stack.append(throw_exit)
+
+        def require_json_ok(ok: ir.Value) -> None:
+            fail_bb = self.builder.append_basic_block('json_dict_parse_invalid')
+            cont_bb = self.builder.append_basic_block('json_dict_parse_valid')
+            self.builder.cbranch(ok, cont_bb, fail_bb)
+            self.builder.position_at_start(fail_bb)
+            self._raise_error(4, 'json parse failed')
+            self.builder.position_at_start(cont_bb)
+
+        result = self._arena_allocate(dict_type, name='_json_dict_value')
+        self.builder.store(self._zero_constant(dict_type), result)
+        self._mark_dict_item_types(result, key_type, value_type)
+        if string_key:
+            valid_top = self._get_or_declare_function('__ez_json_valid_object', ir.FunctionType(i1, [i8_ptr]))
+            top_ok = self.builder.call(valid_top, [func.args[0]], name='_json_dict_ok')
+            require_json_ok(top_ok)
+            length_fn = self._get_or_declare_function('__ez_json_object_field_count', ir.FunctionType(i64, [i8_ptr]))
+            length = self.builder.call(length_fn, [func.args[0]], name='_json_dict_len')
+            key_at_fn = self._get_or_declare_function('__ez_json_object_key_at', ir.FunctionType(i8_ptr, [i8_ptr, i64]))
+            value_at_fn = self._get_or_declare_function('__ez_json_object_value_at', ir.FunctionType(i8_ptr, [i8_ptr, i64]))
+            field_fn = None
+            item_fn = None
+        else:
+            valid_top = self._get_or_declare_function('__ez_json_valid_array', ir.FunctionType(i1, [i8_ptr]))
+            top_ok = self.builder.call(valid_top, [func.args[0]], name='_json_dict_entries_ok')
+            require_json_ok(top_ok)
+            length_fn = self._get_or_declare_function('__ez_json_array_length', ir.FunctionType(i64, [i8_ptr]))
+            length = self.builder.call(length_fn, [func.args[0]], name='_json_dict_len')
+            key_at_fn = None
+            value_at_fn = None
+            field_fn = self._get_or_declare_function('__ez_json_object_field', ir.FunctionType(i8_ptr, [i8_ptr, i8_ptr]))
+            item_fn = self._get_or_declare_function('__ez_json_array_item', ir.FunctionType(i8_ptr, [i8_ptr, i64]))
+        len_ok = self.builder.icmp_signed('>=', length, ir.Constant(i64, 0), name='_json_dict_len_ok')
+        require_json_ok(len_ok)
+        null_str = ir.Constant(i8_ptr, None)
+        index_ptr = self.builder.alloca(i64, name='_json_dict_parse_i')
+        self.builder.store(ir.Constant(i64, 0), index_ptr)
+        loop_cond = self.builder.append_basic_block('json_dict_parse_cond')
+        loop_body = self.builder.append_basic_block('json_dict_parse_body')
+        loop_done = self.builder.append_basic_block('json_dict_parse_done')
+        self.builder.branch(loop_cond)
+        self.builder.position_at_start(loop_cond)
+        index = self.builder.load(index_ptr, name='_json_dict_parse_i_val')
+        more = self.builder.icmp_unsigned('<', index, length, name='_json_dict_parse_more')
+        self.builder.cbranch(more, loop_body, loop_done)
+
+        self.builder.position_at_start(loop_body)
+        if string_key:
+            key = self.builder.call(key_at_fn, [func.args[0], index], name='_json_dict_key')
+            raw = self.builder.call(value_at_fn, [func.args[0], index], name='_json_dict_raw')
+        else:
+            entry_raw = self.builder.call(item_fn, [func.args[0], index], name='_json_dict_entry_raw')
+            entry_found = self.builder.icmp_unsigned('!=', entry_raw, null_str, name='_json_dict_entry_found')
+            require_json_ok(entry_found)
+            valid_entry_object = self._get_or_declare_function('__ez_json_valid_object', ir.FunctionType(i1, [i8_ptr]))
+            entry_ok = self.builder.call(valid_entry_object, [entry_raw], name='_json_dict_entry_ok')
+            require_json_ok(entry_ok)
+            entry_field_count_fn = self._get_or_declare_function('__ez_json_object_field_count', ir.FunctionType(i64, [i8_ptr]))
+            entry_field_count = self.builder.call(entry_field_count_fn, [entry_raw], name='_json_dict_entry_field_count')
+            entry_field_count_ok = self.builder.icmp_signed('==', entry_field_count, ir.Constant(i64, 2), name='_json_dict_entry_field_count_ok')
+            require_json_ok(entry_field_count_ok)
+            key = self.builder.call(field_fn, [entry_raw, self._make_global_string('key', prefix='_json_dict_entry_key')], name='_json_dict_key_raw')
+            raw = self.builder.call(field_fn, [entry_raw, self._make_global_string('value', prefix='_json_dict_entry_key')], name='_json_dict_raw')
+            key_wrapper_name, _, _ = self._json_value_parse_wrapper(key_type, key_source)
+            key_validator_name = self._json_parse_validator_for_value(key_wrapper_name, key_type)
+            key_validator = self._get_or_declare_function(key_validator_name, ir.FunctionType(i1, [i8_ptr]))
+            key_ok = self.builder.call(key_validator, [key], name='_json_dict_key_ok')
+            require_json_ok(key_ok)
+            key_wrapper_name, key_wrapper_type, key_wrapper = self._json_value_parse_wrapper(key_type, key_source)
+            if key_wrapper is None:
+                key_wrapper = self._get_or_declare_function(key_wrapper_name, key_wrapper_type)
+            parsed_key = self.builder.call(key_wrapper, [key], name='_json_dict_key_value')
+            if self._fmt_parse_wrapper_may_throw(key_type):
+                self._emit_throw_check_after_call()
+            if self.builder is not None and not self.builder.block.is_terminated:
+                if parsed_key.type != key_type:
+                    parsed_key = self._coerce_value(parsed_key, key_type)
+                key = parsed_key
+        key_found = self.builder.icmp_unsigned('!=', key, null_str, name='_json_dict_key_found') if string_key else ir.Constant(i1, 1)
+        require_json_ok(key_found)
+        value_found = self.builder.icmp_unsigned('!=', raw, null_str, name='_json_dict_value_found')
+        require_json_ok(value_found)
+        wrapper_name, wrapper_type, wrapper = self._json_value_parse_wrapper(value_type, value_source)
+        validator_name = self._json_parse_validator_for_value(wrapper_name, value_type)
+        validator = self._get_or_declare_function(validator_name, ir.FunctionType(i1, [i8_ptr]))
+        value_ok = self.builder.call(validator, [raw], name='_json_dict_item_ok')
+        require_json_ok(value_ok)
+        if wrapper is None:
+            wrapper = self._get_or_declare_function(wrapper_name, wrapper_type)
+        value = self.builder.call(wrapper, [raw], name='_json_dict_item_value')
+        if self._fmt_parse_wrapper_may_throw(value_type):
+            self._emit_throw_check_after_call()
+        if self.builder is not None and not self.builder.block.is_terminated:
+            if value.type != value_type:
+                value = self._coerce_value(value, value_type)
+            self._gen_dict_upsert_value(result, key, value, key_type, value_type)
+            self.builder.store(self.builder.add(index, ir.Constant(i64, 1)), index_ptr)
+            self.builder.branch(loop_cond)
+
+        self.builder.position_at_start(loop_done)
+        self.builder.ret(result)
+        popped_throw_exit = self._function_throw_exit_stack.pop()
+        if not popped_throw_exit.is_terminated:
+            self.builder.position_at_start(popped_throw_exit)
+            self.builder.ret(ir.Constant(result_type, None))
+
+        self.builder = old_builder
+        self.current_function = old_func
+        self.locals = old_locals
+        self._locals_type_names = old_type_names
+        self._restore_unsigned_state(old_unsigned)
+        self._fmt_generation_stack.discard(func_name)
+        return func
+
+    def _msgpack_encode_struct_supported(self, typ: ir.Type) -> bool:
+        """当前编译期 MessagePack 结构体编码覆盖基础字段与嵌套用户结构体。"""
+        return self._fmt_struct_serializable(typ)
+
+    def _msgpack_decode_struct_supported(self, typ: ir.Type) -> bool:
+        """当前编译期 MessagePack 结构体解析覆盖基础字段与嵌套用户结构体。"""
+        return self._fmt_struct_serializable(typ)
+
+    def _fmt_top_level_list_source_name(self, type_suffixes: list[str] | None, list_type: ir.Type) -> str:
+        if type_suffixes:
+            return type_suffixes[0]
+        return self._type_name_from_ir_type(list_type)
+
+    def _fmt_monomorphize_top_level_list(self, base_name: str, mono_name: str, list_type: ir.Type,
+                                         type_suffixes: list[str] | None) -> bool:
+        if not self._is_list_type(list_type):
+            return False
+        source_name = self._fmt_top_level_list_source_name(type_suffixes, list_type)
+        if not self._fmt_list_serializable(list_type, source_name, set()):
+            return False
+        if base_name == 'jsonStringify':
+            self._gen_json_stringify_list_function(mono_name, list_type, source_name)
+            self.func_param_names[mono_name] = ['data']
+            self.func_return_unsigned[mono_name] = False
+            return True
+        if base_name == 'jsonParse':
+            self._gen_json_parse_list_function(mono_name, list_type, source_name)
+            self.func_param_names[mono_name] = ['s']
+            self.func_return_unsigned[mono_name] = False
+            return True
+        if base_name == 'msgpackEncode':
+            self._gen_msgpack_encode_list_function(mono_name, list_type, source_name)
+            self.func_param_names[mono_name] = ['data']
+            self.func_return_unsigned[mono_name] = False
+            return True
+        if base_name == 'msgpackDecode':
+            self._gen_msgpack_decode_list_function(mono_name, list_type, source_name)
+            self.func_param_names[mono_name] = ['data']
+            self.func_return_unsigned[mono_name] = False
+            return True
+        return False
+
+    def _fmt_top_level_optional_source_name(self, type_suffixes: list[str] | None, opt_type: ir.Type) -> str:
+        if type_suffixes:
+            return type_suffixes[0]
+        return self._type_name_from_ir_type(opt_type)
+
+    def _fmt_monomorphize_top_level_optional(self, base_name: str, mono_name: str, opt_type: ir.Type,
+                                             type_suffixes: list[str] | None) -> bool:
+        if not self._is_optional_type(opt_type):
+            return False
+        source_name = self._fmt_top_level_optional_source_name(type_suffixes, opt_type)
+        if not self._fmt_optional_serializable(opt_type, source_name, set()):
+            return False
+        if base_name == 'jsonStringify':
+            self._gen_json_stringify_optional_function(mono_name, opt_type, source_name)
+            self.func_param_names[mono_name] = ['data']
+            self.func_return_unsigned[mono_name] = False
+            return True
+        if base_name == 'jsonParse':
+            self._gen_json_parse_optional_function(mono_name, opt_type, source_name)
+            self.func_param_names[mono_name] = ['s']
+            self.func_return_unsigned[mono_name] = False
+            return True
+        if base_name == 'msgpackEncode':
+            self._gen_msgpack_encode_optional_function(mono_name, opt_type, source_name)
+            self.func_param_names[mono_name] = ['data']
+            self.func_return_unsigned[mono_name] = False
+            return True
+        if base_name == 'msgpackDecode':
+            self._gen_msgpack_decode_optional_function(mono_name, opt_type, source_name)
+            self.func_param_names[mono_name] = ['data']
+            self.func_return_unsigned[mono_name] = False
+            return True
+        return False
+
+    def _fmt_top_level_dict_source_name(self, type_suffixes: list[str] | None, dict_type: ir.Type) -> str:
+        if type_suffixes:
+            return type_suffixes[0]
+        return self._type_name_from_ir_type(dict_type)
+
+    def _fmt_monomorphize_top_level_dict(self, base_name: str, mono_name: str, dict_type: ir.Type,
+                                         type_suffixes: list[str] | None) -> bool:
+        if not self._is_dict_type(dict_type):
+            return False
+        source_name = self._fmt_top_level_dict_source_name(type_suffixes, dict_type)
+        if not self._fmt_dict_serializable(dict_type, source_name, set()):
+            return False
+        if base_name == 'jsonStringify':
+            self._gen_json_stringify_dict_function(mono_name, dict_type, source_name)
+            self.func_param_names[mono_name] = ['data']
+            self.func_return_unsigned[mono_name] = False
+            return True
+        if base_name == 'jsonParse':
+            self._gen_json_parse_dict_function(mono_name, dict_type, source_name)
+            self.func_param_names[mono_name] = ['s']
+            self.func_return_unsigned[mono_name] = False
+            self.func_return_dict_types[mono_name] = self._fmt_dict_item_types_from_source_name(source_name)
+            return True
+        if base_name == 'msgpackEncode':
+            self._gen_msgpack_encode_dict_function(mono_name, dict_type, source_name)
+            self.func_param_names[mono_name] = ['data']
+            self.func_return_unsigned[mono_name] = False
+            return True
+        if base_name == 'msgpackDecode':
+            self._gen_msgpack_decode_dict_function(mono_name, dict_type, source_name)
+            self.func_param_names[mono_name] = ['data']
+            self.func_return_unsigned[mono_name] = False
+            self.func_return_dict_types[mono_name] = self._fmt_dict_item_types_from_source_name(source_name)
+            return True
+        return False
+
+    def _fmt_top_level_union_source_name(self, type_suffixes: list[str] | None, union_type: ir.Type) -> str:
+        if type_suffixes:
+            return type_suffixes[0]
+        return self._type_name_from_ir_type(union_type)
+
+    def _fmt_monomorphize_top_level_union(self, base_name: str, mono_name: str, union_type: ir.Type,
+                                          type_suffixes: list[str] | None) -> bool:
+        if not self._is_union_type(union_type):
+            return False
+        source_name = self._fmt_top_level_union_source_name(type_suffixes, union_type)
+        if not self._fmt_union_serializable(union_type, source_name, set()):
+            return False
+        if base_name == 'jsonStringify':
+            self._gen_json_stringify_union_function(mono_name, union_type, source_name)
+            self.func_param_names[mono_name] = ['data']
+            self.func_return_unsigned[mono_name] = False
+            return True
+        if base_name == 'jsonParse':
+            self._gen_json_parse_union_function(mono_name, union_type, source_name)
+            self.func_param_names[mono_name] = ['s']
+            self.func_return_unsigned[mono_name] = False
+            return True
+        if base_name == 'msgpackEncode':
+            self._gen_msgpack_encode_union_function(mono_name, union_type, source_name)
+            self.func_param_names[mono_name] = ['data']
+            self.func_return_unsigned[mono_name] = False
+            return True
+        if base_name == 'msgpackDecode':
+            self._gen_msgpack_decode_union_function(mono_name, union_type, source_name)
+            self.func_param_names[mono_name] = ['data']
+            self.func_return_unsigned[mono_name] = False
+            return True
+        return False
+
+    def _msgpack_source_type_name(self, field_type: ir.Type, struct_name: str, index: int) -> str:
+        return self._fmt_source_type_name(field_type, struct_name, index)
+
+    def _msgpack_encode_field_function_name(self, field_type: ir.Type, struct_name: str, index: int) -> str | None:
+        source_name = self._msgpack_source_type_name(field_type, struct_name, index)
+        if source_name == 'Bool':
+            return 'msgpackEncode_I1'
+        if source_name in {'I8', 'I32', 'I64', 'U8', 'U32', 'U64', 'F32', 'F64', 'Str'}:
+            return f"msgpackEncode_{source_name}"
+        if self._is_optional_type(field_type) and self._fmt_optional_serializable(field_type, source_name, set()):
+            return f"msgpackEncode_{self._fmt_optional_function_suffix(field_type, source_name)}"
+        if self._is_list_type(field_type) and self._fmt_list_serializable(field_type, source_name, set()):
+            return f"msgpackEncode_{self._fmt_list_function_suffix(field_type, source_name)}"
+        if self._is_dict_type(field_type) and self._fmt_dict_serializable(field_type, source_name, set()):
+            return f"msgpackEncode_{self._fmt_dict_function_suffix(field_type, source_name)}"
+        if self._is_union_type(field_type) and self._fmt_union_serializable(field_type, source_name, set()):
+            return f"msgpackEncode_{self._fmt_union_function_suffix(field_type, source_name)}"
+        if self._fmt_struct_serializable(field_type):
+            return f"msgpackEncode_{field_type.name}"
+        return None
+
+    def _msgpack_decode_field_function_name(self, field_type: ir.Type, struct_name: str, index: int) -> str | None:
+        source_name = self._msgpack_source_type_name(field_type, struct_name, index)
+        if source_name == 'Bool':
+            return 'msgpackDecode_I1'
+        if source_name in {'I8', 'I32', 'I64', 'U8', 'U32', 'U64', 'F32', 'F64', 'Str'}:
+            return f"msgpackDecode_{source_name}"
+        if self._is_optional_type(field_type) and self._fmt_optional_serializable(field_type, source_name, set()):
+            return f"msgpackDecode_{self._fmt_optional_function_suffix(field_type, source_name)}"
+        if self._is_list_type(field_type) and self._fmt_list_serializable(field_type, source_name, set()):
+            return f"msgpackDecode_{self._fmt_list_function_suffix(field_type, source_name)}"
+        if self._is_dict_type(field_type) and self._fmt_dict_serializable(field_type, source_name, set()):
+            return f"msgpackDecode_{self._fmt_dict_function_suffix(field_type, source_name)}"
+        if self._is_union_type(field_type) and self._fmt_union_serializable(field_type, source_name, set()):
+            return f"msgpackDecode_{self._fmt_union_function_suffix(field_type, source_name)}"
+        if self._fmt_struct_serializable(field_type):
+            return f"msgpackDecode_{field_type.name}"
+        return None
+
+    def _msgpack_function_scalar_type(self, func_name: str, field_type: ir.Type) -> ir.Type:
+        if func_name.endswith('_I1'):
+            return ir.IntType(1)
+        if isinstance(field_type, ir.IdentifiedStructType) or self._is_list_type(field_type) or self._is_optional_type(field_type) or self._is_dict_type(field_type) or self._is_union_type(field_type):
+            return ir.PointerType(field_type)
+        return field_type
+
+    def _msgpack_encode_function_type(self, func_name: str, arg_type: ir.Type) -> ir.FunctionType:
+        blob_type = self.structs['Blob']
+        arg_type = self._msgpack_function_scalar_type(func_name, arg_type)
+        if self._uses_c_sret(blob_type):
+            return ir.FunctionType(ir.VoidType(), [ir.PointerType(blob_type), arg_type])
+        return ir.FunctionType(blob_type, [arg_type])
+
+    def _msgpack_decode_function_type(self, func_name: str, ret_type: ir.Type) -> ir.FunctionType:
+        ret_type = self._msgpack_function_scalar_type(func_name, ret_type)
+        return ir.FunctionType(ret_type, [ir.PointerType(self.structs['Blob'])])
+
+    def _msgpack_value_encode_wrapper(self, value_type: ir.Type, source_name: str) -> tuple[str, ir.FunctionType, ir.Function | None]:
+        if source_name == 'Bool':
+            wrapper_name = 'msgpackEncode_I1'
+        elif source_name in {'I8', 'I32', 'I64', 'U8', 'U32', 'U64', 'F32', 'F64', 'Str'}:
+            wrapper_name = f'msgpackEncode_{source_name}'
+        elif self._is_optional_type(value_type) and self._fmt_optional_serializable(value_type, source_name, set()):
+            wrapper_name = f'msgpackEncode_{self._fmt_optional_function_suffix(value_type, source_name)}'
+        elif self._is_list_type(value_type) and self._fmt_list_serializable(value_type, source_name, set()):
+            wrapper_name = f'msgpackEncode_{self._fmt_list_function_suffix(value_type, source_name)}'
+        elif self._is_dict_type(value_type) and self._fmt_dict_serializable(value_type, source_name, set()):
+            wrapper_name = f'msgpackEncode_{self._fmt_dict_function_suffix(value_type, source_name)}'
+        elif self._is_union_type(value_type) and self._fmt_union_serializable(value_type, source_name, set()):
+            wrapper_name = f'msgpackEncode_{self._fmt_union_function_suffix(value_type, source_name)}'
+        elif isinstance(value_type, ir.IdentifiedStructType) and self._fmt_struct_serializable(value_type):
+            wrapper_name = f'msgpackEncode_{value_type.name}'
+        else:
+            wrapper_name = ''
+        wrapper_type = self._msgpack_encode_function_type(wrapper_name, value_type)
+        wrapper = self._fmt_generate_msgpack_encode_wrapper(wrapper_name, value_type, source_name)
+        return wrapper_name, wrapper_type, wrapper
+
+    def _msgpack_value_decode_wrapper(self, value_type: ir.Type, source_name: str) -> tuple[str, ir.FunctionType, ir.Function | None]:
+        if source_name == 'Bool':
+            wrapper_name = 'msgpackDecode_I1'
+        elif source_name in {'I8', 'I32', 'I64', 'U8', 'U32', 'U64', 'F32', 'F64', 'Str'}:
+            wrapper_name = f'msgpackDecode_{source_name}'
+        elif self._is_optional_type(value_type) and self._fmt_optional_serializable(value_type, source_name, set()):
+            wrapper_name = f'msgpackDecode_{self._fmt_optional_function_suffix(value_type, source_name)}'
+        elif self._is_list_type(value_type) and self._fmt_list_serializable(value_type, source_name, set()):
+            wrapper_name = f'msgpackDecode_{self._fmt_list_function_suffix(value_type, source_name)}'
+        elif self._is_dict_type(value_type) and self._fmt_dict_serializable(value_type, source_name, set()):
+            wrapper_name = f'msgpackDecode_{self._fmt_dict_function_suffix(value_type, source_name)}'
+        elif self._is_union_type(value_type) and self._fmt_union_serializable(value_type, source_name, set()):
+            wrapper_name = f'msgpackDecode_{self._fmt_union_function_suffix(value_type, source_name)}'
+        elif isinstance(value_type, ir.IdentifiedStructType) and self._fmt_struct_serializable(value_type):
+            wrapper_name = f'msgpackDecode_{value_type.name}'
+        else:
+            wrapper_name = ''
+        wrapper_type = self._msgpack_decode_function_type(wrapper_name, value_type)
+        wrapper = self._fmt_generate_msgpack_decode_wrapper(wrapper_name, value_type, source_name)
+        return wrapper_name, wrapper_type, wrapper
+
+    def _msgpack_decode_validator_for_value(self, wrapper_name: str, value_type: ir.Type) -> str | None:
+        validator_name = self._msgpack_decode_validator_name(wrapper_name)
+        if validator_name is None and self._is_optional_type(value_type) and self._fmt_optional_serializable(value_type, '', set()):
+            return '__ez_msgpack_valid_value'
+        if validator_name is None and self._is_list_type(value_type) and self._fmt_list_serializable(value_type, '', set()):
+            return '__ez_msgpack_valid_array'
+        if validator_name is None and self._is_dict_type(value_type):
+            return '__ez_msgpack_valid_map'
+        if validator_name is None and self._is_union_type(value_type):
+            return '__ez_msgpack_valid_map'
+        if validator_name is None and isinstance(value_type, ir.IdentifiedStructType) and self._fmt_struct_serializable(value_type):
+            return '__ez_msgpack_valid_map'
+        return validator_name
+
+    def _gen_msgpack_encode_optional_function(self, func_name: str, opt_type: ir.LiteralStructType, source_name: str) -> ir.Function:
+        existing = self.module.globals.get(func_name)
+        blob_type = self.structs['Blob']
+        if isinstance(existing, ir.Function):
+            if len(existing.blocks) > 0:
+                return existing
+            func = existing
+        else:
+            func = ir.Function(self.module, ir.FunctionType(blob_type, [ir.PointerType(opt_type)]), func_name)
+        if func_name in self._fmt_generation_stack:
+            return func
+        self._fmt_generation_stack.add(func_name)
+
+        i8 = ir.IntType(8)
+        i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
+        inner_type = opt_type.elements[1]
+        inner_source = self._fmt_optional_inner_source_name(source_name, inner_type)
+        func.args[0].name = 'data'
+
+        old_builder = self.builder
+        old_func = self.current_function
+        old_locals = self.locals
+        old_type_names = self._locals_type_names
+
+        entry = func.append_basic_block('entry')
+        value_block = func.append_basic_block('msgpack_optional_value')
+        nil_block = func.append_basic_block('msgpack_optional_nil')
+        self.builder = ir.IRBuilder(entry)
+        self.current_function = func
+        self.locals = {}
+        self._locals_type_names = {}
+
+        ok_ptr = self.builder.gep(func.args[0], [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        ok = self.builder.load(ok_ptr, name='_msgpack_optional_ok')
+        self.builder.cbranch(ok, value_block, nil_block)
+
+        self.builder.position_at_start(nil_block)
+        raw = self.builder.call(self._arena_alloc, [ir.Constant(i64, 1), ir.Constant(i64, 1)], name='_msgpack_optional_nil_raw')
+        self.builder.store(ir.Constant(i8, 0xC0), raw)
+        blob = ir.Constant(blob_type, ir.Undefined)
+        blob = self.builder.insert_value(blob, raw, 0)
+        blob = self.builder.insert_value(blob, ir.Constant(i64, 1), 1)
+        self.builder.ret(blob)
+
+        self.builder.position_at_start(value_block)
+        value_ptr = self.builder.gep(func.args[0], [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        wrapper_name, wrapper_type, wrapper = self._msgpack_value_encode_wrapper(inner_type, inner_source)
+        if wrapper is None:
+            wrapper = self._get_or_declare_function(wrapper_name, wrapper_type)
+        value_arg = value_ptr if value_ptr.type == wrapper_type.args[-1] else self.builder.load(value_ptr, name='_msgpack_optional_value')
+        if value_arg.type != wrapper_type.args[-1]:
+            value_arg = self._coerce_value(value_arg, wrapper_type.args[-1])
+        encoded = self._msgpack_call_blob_returning_function(wrapper, [value_arg], name='_msgpack_optional_blob')
+        self.builder.ret(encoded)
+
+        self.builder = old_builder
+        self.current_function = old_func
+        self.locals = old_locals
+        self._locals_type_names = old_type_names
+        self._fmt_generation_stack.discard(func_name)
+        return func
+
+    def _gen_msgpack_decode_optional_function(self, func_name: str, opt_type: ir.LiteralStructType, source_name: str) -> ir.Function:
+        existing = self.module.globals.get(func_name)
+        blob_type = self.structs['Blob']
+        if isinstance(existing, ir.Function):
+            if len(existing.blocks) > 0:
+                return existing
+            func = existing
+        else:
+            func = ir.Function(self.module, ir.FunctionType(ir.PointerType(opt_type), [ir.PointerType(blob_type)]), func_name)
+        if func_name in self._fmt_generation_stack:
+            return func
+        self._fmt_generation_stack.add(func_name)
+
+        i1 = ir.IntType(1)
+        i32 = ir.IntType(32)
+        blob_ptr = ir.PointerType(blob_type)
+        result_type = ir.PointerType(opt_type)
+        inner_type = opt_type.elements[1]
+        inner_source = self._fmt_optional_inner_source_name(source_name, inner_type)
+        func.args[0].name = 'data'
+
+        old_builder = self.builder
+        old_func = self.current_function
+        old_locals = self.locals
+        old_type_names = self._locals_type_names
+        old_unsigned = self._save_unsigned_state()
+
+        entry = func.append_basic_block('entry')
+        nil_block = func.append_basic_block('msgpack_optional_nil')
+        value_block = func.append_basic_block('msgpack_optional_value')
+        throw_exit = func.append_basic_block('throw_exit')
+        self.builder = ir.IRBuilder(entry)
+        self.current_function = func
+        self.locals = {}
+        self._locals_type_names = {}
+        self._function_throw_exit_stack.append(throw_exit)
+
+        def require_msgpack_ok(ok: ir.Value) -> None:
+            fail_bb = self.builder.append_basic_block('msgpack_optional_decode_invalid')
+            cont_bb = self.builder.append_basic_block('msgpack_optional_decode_valid')
+            self.builder.cbranch(ok, cont_bb, fail_bb)
+            self.builder.position_at_start(fail_bb)
+            self._raise_error(4, 'msgpack decode failed')
+            self.builder.position_at_start(cont_bb)
+
+        result = self._arena_allocate(opt_type, name='_msgpack_optional_value_ptr')
+        self.builder.store(self._zero_constant(opt_type), result)
+        valid_value = self._get_or_declare_function('__ez_msgpack_valid_value', ir.FunctionType(i1, [blob_ptr]))
+        valid_ok = self.builder.call(valid_value, [func.args[0]], name='_msgpack_optional_valid')
+        require_msgpack_ok(valid_ok)
+        valid_nil = self._get_or_declare_function('__ez_msgpack_valid_nil', ir.FunctionType(i1, [blob_ptr]))
+        is_nil = self.builder.call(valid_nil, [func.args[0]], name='_msgpack_optional_is_nil')
+        self.builder.cbranch(is_nil, nil_block, value_block)
+
+        self.builder.position_at_start(nil_block)
+        self.builder.ret(result)
+
+        self.builder.position_at_start(value_block)
+        wrapper_name, wrapper_type, wrapper = self._msgpack_value_decode_wrapper(inner_type, inner_source)
+        validator_name = self._msgpack_decode_validator_for_value(wrapper_name, inner_type)
+        validator = self._get_or_declare_function(validator_name, ir.FunctionType(i1, [blob_ptr]))
+        value_ok = self.builder.call(validator, [func.args[0]], name='_msgpack_optional_inner_ok')
+        require_msgpack_ok(value_ok)
+        if wrapper is None:
+            wrapper = self._get_or_declare_function(wrapper_name, wrapper_type)
+        value = self.builder.call(wrapper, [func.args[0]], name='_msgpack_optional_inner')
+        if self._fmt_parse_wrapper_may_throw(inner_type):
+            self._emit_throw_check_after_call()
+        if self.builder is not None and not self.builder.block.is_terminated:
+            if value.type != inner_type:
+                value = self._coerce_value(value, inner_type)
+            self.builder.store(self._optional_value(inner_type, True, value), result)
+            self.builder.ret(result)
+
+        popped_throw_exit = self._function_throw_exit_stack.pop()
+        if not popped_throw_exit.is_terminated:
+            self.builder.position_at_start(popped_throw_exit)
+            self.builder.ret(ir.Constant(result_type, None))
+
+        self.builder = old_builder
+        self.current_function = old_func
+        self.locals = old_locals
+        self._locals_type_names = old_type_names
+        self._restore_unsigned_state(old_unsigned)
+        self._fmt_generation_stack.discard(func_name)
+        return func
+
+    def _gen_msgpack_encode_union_function(self, func_name: str, union_type: ir.LiteralStructType, source_name: str) -> ir.Function:
+        existing = self.module.globals.get(func_name)
+        blob_type = self.structs['Blob']
+        if isinstance(existing, ir.Function):
+            if len(existing.blocks) > 0:
+                return existing
+            func = existing
+        else:
+            func = ir.Function(self.module, ir.FunctionType(blob_type, [ir.PointerType(union_type)]), func_name)
+        if func_name in self._fmt_generation_stack:
+            return func
+        self._fmt_generation_stack.add(func_name)
+
+        i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
+        i8_ptr = ir.PointerType(ir.IntType(8))
+        variants = self._fmt_union_variant_types_from_source_name(source_name)
+        if variants is None:
+            return func
+        variant_sources, variant_types = variants
+        func.args[0].name = 'data'
+
+        old_builder = self.builder
+        old_func = self.current_function
+        old_locals = self.locals
+        old_type_names = self._locals_type_names
+
+        entry = func.append_basic_block('entry')
+        invalid_block = func.append_basic_block('msgpack_union_invalid')
+        self.builder = ir.IRBuilder(entry)
+        self.current_function = func
+        self.locals = {}
+        self._locals_type_names = {}
+
+        tag_ptr = self.builder.gep(func.args[0], [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        tag = self.builder.load(tag_ptr, name='_msgpack_union_tag')
+        for index, (variant_source, variant_type) in enumerate(zip(variant_sources, variant_types)):
+            is_tag = self.builder.icmp_signed('==', tag, ir.Constant(i32, index), name='_msgpack_union_tag_match')
+            match_block = func.append_basic_block(f'msgpack_union_tag_{index}')
+            next_block = invalid_block if index == len(variant_types) - 1 else func.append_basic_block(f'msgpack_union_next_{index}')
+            self.builder.cbranch(is_tag, match_block, next_block)
+
+            self.builder.position_at_start(match_block)
+            union_value = self.builder.load(func.args[0], name='_msgpack_union_value')
+            variant_value = self._fmt_union_value_for_variant(union_value, union_type, variant_type)
+            wrapper_name, wrapper_type, wrapper = self._msgpack_value_encode_wrapper(variant_type, variant_source)
+            if wrapper is None:
+                wrapper = self._get_or_declare_function(wrapper_name, wrapper_type)
+            variant_arg = self._fmt_arg_for_wrapper(variant_value, wrapper_type.args[-1])
+            value_blob = self._msgpack_call_blob_returning_function(wrapper, [variant_arg], name='_msgpack_union_value_blob')
+            keys = self.builder.alloca(ir.ArrayType(i8_ptr, 2), name='_msgpack_union_keys')
+            values = self.builder.alloca(ir.ArrayType(blob_type, 2), name='_msgpack_union_values')
+            keys_ptr = self.builder.gep(keys, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+            values_ptr = self.builder.gep(values, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+            self.builder.store(self._make_global_string('tag', prefix='_msgpack_union_key'), self.builder.gep(keys, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True))
+            self.builder.store(self._make_global_string('value', prefix='_msgpack_union_key'), self.builder.gep(keys, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True))
+            tag_encoder = self._get_or_declare_function('msgpackEncode_I32', self._msgpack_encode_function_type('msgpackEncode_I32', i32))
+            tag_blob = self._msgpack_call_blob_returning_function(tag_encoder, [ir.Constant(i32, index)], name='_msgpack_union_tag_blob')
+            self.builder.store(tag_blob, self.builder.gep(values, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True))
+            self.builder.store(value_blob, self.builder.gep(values, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True))
+            helper_arg_types = [i64, ir.PointerType(i8_ptr), ir.PointerType(blob_type)]
+            if self._uses_c_sret(blob_type):
+                helper_type = ir.FunctionType(ir.VoidType(), [ir.PointerType(blob_type)] + helper_arg_types)
+            else:
+                helper_type = ir.FunctionType(blob_type, helper_arg_types)
+            helper = self._get_or_declare_function('__ez_msgpack_encode_map', helper_type)
+            result = self._msgpack_call_blob_returning_function(helper, [ir.Constant(i64, 2), keys_ptr, values_ptr], name='_msgpack_union_blob')
+            self.builder.ret(result)
+
+            if next_block is not invalid_block:
+                self.builder.position_at_start(next_block)
+
+        self.builder.position_at_start(invalid_block)
+        raw = self.builder.call(self._arena_alloc, [ir.Constant(i64, 1), ir.Constant(i64, 1)], name='_msgpack_union_invalid_raw')
+        self.builder.store(ir.Constant(ir.IntType(8), 0xC0), raw)
+        blob = ir.Constant(blob_type, ir.Undefined)
+        blob = self.builder.insert_value(blob, raw, 0)
+        blob = self.builder.insert_value(blob, ir.Constant(i64, 1), 1)
+        self.builder.ret(blob)
+
+        self.builder = old_builder
+        self.current_function = old_func
+        self.locals = old_locals
+        self._locals_type_names = old_type_names
+        self._fmt_generation_stack.discard(func_name)
+        return func
+
+    def _gen_msgpack_decode_union_function(self, func_name: str, union_type: ir.LiteralStructType, source_name: str) -> ir.Function:
+        existing = self.module.globals.get(func_name)
+        blob_type = self.structs['Blob']
+        if isinstance(existing, ir.Function):
+            if len(existing.blocks) > 0:
+                return existing
+            func = existing
+        else:
+            func = ir.Function(self.module, ir.FunctionType(ir.PointerType(union_type), [ir.PointerType(blob_type)]), func_name)
+        if func_name in self._fmt_generation_stack:
+            return func
+        self._fmt_generation_stack.add(func_name)
+
+        i1 = ir.IntType(1)
+        i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
+        i8_ptr = ir.PointerType(ir.IntType(8))
+        blob_ptr = ir.PointerType(blob_type)
+        result_type = ir.PointerType(union_type)
+        variants = self._fmt_union_variant_types_from_source_name(source_name)
+        if variants is None:
+            return func
+        variant_sources, variant_types = variants
+        func.args[0].name = 'data'
+
+        old_builder = self.builder
+        old_func = self.current_function
+        old_locals = self.locals
+        old_type_names = self._locals_type_names
+        old_unsigned = self._save_unsigned_state()
+
+        entry = func.append_basic_block('entry')
+        invalid_block = func.append_basic_block('msgpack_union_invalid')
+        throw_exit = func.append_basic_block('throw_exit')
+        self.builder = ir.IRBuilder(entry)
+        self.current_function = func
+        self.locals = {}
+        self._locals_type_names = {}
+        self._function_throw_exit_stack.append(throw_exit)
+
+        def require_msgpack_ok(ok: ir.Value) -> None:
+            if self.builder is None or self.builder.block.is_terminated:
+                return
+            fail_bb = self.builder.append_basic_block('msgpack_union_decode_invalid')
+            cont_bb = self.builder.append_basic_block('msgpack_union_decode_valid')
+            self.builder.cbranch(ok, cont_bb, fail_bb)
+            self.builder.position_at_start(fail_bb)
+            self._raise_error(4, 'msgpack decode failed')
+            self.builder.position_at_start(cont_bb)
+
+        result = self._arena_allocate(union_type, name='_msgpack_union_value_ptr')
+        self.builder.store(self._zero_constant(union_type), result)
+        valid_map = self._get_or_declare_function('__ez_msgpack_valid_map', ir.FunctionType(i1, [blob_ptr]))
+        require_msgpack_ok(self.builder.call(valid_map, [func.args[0]], name='_msgpack_union_map_ok'))
+        field_count_fn = self._get_or_declare_function('__ez_msgpack_map_field_count', ir.FunctionType(i64, [blob_ptr]))
+        field_count = self.builder.call(field_count_fn, [func.args[0]], name='_msgpack_union_field_count')
+        require_msgpack_ok(self.builder.icmp_signed('==', field_count, ir.Constant(i64, 2), name='_msgpack_union_field_count_ok'))
+        if self._uses_c_sret(blob_type):
+            field_fn_type = ir.FunctionType(ir.VoidType(), [blob_ptr, blob_ptr, i8_ptr])
+        else:
+            field_fn_type = ir.FunctionType(blob_type, [blob_ptr, i8_ptr])
+        field_fn = self._get_or_declare_function('__ez_msgpack_map_field', field_fn_type)
+        tag_blob_ptr = self.builder.alloca(blob_type, name='_msgpack_union_tag_blob_ptr')
+        value_blob_ptr = self.builder.alloca(blob_type, name='_msgpack_union_value_blob_ptr')
+        tag_key = self._make_global_string('tag', prefix='_msgpack_union_key')
+        value_key = self._make_global_string('value', prefix='_msgpack_union_key')
+        if self._uses_c_sret(blob_type):
+            self.builder.call(field_fn, [tag_blob_ptr, func.args[0], tag_key])
+            self.builder.call(field_fn, [value_blob_ptr, func.args[0], value_key])
+        else:
+            self.builder.store(self.builder.call(field_fn, [func.args[0], tag_key], name='_msgpack_union_tag_raw'), tag_blob_ptr)
+            self.builder.store(self.builder.call(field_fn, [func.args[0], value_key], name='_msgpack_union_value_raw'), value_blob_ptr)
+        tag_size = self.builder.load(self.builder.gep(tag_blob_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True), name='_msgpack_union_tag_size')
+        value_size = self.builder.load(self.builder.gep(value_blob_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True), name='_msgpack_union_value_size')
+        require_msgpack_ok(self.builder.icmp_signed('>=', tag_size, ir.Constant(i64, 0), name='_msgpack_union_tag_found'))
+        require_msgpack_ok(self.builder.icmp_signed('>=', value_size, ir.Constant(i64, 0), name='_msgpack_union_value_found'))
+        tag_validator = self._get_or_declare_function('__ez_msgpack_valid_I32', ir.FunctionType(i1, [blob_ptr]))
+        require_msgpack_ok(self.builder.call(tag_validator, [tag_blob_ptr], name='_msgpack_union_tag_ok'))
+        tag_parser = self._get_or_declare_function('msgpackDecode_I32', self._msgpack_decode_function_type('msgpackDecode_I32', i32))
+        tag = self.builder.call(tag_parser, [tag_blob_ptr], name='_msgpack_union_tag')
+
+        for index, (variant_source, variant_type) in enumerate(zip(variant_sources, variant_types)):
+            is_tag = self.builder.icmp_signed('==', tag, ir.Constant(i32, index), name='_msgpack_union_tag_match')
+            match_block = func.append_basic_block(f'msgpack_union_parse_tag_{index}')
+            next_block = invalid_block if index == len(variant_types) - 1 else func.append_basic_block(f'msgpack_union_parse_next_{index}')
+            self.builder.cbranch(is_tag, match_block, next_block)
+
+            self.builder.position_at_start(match_block)
+            wrapper_name, wrapper_type, wrapper = self._msgpack_value_decode_wrapper(variant_type, variant_source)
+            validator_name = self._msgpack_decode_validator_for_value(wrapper_name, variant_type)
+            validator = self._get_or_declare_function(validator_name, ir.FunctionType(i1, [blob_ptr]))
+            require_msgpack_ok(self.builder.call(validator, [value_blob_ptr], name='_msgpack_union_value_ok'))
+            if wrapper is None:
+                wrapper = self._get_or_declare_function(wrapper_name, wrapper_type)
+            value = self.builder.call(wrapper, [value_blob_ptr], name='_msgpack_union_variant_value')
+            if self._fmt_parse_wrapper_may_throw(variant_type):
+                self._emit_throw_check_after_call()
+            if self.builder is not None and not self.builder.block.is_terminated:
+                if value.type != variant_type:
+                    value = self._coerce_value(value, variant_type)
+                union_value = self._coerce_union_value(value, union_type, index)
+                self.builder.store(union_value, result)
+                self.builder.ret(result)
+
+            if next_block is not invalid_block:
+                self.builder.position_at_start(next_block)
+
+        self.builder.position_at_start(invalid_block)
+        self._raise_error(4, 'msgpack decode failed')
+
+        popped_throw_exit = self._function_throw_exit_stack.pop()
+        if not popped_throw_exit.is_terminated:
+            self.builder.position_at_start(popped_throw_exit)
+            self.builder.ret(ir.Constant(result_type, None))
+
+        self.builder = old_builder
+        self.current_function = old_func
+        self.locals = old_locals
+        self._locals_type_names = old_type_names
+        self._restore_unsigned_state(old_unsigned)
+        self._fmt_generation_stack.discard(func_name)
+        return func
+
+    def _gen_msgpack_encode_list_function(self, func_name: str, list_type: ir.LiteralStructType, source_name: str) -> ir.Function:
+        existing = self.module.globals.get(func_name)
+        if isinstance(existing, ir.Function):
+            if len(existing.blocks) > 0:
+                return existing
+            func = existing
+        else:
+            func = ir.Function(self.module, ir.FunctionType(self.structs['Blob'], [ir.PointerType(list_type)]), func_name)
+        if func_name in self._fmt_generation_stack:
+            return func
+        self._fmt_generation_stack.add(func_name)
+
+        i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
+        blob_type = self.structs['Blob']
+        elem_type = list_type.elements[0].pointee.pointee
+        elem_source = self._fmt_list_elem_source_name(source_name, elem_type)
+        func.args[0].name = 'data'
+
+        old_builder = self.builder
+        old_func = self.current_function
+        old_locals = self.locals
+        old_type_names = self._locals_type_names
+
+        entry = func.append_basic_block('entry')
+        self.builder = ir.IRBuilder(entry)
+        self.current_function = func
+        self.locals = {}
+        self._locals_type_names = {}
+
+        length = self._list_length(func.args[0])
+        values_bytes = self.builder.mul(length, ir.Constant(i64, max(self._type_width(blob_type), 1)), name='_msgpack_list_values_bytes')
+        has_items = self.builder.icmp_unsigned('>', length, ir.Constant(i64, 0), name='_msgpack_list_has_items')
+        alloc_bytes = self.builder.select(has_items, values_bytes, ir.Constant(i64, max(self._type_width(blob_type), 1)), name='_msgpack_list_values_alloc_bytes')
+        raw_values = self.builder.call(self._arena_alloc, [alloc_bytes, ir.Constant(i64, 8)], name='_msgpack_list_values_raw')
+        values = self.builder.bitcast(raw_values, ir.PointerType(blob_type), name='_msgpack_list_values')
+        index_ptr = self.builder.alloca(i64, name='_msgpack_list_i')
+        self.builder.store(ir.Constant(i64, 0), index_ptr)
+
+        loop_cond = self.builder.append_basic_block('msgpack_list_encode_cond')
+        loop_body = self.builder.append_basic_block('msgpack_list_encode_body')
+        loop_done = self.builder.append_basic_block('msgpack_list_encode_done')
+        self.builder.branch(loop_cond)
+        self.builder.position_at_start(loop_cond)
+        index = self.builder.load(index_ptr, name='_msgpack_list_i_val')
+        more = self.builder.icmp_unsigned('<', index, length, name='_msgpack_list_more')
+        self.builder.cbranch(more, loop_body, loop_done)
+
+        self.builder.position_at_start(loop_body)
+        elem_ptr = self._list_element_ptr(func.args[0], index)
+        wrapper_name, wrapper_type, wrapper = self._msgpack_value_encode_wrapper(elem_type, elem_source)
+        if wrapper is None:
+            wrapper = self._get_or_declare_function(wrapper_name, wrapper_type)
+        elem_arg = elem_ptr if elem_ptr.type == wrapper_type.args[-1] else self.builder.load(elem_ptr, name='_msgpack_list_item')
+        if elem_arg.type != wrapper_type.args[-1]:
+            elem_arg = self._coerce_value(elem_arg, wrapper_type.args[-1])
+        encoded = self._msgpack_call_blob_returning_function(wrapper, [elem_arg], name='_msgpack_list_item_blob')
+        value_slot = self.builder.gep(values, [index], inbounds=True)
+        self.builder.store(encoded, value_slot)
+        self.builder.store(self.builder.add(index, ir.Constant(i64, 1)), index_ptr)
+        self.builder.branch(loop_cond)
+
+        self.builder.position_at_start(loop_done)
+        helper_args = [i64, ir.PointerType(blob_type)]
+        if self._uses_c_sret(blob_type):
+            helper_type = ir.FunctionType(ir.VoidType(), [ir.PointerType(blob_type)] + helper_args)
+        else:
+            helper_type = ir.FunctionType(blob_type, helper_args)
+        helper = self._get_or_declare_function('__ez_msgpack_encode_array', helper_type)
+        result = self._msgpack_call_blob_returning_function(helper, [length, values], name='_msgpack_list_blob')
+        self.builder.ret(result)
+
+        self.builder = old_builder
+        self.current_function = old_func
+        self.locals = old_locals
+        self._locals_type_names = old_type_names
+        self._fmt_generation_stack.discard(func_name)
+        return func
+
+    def _gen_msgpack_decode_list_function(self, func_name: str, list_type: ir.LiteralStructType, source_name: str) -> ir.Function:
+        existing = self.module.globals.get(func_name)
+        if isinstance(existing, ir.Function):
+            if len(existing.blocks) > 0:
+                return existing
+            func = existing
+        else:
+            func = ir.Function(self.module, ir.FunctionType(ir.PointerType(list_type), [ir.PointerType(self.structs['Blob'])]), func_name)
+        if func_name in self._fmt_generation_stack:
+            return func
+        self._fmt_generation_stack.add(func_name)
+
+        i1 = ir.IntType(1)
+        i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
+        blob_type = self.structs['Blob']
+        blob_ptr = ir.PointerType(blob_type)
+        result_type = ir.PointerType(list_type)
+        elem_type = list_type.elements[0].pointee.pointee
+        elem_source = self._fmt_list_elem_source_name(source_name, elem_type)
+        func.args[0].name = 'data'
+
+        old_builder = self.builder
+        old_func = self.current_function
+        old_locals = self.locals
+        old_type_names = self._locals_type_names
+        old_unsigned = self._save_unsigned_state()
+
+        entry = func.append_basic_block('entry')
+        throw_exit = func.append_basic_block('throw_exit')
+        self.builder = ir.IRBuilder(entry)
+        self.current_function = func
+        self.locals = {}
+        self._locals_type_names = {}
+        self._function_throw_exit_stack.append(throw_exit)
+
+        def require_msgpack_ok(ok: ir.Value) -> None:
+            fail_bb = self.builder.append_basic_block('msgpack_list_decode_invalid')
+            cont_bb = self.builder.append_basic_block('msgpack_list_decode_valid')
+            self.builder.cbranch(ok, cont_bb, fail_bb)
+            self.builder.position_at_start(fail_bb)
+            self._raise_error(4, 'msgpack decode failed')
+            self.builder.position_at_start(cont_bb)
+
+        valid_array = self._get_or_declare_function('__ez_msgpack_valid_array', ir.FunctionType(i1, [blob_ptr]))
+        array_ok = self.builder.call(valid_array, [func.args[0]], name='_msgpack_list_ok')
+        require_msgpack_ok(array_ok)
+        length_fn = self._get_or_declare_function('__ez_msgpack_array_length', ir.FunctionType(i64, [blob_ptr]))
+        length = self.builder.call(length_fn, [func.args[0]], name='_msgpack_list_len')
+        len_ok = self.builder.icmp_signed('>=', length, ir.Constant(i64, 0), name='_msgpack_list_len_ok')
+        require_msgpack_ok(len_ok)
+        result = self._list_new(elem_type, length)
+        self._mark_list_elem_unsigned(result, elem_source in {'U8', 'U32', 'U64'})
+        if self._uses_c_sret(blob_type):
+            item_fn_type = ir.FunctionType(ir.VoidType(), [blob_ptr, blob_ptr, i64])
+        else:
+            item_fn_type = ir.FunctionType(blob_type, [blob_ptr, i64])
+        item_fn = self._get_or_declare_function('__ez_msgpack_array_item', item_fn_type)
+        index_ptr = self.builder.alloca(i64, name='_msgpack_list_parse_i')
+        self.builder.store(ir.Constant(i64, 0), index_ptr)
+        loop_cond = self.builder.append_basic_block('msgpack_list_parse_cond')
+        loop_body = self.builder.append_basic_block('msgpack_list_parse_body')
+        loop_done = self.builder.append_basic_block('msgpack_list_parse_done')
+        self.builder.branch(loop_cond)
+        self.builder.position_at_start(loop_cond)
+        index = self.builder.load(index_ptr, name='_msgpack_list_parse_i_val')
+        more = self.builder.icmp_unsigned('<', index, length, name='_msgpack_list_parse_more')
+        self.builder.cbranch(more, loop_body, loop_done)
+
+        self.builder.position_at_start(loop_body)
+        item_blob_ptr = self.builder.alloca(blob_type, name='_msgpack_list_item_blob_ptr')
+        if self._uses_c_sret(blob_type):
+            self.builder.call(item_fn, [item_blob_ptr, func.args[0], index])
+        else:
+            item_blob = self.builder.call(item_fn, [func.args[0], index], name='_msgpack_list_item_raw')
+            self.builder.store(item_blob, item_blob_ptr)
+        size_ptr = self.builder.gep(item_blob_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        size = self.builder.load(size_ptr, name='_msgpack_list_item_size')
+        found = self.builder.icmp_signed('>=', size, ir.Constant(i64, 0), name='_msgpack_list_item_found')
+        require_msgpack_ok(found)
+        wrapper_name, wrapper_type, wrapper = self._msgpack_value_decode_wrapper(elem_type, elem_source)
+        validator_name = self._msgpack_decode_validator_for_value(wrapper_name, elem_type)
+        validator = self._get_or_declare_function(validator_name, ir.FunctionType(i1, [blob_ptr]))
+        value_ok = self.builder.call(validator, [item_blob_ptr], name='_msgpack_list_item_ok')
+        require_msgpack_ok(value_ok)
+        if wrapper is None:
+            wrapper = self._get_or_declare_function(wrapper_name, wrapper_type)
+        value = self.builder.call(wrapper, [item_blob_ptr], name='_msgpack_list_item_value')
+        if self._fmt_parse_wrapper_may_throw(elem_type):
+            self._emit_throw_check_after_call()
+        if self.builder is not None and not self.builder.block.is_terminated:
+            if value.type != elem_type:
+                value = self._coerce_value(value, elem_type)
+            self.builder.store(value, self._list_element_ptr(result, index))
+            self.builder.store(self.builder.add(index, ir.Constant(i64, 1)), index_ptr)
+            self.builder.branch(loop_cond)
+
+        self.builder.position_at_start(loop_done)
+        self.builder.ret(result)
+        popped_throw_exit = self._function_throw_exit_stack.pop()
+        if not popped_throw_exit.is_terminated:
+            self.builder.position_at_start(popped_throw_exit)
+            self.builder.ret(ir.Constant(result_type, None))
+
+        self.builder = old_builder
+        self.current_function = old_func
+        self.locals = old_locals
+        self._locals_type_names = old_type_names
+        self._restore_unsigned_state(old_unsigned)
+        self._fmt_generation_stack.discard(func_name)
+        return func
+
+    def _gen_msgpack_encode_dict_function(self, func_name: str, dict_type: ir.IdentifiedStructType, source_name: str) -> ir.Function:
+        existing = self.module.globals.get(func_name)
+        blob_type = self.structs['Blob']
+        if isinstance(existing, ir.Function):
+            if len(existing.blocks) > 0:
+                return existing
+            func = existing
+        else:
+            func = ir.Function(self.module, ir.FunctionType(blob_type, [ir.PointerType(dict_type)]), func_name)
+        if func_name in self._fmt_generation_stack:
+            return func
+        self._fmt_generation_stack.add(func_name)
+
+        i8 = ir.IntType(8)
+        i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
+        i8_ptr = ir.PointerType(i8)
+        key_type, value_type = self._fmt_dict_item_types_from_source_name(source_name)
+        key_source = self._fmt_dict_key_source_name(source_name, key_type)
+        value_source = self._fmt_dict_value_source_name(source_name, value_type)
+        string_key = self._fmt_dict_has_string_key(source_name)
+        func.args[0].name = 'data'
+
+        old_builder = self.builder
+        old_func = self.current_function
+        old_locals = self.locals
+        old_type_names = self._locals_type_names
+
+        entry = func.append_basic_block('entry')
+        self.builder = ir.IRBuilder(entry)
+        self.current_function = func
+        self.locals = {}
+        self._locals_type_names = {}
+
+        count32 = self._dict_count(func.args[0])
+        count = self.builder.zext(count32, i64, name='_msgpack_dict_count')
+        has_items = self.builder.icmp_unsigned('>', count, ir.Constant(i64, 0), name='_msgpack_dict_has_items')
+        value_bytes = self.builder.mul(count, ir.Constant(i64, max(self._type_width(blob_type), 1)), name='_msgpack_dict_value_bytes')
+        values_alloc_bytes = self.builder.select(has_items, value_bytes, ir.Constant(i64, max(self._type_width(blob_type), 1)), name='_msgpack_dict_values_alloc_bytes')
+        if string_key:
+            key_bytes = self.builder.mul(count, ir.Constant(i64, 8), name='_msgpack_dict_key_bytes')
+            keys_alloc_bytes = self.builder.select(has_items, key_bytes, ir.Constant(i64, 8), name='_msgpack_dict_keys_alloc_bytes')
+        else:
+            key_blob_bytes = self.builder.mul(count, ir.Constant(i64, max(self._type_width(blob_type), 1)), name='_msgpack_dict_key_blob_bytes')
+            keys_alloc_bytes = self.builder.select(has_items, key_blob_bytes, ir.Constant(i64, max(self._type_width(blob_type), 1)), name='_msgpack_dict_keys_alloc_bytes')
+        keys_raw = self.builder.call(self._arena_alloc, [keys_alloc_bytes, ir.Constant(i64, 8)], name='_msgpack_dict_keys_raw')
+        values_raw = self.builder.call(self._arena_alloc, [values_alloc_bytes, ir.Constant(i64, 8)], name='_msgpack_dict_values_raw')
+        keys = self.builder.bitcast(keys_raw, ir.PointerType(i8_ptr if string_key else blob_type), name='_msgpack_dict_keys')
+        values = self.builder.bitcast(values_raw, ir.PointerType(blob_type), name='_msgpack_dict_values')
+        index_ptr = self.builder.alloca(i32, name='_msgpack_dict_i')
+        self.builder.store(ir.Constant(i32, 0), index_ptr)
+
+        loop_cond = self.builder.append_basic_block('msgpack_dict_encode_cond')
+        loop_body = self.builder.append_basic_block('msgpack_dict_encode_body')
+        loop_done = self.builder.append_basic_block('msgpack_dict_encode_done')
+        self.builder.branch(loop_cond)
+        self.builder.position_at_start(loop_cond)
+        index = self.builder.load(index_ptr, name='_msgpack_dict_i_val')
+        more = self.builder.icmp_unsigned('<', index, count32, name='_msgpack_dict_more')
+        self.builder.cbranch(more, loop_body, loop_done)
+
+        self.builder.position_at_start(loop_body)
+        raw_key = self.builder.load(self._dict_key_slot_ptr(func.args[0], index), name='_msgpack_dict_key_raw')
+        key_value = self._dict_from_i8_ptr(raw_key, key_type)
+        index64 = self.builder.zext(index, i64, name='_msgpack_dict_i64')
+        if string_key:
+            self.builder.store(key_value, self.builder.gep(keys, [index64], inbounds=True))
+        else:
+            key_wrapper_name, key_wrapper_type, key_wrapper = self._msgpack_value_encode_wrapper(key_type, key_source)
+            if key_wrapper is None:
+                key_wrapper = self._get_or_declare_function(key_wrapper_name, key_wrapper_type)
+            key_arg = self._fmt_arg_for_wrapper(key_value, key_wrapper_type.args[-1])
+            key_blob = self._msgpack_call_blob_returning_function(key_wrapper, [key_arg], name='_msgpack_dict_key_blob')
+            self.builder.store(key_blob, self.builder.gep(keys, [index64], inbounds=True))
+        raw_value = self.builder.load(self._dict_value_slot_ptr(func.args[0], index), name='_msgpack_dict_value_raw')
+        wrapper_name, wrapper_type, wrapper = self._msgpack_value_encode_wrapper(value_type, value_source)
+        if wrapper is None:
+            wrapper = self._get_or_declare_function(wrapper_name, wrapper_type)
+        value_arg = self._fmt_value_from_raw_ptr(raw_value, value_type, wrapper_type.args[-1])
+        encoded = self._msgpack_call_blob_returning_function(wrapper, [value_arg], name='_msgpack_dict_item_blob')
+        self.builder.store(encoded, self.builder.gep(values, [index64], inbounds=True))
+        self.builder.store(self.builder.add(index, ir.Constant(i32, 1)), index_ptr)
+        self.builder.branch(loop_cond)
+
+        self.builder.position_at_start(loop_done)
+        helper_arg_types = [i64, ir.PointerType(i8_ptr if string_key else blob_type), ir.PointerType(blob_type)]
+        if self._uses_c_sret(blob_type):
+            helper_type = ir.FunctionType(ir.VoidType(), [ir.PointerType(blob_type)] + helper_arg_types)
+        else:
+            helper_type = ir.FunctionType(blob_type, helper_arg_types)
+        helper_name = '__ez_msgpack_encode_map' if string_key else '__ez_msgpack_encode_map_raw'
+        helper = self._get_or_declare_function(helper_name, helper_type)
+        result = self._msgpack_call_blob_returning_function(helper, [count, keys, values], name='_msgpack_dict_blob')
+        self.builder.ret(result)
+
+        self.builder = old_builder
+        self.current_function = old_func
+        self.locals = old_locals
+        self._locals_type_names = old_type_names
+        self._fmt_generation_stack.discard(func_name)
+        return func
+
+    def _gen_msgpack_decode_dict_function(self, func_name: str, dict_type: ir.IdentifiedStructType, source_name: str) -> ir.Function:
+        existing = self.module.globals.get(func_name)
+        blob_type = self.structs['Blob']
+        if isinstance(existing, ir.Function):
+            if len(existing.blocks) > 0:
+                return existing
+            func = existing
+        else:
+            func = ir.Function(self.module, ir.FunctionType(ir.PointerType(dict_type), [ir.PointerType(blob_type)]), func_name)
+        if func_name in self._fmt_generation_stack:
+            return func
+        self._fmt_generation_stack.add(func_name)
+
+        i1 = ir.IntType(1)
+        i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
+        i8_ptr = ir.PointerType(ir.IntType(8))
+        blob_ptr = ir.PointerType(blob_type)
+        result_type = ir.PointerType(dict_type)
+        key_type, value_type = self._fmt_dict_item_types_from_source_name(source_name)
+        key_source = self._fmt_dict_key_source_name(source_name, key_type)
+        value_source = self._fmt_dict_value_source_name(source_name, value_type)
+        string_key = self._fmt_dict_has_string_key(source_name)
+        func.args[0].name = 'data'
+
+        old_builder = self.builder
+        old_func = self.current_function
+        old_locals = self.locals
+        old_type_names = self._locals_type_names
+        old_unsigned = self._save_unsigned_state()
+
+        entry = func.append_basic_block('entry')
+        throw_exit = func.append_basic_block('throw_exit')
+        self.builder = ir.IRBuilder(entry)
+        self.current_function = func
+        self.locals = {}
+        self._locals_type_names = {}
+        self._function_throw_exit_stack.append(throw_exit)
+
+        def require_msgpack_ok(ok: ir.Value) -> None:
+            fail_bb = self.builder.append_basic_block('msgpack_dict_decode_invalid')
+            cont_bb = self.builder.append_basic_block('msgpack_dict_decode_valid')
+            self.builder.cbranch(ok, cont_bb, fail_bb)
+            self.builder.position_at_start(fail_bb)
+            self._raise_error(4, 'msgpack decode failed')
+            self.builder.position_at_start(cont_bb)
+
+        result = self._arena_allocate(dict_type, name='_msgpack_dict_value')
+        self.builder.store(self._zero_constant(dict_type), result)
+        self._mark_dict_item_types(result, key_type, value_type)
+        valid_map_name = '__ez_msgpack_valid_map' if string_key else '__ez_msgpack_valid_map_any'
+        valid_map = self._get_or_declare_function(valid_map_name, ir.FunctionType(i1, [blob_ptr]))
+        map_ok = self.builder.call(valid_map, [func.args[0]], name='_msgpack_dict_ok')
+        require_msgpack_ok(map_ok)
+        field_count_fn = self._get_or_declare_function('__ez_msgpack_map_field_count', ir.FunctionType(i64, [blob_ptr]))
+        length = self.builder.call(field_count_fn, [func.args[0]], name='_msgpack_dict_len')
+        len_ok = self.builder.icmp_signed('>=', length, ir.Constant(i64, 0), name='_msgpack_dict_len_ok')
+        require_msgpack_ok(len_ok)
+        if string_key:
+            key_at_fn = self._get_or_declare_function('__ez_msgpack_map_key_at', ir.FunctionType(i8_ptr, [blob_ptr, i64]))
+        else:
+            if self._uses_c_sret(blob_type):
+                key_at_type = ir.FunctionType(ir.VoidType(), [blob_ptr, blob_ptr, i64])
+            else:
+                key_at_type = ir.FunctionType(blob_type, [blob_ptr, i64])
+            key_at_fn = self._get_or_declare_function('__ez_msgpack_map_key_blob_at', key_at_type)
+        if self._uses_c_sret(blob_type):
+            value_at_type = ir.FunctionType(ir.VoidType(), [blob_ptr, blob_ptr, i64])
+        else:
+            value_at_type = ir.FunctionType(blob_type, [blob_ptr, i64])
+        value_at_fn = self._get_or_declare_function('__ez_msgpack_map_value_at', value_at_type)
+        null_str = ir.Constant(i8_ptr, None)
+        index_ptr = self.builder.alloca(i64, name='_msgpack_dict_parse_i')
+        self.builder.store(ir.Constant(i64, 0), index_ptr)
+        loop_cond = self.builder.append_basic_block('msgpack_dict_parse_cond')
+        loop_body = self.builder.append_basic_block('msgpack_dict_parse_body')
+        loop_done = self.builder.append_basic_block('msgpack_dict_parse_done')
+        self.builder.branch(loop_cond)
+        self.builder.position_at_start(loop_cond)
+        index = self.builder.load(index_ptr, name='_msgpack_dict_parse_i_val')
+        more = self.builder.icmp_unsigned('<', index, length, name='_msgpack_dict_parse_more')
+        self.builder.cbranch(more, loop_body, loop_done)
+
+        self.builder.position_at_start(loop_body)
+        if string_key:
+            key = self.builder.call(key_at_fn, [func.args[0], index], name='_msgpack_dict_key')
+            key_found = self.builder.icmp_unsigned('!=', key, null_str, name='_msgpack_dict_key_found')
+            require_msgpack_ok(key_found)
+        else:
+            key_blob_ptr = self.builder.alloca(blob_type, name='_msgpack_dict_key_blob_ptr')
+            if self._uses_c_sret(blob_type):
+                self.builder.call(key_at_fn, [key_blob_ptr, func.args[0], index])
+            else:
+                raw_key_blob = self.builder.call(key_at_fn, [func.args[0], index], name='_msgpack_dict_key_raw_blob')
+                self.builder.store(raw_key_blob, key_blob_ptr)
+            key_size_ptr = self.builder.gep(key_blob_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+            key_size = self.builder.load(key_size_ptr, name='_msgpack_dict_key_size')
+            key_found = self.builder.icmp_signed('>=', key_size, ir.Constant(i64, 0), name='_msgpack_dict_key_found')
+            require_msgpack_ok(key_found)
+            key_wrapper_name, key_wrapper_type, key_wrapper = self._msgpack_value_decode_wrapper(key_type, key_source)
+            key_validator_name = self._msgpack_decode_validator_for_value(key_wrapper_name, key_type)
+            key_validator = self._get_or_declare_function(key_validator_name, ir.FunctionType(i1, [blob_ptr]))
+            key_ok = self.builder.call(key_validator, [key_blob_ptr], name='_msgpack_dict_key_ok')
+            require_msgpack_ok(key_ok)
+            if key_wrapper is None:
+                key_wrapper = self._get_or_declare_function(key_wrapper_name, key_wrapper_type)
+            key = self.builder.call(key_wrapper, [key_blob_ptr], name='_msgpack_dict_key_value')
+            if self._fmt_parse_wrapper_may_throw(key_type):
+                self._emit_throw_check_after_call()
+        value_blob_ptr = self.builder.alloca(blob_type, name='_msgpack_dict_item_blob_ptr')
+        if self._uses_c_sret(blob_type):
+            self.builder.call(value_at_fn, [value_blob_ptr, func.args[0], index])
+        else:
+            raw_blob = self.builder.call(value_at_fn, [func.args[0], index], name='_msgpack_dict_item_raw')
+            self.builder.store(raw_blob, value_blob_ptr)
+        size_ptr = self.builder.gep(value_blob_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+        size = self.builder.load(size_ptr, name='_msgpack_dict_item_size')
+        found = self.builder.icmp_signed('>=', size, ir.Constant(i64, 0), name='_msgpack_dict_item_found')
+        require_msgpack_ok(found)
+        wrapper_name, wrapper_type, wrapper = self._msgpack_value_decode_wrapper(value_type, value_source)
+        validator_name = self._msgpack_decode_validator_for_value(wrapper_name, value_type)
+        validator = self._get_or_declare_function(validator_name, ir.FunctionType(i1, [blob_ptr]))
+        value_ok = self.builder.call(validator, [value_blob_ptr], name='_msgpack_dict_item_ok')
+        require_msgpack_ok(value_ok)
+        if wrapper is None:
+            wrapper = self._get_or_declare_function(wrapper_name, wrapper_type)
+        value = self.builder.call(wrapper, [value_blob_ptr], name='_msgpack_dict_item_value')
+        if self._fmt_parse_wrapper_may_throw(value_type):
+            self._emit_throw_check_after_call()
+        if self.builder is not None and not self.builder.block.is_terminated:
+            if key.type != key_type:
+                key = self._coerce_value(key, key_type)
+            if value.type != value_type:
+                value = self._coerce_value(value, value_type)
+            self._gen_dict_upsert_value(result, key, value, key_type, value_type)
+            self.builder.store(self.builder.add(index, ir.Constant(i64, 1)), index_ptr)
+            self.builder.branch(loop_cond)
+
+        self.builder.position_at_start(loop_done)
+        self.builder.ret(result)
+        popped_throw_exit = self._function_throw_exit_stack.pop()
+        if not popped_throw_exit.is_terminated:
+            self.builder.position_at_start(popped_throw_exit)
+            self.builder.ret(ir.Constant(result_type, None))
+
+        self.builder = old_builder
+        self.current_function = old_func
+        self.locals = old_locals
+        self._locals_type_names = old_type_names
+        self._restore_unsigned_state(old_unsigned)
+        self._fmt_generation_stack.discard(func_name)
+        return func
+
+    def _gen_json_stringify_struct_function(self, func_name: str, struct_type: ir.IdentifiedStructType) -> ir.Function:
+        existing = self.module.globals.get(func_name)
+        if isinstance(existing, ir.Function):
+            if len(existing.blocks) > 0:
+                return existing
+            func = existing
+        else:
+            func = ir.Function(self.module, ir.FunctionType(ir.PointerType(ir.IntType(8)), [ir.PointerType(struct_type)]), func_name)
+
+        i8 = ir.IntType(8)
+        i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
+        i8_ptr = ir.PointerType(i8)
+        func.args[0].name = 'data'
+
+        old_builder = self.builder
+        old_func = self.current_function
+        old_locals = self.locals
+        old_type_names = self._locals_type_names
+
+        entry = func.append_basic_block('entry')
+        self.builder = ir.IRBuilder(entry)
+        self.current_function = func
+        self.locals = {}
+        self._locals_type_names = {}
+
+        strlen = self._get_or_define_strlen()
+        segments: list[tuple[ir.Value, ir.Value]] = []
+        self._append_json_literal_segment(segments, '{')
+        field_names = self.struct_fields.get(struct_type.name, [])
+        for index, field_name in enumerate(field_names):
+            if index > 0:
+                self._append_json_literal_segment(segments, ',')
+            self._append_json_literal_segment(segments, '"' + field_name + '":')
+            field_type = struct_type.elements[index]
+            field_ptr = self.builder.gep(func.args[0], [ir.Constant(i32, 0), ir.Constant(i32, index)], inbounds=True)
+            field_value = self.builder.load(field_ptr, name=f"_json_{field_name}")
+            wrapper_name = self._json_stringify_field_function_name(field_type, struct_type.name, index)
+            wrapper_type = self._json_stringify_function_type(wrapper_name, field_type)
+            source_name = self._fmt_source_type_name(field_type, struct_type.name, index)
+            wrapper = self._fmt_generate_json_stringify_wrapper(wrapper_name, field_type, source_name)
+            if wrapper is None:
+                wrapper = self._get_or_declare_function(wrapper_name, wrapper_type)
+            field_value = self._fmt_arg_for_wrapper(field_value, wrapper_type.args[0])
+            text = self.builder.call(wrapper, [field_value], name=f"_json_{field_name}_text")
+            length = self.builder.call(strlen, [text], name=f"_json_{field_name}_len")
+            segments.append((text, length))
+        self._append_json_literal_segment(segments, '}')
+
+        result = self._join_c_string_segments(segments, name_prefix='_json_struct')
+        self.builder.ret(result)
+
+        self.builder = old_builder
+        self.current_function = old_func
+        self.locals = old_locals
+        self._locals_type_names = old_type_names
+        return func
+
+    def _gen_json_parse_struct_function(self, func_name: str, struct_type: ir.IdentifiedStructType) -> ir.Function:
+        existing = self.module.globals.get(func_name)
+        if isinstance(existing, ir.Function):
+            if len(existing.blocks) > 0:
+                return existing
+            func = existing
+        else:
+            func = ir.Function(self.module, ir.FunctionType(ir.PointerType(struct_type), [ir.PointerType(ir.IntType(8))]), func_name)
+
+        i1 = ir.IntType(1)
+        i8 = ir.IntType(8)
+        i32 = ir.IntType(32)
+        i8_ptr = ir.PointerType(i8)
+        result_type = ir.PointerType(struct_type)
+        func.args[0].name = 's'
+
+        old_builder = self.builder
+        old_func = self.current_function
+        old_locals = self.locals
+        old_type_names = self._locals_type_names
+        old_unsigned = self._save_unsigned_state()
+
+        entry = func.append_basic_block('entry')
+        throw_exit = func.append_basic_block('throw_exit')
+        self.builder = ir.IRBuilder(entry)
+        self.current_function = func
+        self.locals = {}
+        self._locals_type_names = {}
+        self._function_throw_exit_stack.append(throw_exit)
+
+        def require_json_ok(ok: ir.Value) -> None:
+            fail_bb = self.builder.append_basic_block('json_parse_invalid')
+            cont_bb = self.builder.append_basic_block('json_parse_valid')
+            self.builder.cbranch(ok, cont_bb, fail_bb)
+            self.builder.position_at_start(fail_bb)
+            self._raise_error(4, 'json parse failed')
+            self.builder.position_at_start(cont_bb)
+
+        result = self._arena_allocate(struct_type, name=f'_json_{struct_type.name}_value')
+        self.builder.store(self._zero_constant(struct_type), result)
+
+        valid_object = self._get_or_declare_function('__ez_json_valid_object', ir.FunctionType(i1, [i8_ptr]))
+        object_ok = self.builder.call(valid_object, [func.args[0]], name='_json_object_ok')
+        require_json_ok(object_ok)
+
+        field_names = self.struct_fields.get(struct_type.name, [])
+        field_count_fn = self._get_or_declare_function('__ez_json_object_field_count', ir.FunctionType(ir.IntType(64), [i8_ptr]))
+        field_count = self.builder.call(field_count_fn, [func.args[0]], name='_json_object_field_count')
+        field_count_ok = self.builder.icmp_signed('==', field_count, ir.Constant(ir.IntType(64), len(field_names)), name='_json_object_field_count_ok')
+        require_json_ok(field_count_ok)
+
+        field_fn = self._get_or_declare_function('__ez_json_object_field', ir.FunctionType(i8_ptr, [i8_ptr, i8_ptr]))
+        null_str = ir.Constant(i8_ptr, None)
+        for index, field_name in enumerate(field_names):
+            key = self._make_global_string(field_name, prefix='_json_key')
+            raw = self.builder.call(field_fn, [func.args[0], key], name=f'_json_{field_name}_raw')
+            found = self.builder.icmp_unsigned('!=', raw, null_str, name=f'_json_{field_name}_found')
+            require_json_ok(found)
+
+            field_type = struct_type.elements[index]
+            wrapper_name = self._json_parse_field_function_name(field_type, struct_type.name, index)
+            validator_name = self._json_parse_validator_for_value(wrapper_name, field_type)
+            validator = self._get_or_declare_function(validator_name, ir.FunctionType(i1, [i8_ptr]))
+            value_ok = self.builder.call(validator, [raw], name=f'_json_{field_name}_ok')
+            require_json_ok(value_ok)
+
+            wrapper_type = self._json_parse_function_type(wrapper_name, field_type)
+            source_name = self._fmt_source_type_name(field_type, struct_type.name, index)
+            wrapper = self._fmt_generate_json_parse_wrapper(wrapper_name, field_type, source_name)
+            if wrapper is None:
+                wrapper = self._get_or_declare_function(wrapper_name, wrapper_type)
+            nested_struct = self._fmt_parse_wrapper_may_throw(field_type)
+            value = self.builder.call(wrapper, [raw], name=f'_json_{field_name}')
+            if nested_struct:
+                self._emit_throw_check_after_call()
+                if self.builder is None or self.builder.block.is_terminated:
+                    continue
+            if value.type != field_type:
+                value = self._coerce_value(value, field_type)
+            field_ptr = self.builder.gep(result, [ir.Constant(i32, 0), ir.Constant(i32, index)], inbounds=True)
+            self.builder.store(value, field_ptr)
+
+        if self.builder is not None and not self.builder.block.is_terminated:
+            self.builder.ret(result)
+        popped_throw_exit = self._function_throw_exit_stack.pop()
+        if not popped_throw_exit.is_terminated:
+            self.builder.position_at_start(popped_throw_exit)
+            self.builder.ret(ir.Constant(result_type, None))
+
+        self.builder = old_builder
+        self.current_function = old_func
+        self.locals = old_locals
+        self._locals_type_names = old_type_names
+        self._restore_unsigned_state(old_unsigned)
+        return func
+
+    def _msgpack_call_blob_returning_function(self, func: ir.Function, args: list[ir.Value], name: str) -> ir.Value:
+        blob_type = self.structs['Blob']
+        if isinstance(func.function_type.return_type, ir.VoidType):
+            ret_slot = self.builder.alloca(blob_type, name=f'{name}_slot')
+            self.builder.call(func, [ret_slot] + args)
+            return self.builder.load(ret_slot, name=name)
+        return self.builder.call(func, args, name=name)
+
+    def _gen_msgpack_encode_struct_function(self, func_name: str, struct_type: ir.IdentifiedStructType) -> ir.Function:
+        existing = self.module.globals.get(func_name)
+        if isinstance(existing, ir.Function):
+            if len(existing.blocks) > 0:
+                return existing
+            func = existing
+        else:
+            func = ir.Function(self.module, ir.FunctionType(self.structs['Blob'], [ir.PointerType(struct_type)]), func_name)
+
+        i8 = ir.IntType(8)
+        i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
+        i8_ptr = ir.PointerType(i8)
+        blob_type = self.structs['Blob']
+        func.args[0].name = 'data'
+
+        old_builder = self.builder
+        old_func = self.current_function
+        old_locals = self.locals
+        old_type_names = self._locals_type_names
+
+        entry = func.append_basic_block('entry')
+        self.builder = ir.IRBuilder(entry)
+        self.current_function = func
+        self.locals = {}
+        self._locals_type_names = {}
+
+        field_names = self.struct_fields.get(struct_type.name, [])
+        field_count = len(field_names)
+        if field_count > 0:
+            key_array_type = ir.ArrayType(i8_ptr, field_count)
+            value_array_type = ir.ArrayType(blob_type, field_count)
+            keys = self.builder.alloca(key_array_type, name='_msgpack_keys')
+            values = self.builder.alloca(value_array_type, name='_msgpack_values')
+            keys_ptr = self.builder.gep(keys, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+            values_ptr = self.builder.gep(values, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        else:
+            keys_ptr = ir.Constant(ir.PointerType(i8_ptr), None)
+            values_ptr = ir.Constant(ir.PointerType(blob_type), None)
+
+        for index, field_name in enumerate(field_names):
+            key_slot = self.builder.gep(keys, [ir.Constant(i32, 0), ir.Constant(i32, index)], inbounds=True)
+            self.builder.store(self._make_global_string(field_name, prefix='_msgpack_key'), key_slot)
+
+            field_type = struct_type.elements[index]
+            field_ptr = self.builder.gep(func.args[0], [ir.Constant(i32, 0), ir.Constant(i32, index)], inbounds=True)
+            field_value = self.builder.load(field_ptr, name=f'_msgpack_{field_name}')
+            wrapper_name = self._msgpack_encode_field_function_name(field_type, struct_type.name, index)
+            wrapper_type = self._msgpack_encode_function_type(wrapper_name, field_type)
+            source_name = self._msgpack_source_type_name(field_type, struct_type.name, index)
+            wrapper = self._fmt_generate_msgpack_encode_wrapper(wrapper_name, field_type, source_name)
+            if wrapper is None:
+                wrapper = self._get_or_declare_function(wrapper_name, wrapper_type)
+            field_value = self._fmt_arg_for_wrapper(field_value, wrapper_type.args[-1])
+            encoded = self._msgpack_call_blob_returning_function(wrapper, [field_value], name=f'_msgpack_{field_name}_blob')
+            value_slot = self.builder.gep(values, [ir.Constant(i32, 0), ir.Constant(i32, index)], inbounds=True)
+            self.builder.store(encoded, value_slot)
+
+        helper_arg_types = [i64, ir.PointerType(i8_ptr), ir.PointerType(blob_type)]
+        if self._uses_c_sret(blob_type):
+            helper_type = ir.FunctionType(ir.VoidType(), [ir.PointerType(blob_type)] + helper_arg_types)
+        else:
+            helper_type = ir.FunctionType(blob_type, helper_arg_types)
+        helper = self._get_or_declare_function('__ez_msgpack_encode_map', helper_type)
+        result = self._msgpack_call_blob_returning_function(
+            helper,
+            [ir.Constant(i64, field_count), keys_ptr, values_ptr],
+            name='_msgpack_struct_blob',
+        )
+        self.builder.ret(result)
+
+        self.builder = old_builder
+        self.current_function = old_func
+        self.locals = old_locals
+        self._locals_type_names = old_type_names
+        return func
+
+    def _msgpack_decode_validator_name(self, func_name: str) -> str | None:
+        prefix = 'msgpackDecode_'
+        if not func_name.startswith(prefix):
+            return None
+        suffix = func_name[len(prefix):]
+        if suffix == 'I1':
+            suffix = 'Bool'
+        if suffix in {'I8', 'I32', 'I64', 'U8', 'U32', 'U64', 'F32', 'F64', 'Str', 'Bool'}:
+            return f'__ez_msgpack_valid_{suffix}'
+        return None
+
+    def _gen_msgpack_decode_struct_function(self, func_name: str, struct_type: ir.IdentifiedStructType) -> ir.Function:
+        existing = self.module.globals.get(func_name)
+        if isinstance(existing, ir.Function):
+            if len(existing.blocks) > 0:
+                return existing
+            func = existing
+        else:
+            func = ir.Function(self.module, ir.FunctionType(ir.PointerType(struct_type), [ir.PointerType(self.structs['Blob'])]), func_name)
+
+        i1 = ir.IntType(1)
+        i8 = ir.IntType(8)
+        i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
+        i8_ptr = ir.PointerType(i8)
+        blob_type = self.structs['Blob']
+        blob_ptr = ir.PointerType(blob_type)
+        result_type = ir.PointerType(struct_type)
+        func.args[0].name = 'data'
+
+        old_builder = self.builder
+        old_func = self.current_function
+        old_locals = self.locals
+        old_type_names = self._locals_type_names
+        old_unsigned = self._save_unsigned_state()
+
+        entry = func.append_basic_block('entry')
+        throw_exit = func.append_basic_block('throw_exit')
+        self.builder = ir.IRBuilder(entry)
+        self.current_function = func
+        self.locals = {}
+        self._locals_type_names = {}
+        self._function_throw_exit_stack.append(throw_exit)
+
+        def require_msgpack_ok(ok: ir.Value) -> None:
+            fail_bb = self.builder.append_basic_block('msgpack_decode_invalid')
+            cont_bb = self.builder.append_basic_block('msgpack_decode_valid')
+            self.builder.cbranch(ok, cont_bb, fail_bb)
+            self.builder.position_at_start(fail_bb)
+            self._raise_error(4, 'msgpack decode failed')
+            self.builder.position_at_start(cont_bb)
+
+        result = self._arena_allocate(struct_type, name=f'_msgpack_{struct_type.name}_value')
+        self.builder.store(self._zero_constant(struct_type), result)
+
+        valid_map = self._get_or_declare_function('__ez_msgpack_valid_map', ir.FunctionType(i1, [blob_ptr]))
+        map_ok = self.builder.call(valid_map, [func.args[0]], name='_msgpack_map_ok')
+        require_msgpack_ok(map_ok)
+
+        field_names = self.struct_fields.get(struct_type.name, [])
+        field_count_fn = self._get_or_declare_function('__ez_msgpack_map_field_count', ir.FunctionType(i64, [blob_ptr]))
+        field_count = self.builder.call(field_count_fn, [func.args[0]], name='_msgpack_map_field_count')
+        field_count_ok = self.builder.icmp_signed('==', field_count, ir.Constant(i64, len(field_names)), name='_msgpack_map_field_count_ok')
+        require_msgpack_ok(field_count_ok)
+
+        if self._uses_c_sret(blob_type):
+            field_fn_type = ir.FunctionType(ir.VoidType(), [blob_ptr, blob_ptr, i8_ptr])
+        else:
+            field_fn_type = ir.FunctionType(blob_type, [blob_ptr, i8_ptr])
+        field_fn = self._get_or_declare_function('__ez_msgpack_map_field', field_fn_type)
+
+        for index, field_name in enumerate(field_names):
+            key = self._make_global_string(field_name, prefix='_msgpack_key')
+            field_blob_ptr = self.builder.alloca(blob_type, name=f'_msgpack_{field_name}_blob_ptr')
+            if self._uses_c_sret(blob_type):
+                self.builder.call(field_fn, [field_blob_ptr, func.args[0], key])
+            else:
+                raw_blob = self.builder.call(field_fn, [func.args[0], key], name=f'_msgpack_{field_name}_raw')
+                self.builder.store(raw_blob, field_blob_ptr)
+            size_ptr = self.builder.gep(field_blob_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 1)], inbounds=True)
+            size = self.builder.load(size_ptr, name=f'_msgpack_{field_name}_size')
+            found = self.builder.icmp_signed('>=', size, ir.Constant(i64, 0), name=f'_msgpack_{field_name}_found')
+            require_msgpack_ok(found)
+
+            field_type = struct_type.elements[index]
+            wrapper_name = self._msgpack_decode_field_function_name(field_type, struct_type.name, index)
+            validator_name = self._msgpack_decode_validator_for_value(wrapper_name, field_type)
+            validator = self._get_or_declare_function(validator_name, ir.FunctionType(i1, [blob_ptr]))
+            value_ok = self.builder.call(validator, [field_blob_ptr], name=f'_msgpack_{field_name}_ok')
+            require_msgpack_ok(value_ok)
+
+            wrapper_type = self._msgpack_decode_function_type(wrapper_name, field_type)
+            source_name = self._msgpack_source_type_name(field_type, struct_type.name, index)
+            wrapper = self._fmt_generate_msgpack_decode_wrapper(wrapper_name, field_type, source_name)
+            if wrapper is None:
+                wrapper = self._get_or_declare_function(wrapper_name, wrapper_type)
+            nested_struct = self._fmt_parse_wrapper_may_throw(field_type)
+            value = self.builder.call(wrapper, [field_blob_ptr], name=f'_msgpack_{field_name}')
+            if nested_struct:
+                self._emit_throw_check_after_call()
+                if self.builder is None or self.builder.block.is_terminated:
+                    continue
+            if value.type != field_type:
+                value = self._coerce_value(value, field_type)
+            field_ptr = self.builder.gep(result, [ir.Constant(i32, 0), ir.Constant(i32, index)], inbounds=True)
+            self.builder.store(value, field_ptr)
+
+        if self.builder is not None and not self.builder.block.is_terminated:
+            self.builder.ret(result)
+        popped_throw_exit = self._function_throw_exit_stack.pop()
+        if not popped_throw_exit.is_terminated:
+            self.builder.position_at_start(popped_throw_exit)
+            self.builder.ret(ir.Constant(result_type, None))
+
+        self.builder = old_builder
+        self.current_function = old_func
+        self.locals = old_locals
+        self._locals_type_names = old_type_names
+        self._restore_unsigned_state(old_unsigned)
+        return func
+
+    def _append_json_literal_segment(self, segments: list[tuple[ir.Value, ir.Value]], text: str) -> None:
+        segments.append((self._make_global_string(text, prefix='_json_seg'), ir.Constant(ir.IntType(64), len(bytearray(text, 'utf-8')))))
+
+    def _join_c_string_segments(self, segments: list[tuple[ir.Value, ir.Value]], name_prefix: str = '_str_join') -> ir.Value:
+        i8 = ir.IntType(8)
+        i64 = ir.IntType(64)
+        memcpy = self.module.get_global('llvm.memcpy.p0.p0.i64')
+
+        total_len = ir.Constant(i64, 0)
+        for _, seg_len in segments:
+            total_len = self.builder.add(total_len, seg_len, name=f'{name_prefix}_total')
+        alloc_len = self.builder.add(total_len, ir.Constant(i64, 1), name=f'{name_prefix}_alloc_len')
+        buf_base = self.builder.call(self._arena_alloc, [alloc_len, ir.Constant(i64, 1)], name=f'{name_prefix}_buf')
+
+        pos = ir.Constant(i64, 0)
+        for src, seg_len in segments:
+            dst_ptr = self.builder.gep(buf_base, [pos], inbounds=True)
+            self.builder.call(memcpy, [dst_ptr, src, seg_len, ir.Constant(ir.IntType(1), 0)])
+            pos = self.builder.add(pos, seg_len, name=f'{name_prefix}_pos')
+
+        null_ptr = self.builder.gep(buf_base, [pos], inbounds=True)
+        self.builder.store(ir.Constant(i8, 0), null_ptr)
+        return buf_base
+
     def _make_global_string(self, text: str, prefix: str = "_str") -> ir.Value:
         """创建全局字符串常量，返回 i8*"""
         data = bytearray(text + '\0', 'utf-8')
@@ -2968,7 +6455,7 @@ class LLVMCodeGenerator(EzLangVisitor):
         if text == 'true' or text == 'false':
             return ir.Constant(ir.IntType(1), int(text == 'true'))
         if text.startswith('"') and text.endswith('"'):
-            ptr = self._make_global_string(text[1:-1])
+            ptr = self._make_global_string(decode_string_literal_token(text))
             if isinstance(ptr, ir.GlobalVariable):
                 return ir.Constant(ir.PointerType(ir.IntType(8)), None)
             return ptr
@@ -3023,7 +6510,7 @@ class LLVMCodeGenerator(EzLangVisitor):
                               int(lit.BOOL_LITERAL().getText() == 'true'))
 
         if lit.STRING_LITERAL() is not None:
-            text = lit.STRING_LITERAL().getText()[1:-1]
+            text = decode_string_literal_token(lit.STRING_LITERAL().getText())
             # 检查字符串插值 {{expr}}
             parts = self._parse_str_interp(text)
             if len(parts) > 1 and self.builder is not None:
@@ -3041,8 +6528,15 @@ class LLVMCodeGenerator(EzLangVisitor):
 
         # 泛型实例化: func<T1, T2>
         if ctx.genericArgs() is not None:
-            type_args = [self._map_type(t) for t in ctx.genericArgs().type_()]
-            name = self._monomorphize(name, type_args)
+            type_arg_ctxs = list(ctx.genericArgs().type_())
+            type_args = [self._map_type(t) for t in type_arg_ctxs]
+            name = self._monomorphize(
+                name,
+                type_args,
+                [self._type_ctx_suffix(t) for t in type_arg_ctxs],
+                [self._type_ctx_is_unsigned(t) for t in type_arg_ctxs],
+                [self._type_ctx_name(t) for t in type_arg_ctxs],
+            )
 
         if name in self.locals:
             self._join_flow_future(name)
@@ -3061,9 +6555,12 @@ class LLVMCodeGenerator(EzLangVisitor):
             return ir.Constant(ir.IntType(32), self._type_id(name))
         return ir.Constant(ir.IntType(32), 0)
 
-    def _monomorphize(self, base_name: str, type_args: list[ir.Type]) -> str:
+    def _monomorphize(self, base_name: str, type_args: list[ir.Type],
+                      type_suffixes: list[str] | None = None,
+                      type_arg_unsigned: list[bool] | None = None,
+                      type_source_names: list[str] | None = None) -> str:
         """为泛型函数生成特定类型的单态化版本"""
-        suffix = '_'.join(self._type_name(t) for t in type_args)
+        suffix = '_'.join(type_suffixes if type_suffixes is not None else [self._type_name(t) for t in type_args])
         mono_name = f"{base_name}_{suffix}"
         if mono_name in self._monomorphized:
             return mono_name
@@ -3083,12 +6580,51 @@ class LLVMCodeGenerator(EzLangVisitor):
             return mono_name
         # 创建类型替换映射
         type_map = dict(zip(param_names, type_args))
+        unsigned_map = dict(zip(param_names, type_arg_unsigned or [False] * len(param_names)))
 
         # 判断是否为泛型 declare（GenericParamFunctionTypeContext）
         if hasattr(template_ctx, 'paramTypeList'):
             # 泛型 declare：只生成外部函数声明（无函数体）
+            fmt_source_names = type_source_names or type_suffixes
+            if len(type_args) == 1 and self._fmt_monomorphize_top_level_list(base_name, mono_name, type_args[0], fmt_source_names):
+                return mono_name
+
+            if len(type_args) == 1 and self._fmt_monomorphize_top_level_optional(base_name, mono_name, type_args[0], fmt_source_names):
+                return mono_name
+
+            if len(type_args) == 1 and self._fmt_monomorphize_top_level_dict(base_name, mono_name, type_args[0], fmt_source_names):
+                return mono_name
+
+            if len(type_args) == 1 and self._fmt_monomorphize_top_level_union(base_name, mono_name, type_args[0], fmt_source_names):
+                return mono_name
+
+            if base_name == 'jsonStringify' and len(type_args) == 1 and self._json_stringify_struct_supported(type_args[0]):
+                self._gen_json_stringify_struct_function(mono_name, type_args[0])
+                self.func_param_names[mono_name] = ['data']
+                self.func_return_unsigned[mono_name] = False
+                return mono_name
+
+            if base_name == 'jsonParse' and len(type_args) == 1 and self._json_parse_struct_supported(type_args[0]):
+                self._gen_json_parse_struct_function(mono_name, type_args[0])
+                self.func_param_names[mono_name] = ['s']
+                self.func_return_unsigned[mono_name] = False
+                return mono_name
+
+            if base_name == 'msgpackEncode' and len(type_args) == 1 and self._msgpack_encode_struct_supported(type_args[0]):
+                self._gen_msgpack_encode_struct_function(mono_name, type_args[0])
+                self.func_param_names[mono_name] = ['data']
+                self.func_return_unsigned[mono_name] = False
+                return mono_name
+
+            if base_name == 'msgpackDecode' and len(type_args) == 1 and self._msgpack_decode_struct_supported(type_args[0]):
+                self._gen_msgpack_decode_struct_function(mono_name, type_args[0])
+                self.func_param_names[mono_name] = ['data']
+                self.func_return_unsigned[mono_name] = False
+                return mono_name
+
             gen_ctx = template_ctx
             ret_type = self._map_type_with_map(gen_ctx.type_(), type_map)
+            self.func_return_unsigned[mono_name] = self._type_ctx_is_unsigned_with_map(gen_ctx.type_(), unsigned_map)
             ret_dict_types = self._dict_types_from_type_ctx_with_map(gen_ctx.type_(), type_map)
             if ret_dict_types is not None:
                 self.func_return_dict_types[mono_name] = ret_dict_types
@@ -3099,11 +6635,8 @@ class LLVMCodeGenerator(EzLangVisitor):
                 for p in ptl.paramType():
                     pname = p.VAR_IDENTIFIER().getText()
                     ptype = self._map_type_with_map(p.type_(), type_map)
-                    # 结构体参数使用指针传递（与 extern C ABI 兼容）
-                    if isinstance(ptype, (ir.LiteralStructType, ir.IdentifiedStructType)):
-                        ptype = ir.PointerType(ptype)
                     orig_param_names.append(pname)
-                    param_types.append(ptype)
+                    param_types.append(self._c_abi_param_type(ptype))
 
             uses_sret = self._uses_c_sret(ret_type)
             bridged_ret_type = self._c_abi_return_type(ret_type)
@@ -3126,6 +6659,7 @@ class LLVMCodeGenerator(EzLangVisitor):
         fn_lit = template_ctx.functionLiteral()
 
         ret_type = self._map_type_with_map(fn_lit.type_(), type_map)
+        self.func_return_unsigned[mono_name] = self._type_ctx_is_unsigned_with_map(fn_lit.type_(), unsigned_map)
         ret_dict_types = self._dict_types_from_type_ctx_with_map(fn_lit.type_(), type_map)
         if ret_dict_types is not None:
             self.func_return_dict_types[mono_name] = ret_dict_types
@@ -3150,17 +6684,10 @@ class LLVMCodeGenerator(EzLangVisitor):
         body = fn_lit.block() or fn_lit.expression()
         if body is not None:
             entry = func.append_basic_block(name='entry')
-            prev_builder = self.builder
-            prev_func = self.current_function
-            prev_locals = self.locals
             prev_unsigned = self._save_unsigned_state()
-            prev_type_names = self._locals_type_names
-
-            self.builder = ir.IRBuilder(entry)
-            self.current_function = func
-            self.locals = {}
-            self._locals_type_names = {}
-            self._generic_type_map_stack.append(type_map)
+            prev_codegen_state = self._enter_function_codegen_state(ir.IRBuilder(entry), func)
+            type_name_map = dict(zip(param_names, type_suffixes or [self._type_name_from_ir_type_with_unsigned(t, unsigned_map.get(name, False)) for name, t in zip(param_names, type_args)]))
+            self._generic_type_map_stack.append((type_map, unsigned_map, type_name_map))
             throw_exit = func.append_basic_block('throw_exit')
             self._function_throw_exit_stack.append(throw_exit)
             self._function_return_type_ctx_stack.append(fn_lit.type_())
@@ -3174,23 +6701,24 @@ class LLVMCodeGenerator(EzLangVisitor):
             self._function_return_type_ctx_stack.pop()
             self._generic_type_map_stack.pop()
 
-            self.builder = prev_builder
-            self.current_function = prev_func
-            self.locals = prev_locals
-            self._locals_type_names = prev_type_names
+            self._restore_function_codegen_state(prev_codegen_state)
             self._restore_unsigned_state(prev_unsigned)
 
         return mono_name
 
-    def _map_type_with_map(self, ctx, type_map: dict[str, ir.Type]) -> ir.Type:
+    def _map_type_with_map(self, ctx, type_map: dict[str, ir.Type],
+                           unsigned_map: dict[str, bool] | None = None,
+                           type_name_map: dict[str, str] | None = None) -> ir.Type:
         prev_mapping = self._mapping_with_map
         self._mapping_with_map = True
         try:
-            return self._map_type_with_map_impl(ctx, type_map)
+            return self._map_type_with_map_impl(ctx, type_map, unsigned_map or {}, type_name_map or {})
         finally:
             self._mapping_with_map = prev_mapping
 
-    def _map_type_with_map_impl(self, ctx, type_map: dict[str, ir.Type]) -> ir.Type:
+    def _map_type_with_map_impl(self, ctx, type_map: dict[str, ir.Type],
+                                unsigned_map: dict[str, bool],
+                                type_name_map: dict[str, str]) -> ir.Type:
         """带泛型参数替换的类型映射 — 递归处理复合类型"""
         if ctx is None:
             return ir.IntType(32)
@@ -3208,31 +6736,42 @@ class LLVMCodeGenerator(EzLangVisitor):
             if bt.genericArgs() is not None:
                 args = list(bt.genericArgs().type_())
                 if name in self.struct_generic_templates:
-                    type_args = [self._map_type_with_map(t, type_map) for t in args]
-                    type_arg_unsigned = [self._type_ctx_is_unsigned(t) for t in args]
-                    mono_name = self._monomorphize_struct(name, type_args, type_arg_unsigned)
+                    type_args = [self._map_type_with_map(t, type_map, unsigned_map, type_name_map) for t in args]
+                    type_arg_unsigned = [self._type_ctx_is_unsigned_with_map(t, unsigned_map) for t in args]
+                    type_arg_names = [self._type_ctx_name_with_map(t, type_map, unsigned_map, type_name_map) for t in args]
+                    mono_name = self._monomorphize_struct(name, type_args, type_arg_unsigned, type_arg_names)
                     return self.structs.get(mono_name, self.structs.get(name, ir.IntType(32)))
                 if name == 'Dict':
                     return self.structs['Dict']
                 if name == 'List':
-                    inner = self._map_type_with_map(args[0], type_map) if args else ir.IntType(32)
+                    inner = self._map_type_with_map(args[0], type_map, unsigned_map, type_name_map) if args else ir.IntType(32)
                     return ir.LiteralStructType([ir.PointerType(ir.PointerType(inner)), ir.IntType(64), ir.IntType(64), ir.IntType(64)])
             return self._map_type(ctx)
 
         # 可选类型: T? → {i1, T}
         if isinstance(ctx, P.OptionalTypeContext):
-            inner = self._map_type_with_map(ctx.type_(), type_map)
+            inner = self._map_type_with_map(ctx.type_(), type_map, unsigned_map, type_name_map)
             return ir.LiteralStructType([ir.IntType(1), inner])
 
         # List 类型: List<T> → { pages, length, capacity, page_count }
         if isinstance(ctx, P.ListTypeContext):
-            inner = self._map_type_with_map(ctx.type_(), type_map)
+            inner = self._map_type_with_map(ctx.type_(), type_map, unsigned_map, type_name_map)
             return ir.LiteralStructType([ir.PointerType(ir.PointerType(inner)), ir.IntType(64), ir.IntType(64), ir.IntType(64)])
 
         # 数组类型: T[] → { pages, length, capacity, page_count }
         if isinstance(ctx, P.ArrayTypeContext):
-            inner = self._map_type_with_map(ctx.type_(), type_map)
+            inner = self._map_type_with_map(ctx.type_(), type_map, unsigned_map, type_name_map)
             return ir.LiteralStructType([ir.PointerType(ir.PointerType(inner)), ir.IntType(64), ir.IntType(64), ir.IntType(64)])
+
+        if isinstance(ctx, P.FunctionTypeRefContext):
+            fn_ctx = ctx.functionType()
+            ret_type = self._map_type_with_map(fn_ctx.type_(), type_map, unsigned_map, type_name_map)
+            param_types = []
+            ptl = fn_ctx.paramTypeList()
+            if ptl is not None:
+                for p in ptl.paramType():
+                    param_types.append(self._map_type_with_map(p.type_(), type_map, unsigned_map, type_name_map))
+            return ir.PointerType(ir.FunctionType(ret_type, param_types))
 
         return self._map_type(ctx)
 
@@ -3270,27 +6809,110 @@ class LLVMCodeGenerator(EzLangVisitor):
         func_name = ctx.VAR_IDENTIFIER().getText()
         generic_args = ctx.genericArgs()
         if generic_args is not None:
-            type_args = [self._map_type(t) for t in generic_args.type_()]
-            func_name = self._monomorphize(func_name, type_args)
-        func = self.module.get_global(func_name)
-        if func is None or not isinstance(func, ir.Function):
+            type_arg_ctxs = list(generic_args.type_())
+            type_args = [self._map_type(t) for t in type_arg_ctxs]
+            func_name = self._monomorphize(
+                func_name,
+                type_args,
+                [self._type_ctx_suffix(t) for t in type_arg_ctxs],
+                [self._type_ctx_is_unsigned(t) for t in type_arg_ctxs],
+                [self._type_ctx_name(t) for t in type_arg_ctxs],
+            )
+        result = self._gen_pipeline_function_call(func_name, left, ctx.pipelineArgList())
+        if result is None:
             return left
+        return result
 
-        call_args = []
+    def _gen_pipeline_function_call(self, func_name: str, pipe_val: ir.Value, arg_list) -> ir.Value | None:
+        """生成管道调用，按函数形参名重排并注入默认参数。"""
+        try:
+            func = self.module.get_global(func_name)
+        except KeyError:
+            return None
+        if func is None or not isinstance(func, ir.Function):
+            return None
+
+        expected_names = self.func_param_names.get(func_name, [])
+        defaults = self.func_defaults.get(func_name, {})
+        provided: dict[str, ir.Value] = {}
+        positional_args: list[ir.Value] = []
         has_percent = False
-        arg_list = ctx.pipelineArgList()
+
         if arg_list is not None:
             for a in arg_list.pipelineArg():
+                if a.VAR_IDENTIFIER() is None:
+                    continue
+                pname = a.VAR_IDENTIFIER().getText()
                 if a.PERCENT() is not None:
-                    call_args.append(left)
+                    provided[pname] = pipe_val
+                    positional_args.append(pipe_val)
                     has_percent = True
                 elif a.expression() is not None:
                     val = self._eval(a.expression())
-                    call_args.append(val if val is not None else ir.Constant(ir.IntType(32), 0))
-        if not has_percent:
-            call_args.insert(0, left)
+                    if val is not None:
+                        provided[pname] = val
+                        positional_args.append(val)
 
-        return self.builder.call(func, call_args)
+        call_args: list[ir.Value] = []
+        if expected_names:
+            if not has_percent:
+                provided[expected_names[0]] = pipe_val
+            for pname in expected_names:
+                if pname in provided:
+                    call_args.append(provided[pname])
+                elif pname in defaults:
+                    default_value = self._eval(defaults[pname])
+                    call_args.append(default_value if default_value is not None else ir.Constant(ir.IntType(32), 0))
+                else:
+                    call_args.append(ir.Constant(ir.IntType(32), 0))
+        else:
+            call_args = list(positional_args)
+            if not has_percent:
+                call_args.insert(0, pipe_val)
+
+        intrinsic_result = self._try_gen_intrinsic_call(func_name, call_args)
+        if intrinsic_result is not None:
+            if intrinsic_result is self._void_intrinsic_result:
+                return None
+            return intrinsic_result
+
+        func_type = func.type.pointee if isinstance(func.type, ir.PointerType) else None
+        sret_type = self._sret_functions.get(func_name)
+        abi_arg_types = list(func_type.args) if func_type is not None else []
+        if sret_type is not None:
+            ret_slot = self._arena_allocate(sret_type, name=f"_{func_name}_ret")
+            call_args = [ret_slot] + call_args
+
+        if func_type is not None:
+            call_args = [
+                self._coerce_call_arg(arg, abi_arg_types[i]) if i < len(abi_arg_types) else arg
+                for i, arg in enumerate(call_args)
+            ]
+            call_args = [
+                self._load_if_aggregate_ptr(arg)
+                if i < len(abi_arg_types) and arg.type != abi_arg_types[i] and self._is_aggregate_ptr(arg)
+                else arg
+                for i, arg in enumerate(call_args)
+            ]
+
+        self._json_parse_validate_or_throw(func_name, call_args)
+        if self.builder is not None and self.builder.block.is_terminated:
+            return self._zero_constant(func_type.return_type if func_type is not None else ir.IntType(32))
+
+        call = self.builder.call(func, call_args)
+        if sret_type is not None:
+            self._emit_throw_check_after_call()
+            ret_dict_types = self.func_return_dict_types.get(func_name)
+            if ret_dict_types is not None:
+                self._mark_dict_item_types(ret_slot, ret_dict_types[0], ret_dict_types[1])
+            return ret_slot
+        call = self._restore_c_abi_return(func_name, call)
+        self._mark_unsigned(call, self.func_return_unsigned.get(func_name, False))
+        ret_dict_types = self.func_return_dict_types.get(func_name)
+        if ret_dict_types is not None:
+            self._mark_dict_item_types(call, ret_dict_types[0], ret_dict_types[1])
+        self._emit_throw_check_after_call()
+        return call
 
     # PrimaryExpr（postfixExpression → primaryExpression 的入口）
     def visitPrimaryExpr(self, ctx: EzLangParser.PrimaryExprContext):
@@ -3527,15 +7149,32 @@ class LLVMCodeGenerator(EzLangVisitor):
 
     def visitMemberAccess(self, ctx: EzLangParser.MemberAccessContext):
         """对象字段访问: obj.field 或方法访问: obj.method"""
+        field_name = ctx.VAR_IDENTIFIER().getText()
+        static_struct_name = self._static_struct_member_owner(ctx.postfixExpression())
+        if static_struct_name is not None:
+            methods = self.struct_methods.get(static_struct_name, {})
+            func_name = methods.get(field_name)
+            if func_name is not None:
+                try:
+                    return self.module.get_global(func_name)
+                except KeyError:
+                    return None
+
         if isinstance(ctx.postfixExpression(), EzLangParser.OptionalUnwrapContext):
-            safe_value = self._optional_safe_member_access(ctx.postfixExpression(), ctx.VAR_IDENTIFIER().getText())
+            safe_value = self._optional_safe_member_access(ctx.postfixExpression(), field_name)
             if safe_value is not None:
                 return safe_value
 
         obj_ptr = self._eval(ctx.postfixExpression())
         if obj_ptr is None:
             return None
-        field_name = ctx.VAR_IDENTIFIER().getText()
+        if (
+            not isinstance(obj_ptr.type, ir.PointerType)
+            and isinstance(obj_ptr.type, (ir.IdentifiedStructType, ir.LiteralStructType, ir.ArrayType))
+        ):
+            tmp = self.builder.alloca(obj_ptr.type, name='_member_tmp')
+            self.builder.store(obj_ptr, tmp)
+            obj_ptr = tmp
 
         pointee = obj_ptr.type.pointee if hasattr(obj_ptr.type, 'pointee') else obj_ptr.type
         if not isinstance(pointee, (ir.IdentifiedStructType, ir.LiteralStructType)):
@@ -3609,6 +7248,17 @@ class LLVMCodeGenerator(EzLangVisitor):
 
         return None
 
+    def _static_struct_member_owner(self, ctx) -> str | None:
+        """识别 StructName.method 这种类型级结构体成员访问。"""
+        primary = ctx.primaryExpression() if hasattr(ctx, 'primaryExpression') else None
+        if primary is None or not isinstance(primary, EzLangParser.IdentifierExprContext):
+            return None
+        token = primary.TYPE_IDENTIFIER()
+        if token is None:
+            return None
+        name = token.getText()
+        return name if name in self.structs or name in self.struct_generic_templates else None
+
     # ==================== 数组字面量与索引 ====================
 
     def visitArrayLiteral(self, ctx: EzLangParser.ArrayLiteralContext):
@@ -3623,7 +7273,7 @@ class LLVMCodeGenerator(EzLangVisitor):
         for e in exprs:
             v = self._eval(e)
             if v is not None:
-                if isinstance(v, ir.AllocaInstr):
+                if self._is_aggregate_ptr(v):
                     v = self.builder.load(v)
                 values.append(v)
                 elem_unsigned = elem_unsigned or self._is_unsigned_value(v)
@@ -3699,7 +7349,14 @@ class LLVMCodeGenerator(EzLangVisitor):
             val = self._eval(f.expression())
             if isinstance(val, ir.AllocaInstr):
                 val = self.builder.load(val)
-            if val is not None and not saw_value_type:
+            type_ctx = f.type_()
+            if type_ctx is not None:
+                annotated_type = self._map_type(type_ctx)
+                value_type = annotated_type
+                saw_value_type = True
+                if val is not None and val.type != annotated_type:
+                    val = self._coerce_preserve_unsigned(val, annotated_type)
+            elif val is not None and not saw_value_type:
                 value_type = val.type
                 saw_value_type = True
             self._gen_dict_set(alloca, key, val)
@@ -3728,7 +7385,7 @@ class LLVMCodeGenerator(EzLangVisitor):
         if attr.expression() is not None:
             return self._eval(attr.expression())
         if attr.STRING_LITERAL() is not None:
-            text = attr.STRING_LITERAL().getText()[1:-1]
+            text = decode_string_literal_token(attr.STRING_LITERAL().getText())
             return self._make_global_string(text, prefix="_markup_attr")
         if attr.INTEGER_LITERAL() is not None:
             return ir.Constant(ir.IntType(32), int(attr.INTEGER_LITERAL().getText(), 0))
@@ -3742,7 +7399,7 @@ class LLVMCodeGenerator(EzLangVisitor):
         if child.expression() is not None:
             return self._eval(child.expression())
         if child.STRING_LITERAL() is not None:
-            return self._make_global_string(child.STRING_LITERAL().getText()[1:-1], prefix="_markup_child")
+            return self._make_global_string(decode_string_literal_token(child.STRING_LITERAL().getText()), prefix="_markup_child")
         return None
 
     def _markup_children_array(self, children) -> ir.Value:
@@ -4031,7 +7688,7 @@ class LLVMCodeGenerator(EzLangVisitor):
         if pl_array is None:
             return legacy_race_hook()
 
-        async_result = self._gen_race_i32_runtime_call(pl_array, timeout_arg)
+        async_result = None if self.compile_target == 'emcc' else self._gen_race_i32_runtime_call(pl_array, timeout_arg)
         if async_result is not None:
             return async_result
 
@@ -4220,6 +7877,8 @@ class LLVMCodeGenerator(EzLangVisitor):
 
     def _start_flow_parallel_i32_future(self, name: str, parallel_block) -> ir.Value | None:
         """flow 内 parallel I32 块启动为后台任务，读取变量时 join。"""
+        if self.compile_target == 'emcc':
+            return None
         if self._flow_depth <= 0 or not self._flow_future_stack or parallel_block is None:
             return None
         if self._ctx_references_local_capture(parallel_block):
@@ -4345,23 +8004,15 @@ class LLVMCodeGenerator(EzLangVisitor):
             key_type, value_type = self._dict_item_types_for_value(obj_ptr)
             return self._gen_dict_lookup_value(obj_ptr, index_val, key_type, value_type)
 
-        if isinstance(pointee, ir.LiteralStructType) and len(pointee.elements) == 4 and isinstance(pointee.elements[0], ir.PointerType):
-            pages_field = self.builder.gep(obj_ptr, [
-                ir.Constant(ir.IntType(32), 0),
-                ir.Constant(ir.IntType(32), 0)
-            ], inbounds=True)
-            pages_ptr = self.builder.load(pages_field, name='_arr_pages')
-            if isinstance(index_val.type, ir.IntType) and index_val.type.width < 64:
-                index_val = self.builder.zext(index_val, ir.IntType(64))
-            page_idx = self.builder.udiv(index_val, ir.Constant(ir.IntType(64), 8))
-            slot_idx = self.builder.urem(index_val, ir.Constant(ir.IntType(64), 8))
-            page_slot = self.builder.gep(pages_ptr, [page_idx], inbounds=True)
-            page_ptr = self.builder.load(page_slot, name='_arr_page')
-            elem_ptr = self.builder.gep(page_ptr, [slot_idx], inbounds=True)
-            self._mark_unsigned(elem_ptr, self._list_type_is_unsigned(obj_ptr.type))
+        list_ptr = self._as_list_ptr(obj_ptr)
+        if list_ptr is not None:
+            elem_ptr = self._list_element_ptr(list_ptr, index_val)
+            self._mark_unsigned(elem_ptr, self._list_type_is_unsigned(list_ptr.type))
             return self._load_with_unsigned(elem_ptr)
 
         # 兼容旧裸数组指针
+        if not isinstance(obj_ptr.type, ir.PointerType):
+            return None
         gep = self.builder.gep(obj_ptr, [
             ir.Constant(ir.IntType(32), 0),
             index_val
@@ -4439,8 +8090,15 @@ class LLVMCodeGenerator(EzLangVisitor):
                     if name in self.struct_generic_templates:
                         name = self._struct_name_from_generic_args(name, id_ctx.genericArgs())
                     else:
-                        type_args = [self._map_type(t) for t in id_ctx.genericArgs().type_()]
-                        name = self._monomorphize(name, type_args)
+                        type_arg_ctxs = list(id_ctx.genericArgs().type_())
+                        type_args = [self._map_type(t) for t in type_arg_ctxs]
+                        name = self._monomorphize(
+                            name,
+                            type_args,
+                            [self._type_ctx_suffix(t) for t in type_arg_ctxs],
+                            [self._type_ctx_is_unsigned(t) for t in type_arg_ctxs],
+                            [self._type_ctx_name(t) for t in type_arg_ctxs],
+                        )
             elif hasattr(inner, 'VAR_IDENTIFIER') and inner.VAR_IDENTIFIER():
                 name = inner.VAR_IDENTIFIER().getText()
                 # 泛型函数调用（primaryExpression 直接返回 IdentifierExprContext 时不走上面分支）
@@ -4448,8 +8106,15 @@ class LLVMCodeGenerator(EzLangVisitor):
                     if name in self.struct_generic_templates:
                         name = self._struct_name_from_generic_args(name, inner.genericArgs())
                     else:
-                        type_args = [self._map_type(t) for t in inner.genericArgs().type_()]
-                        name = self._monomorphize(name, type_args)
+                        type_arg_ctxs = list(inner.genericArgs().type_())
+                        type_args = [self._map_type(t) for t in type_arg_ctxs]
+                        name = self._monomorphize(
+                            name,
+                            type_args,
+                            [self._type_ctx_suffix(t) for t in type_arg_ctxs],
+                            [self._type_ctx_is_unsigned(t) for t in type_arg_ctxs],
+                            [self._type_ctx_name(t) for t in type_arg_ctxs],
+                        )
             elif hasattr(inner, 'TYPE_IDENTIFIER') and inner.TYPE_IDENTIFIER():
                 name = inner.TYPE_IDENTIFIER().getText()
             else:
@@ -4546,10 +8211,11 @@ class LLVMCodeGenerator(EzLangVisitor):
             if curried_target is not None and curried_closure_value is not None:
                 call_args.append(curried_closure_value)
             # 方法调用：首个参数是 this
-            if method_this is not None:
+            inject_method_this = method_this is not None and bool(expected_names) and expected_names[0] == 'this'
+            if inject_method_this:
                 call_args.append(method_this)
             for pname in expected_names:
-                if method_this is not None and pname == expected_names[0]:
+                if inject_method_this and pname == expected_names[0]:
                     continue  # this 已添加
                 if pname in provided:
                     call_args.append(provided[pname])
@@ -4581,7 +8247,7 @@ class LLVMCodeGenerator(EzLangVisitor):
         func_type = func.type.pointee if isinstance(func.type, ir.PointerType) else None
         if self._flow_depth > 0 and func_name == 'sleep' and call_args:
             sleep_arg = self._coerce_value(call_args[0], ir.IntType(64))
-            return self.builder.call(self._flow_sleep, [sleep_arg])
+            return self.builder.call(self._require_flow_sleep(), [sleep_arg])
         sret_type = self._sret_functions.get(func_name)
         abi_arg_types = list(func_type.args) if func_type is not None else []
         if sret_type is not None:
@@ -4590,7 +8256,7 @@ class LLVMCodeGenerator(EzLangVisitor):
 
         if func_type is not None:
             call_args = [
-                self._coerce_value(arg, abi_arg_types[i]) if i < len(abi_arg_types) else arg
+                self._coerce_call_arg(arg, abi_arg_types[i]) if i < len(abi_arg_types) else arg
                 for i, arg in enumerate(call_args)
             ]
             call_args = [
@@ -4599,6 +8265,10 @@ class LLVMCodeGenerator(EzLangVisitor):
                 else arg
                 for i, arg in enumerate(call_args)
             ]
+
+        self._json_parse_validate_or_throw(func_name, call_args)
+        if self.builder is not None and self.builder.block.is_terminated:
+            return self._zero_constant(self._call_return_type(ctx))
 
         call = self.builder.call(func, call_args)
         if sret_type is not None:
@@ -4632,6 +8302,35 @@ class LLVMCodeGenerator(EzLangVisitor):
         if hasattr(template_ctx, 'type_'):
             return self._map_type_with_map(template_ctx.type_(), type_map)
         return ir.IntType(32)
+
+    def _json_parse_validator_name(self, func_name: str) -> str | None:
+        prefix = 'jsonParse_'
+        if not func_name.startswith(prefix):
+            return None
+        suffix = func_name[len(prefix):]
+        if suffix == 'I1':
+            suffix = 'Bool'
+        if suffix in {'I8', 'I32', 'I64', 'U8', 'U32', 'U64', 'F32', 'F64', 'Str', 'Bool'}:
+            return f'__ez_json_valid_{suffix}'
+        return None
+
+    def _json_parse_validate_or_throw(self, func_name: str, call_args: list[ir.Value]) -> None:
+        validator_name = self._json_parse_validator_name(func_name)
+        if validator_name is None or not call_args or self.builder is None:
+            return
+        i1 = ir.IntType(1)
+        i8_ptr = ir.PointerType(ir.IntType(8))
+        validator = self._get_or_declare_function(validator_name, ir.FunctionType(i1, [i8_ptr]))
+        arg = call_args[0]
+        if arg.type != i8_ptr:
+            arg = self._coerce_value(arg, i8_ptr)
+        ok = self.builder.call(validator, [arg], name='_json_parse_ok')
+        fail_bb = self.builder.append_basic_block('json_parse_invalid')
+        cont_bb = self.builder.append_basic_block('json_parse_valid')
+        self.builder.cbranch(ok, cont_bb, fail_bb)
+        self.builder.position_at_start(fail_bb)
+        self._raise_error(4, 'json parse failed')
+        self.builder.position_at_start(cont_bb)
 
     def _value_type_for_generic_inference(self, value: ir.Value) -> ir.Type:
         """泛型推导使用值语义类型，聚合指针按其指向类型推导。"""
@@ -4796,6 +8495,8 @@ class LLVMCodeGenerator(EzLangVisitor):
         if list_builtin == 'listSort' and len(call_args) >= 2:
             self._gen_list_sort(call_args[0], call_args[1])
             return self._void_intrinsic_result
+        if list_builtin == 'randomShuffle' and len(call_args) >= 2:
+            return self._gen_random_shuffle(name, call_args[0], call_args[1])
 
         dict_builtin = self._dict_builtin_base(name)
         if dict_builtin == 'dictLen' and len(call_args) >= 1:
@@ -5286,6 +8987,107 @@ class LLVMCodeGenerator(EzLangVisitor):
 
         self.builder.position_at_start(done_block)
         return None
+
+    @staticmethod
+    def _u64_constant(value: int) -> ir.Constant:
+        value &= (1 << 64) - 1
+        if value >= (1 << 63):
+            value -= 1 << 64
+        return ir.Constant(ir.IntType(64), value)
+
+    def _random_source_state_ptr(self, source_value: ir.Value) -> ir.Value:
+        i64 = ir.IntType(64)
+        random_type = self.structs.get('RandomSource')
+        if random_type is not None:
+            if isinstance(source_value.type, ir.PointerType) and source_value.type.pointee == random_type:
+                return self.builder.gep(source_value, [
+                    ir.Constant(ir.IntType(32), 0),
+                    ir.Constant(ir.IntType(32), 0),
+                ], inbounds=True)
+            if source_value.type == random_type:
+                tmp = self.builder.alloca(random_type, name='_random_source_tmp')
+                self.builder.store(source_value, tmp)
+                return self.builder.gep(tmp, [
+                    ir.Constant(ir.IntType(32), 0),
+                    ir.Constant(ir.IntType(32), 0),
+                ], inbounds=True)
+        tmp = self.builder.alloca(i64, name='_random_source_state')
+        self.builder.store(ir.Constant(i64, 0), tmp)
+        return tmp
+
+    def _random_next_u64(self, state_ptr: ir.Value) -> ir.Value:
+        i64 = ir.IntType(64)
+        zero = ir.Constant(i64, 0)
+        x = self.builder.load(state_ptr, name='_random_state')
+        is_zero = self.builder.icmp_unsigned('==', x, zero, name='_random_state_zero')
+        x = self.builder.select(is_zero, self._u64_constant(0xE220A8397B1DCDAF), x, name='_random_state_seeded')
+        x = self.builder.xor(x, self.builder.lshr(x, ir.Constant(i64, 12)), name='_random_xor_12')
+        x = self.builder.xor(x, self.builder.shl(x, ir.Constant(i64, 25)), name='_random_xor_25')
+        x = self.builder.xor(x, self.builder.lshr(x, ir.Constant(i64, 27)), name='_random_xor_27')
+        self.builder.store(x, state_ptr)
+        return self.builder.mul(x, self._u64_constant(0x2545F4914F6CDD1D), name='_random_next')
+
+    def _random_index_below(self, state_ptr: ir.Value, span: ir.Value) -> ir.Value:
+        i64 = ir.IntType(64)
+        zero = ir.Constant(i64, 0)
+        threshold = self.builder.urem(self.builder.sub(zero, span), span, name='_random_threshold')
+        value_ptr = self.builder.alloca(i64, name='_random_value')
+        draw_block = self.builder.append_basic_block('random_range_draw')
+        done_block = self.builder.append_basic_block('random_range_done')
+        self.builder.branch(draw_block)
+
+        self.builder.position_at_start(draw_block)
+        value = self._random_next_u64(state_ptr)
+        self.builder.store(value, value_ptr)
+        too_low = self.builder.icmp_unsigned('<', value, threshold, name='_random_reject')
+        self.builder.cbranch(too_low, draw_block, done_block)
+
+        self.builder.position_at_start(done_block)
+        accepted = self.builder.load(value_ptr, name='_random_accepted')
+        return self.builder.urem(accepted, span, name='_random_index')
+
+    def _gen_random_shuffle(self, name: str, source_value: ir.Value, list_value: ir.Value) -> ir.Value:
+        list_ptr = self._as_list_ptr(list_value)
+        if list_ptr is None:
+            type_args = self._collection_type_args(name)
+            elem_type = type_args[0] if type_args else ir.IntType(32)
+            return self._list_new(elem_type, ir.Constant(ir.IntType(64), 0))
+
+        i64 = ir.IntType(64)
+        result = self._copy_list_value(list_ptr, name='_random_shuffle_result')
+        length = self._list_length(result)
+        state_ptr = self._random_source_state_ptr(source_value)
+        index_ptr = self.builder.alloca(i64, name='_random_shuffle_i')
+
+        init_block = self.builder.append_basic_block('random_shuffle_init')
+        cond_block = self.builder.append_basic_block('random_shuffle_cond')
+        body_block = self.builder.append_basic_block('random_shuffle_body')
+        done_block = self.builder.append_basic_block('random_shuffle_done')
+        has_items = self.builder.icmp_unsigned('>', length, ir.Constant(i64, 1), name='_random_shuffle_has_items')
+        self.builder.cbranch(has_items, init_block, done_block)
+
+        self.builder.position_at_start(init_block)
+        self.builder.store(self.builder.sub(length, ir.Constant(i64, 1), name='_random_shuffle_last'), index_ptr)
+        self.builder.branch(cond_block)
+
+        self.builder.position_at_start(cond_block)
+        index = self.builder.load(index_ptr, name='_random_shuffle_i_val')
+        keep_shuffling = self.builder.icmp_unsigned('>', index, ir.Constant(i64, 0), name='_random_shuffle_more')
+        self.builder.cbranch(keep_shuffling, body_block, done_block)
+
+        self.builder.position_at_start(body_block)
+        span = self.builder.add(index, ir.Constant(i64, 1), name='_random_shuffle_span')
+        swap_index = self._random_index_below(state_ptr, span)
+        item_ptr = self._list_element_ptr(result, index)
+        swap_ptr = self._list_element_ptr(result, swap_index)
+        tmp = self.builder.load(item_ptr, name='_random_shuffle_tmp')
+        self.builder.store(self.builder.load(swap_ptr, name='_random_shuffle_other'), item_ptr)
+        self.builder.store(tmp, swap_ptr)
+        self.builder.store(self.builder.sub(index, ir.Constant(i64, 1), name='_random_shuffle_prev'), index_ptr)
+        self.builder.branch(cond_block)
+
+        self.builder.position_at_start(done_block)
+        return result
 
     def _clamp_list_index(self, value: ir.Value, length: ir.Value) -> ir.Value:
         i64 = ir.IntType(64)
@@ -6126,29 +9928,16 @@ class LLVMCodeGenerator(EzLangVisitor):
         func_name = ctx.VAR_IDENTIFIER().getText()
         generic_args = ctx.genericArgs()
         if generic_args is not None:
-            type_args = [self._map_type(t) for t in generic_args.type_()]
-            func_name = self._monomorphize(func_name, type_args)
-        func = self.module.get_global(func_name)
-        if func is None or not isinstance(func, ir.Function):
-            return None
-
-        # 构建参数：% 占位符替换为管道左侧的值
-        call_args = []
-        has_percent = False
-        arg_list = ctx.pipelineArgList()
-        if arg_list is not None:
-            for a in arg_list.pipelineArg():
-                if a.PERCENT() is not None:
-                    call_args.append(pipe_val)
-                    has_percent = True
-                elif a.expression() is not None:
-                    val = self._eval(a.expression())
-                    call_args.append(val if val is not None else ir.Constant(ir.IntType(32), 0))
-        # 如果没有显式的 % 占位符，管道值作为第一个参数
-        if not has_percent:
-            call_args.insert(0, pipe_val)
-
-        return self.builder.call(func, call_args)
+            type_arg_ctxs = list(generic_args.type_())
+            type_args = [self._map_type(t) for t in type_arg_ctxs]
+            func_name = self._monomorphize(
+                func_name,
+                type_args,
+                [self._type_ctx_suffix(t) for t in type_arg_ctxs],
+                [self._type_ctx_is_unsigned(t) for t in type_arg_ctxs],
+                [self._type_ctx_name(t) for t in type_arg_ctxs],
+            )
+        return self._gen_pipeline_function_call(func_name, pipe_val, ctx.pipelineArgList())
 
     # 条件表达式（三元）
     def visitConditionalExpression(self, ctx: EzLangParser.ConditionalExpressionContext):
@@ -6304,7 +10093,14 @@ class LLVMCodeGenerator(EzLangVisitor):
                 self.builder.ret_void()
         else:
             self._restore_active_arena_scopes()
-            self.builder.ret_void()
+            if (
+                self.current_function is not None
+                and self.current_function.name == 'main'
+                and not isinstance(self.current_function.function_type.return_type, ir.VoidType)
+            ):
+                self.builder.ret(self._zero_constant(self.current_function.function_type.return_type))
+            else:
+                self.builder.ret_void()
         return None
 
     def visitBlock(self, ctx: EzLangParser.BlockContext):
@@ -6587,7 +10383,8 @@ class LLVMCodeGenerator(EzLangVisitor):
 
 
 def compile_source(source: str, module_name: str = "ezlang", compile_target: Optional[str] = None,
-                   target_arch: Optional[str] = None, log_compile_min_level: Optional[int] = None):
+                   target_arch: Optional[str] = None, log_compile_min_level: Optional[int] = None,
+                   ensure_entrypoint: bool = False, base_dir: Optional[Path | str] = None):
     """编译 EzLang 源码 → (LLVM Module, 解析错误, extern 库列表)"""
     from antlr4 import InputStream, CommonTokenStream
     from parser.EzLangLexer import EzLangLexer
@@ -6607,6 +10404,8 @@ def compile_source(source: str, module_name: str = "ezlang", compile_target: Opt
         compile_target=compile_target,
         target_arch=target_arch,
         log_compile_min_level=log_compile_min_level,
+        ensure_entrypoint=ensure_entrypoint,
+        base_dir=base_dir,
     )
     codegen.visitCompilationUnit(tree)
     errors = list(_parse_errors) + codegen._extern_diagnostics

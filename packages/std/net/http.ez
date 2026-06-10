@@ -4,6 +4,7 @@
 extern "@std/native/net/http.c" for linux;
 extern "@std/native/net/http.c" for macos;
 extern "@std/native/net/http.c" for windows;
+extern "ws2_32" for windows;
 extern "@std/native/net/http.c" for android;
 extern "@std/native/net/http.c" for ios;
 extern "@std/emcc/net/http.js" for emcc;
@@ -28,10 +29,9 @@ export type RouteHandler = (req: HttpRequest) => HttpResponse;
 
 export struct HttpServer {
     handle: I64;
-    // HTTP 服务端当前明确不支持：handle = 0，以下方法为空操作。
-    on = (this: HttpServer, path: Str, handler: RouteHandler): Void => {};
-    start = (this: HttpServer): Void => {};
-    stop = (this: HttpServer): Void => {};
+    on(this: HttpServer, path: Str, handler: RouteHandler) => Void;
+    start(this: HttpServer) => Void;
+    stop(this: HttpServer) => Void;
 };
 
 export declare const fetch: (url: Str) => HttpResponse?;

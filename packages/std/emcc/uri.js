@@ -60,6 +60,12 @@
     return String(value || '').toLowerCase();
   }
 
+  function parsePort(value) {
+    if (!/^\d+$/.test(value || '')) return null;
+    var port = Number(value);
+    return port >= 0 && port <= 65535 ? port : null;
+  }
+
   function parse(url) {
     url = text(url);
     var schemeMatch = /^([^:/?#]+):/.exec(url);
@@ -83,12 +89,18 @@
         var close = hostPort.indexOf(']');
         if (close < 0) return null;
         parts.host = lower(hostPort.slice(0, close + 1));
-        if (hostPort.charAt(close + 1) === ':') parts.port = Number.parseInt(hostPort.slice(close + 2), 10) | 0;
+        if (hostPort.charAt(close + 1) === ':') {
+          parts.port = parsePort(hostPort.slice(close + 2));
+          if (parts.port === null) return null;
+        } else if (close + 1 !== hostPort.length) {
+          return null;
+        }
       } else {
         var colon = hostPort.lastIndexOf(':');
         if (colon >= 0) {
           parts.host = lower(hostPort.slice(0, colon));
-          parts.port = Number.parseInt(hostPort.slice(colon + 1), 10) | 0;
+          parts.port = parsePort(hostPort.slice(colon + 1));
+          if (parts.port === null) return null;
         } else {
           parts.host = lower(hostPort);
         }
@@ -107,19 +119,26 @@
     return parts;
   }
 
-  function build(parts) {
+  function hasAuthorityMarker(url) {
+    url = String(url || '');
+    var match = /^[A-Za-z][A-Za-z0-9+.-]*:/.exec(url);
+    return !!(match && url.slice(match[0].length, match[0].length + 2) === '//');
+  }
+
+  function build(parts, forceAuthority) {
     if (!parts || !parts.scheme) return '';
     var out = parts.scheme + ':';
-    if (parts.host || parts.userInfo) {
+    var hasAuthority = !!(forceAuthority || parts.host || parts.userInfo);
+    if (hasAuthority) {
       out += '//';
       if (parts.userInfo) out += parts.userInfo + '@';
       out += parts.host || '';
       if (parts.port >= 0) out += ':' + parts.port;
     }
     if (parts.path) {
-      if (parts.host && parts.path.charAt(0) !== '/') out += '/';
+      if (hasAuthority && parts.path.charAt(0) !== '/') out += '/';
       out += parts.path;
-    } else if (parts.host) {
+    } else if (hasAuthority) {
       out += '/';
     }
     if (parts.query) out += '?' + parts.query;
@@ -173,6 +192,46 @@
     return -1;
   }
 
+  function appendCodePointUtf8(bytes, cp) {
+    if (cp <= 0x7f) {
+      bytes.push(cp);
+    } else if (cp <= 0x7ff) {
+      bytes.push(0xc0 | (cp >> 6), 0x80 | (cp & 0x3f));
+    } else if (cp >= 0xd800 && cp <= 0xdfff) {
+      return false;
+    } else if (cp <= 0xffff) {
+      bytes.push(0xe0 | (cp >> 12), 0x80 | ((cp >> 6) & 0x3f), 0x80 | (cp & 0x3f));
+    } else if (cp <= 0x10ffff) {
+      bytes.push(0xf0 | (cp >> 18), 0x80 | ((cp >> 12) & 0x3f), 0x80 | ((cp >> 6) & 0x3f), 0x80 | (cp & 0x3f));
+    } else {
+      return false;
+    }
+    return true;
+  }
+
+  function validUtf8Bytes(bytes) {
+    var i = 0;
+    while (i < bytes.length) {
+      var ch = bytes[i];
+      var width = 0;
+      if (ch < 0x80) width = 1;
+      else if (ch >= 0xc2 && ch <= 0xdf) width = 2;
+      else if (ch >= 0xe0 && ch <= 0xef) width = 3;
+      else if (ch >= 0xf0 && ch <= 0xf4) width = 4;
+      else return false;
+      if (i + width > bytes.length) return false;
+      for (var j = 1; j < width; j++) {
+        if ((bytes[i + j] & 0xc0) !== 0x80) return false;
+      }
+      if (width === 3 && ch === 0xe0 && bytes[i + 1] < 0xa0) return false;
+      if (width === 3 && ch === 0xed && bytes[i + 1] >= 0xa0) return false;
+      if (width === 4 && ch === 0xf0 && bytes[i + 1] < 0x90) return false;
+      if (width === 4 && ch === 0xf4 && bytes[i + 1] > 0x8f) return false;
+      i += width;
+    }
+    return true;
+  }
+
   function percentDecodeString(value, queryMode) {
     value = String(value || '');
     var bytes = [];
@@ -188,9 +247,13 @@
         bytes.push((hi << 4) | lo);
         i += 2;
       } else {
-        bytes.push(ch.charCodeAt(0) & 0xff);
+        var cp = value.codePointAt(i);
+        if (cp > 0xffff) i++;
+        if (!appendCodePointUtf8(bytes, cp)) return null;
       }
     }
+    if (bytes.indexOf(0) >= 0) return null;
+    if (!validUtf8Bytes(bytes)) return null;
     var ptr = _malloc(bytes.length + 1);
     HEAPU8.set(bytes, ptr);
     HEAPU8[ptr + bytes.length] = 0;
@@ -213,7 +276,7 @@
   function queryGet(queryPtr, keyPtr) {
     var query = text(queryPtr);
     var key = text(keyPtr);
-    var entries = query ? query.split('&') : [];
+    var entries = query ? query.split('&').filter(function (entry) { return entry.length > 0; }) : [];
     for (var i = 0; i < entries.length; i++) {
       var entry = entries[i];
       var eq = entry.indexOf('=');
@@ -228,7 +291,7 @@
     var key = text(keyPtr);
     var encodedKey = percentEncodeString(key, true);
     var encodedValue = percentEncode(valuePtr, true);
-    var entries = query ? query.split('&') : [];
+    var entries = query ? query.split('&').filter(function (entry) { return entry.length > 0; }) : [];
     var replaced = false;
     for (var i = 0; i < entries.length; i++) {
       var eq = entries[i].indexOf('=');
@@ -252,8 +315,9 @@
     uriNormalize: function (url) {
       var parts = parse(url);
       if (!parts) return stringToNewUTF8('');
-      parts.path = normalizePath(parts.path);
-      return stringToNewUTF8(build(parts));
+      var forceAuthority = hasAuthorityMarker(text(url));
+      parts.path = !forceAuthority && !parts.path ? '' : normalizePath(parts.path);
+      return stringToNewUTF8(build(parts, forceAuthority));
     },
     uriScheme: function (ret, url) {
       var parts = parse(url);

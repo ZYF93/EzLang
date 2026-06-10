@@ -1,6 +1,8 @@
 """ez CLI 工具链测试"""
 
+import base64
 import builtins
+import hashlib
 import os
 import socket
 import subprocess
@@ -19,6 +21,25 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "compiler" / "src"))
 
 from cli import ez
+
+
+def _ws_header_value(request: bytes, name: str) -> bytes:
+    prefix = name.lower().encode("ascii") + b":"
+    for line in request.split(b"\r\n"):
+        if line.lower().startswith(prefix):
+            return line[len(prefix):].strip()
+    return b""
+
+
+def _ws_handshake_response(request: bytes) -> bytes:
+    key = _ws_header_value(request, "Sec-WebSocket-Key")
+    accept = base64.b64encode(hashlib.sha1(key + b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11").digest())
+    return (
+        b"HTTP/1.1 101 Switching Protocols\r\n"
+        b"Upgrade: websocket\r\n"
+        b"Connection: Upgrade\r\n"
+        b"Sec-WebSocket-Accept: " + accept + b"\r\n\r\n"
+    )
 
 
 def write_project(
@@ -108,6 +129,133 @@ def test_subcommand_help(command, capsys):
     assert command in out
 
 
+def test_build_auto_discovers_project_from_child_directory(tmp_path, monkeypatch, capsys):
+    write_project(tmp_path, os_name="linux")
+    child = tmp_path / "src" / "nested"
+    child.mkdir()
+    monkeypatch.chdir(child)
+
+    assert ez.main(["build"]) == 0
+
+    out = capsys.readouterr().out
+    assert "built linux/x86_64" in out
+    assert (tmp_path / "dist" / "linux" / "demo.ll").exists()
+
+
+def test_build_native_links_entry_without_user_main(tmp_path, capsys):
+    project_toml = write_project(
+        tmp_path,
+        os_name=ez._native_os(),
+        arch=ez._native_arch(),
+    )
+    (tmp_path / "src" / "index.ez").write_text(
+        "type Answer = { value: I32; };\n",
+        encoding="utf-8",
+    )
+
+    assert ez.main(["build", "--project", str(project_toml)]) == 0
+
+    out = capsys.readouterr().out
+    assert "executable:" in out
+    assert (tmp_path / "dist" / ez._native_os() / "demo").exists()
+
+
+def test_run_accepts_explicit_file_without_project(tmp_path, monkeypatch):
+    source = tmp_path / "loose.ez"
+    source.write_text(
+        'from "std/os" import { exit };\nlet $code: I32 = 3;\n$code = $code + 1;\nexit(code = $code);\n',
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+
+    assert ez.main(["run", str(source)]) == 4
+
+    exe_file = tmp_path / ".ez" / "run" / "loose" / "loose"
+    assert exe_file.exists()
+
+
+def test_run_auto_discovers_project_and_allows_entry_override(tmp_path, monkeypatch):
+    write_project(
+        tmp_path,
+        os_name=ez._native_os(),
+        arch=ez._native_arch(),
+    )
+    alt = tmp_path / "src" / "alt.ez"
+    alt.write_text("const main = (): I32 => { return 0; };\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path / "src")
+
+    assert ez.main(["run", "alt.ez"]) == 0
+
+
+def test_run_executes_top_level_file_without_user_main(tmp_path, monkeypatch):
+    write_project(
+        tmp_path,
+        os_name=ez._native_os(),
+        arch=ez._native_arch(),
+    )
+    source = tmp_path / "src" / "exit_top_level.ez"
+    source.write_text(
+        'from "std/os" import { exit };\nexit(code = 6);\n',
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path / "src")
+
+    assert ez.main(["run", "exit_top_level.ez"]) == 6
+
+
+def test_init_creates_default_project_and_run_uses_auto_discovery(tmp_path, monkeypatch, capfd):
+    target = tmp_path / "sample-app"
+
+    assert ez.main(["init", str(target), "--name", "sample"]) == 0
+
+    assert (target / "project.toml").exists()
+    assert (target / "src" / "main.ez").exists()
+    monkeypatch.chdir(target)
+    assert ez.main(["run"]) == 0
+
+    out = capfd.readouterr().out
+    assert f"initialized {target}" in out
+    assert "Hello from sample" in out
+
+
+def test_init_template_clones_remote_git_template(tmp_path, monkeypatch, capsys):
+    calls = []
+
+    def fake_run(cmd, text=False, capture_output=False):
+        calls.append((cmd, text, capture_output))
+        clone_dir = Path(cmd[-1])
+        clone_dir.mkdir(parents=True)
+        (clone_dir / ".git").mkdir()
+        (clone_dir / "src").mkdir()
+        (clone_dir / "project.toml").write_text(
+            '[project]\nname = "tmpl"\nversion = "0.1.0"\nmain = "src/main.ez"\n',
+            encoding="utf-8",
+        )
+        (clone_dir / "src" / "main.ez").write_text(
+            "const main = (): I32 => { return 0; };\n",
+            encoding="utf-8",
+        )
+
+        class Result:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+
+        return Result()
+
+    monkeypatch.setattr(ez.subprocess, "run", fake_run)
+    target = tmp_path / "templated"
+
+    assert ez.main(["init", str(target), "--template", "https://example.com/template.git"]) == 0
+
+    assert calls[0][0][:4] == ["git", "clone", "--depth", "1"]
+    assert calls[0][0][4] == "https://example.com/template.git"
+    assert (target / "project.toml").exists()
+    assert (target / "src" / "main.ez").exists()
+    assert not (target / ".git").exists()
+    assert f"initialized {target}" in capsys.readouterr().out
+
+
 def test_build_writes_ir_for_output(tmp_path, capsys):
     project_toml = write_project(tmp_path, os_name="linux")
 
@@ -194,6 +342,116 @@ def test_project_optimize_defaults_to_documented_level(tmp_path):
     config = ez.load_project(project_toml, require_main=True)
 
     assert config.optimize == 2
+
+
+def test_build_discovers_default_entry_when_project_main_is_omitted(tmp_path, capsys):
+    project_toml = write_project(tmp_path, os_name="linux")
+    text = project_toml.read_text(encoding="utf-8")
+    project_toml.write_text(text.replace('main = "src/index.ez"\n', ""), encoding="utf-8")
+
+    assert ez.main(["build", "--project", str(project_toml)]) == 0
+
+    out = capsys.readouterr().out
+    assert "built linux/x86_64" in out
+    assert (tmp_path / "dist" / "linux" / "demo.ll").exists()
+
+
+def test_run_executes_top_level_statements_without_user_main(tmp_path):
+    project_toml = write_project(
+        tmp_path,
+        os_name=ez._native_os(),
+        arch=ez._native_arch(),
+    )
+    (tmp_path / "src" / "index.ez").write_text(
+        'from "std/os" import { exit };\nlet $code: I32 = 2;\n$code = $code + 3;\nexit(code = $code);\n',
+        encoding="utf-8",
+    )
+
+    assert ez.main(["run", "--project", str(project_toml)]) == 5
+
+    exe_file = tmp_path / "dist" / ez._native_os() / "demo"
+    assert exe_file.exists()
+
+
+def test_run_executes_top_level_declarations_in_file_order_without_user_main(tmp_path):
+    project_toml = write_project(
+        tmp_path,
+        os_name=ez._native_os(),
+        arch=ez._native_arch(),
+    )
+    (tmp_path / "src" / "index.ez").write_text(
+        'from "std/os" import { exit };\n'
+        'let $code: I32 = 1;\n'
+        '$code = $code + 2;\n'
+        'let after: I32 = $code * 2;\n'
+        '$code = after + 1;\n'
+        'exit(code = $code);\n',
+        encoding="utf-8",
+    )
+
+    assert ez.main(["run", "--project", str(project_toml)]) == 7
+
+
+def test_run_allows_top_level_return_without_user_main(tmp_path):
+    project_toml = write_project(
+        tmp_path,
+        os_name=ez._native_os(),
+        arch=ez._native_arch(),
+    )
+    (tmp_path / "src" / "index.ez").write_text("return 7;\n", encoding="utf-8")
+
+    assert ez.main(["run", "--project", str(project_toml)]) == 7
+
+
+def test_run_executes_top_level_flow_parallel_without_user_main(tmp_path):
+    project_toml = write_project(
+        tmp_path,
+        os_name=ez._native_os(),
+        arch=ez._native_arch(),
+    )
+    (tmp_path / "src" / "index.ez").write_text(
+        'from "std/os" import { exit };\n'
+        'const value = flow {\n'
+        '    const p = parallel { return 7; };\n'
+        '    return p + 1;\n'
+        '};\n'
+        'exit(code = value);\n',
+        encoding="utf-8",
+    )
+
+    assert ez.main(["run", "--project", str(project_toml)]) == 8
+
+
+def test_run_infers_top_level_flow_parallel_str_without_user_main(tmp_path):
+    project_toml = write_project(
+        tmp_path,
+        os_name=ez._native_os(),
+        arch=ez._native_arch(),
+    )
+    (tmp_path / "src" / "index.ez").write_text(
+        'from "std/os" import { exit };\n'
+        'from "std/test" import { testReset, testEqualStr, testFailed };\n'
+        'testReset();\n'
+        'const value = flow {\n'
+        '    const p = parallel { return "ok"; };\n'
+        '    return p;\n'
+        '};\n'
+        'testEqualStr(actual = value, expected = "ok", msg = "top-level flow str");\n'
+        'exit(code = testFailed());\n',
+        encoding="utf-8",
+    )
+
+    assert ez.main(["run", "--project", str(project_toml)]) == 0
+
+
+def test_load_project_rejects_ambiguous_default_entries(tmp_path):
+    project_toml = write_project(tmp_path)
+    text = project_toml.read_text(encoding="utf-8")
+    project_toml.write_text(text.replace('main = "src/index.ez"\n', ""), encoding="utf-8")
+    (tmp_path / "src" / "main.ez").write_text("let x: I32 = 1;\n", encoding="utf-8")
+
+    with pytest.raises(ez.CliError, match="多个默认入口"):
+        ez.load_project(project_toml, require_main=True)
 
 
 def test_project_log_compile_min_level_is_parsed(tmp_path):
@@ -486,6 +744,52 @@ def test_run_links_c_extern_from_search_path(tmp_path):
     assert ez.main(["run", "--project", str(project_toml)]) == 9
 
 
+def test_run_links_c_extern_callback_returning_large_struct(tmp_path):
+    project_toml = write_project(
+        tmp_path,
+        os_name=ez._native_os(),
+        arch=ez._native_arch(),
+    )
+    libs_dir = tmp_path / "libs"
+    libs_dir.mkdir()
+    (libs_dir / "native.c").write_text(
+        """
+#include <stdint.h>
+
+typedef struct {
+    int64_t a;
+    int64_t b;
+    int64_t c;
+} Pair;
+
+typedef Pair (*PairCallback)(int32_t);
+
+int call_pair(PairCallback cb) {
+    Pair out = cb(7);
+    return (out.a == 7 && out.b == 8 && out.c == 9) ? 0 : 1;
+}
+""".lstrip(),
+        encoding="utf-8",
+    )
+    project_toml.write_text(
+        project_toml.read_text(encoding="utf-8")
+        + '\n[extern]\nsearch_paths = ["libs"]\n',
+        encoding="utf-8",
+    )
+    (tmp_path / "src" / "index.ez").write_text(
+        'extern "native.c";\n'
+        'struct Pair { a: I64; b: I64; c: I64; };\n'
+        'declare const call_pair: (cb: (x: I32) => Pair) => I32;\n'
+        'const make_pair = (x: I32): Pair => {\n'
+        '    return Pair(a = x, b = x + 1, c = x + 2);\n'
+        '};\n'
+        'const main = (): I32 => { return call_pair(cb = make_pair); };\n',
+        encoding="utf-8",
+    )
+
+    assert ez.main(["run", "--project", str(project_toml)]) == 0
+
+
 def test_run_links_std_time_extern_without_libc_sleep_conflict(tmp_path):
     project_toml = write_project(
         tmp_path,
@@ -513,7 +817,7 @@ def test_run_links_std_time_date_methods_native_abi(tmp_path):
     )
     (tmp_path / "src" / "index.ez").write_text(
         'from "std/time" import { now, getYear, getMonth, getDay, getHour, getMinute, getSecond, add, sub, format };\n'
-        'from "std/test" import { testReset, testEqualStr, testFailed };\n'
+        'from "std/test" import { testReset, testEqualI64, testEqualStr, testFailed };\n'
         'const main = (): I32 => {\n'
         '    testReset();\n'
         '    const current = now();\n'
@@ -525,9 +829,47 @@ def test_run_links_std_time_date_methods_native_abi(tmp_path):
         '    const second = getSecond(this = current);\n'
         '    add(this = current, year = 1, month = 0, day = 0, hour = 0, minute = 0, second = 0);\n'
         '    sub(this = current, year = 1, month = 0, day = 0, hour = 0, minute = 0, second = 0);\n'
-        '    const epoch = Date(timestamp = 0);\n'
+        '    let epoch = Date(timestamp = 0);\n'
+        '    const before_epoch = Date(timestamp = -1);\n'
         '    testEqualStr(actual = format(this = epoch, fmt = "YYYY-MM-DD HH:%M:SS"), expected = "1970-01-01 00:00:00", msg = "mixed time format");\n'
+        '    testEqualStr(actual = format(this = epoch, fmt = "YYYY-MM-DD HH:mm:SS"), expected = "1970-01-01 00:00:00", msg = "named minute time format");\n'
         '    testEqualStr(actual = format(this = epoch, fmt = "%Y-%m-%d %H:%M:%S"), expected = "1970-01-01 00:00:00", msg = "strftime time format");\n'
+        '    add(this = epoch, year = 1, month = 0, day = 0, hour = 0, minute = 0, second = 0);\n'
+        '    testEqualStr(actual = format(this = epoch, fmt = "%Y-%m-%d"), expected = "1971-01-01", msg = "date add mutates this");\n'
+        '    sub(this = epoch, year = 1, month = 0, day = 0, hour = 0, minute = 0, second = 0);\n'
+        '    testEqualStr(actual = format(this = epoch, fmt = "%Y-%m-%d"), expected = "1970-01-01", msg = "date sub mutates this");\n'
+        '    testEqualI64(actual = getYear(this = before_epoch), expected = 1969, msg = "negative timestamp year");\n'
+        '    testEqualStr(actual = format(this = before_epoch, fmt = "%Y-%m-%d %H:%M:%S"), expected = "1969-12-31 23:59:59", msg = "negative timestamp floor seconds");\n'
+        '    return testFailed();\n'
+        '};\n',
+        encoding="utf-8",
+    )
+
+    assert ez.main(["run", "--project", str(project_toml)]) == 0
+
+
+def test_run_links_std_time_duration_and_long_format(tmp_path):
+    project_toml = write_project(
+        tmp_path,
+        os_name=ez._native_os(),
+        arch=ez._native_arch(),
+    )
+    long_fmt = "x" * 160 + "YYYY-MM-DD"
+    expected = "x" * 160 + "1970-01-01"
+    (tmp_path / "src" / "index.ez").write_text(
+        'from "std/time" import { Duration, durationToString, format };\n'
+        'from "std/test" import { testReset, testEqualI64, testEqualStr, testFailed };\n'
+        'const main = (): I32 => {\n'
+        '    testReset();\n'
+        '    const seconds = Duration.fromSec(s = 2);\n'
+        '    const minutes = Duration.fromMin(m = 1);\n'
+        '    const epoch = Date(timestamp = 0);\n'
+        f'    const formatted = format(this = epoch, fmt = "{long_fmt}");\n'
+        '    testEqualI64(actual = seconds.ms, expected = 2000, msg = "seconds to milliseconds");\n'
+        '    testEqualI64(actual = minutes.ms, expected = 60000, msg = "minutes to milliseconds");\n'
+        '    testEqualStr(actual = seconds.toString(), expected = "2000ms", msg = "duration method string");\n'
+        '    testEqualStr(actual = durationToString(value = minutes), expected = "60000ms", msg = "duration function string");\n'
+        f'    testEqualStr(actual = formatted, expected = "{expected}", msg = "long time format not truncated");\n'
         '    return testFailed();\n'
         '};\n',
         encoding="utf-8",
@@ -550,8 +892,16 @@ def test_run_links_std_fmt_basic_native_functions(tmp_path):
         '    const parsed = parseInt(s = "42");\n'
         '    const parsed_i64 = parseI64(s = "123456789");\n'
         '    const parsed_f64 = parseF64(s = "3.5");\n'
+        '    const unicode_i32 = parseInt(s = "\\u00A0+42\\u3000");\n'
+        '    const unicode_i64 = parseI64(s = "\\u2007-123456789\\u202F");\n'
+        '    const unicode_f64 = parseF64(s = "\\u205F+.5\\u3000");\n'
         '    const bad_i32 = parseInt(s = "bad");\n'
+        '    const bad_i64_float = parseI64(s = "42.0");\n'
+        '    const bad_i32_hex = parseInt(s = "0x10");\n'
+        '    const bad_i32_feff = parseInt(s = "\\uFEFF42");\n'
         '    const bad_f64 = parseF64(s = "bad");\n'
+        '    const bad_f64_hex = parseF64(s = "0x1p2");\n'
+        '    const bad_f64_nan = parseF64(s = "nan");\n'
         '    const blob = Blob(data = "hello", size = 5);\n'
         '    const encoded = b64Encode(data = blob);\n'
         '    const decoded = b64Decode(s = encoded);\n'
@@ -563,8 +913,19 @@ def test_run_links_std_fmt_basic_native_functions(tmp_path):
         '    testEqualI64(actual = parsed_i64.value, expected = 123456789, msg = "parse i64 value");\n'
         '    testAssert(condition = parsed_f64.ok, msg = "parse f64 ok");\n'
         '    testAssert(condition = parsed_f64.value > 3.49 && parsed_f64.value < 3.51, msg = "parse f64 value");\n'
+        '    testAssert(condition = unicode_i32.ok, msg = "parse i32 trims unicode space");\n'
+        '    testEqualI64(actual = unicode_i32.value, expected = 42, msg = "parse i32 unicode value");\n'
+        '    testAssert(condition = unicode_i64.ok, msg = "parse i64 trims unicode space");\n'
+        '    testEqualI64(actual = unicode_i64.value, expected = -123456789, msg = "parse i64 unicode value");\n'
+        '    testAssert(condition = unicode_f64.ok, msg = "parse f64 trims unicode space");\n'
+        '    testAssert(condition = unicode_f64.value > 0.49 && unicode_f64.value < 0.51, msg = "parse f64 unicode value");\n'
         '    testAssert(condition = !bad_i32.ok, msg = "parse i32 invalid");\n'
+        '    testAssert(condition = !bad_i64_float.ok, msg = "parse i64 rejects float syntax");\n'
+        '    testAssert(condition = !bad_i32_hex.ok, msg = "parse i32 rejects hex syntax");\n'
+        '    testAssert(condition = !bad_i32_feff.ok, msg = "parse i32 does not trim feff");\n'
         '    testAssert(condition = !bad_f64.ok, msg = "parse f64 invalid");\n'
+        '    testAssert(condition = !bad_f64_hex.ok, msg = "parse f64 rejects hex float");\n'
+        '    testAssert(condition = !bad_f64_nan.ok, msg = "parse f64 rejects nan");\n'
         '    return testFailed();\n'
         '};\n',
         encoding="utf-8",
@@ -647,34 +1008,752 @@ def test_run_std_fmt_json_and_msgpack_basic_roundtrip(tmp_path):
         arch=ez._native_arch(),
     )
     (tmp_path / "src" / "index.ez").write_text(
-        'from "std/fmt" import { jsonStringify, jsonParse, msgpackEncode, msgpackDecode };\n'
+        'from "std/fmt" import { toString, jsonStringify, jsonParse, msgpackEncode, msgpackDecode };\n'
         'from "std/test" import { testReset, testAssert, testEqualI64, testEqualStr, testFailed };\n'
         'const main = (): I32 => {\n'
         '    testReset();\n'
         '    const json_i32 = jsonStringify<I32>(data = 42);\n'
         '    const parsed_i32 = jsonParse<I32>(s = json_i32);\n'
+        '    const json_i8 = jsonStringify<I8>(data = -128);\n'
+        '    const parsed_i8 = jsonParse<I8>(s = json_i8);\n'
         '    const json_i64 = jsonStringify<I64>(data = 123456789);\n'
         '    const parsed_i64 = jsonParse<I64>(s = json_i64);\n'
+        '    const json_u8 = jsonStringify<U8>(data = 255);\n'
+        '    const parsed_u8 = jsonParse<U8>(s = json_u8);\n'
+        '    const json_u32 = jsonStringify<U32>(data = 4294967295);\n'
+        '    const parsed_u32 = jsonParse<U32>(s = json_u32);\n'
+        '    const json_u64 = jsonStringify<U64>(data = 123456789);\n'
+        '    const parsed_u64 = jsonParse<U64>(s = json_u64);\n'
+        '    const json_f32 = jsonStringify<F32>(data = 1.5);\n'
+        '    const parsed_f32 = jsonParse<F32>(s = json_f32);\n'
         '    const json_bool = jsonStringify<Bool>(data = true);\n'
         '    const parsed_bool = jsonParse<Bool>(s = json_bool);\n'
         '    const json_str = jsonStringify<Str>(data = "EzLang");\n'
         '    const parsed_str = jsonParse<Str>(s = json_str);\n'
         '    const packed = msgpackEncode<I64>(data = parsed_i64);\n'
         '    const unpacked = msgpackDecode<I64>(data = packed);\n'
+        '    const packed_i8 = msgpackEncode<I8>(data = parsed_i8);\n'
+        '    const unpacked_i8 = msgpackDecode<I8>(data = packed_i8);\n'
+        '    const packed_u8 = msgpackEncode<U8>(data = parsed_u8);\n'
+        '    const unpacked_u8 = msgpackDecode<U8>(data = packed_u8);\n'
+        '    const packed_u32 = msgpackEncode<U32>(data = parsed_u32);\n'
+        '    const unpacked_u32 = msgpackDecode<U32>(data = packed_u32);\n'
+        '    const packed_u64 = msgpackEncode<U64>(data = parsed_u64);\n'
+        '    const unpacked_u64 = msgpackDecode<U64>(data = packed_u64);\n'
         '    const packed_bool = msgpackEncode<Bool>(data = parsed_bool);\n'
         '    const unpacked_bool = msgpackDecode<Bool>(data = packed_bool);\n'
         '    const packed_str = msgpackEncode<Str>(data = parsed_str);\n'
         '    const unpacked_str = msgpackDecode<Str>(data = packed_str);\n'
+        '    const packed_f32 = msgpackEncode<F32>(data = parsed_f32);\n'
+        '    const unpacked_f32 = msgpackDecode<F32>(data = packed_f32);\n'
         '    const packed_f64 = msgpackEncode<F64>(data = 3.0);\n'
         '    const unpacked_f64 = msgpackDecode<F64>(data = packed_f64);\n'
         '    testEqualI64(actual = parsed_i32, expected = 42, msg = "json i32");\n'
+        '    testEqualI64(actual = parsed_i8, expected = -128, msg = "json i8");\n'
         '    testEqualI64(actual = parsed_i64, expected = 123456789, msg = "json i64");\n'
+        '    testEqualI64(actual = parsed_u8, expected = 255, msg = "json u8");\n'
+        '    testEqualStr(actual = json_u32, expected = "4294967295", msg = "json u32 text");\n'
+        '    testEqualI64(actual = parsed_u32, expected = 4294967295, msg = "json u32");\n'
+        '    testEqualI64(actual = parsed_u64, expected = 123456789, msg = "json u64");\n'
+        '    testEqualStr(actual = toString<U64>(value = parsed_u64), expected = "123456789", msg = "toString u64");\n'
+        '    testAssert(condition = parsed_f32 == 1.5, msg = "json f32");\n'
         '    testAssert(condition = parsed_bool, msg = "json bool");\n'
         '    testEqualStr(actual = parsed_str, expected = "EzLang", msg = "json str");\n'
         '    testEqualI64(actual = unpacked, expected = 123456789, msg = "msgpack i64");\n'
+        '    testEqualI64(actual = unpacked_i8, expected = -128, msg = "msgpack i8");\n'
+        '    testEqualI64(actual = unpacked_u8, expected = 255, msg = "msgpack u8");\n'
+        '    testEqualI64(actual = unpacked_u32, expected = 4294967295, msg = "msgpack u32");\n'
+        '    testEqualI64(actual = unpacked_u64, expected = 123456789, msg = "msgpack u64");\n'
         '    testAssert(condition = unpacked_bool, msg = "msgpack bool");\n'
         '    testEqualStr(actual = unpacked_str, expected = "EzLang", msg = "msgpack str");\n'
+        '    testAssert(condition = unpacked_f32 == 1.5, msg = "msgpack f32");\n'
         '    testAssert(condition = unpacked_f64 == 3.0, msg = "msgpack f64");\n'
+        '    return testFailed();\n'
+        '};\n',
+        encoding="utf-8",
+    )
+
+    assert ez.main(["run", "--project", str(project_toml)]) == 0
+
+
+def test_run_std_fmt_json_stringify_struct_basic_fields(tmp_path):
+    project_toml = write_project(
+        tmp_path,
+        os_name=ez._native_os(),
+        arch=ez._native_arch(),
+    )
+    (tmp_path / "src" / "index.ez").write_text(
+        'from "std/fmt" import { jsonStringify };\n'
+        'from "std/test" import { testReset, testEqualStr, testFailed };\n'
+        'struct User { name: Str; age: U32; active: Bool; score: F64; };\n'
+        'struct Empty {};\n'
+        'const main = (): I32 => {\n'
+        '    testReset();\n'
+        '    const u = User(name = "Ez", age = 42, active = true, score = 1.5);\n'
+        '    const empty = Empty();\n'
+        '    testEqualStr(actual = jsonStringify<User>(data = u), expected = "{\\\"name\\\":\\\"Ez\\\",\\\"age\\\":42,\\\"active\\\":true,\\\"score\\\":1.5}", msg = "json struct stringify");\n'
+        '    testEqualStr(actual = jsonStringify<Empty>(data = empty), expected = "{}", msg = "json empty struct stringify");\n'
+        '    return testFailed();\n'
+        '};\n',
+        encoding="utf-8",
+    )
+
+    assert ez.main(["run", "--project", str(project_toml)]) == 0
+
+
+def test_run_std_fmt_json_parse_struct_basic_fields(tmp_path):
+    project_toml = write_project(
+        tmp_path,
+        os_name=ez._native_os(),
+        arch=ez._native_arch(),
+    )
+    source = r'''
+from "std/fmt" import { jsonParse };
+from "std/mem" import { errIO };
+from "std/test" import { testReset, testAssert, testEqualI64, testEqualStr, testFailed };
+
+struct User { name: Str; age: U32; active: Bool; score: F64; };
+struct Empty {};
+
+const main = (): I32 => {
+    testReset();
+    const u = jsonParse<User>(s = "{\"score\":1.5,\"active\":true,\"age\":42,\"name\":\"E\\\"z,}\"}");
+    const empty = jsonParse<Empty>(s = "{}");
+    testEqualStr(actual = u.name, expected = "E\"z,}", msg = "json struct str field");
+    testEqualI64(actual = u.age, expected = 42, msg = "json struct u32 field");
+    testAssert(condition = u.active, msg = "json struct bool field");
+    testAssert(condition = u.score == 1.5, msg = "json struct f64 field");
+    testEqualI64(actual = jsonParse<User>(s = "{\"name\":\"Ez\",\"age\":7,\"active\":false,\"score\":2.0}").age, expected = 7, msg = "json struct direct field");
+
+    const missingErr = catch { const ignored = jsonParse<User>(s = "{\"name\":\"Ez\",\"age\":42,\"active\":true}"); };
+    const unknownErr = catch { const ignored = jsonParse<User>(s = "{\"name\":\"Ez\",\"age\":42,\"active\":true,\"score\":1.5,\"extra\":1}"); };
+    const duplicateErr = catch { const ignored = jsonParse<User>(s = "{\"name\":\"Ez\",\"name\":\"Other\",\"age\":42,\"active\":true,\"score\":1.5}"); };
+    const typeErr = catch { const ignored = jsonParse<User>(s = "{\"name\":\"Ez\",\"age\":-1,\"active\":true,\"score\":1.5}"); };
+    const objectErr = catch { const ignored = jsonParse<User>(s = "[]"); };
+
+    testAssert(condition = missingErr.code == errIO && unknownErr.code == errIO && duplicateErr.code == errIO, msg = "json struct field set invalid throws errIO");
+    testAssert(condition = typeErr.code == errIO && objectErr.code == errIO, msg = "json struct value invalid throws errIO");
+    return testFailed();
+};
+'''.lstrip()
+    (tmp_path / "src" / "index.ez").write_text(source, encoding="utf-8")
+
+    assert ez.main(["run", "--project", str(project_toml)]) == 0
+
+
+def test_run_std_fmt_json_nested_struct_roundtrip(tmp_path):
+    project_toml = write_project(
+        tmp_path,
+        os_name=ez._native_os(),
+        arch=ez._native_arch(),
+    )
+    source = r'''
+from "std/fmt" import { jsonStringify, jsonParse };
+from "std/mem" import { errIO };
+from "std/test" import { testReset, testAssert, testEqualI64, testEqualStr, testFailed };
+
+struct Address { city: Str; zip: U32; };
+struct User { name: Str; address: Address; active: Bool; };
+
+const main = (): I32 => {
+    testReset();
+    const original = User(name = "Ez", address = Address(city = "Shenzhen", zip = 518000), active = true);
+    const json = jsonStringify<User>(data = original);
+    testEqualStr(actual = json, expected = "{\"name\":\"Ez\",\"address\":{\"city\":\"Shenzhen\",\"zip\":518000},\"active\":true}", msg = "json nested struct stringify");
+    const decoded = jsonParse<User>(s = "{\"active\":true,\"address\":{\"zip\":518000,\"city\":\"Shenzhen\"},\"name\":\"Ez\"}");
+    testEqualStr(actual = decoded.address.city, expected = "Shenzhen", msg = "json nested struct field str");
+    testEqualI64(actual = decoded.address.zip, expected = 518000, msg = "json nested struct field u32");
+    testAssert(condition = decoded.active, msg = "json nested struct bool");
+
+    const missingNestedErr = catch { const ignored = jsonParse<User>(s = "{\"name\":\"Ez\",\"address\":{\"city\":\"Shenzhen\"},\"active\":true}"); };
+    const badNestedErr = catch { const ignored = jsonParse<User>(s = "{\"name\":\"Ez\",\"address\":[],\"active\":true}"); };
+    testAssert(condition = missingNestedErr.code == errIO && badNestedErr.code == errIO, msg = "json nested invalid throws errIO");
+    return testFailed();
+};
+'''.lstrip()
+    (tmp_path / "src" / "index.ez").write_text(source, encoding="utf-8")
+
+    assert ez.main(["run", "--project", str(project_toml)]) == 0
+
+
+def test_run_std_fmt_json_and_msgpack_struct_list_fields(tmp_path):
+    project_toml = write_project(
+        tmp_path,
+        os_name=ez._native_os(),
+        arch=ez._native_arch(),
+    )
+    source = r'''
+from "std/fmt" import { jsonStringify, jsonParse, msgpackEncode, msgpackDecode };
+from "std/mem" import { errIO };
+from "std/test" import { testReset, testAssert, testEqualI64, testEqualStr, testFailed };
+
+struct Payload { nums: List<I32>; names: Str[]; };
+
+const main = (): I32 => {
+    testReset();
+    const original = Payload(nums = [1, 2, 3], names = ["a", "b"]);
+    const json = jsonStringify<Payload>(data = original);
+    testEqualStr(actual = json, expected = "{\"nums\":[1,2,3],\"names\":[\"a\",\"b\"]}", msg = "json list fields stringify");
+
+    const parsed = jsonParse<Payload>(s = "{\"names\":[\"x\",\"y\"],\"nums\":[4,5]}");
+    testEqualI64(actual = parsed.nums[0], expected = 4, msg = "json list i32 item 0");
+    testEqualI64(actual = parsed.nums[1], expected = 5, msg = "json list i32 item 1");
+    testEqualStr(actual = parsed.names[0], expected = "x", msg = "json str array item 0");
+    testEqualStr(actual = parsed.names[1], expected = "y", msg = "json str array item 1");
+
+    const typeErr = catch { const ignored = jsonParse<Payload>(s = "{\"nums\":[1,\"bad\"],\"names\":[\"x\"]}"); };
+    testAssert(condition = typeErr.code == errIO, msg = "json list bad item throws errIO");
+
+    const decoded = msgpackDecode<Payload>(data = msgpackEncode<Payload>(data = original));
+    testEqualI64(actual = decoded.nums[2], expected = 3, msg = "msgpack list i32 item");
+    testEqualStr(actual = decoded.names[1], expected = "b", msg = "msgpack str array item");
+    return testFailed();
+};
+'''.lstrip()
+    (tmp_path / "src" / "index.ez").write_text(source, encoding="utf-8")
+
+    assert ez.main(["run", "--project", str(project_toml)]) == 0
+
+
+def test_run_std_fmt_json_and_msgpack_top_level_list(tmp_path):
+    project_toml = write_project(
+        tmp_path,
+        os_name=ez._native_os(),
+        arch=ez._native_arch(),
+    )
+    source = r'''
+from "std/fmt" import { jsonStringify, jsonParse, msgpackEncode, msgpackDecode };
+from "std/test" import { testReset, testEqualI64, testEqualStr, testFailed };
+
+const main = (): I32 => {
+    testReset();
+    const nums: List<I32> = [1, 2, 3];
+    const json = jsonStringify<List<I32>>(data = nums);
+    testEqualStr(actual = json, expected = "[1,2,3]", msg = "json top list stringify");
+
+    const parsed = jsonParse<List<I32>>(s = "[4,5]");
+    testEqualI64(actual = parsed[0], expected = 4, msg = "json top list parse");
+    testEqualI64(actual = parsed[1], expected = 5, msg = "json top list parse second");
+
+    const decoded = msgpackDecode<List<I32>>(data = msgpackEncode<List<I32>>(data = nums));
+    testEqualI64(actual = decoded[2], expected = 3, msg = "msgpack top list roundtrip");
+    return testFailed();
+};
+'''.lstrip()
+    (tmp_path / "src" / "index.ez").write_text(source, encoding="utf-8")
+
+    assert ez.main(["run", "--project", str(project_toml)]) == 0
+
+
+def test_run_std_fmt_json_and_msgpack_nested_list(tmp_path):
+    project_toml = write_project(
+        tmp_path,
+        os_name=ez._native_os(),
+        arch=ez._native_arch(),
+    )
+    source = r'''
+from "std/fmt" import { jsonStringify, jsonParse, msgpackEncode, msgpackDecode };
+from "std/test" import { testReset, testEqualI64, testEqualStr, testFailed };
+
+const main = (): I32 => {
+    testReset();
+    const rows: List<List<I32>> = [[1, 2], [3, 4]];
+    const json = jsonStringify<List<List<I32>>>(data = rows);
+    testEqualStr(actual = json, expected = "[[1,2],[3,4]]", msg = "json nested list stringify");
+
+    const parsed = jsonParse<List<List<I32>>>(s = "[[5,6],[7,8]]");
+    testEqualI64(actual = parsed[1][0], expected = 7, msg = "json nested list parse");
+
+    const decoded = msgpackDecode<List<List<I32>>>(data = msgpackEncode<List<List<I32>>>(data = rows));
+    testEqualI64(actual = decoded[1][1], expected = 4, msg = "msgpack nested list roundtrip");
+    return testFailed();
+};
+'''.lstrip()
+    (tmp_path / "src" / "index.ez").write_text(source, encoding="utf-8")
+
+    assert ez.main(["run", "--project", str(project_toml)]) == 0
+
+
+def test_run_std_fmt_json_and_msgpack_struct_nested_list_fields(tmp_path):
+    project_toml = write_project(
+        tmp_path,
+        os_name=ez._native_os(),
+        arch=ez._native_arch(),
+    )
+    source = r'''
+from "std/fmt" import { jsonStringify, jsonParse, msgpackEncode, msgpackDecode };
+from "std/test" import { testReset, testEqualI64, testEqualStr, testFailed };
+
+struct Payload { rows: List<List<I32>>; };
+
+const main = (): I32 => {
+    testReset();
+    const payload = Payload(rows = [[1, 2], [3, 4]]);
+    const json = jsonStringify<Payload>(data = payload);
+    testEqualStr(actual = json, expected = "{\"rows\":[[1,2],[3,4]]}", msg = "json struct nested list stringify");
+
+    const parsed = jsonParse<Payload>(s = "{\"rows\":[[5,6],[7,8]]}");
+    testEqualI64(actual = parsed.rows[1][0], expected = 7, msg = "json struct nested list parse");
+
+    const decoded = msgpackDecode<Payload>(data = msgpackEncode<Payload>(data = payload));
+    testEqualI64(actual = decoded.rows[1][1], expected = 4, msg = "msgpack struct nested list roundtrip");
+    return testFailed();
+};
+'''.lstrip()
+    (tmp_path / "src" / "index.ez").write_text(source, encoding="utf-8")
+
+    assert ez.main(["run", "--project", str(project_toml)]) == 0
+
+
+def test_run_std_fmt_json_and_msgpack_optional(tmp_path):
+    project_toml = write_project(
+        tmp_path,
+        os_name=ez._native_os(),
+        arch=ez._native_arch(),
+    )
+    source = r'''
+from "std/fmt" import { jsonStringify, jsonParse, msgpackEncode, msgpackDecode };
+from "std/test" import { testReset, testAssert, testEqualI64, testEqualStr, testFailed };
+
+struct Payload { value: I32?; };
+
+const main = (): I32 => {
+    testReset();
+    const some: I32? = 42;
+    let none: I32?;
+
+    testEqualStr(actual = jsonStringify<I32?>(data = some), expected = "42", msg = "json optional some stringify");
+    testEqualStr(actual = jsonStringify<I32?>(data = none), expected = "null", msg = "json optional none stringify");
+
+    const parsed_some = jsonParse<I32?>(s = "42");
+    const parsed_none = jsonParse<I32?>(s = "null");
+    testAssert(condition = parsed_some.ok, msg = "json optional some ok");
+    testEqualI64(actual = parsed_some.value, expected = 42, msg = "json optional some value");
+    testAssert(condition = !parsed_none.ok, msg = "json optional none ok");
+
+    const decoded_some = msgpackDecode<I32?>(data = msgpackEncode<I32?>(data = some));
+    const decoded_none = msgpackDecode<I32?>(data = msgpackEncode<I32?>(data = none));
+    testAssert(condition = decoded_some.ok, msg = "msgpack optional some ok");
+    testEqualI64(actual = decoded_some.value, expected = 42, msg = "msgpack optional some value");
+    testAssert(condition = !decoded_none.ok, msg = "msgpack optional none ok");
+
+    const payload = Payload(value = some);
+    const payload_json = jsonStringify<Payload>(data = payload);
+    testEqualStr(actual = payload_json, expected = "{\"value\":42}", msg = "json optional field stringify");
+    const payload_parsed = jsonParse<Payload>(s = "{\"value\":null}");
+    testAssert(condition = !payload_parsed.value.ok, msg = "json optional field null parse");
+    const payload_decoded = msgpackDecode<Payload>(data = msgpackEncode<Payload>(data = payload));
+    testAssert(condition = payload_decoded.value.ok, msg = "msgpack optional field ok");
+    testEqualI64(actual = payload_decoded.value.value, expected = 42, msg = "msgpack optional field value");
+
+    const list: List<I32?> = [some, none];
+    const list_json = jsonStringify<List<I32?>>(data = list);
+    testEqualStr(actual = list_json, expected = "[42,null]", msg = "json optional list stringify");
+    const list_parsed = jsonParse<List<I32?>>(s = "[1,null]");
+    testAssert(condition = list_parsed[0].ok, msg = "json optional list item some ok");
+    testEqualI64(actual = list_parsed[0].value, expected = 1, msg = "json optional list item some value");
+    testAssert(condition = !list_parsed[1].ok, msg = "json optional list item none ok");
+    const list_decoded = msgpackDecode<List<I32?>>(data = msgpackEncode<List<I32?>>(data = list));
+    testAssert(condition = list_decoded[0].ok, msg = "msgpack optional list item some ok");
+    testEqualI64(actual = list_decoded[0].value, expected = 42, msg = "msgpack optional list item some value");
+    testAssert(condition = !list_decoded[1].ok, msg = "msgpack optional list item none ok");
+    return testFailed();
+};
+'''.lstrip()
+    (tmp_path / "src" / "index.ez").write_text(source, encoding="utf-8")
+
+    assert ez.main(["run", "--project", str(project_toml)]) == 0
+
+
+def test_run_std_fmt_json_and_msgpack_dict_str_keys(tmp_path):
+    project_toml = write_project(
+        tmp_path,
+        os_name=ez._native_os(),
+        arch=ez._native_arch(),
+    )
+    source = r'''
+from "std/collections" import { dictLen };
+from "std/fmt" import { jsonStringify, jsonParse, msgpackEncode, msgpackDecode };
+from "std/test" import { testReset, testEqualI64, testEqualStr, testFailed };
+
+const main = (): I32 => {
+    testReset();
+    const scores: Dict<Str, I32> = { a: I32 = 1, b: I32 = 2 };
+    const json = jsonStringify<Dict<Str, I32>>(data = scores);
+    testEqualStr(actual = json, expected = "{\"a\":1,\"b\":2}", msg = "json dict stringify");
+
+    const parsed = jsonParse<Dict<Str, I32>>(s = "{\"x\":4,\"y\":5}");
+    testEqualI64(actual = parsed["x"], expected = 4, msg = "json dict parse x");
+    testEqualI64(actual = parsed["y"], expected = 5, msg = "json dict parse y");
+    testEqualI64(actual = dictLen<Str, I32>(dict = parsed), expected = 2, msg = "json dict len");
+
+    const decoded = msgpackDecode<Dict<Str, I32>>(data = msgpackEncode<Dict<Str, I32>>(data = scores));
+    testEqualI64(actual = decoded["a"], expected = 1, msg = "msgpack dict a");
+    testEqualI64(actual = decoded["b"], expected = 2, msg = "msgpack dict b");
+
+    const groups: Dict<Str, List<I32>> = { nums: List<I32> = [3, 4] };
+    const groups_json = jsonStringify<Dict<Str, List<I32>>>(data = groups);
+    testEqualStr(actual = groups_json, expected = "{\"nums\":[3,4]}", msg = "json dict list stringify");
+    const groups_parsed = jsonParse<Dict<Str, List<I32>>>(s = "{\"nums\":[5,6]}");
+    testEqualI64(actual = groups_parsed["nums"][1], expected = 6, msg = "json dict list parse");
+    const groups_decoded = msgpackDecode<Dict<Str, List<I32>>>(data = msgpackEncode<Dict<Str, List<I32>>>(data = groups));
+    testEqualI64(actual = groups_decoded["nums"][0], expected = 3, msg = "msgpack dict list roundtrip");
+    return testFailed();
+};
+'''.lstrip()
+    (tmp_path / "src" / "index.ez").write_text(source, encoding="utf-8")
+
+    assert ez.main(["run", "--project", str(project_toml)]) == 0
+
+
+def test_run_std_fmt_json_and_msgpack_dict_non_str_keys(tmp_path):
+    project_toml = write_project(
+        tmp_path,
+        os_name=ez._native_os(),
+        arch=ez._native_arch(),
+    )
+    source = r'''
+from "std/collections" import { dictLen };
+from "std/fmt" import { jsonStringify, jsonParse, msgpackEncode, msgpackDecode };
+from "std/test" import { testReset, testEqualI64, testEqualStr, testFailed };
+
+const main = (): I32 => {
+    testReset();
+    const scores: Dict<I32, Str> = { [1]: Str = "one", [2]: Str = "two" };
+    const json = jsonStringify<Dict<I32, Str>>(data = scores);
+    testEqualStr(actual = json, expected = "[{\"key\":1,\"value\":\"one\"},{\"key\":2,\"value\":\"two\"}]", msg = "json dict non-str stringify");
+
+    const parsed = jsonParse<Dict<I32, Str>>(s = "[{\"key\":3,\"value\":\"three\"},{\"key\":4,\"value\":\"four\"}]");
+    testEqualStr(actual = parsed[3], expected = "three", msg = "json dict non-str parse first");
+    testEqualStr(actual = parsed[4], expected = "four", msg = "json dict non-str parse second");
+    testEqualI64(actual = dictLen<I32, Str>(dict = parsed), expected = 2, msg = "json dict non-str len");
+
+    const decoded = msgpackDecode<Dict<I32, Str>>(data = msgpackEncode<Dict<I32, Str>>(data = scores));
+    testEqualStr(actual = decoded[1], expected = "one", msg = "msgpack dict non-str first");
+    testEqualStr(actual = decoded[2], expected = "two", msg = "msgpack dict non-str second");
+    return testFailed();
+};
+'''.lstrip()
+    (tmp_path / "src" / "index.ez").write_text(source, encoding="utf-8")
+
+    assert ez.main(["run", "--project", str(project_toml)]) == 0
+
+
+def test_run_std_fmt_json_and_msgpack_union(tmp_path):
+    project_toml = write_project(
+        tmp_path,
+        os_name=ez._native_os(),
+        arch=ez._native_arch(),
+    )
+    source = r'''
+from "std/fmt" import { jsonStringify, jsonParse, msgpackEncode, msgpackDecode };
+from "std/str" import { strEqual };
+from "std/test" import { testReset, testAssert, testEqualI64, testEqualStr, testFailed };
+
+struct Payload { value: I32 | Str; };
+
+const main = (): I32 => {
+    testReset();
+    const number: I32 | Str = 42;
+    const text: I32 | Str = "ez";
+
+    const number_json = jsonStringify<I32 | Str>(data = number);
+    testEqualStr(actual = number_json, expected = "{\"tag\":0,\"value\":42}", msg = "json union number stringify");
+    const text_json = jsonStringify<I32 | Str>(data = text);
+    testEqualStr(actual = text_json, expected = "{\"tag\":1,\"value\":\"ez\"}", msg = "json union text stringify");
+
+    const parsed = jsonParse<I32 | Str>(s = "{\"tag\":1,\"value\":\"ok\"}");
+    testEqualI64(actual = parsed.tag, expected = 1, msg = "json union tag");
+    testAssert(condition = strEqual(a = parsed.value, b = "ok"), msg = "json union value");
+
+    const decoded_text = msgpackDecode<I32 | Str>(data = msgpackEncode<I32 | Str>(data = text));
+    testEqualI64(actual = decoded_text.tag, expected = 1, msg = "msgpack union text tag");
+    testAssert(condition = strEqual(a = decoded_text.value, b = "ez"), msg = "msgpack union text value");
+
+    const payload = Payload(value = parsed);
+    const payload_json = jsonStringify<Payload>(data = payload);
+    testEqualStr(actual = payload_json, expected = "{\"value\":{\"tag\":1,\"value\":\"ok\"}}", msg = "json union field stringify");
+    const payload_decoded = msgpackDecode<Payload>(data = msgpackEncode<Payload>(data = jsonParse<Payload>(s = payload_json)));
+    testEqualI64(actual = payload_decoded.value.tag, expected = 1, msg = "msgpack union field tag");
+    testAssert(condition = strEqual(a = payload_decoded.value.value, b = "ok"), msg = "msgpack union field value");
+
+    const list: List<I32 | Str> = [number, text];
+    const list_json = jsonStringify<List<I32 | Str>>(data = list);
+    testEqualStr(actual = list_json, expected = "[{\"tag\":0,\"value\":42},{\"tag\":1,\"value\":\"ez\"}]", msg = "json union list stringify");
+    const list_decoded = msgpackDecode<List<I32 | Str>>(data = msgpackEncode<List<I32 | Str>>(data = jsonParse<List<I32 | Str>>(s = list_json)));
+    testEqualI64(actual = list_decoded[0].tag, expected = 0, msg = "msgpack union list first tag");
+    testEqualStr(actual = jsonStringify<I32 | Str>(data = list_decoded[0]), expected = "{\"tag\":0,\"value\":42}", msg = "msgpack union list first value");
+    testEqualI64(actual = list_decoded[1].tag, expected = 1, msg = "msgpack union list second tag");
+    testAssert(condition = strEqual(a = list_decoded[1].value, b = "ez"), msg = "msgpack union list second value");
+
+    const badTagErr = catch { const ignored = jsonParse<I32 | Str>(s = "{\"tag\":2,\"value\":0}"); };
+    testEqualI64(actual = badTagErr.code, expected = 4, msg = "json union bad tag");
+    const badValueErr = catch { const ignored = jsonParse<I32 | Str>(s = "{\"tag\":0,\"value\":\"bad\"}"); };
+    testEqualI64(actual = badValueErr.code, expected = 4, msg = "json union bad value");
+    return testFailed();
+};
+'''.lstrip()
+    (tmp_path / "src" / "index.ez").write_text(source, encoding="utf-8")
+
+    assert ez.main(["run", "--project", str(project_toml)]) == 0
+
+
+def test_run_std_fmt_msgpack_struct_basic_fields(tmp_path):
+    project_toml = write_project(
+        tmp_path,
+        os_name=ez._native_os(),
+        arch=ez._native_arch(),
+    )
+    source = r'''
+from "std/fmt" import { b64Decode, msgpackEncode, msgpackDecode };
+from "std/mem" import { errIO };
+from "std/test" import { testReset, testAssert, testEqualI64, testEqualStr, testFailed };
+
+struct User { name: Str; age: U32; active: Bool; score: F64; };
+struct Empty {};
+
+const main = (): I32 => {
+    testReset();
+
+    const original = User(name = "Ez", age = 42, active = true, score = 1.5);
+    const decoded = msgpackDecode<User>(data = msgpackEncode<User>(data = original));
+    const empty = msgpackDecode<Empty>(data = msgpackEncode<Empty>(data = Empty()));
+    testEqualStr(actual = decoded.name, expected = "Ez", msg = "msgpack struct str field");
+    testEqualI64(actual = decoded.age, expected = 42, msg = "msgpack struct u32 field");
+    testAssert(condition = decoded.active, msg = "msgpack struct bool field");
+    testAssert(condition = decoded.score == 1.5, msg = "msgpack struct f64 field");
+
+    const valid = b64Decode(s = "hKVzY29yZcs/+AAAAAAAAKZhY3RpdmXDo2FnZc4AAAAqpG5hbWWlRSJ6LH0=");
+    testAssert(condition = valid.ok, msg = "msgpack struct fixture decoded");
+    const fromFixture = msgpackDecode<User>(data = valid.value);
+    testEqualStr(actual = fromFixture.name, expected = "E\"z,}", msg = "msgpack struct fixture str");
+    testEqualI64(actual = fromFixture.age, expected = 42, msg = "msgpack struct fixture age");
+    testAssert(condition = fromFixture.active && fromFixture.score == 1.5, msg = "msgpack struct fixture rest");
+
+    const missing = b64Decode(s = "g6RuYW1lokV6o2FnZc4AAAAqpmFjdGl2ZcM=");
+    const unknown = b64Decode(s = "haRuYW1lokV6o2FnZc4AAAAqpmFjdGl2ZcOlc2NvcmXLP/gAAAAAAAClZXh0cmEB");
+    const duplicate = b64Decode(s = "haRuYW1lokV6pG5hbWWlT3RoZXKjYWdlzgAAACqmYWN0aXZlw6VzY29yZcs/+AAAAAAAAA==");
+    const typeBad = b64Decode(s = "hKRuYW1lokV6o2FnZf+mYWN0aXZlw6VzY29yZcs/+AAAAAAAAA==");
+    const nonMap = b64Decode(s = "kA==");
+    testAssert(condition = missing.ok && unknown.ok && duplicate.ok && typeBad.ok && nonMap.ok, msg = "msgpack invalid fixtures decoded");
+
+    const missingErr = catch { const ignored = msgpackDecode<User>(data = missing.value); };
+    const unknownErr = catch { const ignored = msgpackDecode<User>(data = unknown.value); };
+    const duplicateErr = catch { const ignored = msgpackDecode<User>(data = duplicate.value); };
+    const typeErr = catch { const ignored = msgpackDecode<User>(data = typeBad.value); };
+    const mapErr = catch { const ignored = msgpackDecode<User>(data = nonMap.value); };
+    testAssert(condition = missingErr.code == errIO && unknownErr.code == errIO && duplicateErr.code == errIO, msg = "msgpack struct field set invalid throws errIO");
+    testAssert(condition = typeErr.code == errIO && mapErr.code == errIO, msg = "msgpack struct value invalid throws errIO");
+    return testFailed();
+};
+'''.lstrip()
+    (tmp_path / "src" / "index.ez").write_text(source, encoding="utf-8")
+
+    assert ez.main(["run", "--project", str(project_toml)]) == 0
+
+
+def test_run_std_fmt_msgpack_nested_struct_roundtrip(tmp_path):
+    project_toml = write_project(
+        tmp_path,
+        os_name=ez._native_os(),
+        arch=ez._native_arch(),
+    )
+    source = r'''
+from "std/fmt" import { b64Decode, msgpackEncode, msgpackDecode };
+from "std/mem" import { errIO };
+from "std/test" import { testReset, testAssert, testEqualI64, testEqualStr, testFailed };
+
+struct Address { city: Str; zip: U32; };
+struct User { name: Str; address: Address; active: Bool; };
+
+const main = (): I32 => {
+    testReset();
+    const original = User(name = "Ez", address = Address(city = "Shenzhen", zip = 518000), active = true);
+    const decoded = msgpackDecode<User>(data = msgpackEncode<User>(data = original));
+    testEqualStr(actual = decoded.address.city, expected = "Shenzhen", msg = "msgpack nested struct field str");
+    testEqualI64(actual = decoded.address.zip, expected = 518000, msg = "msgpack nested struct field u32");
+    testAssert(condition = decoded.active, msg = "msgpack nested struct bool");
+
+    const valid = b64Decode(s = "g6ZhY3RpdmXDp2FkZHJlc3OCo3ppcM4AB+dwpGNpdHmoU2hlbnpoZW6kbmFtZaJFeg==");
+    testAssert(condition = valid.ok, msg = "msgpack nested fixture decoded");
+    const fromFixture = msgpackDecode<User>(data = valid.value);
+    testEqualStr(actual = fromFixture.address.city, expected = "Shenzhen", msg = "msgpack nested fixture city");
+    testEqualI64(actual = fromFixture.address.zip, expected = 518000, msg = "msgpack nested fixture zip");
+
+    const missingNested = b64Decode(s = "g6RuYW1lokV6p2FkZHJlc3OBpGNpdHmoU2hlbnpoZW6mYWN0aXZlww==");
+    const badNested = b64Decode(s = "g6RuYW1lokV6p2FkZHJlc3OQpmFjdGl2ZcM=");
+    testAssert(condition = missingNested.ok && badNested.ok, msg = "msgpack nested invalid fixtures decoded");
+    const missingNestedErr = catch { const ignored = msgpackDecode<User>(data = missingNested.value); };
+    const badNestedErr = catch { const ignored = msgpackDecode<User>(data = badNested.value); };
+    testAssert(condition = missingNestedErr.code == errIO && badNestedErr.code == errIO, msg = "msgpack nested invalid throws errIO");
+    return testFailed();
+};
+'''.lstrip()
+    (tmp_path / "src" / "index.ez").write_text(source, encoding="utf-8")
+
+    assert ez.main(["run", "--project", str(project_toml)]) == 0
+
+
+def test_run_std_fmt_json_string_escapes_and_string_literal_decoding(tmp_path):
+    project_toml = write_project(
+        tmp_path,
+        os_name=ez._native_os(),
+        arch=ez._native_arch(),
+    )
+    (tmp_path / "src" / "index.ez").write_text(
+        'from "std/fmt" import { jsonStringify, jsonParse };\n'
+        'from "std/mem" import { errIO };\n'
+        'from "std/str" import { strByteLen, strContains };\n'
+        'from "std/test" import { testReset, testAssert, testEqualI64, testEqualStr, testFailed };\n'
+        'const main = (): I32 => {\n'
+        '    testReset();\n'
+        '    const literal = "line\\nquote\\\" slash\\\\ tab\\t smile\\u263A";\n'
+        '    testEqualI64(actual = strByteLen(s = literal), expected = 32, msg = "decoded literal byte len");\n'
+        '    const json = jsonStringify<Str>(data = literal);\n'
+        '    testAssert(condition = strContains(s = json, needle = "\\\\n"), msg = "json escapes newline");\n'
+        '    testAssert(condition = strContains(s = json, needle = "\\\\t"), msg = "json escapes tab");\n'
+        '    testAssert(condition = strContains(s = json, needle = "\\\\\\\""), msg = "json escapes quote");\n'
+        '    const parsed = jsonParse<Str>(s = "\\\"line\\\\nquote\\\\\\\" slash\\\\\\\\ tab\\\\t smile\\\\u263A\\\"");\n'
+        '    testEqualStr(actual = parsed, expected = literal, msg = "json string parse escapes");\n'
+        '    const pair = jsonParse<Str>(s = "\\\"\\\\uD83D\\\\uDE00\\\"");\n'
+        '    testEqualI64(actual = strByteLen(s = pair), expected = 4, msg = "json surrogate pair utf8 bytes");\n'
+        '    const badErr = catch { const ignored = jsonParse<Str>(s = "\\\"bad\\\\q\\\""); };\n'
+        '    testAssert(condition = badErr.code == errIO, msg = "invalid json escape throws errIO");\n'
+        '    return testFailed();\n'
+        '};\n',
+        encoding="utf-8",
+    )
+
+    assert ez.main(["run", "--project", str(project_toml)]) == 0
+
+
+def test_run_std_fmt_json_parse_rejects_non_json_scalar_forms(tmp_path):
+    project_toml = write_project(
+        tmp_path,
+        os_name=ez._native_os(),
+        arch=ez._native_arch(),
+    )
+    (tmp_path / "src" / "index.ez").write_text(
+        'from "std/fmt" import { jsonStringify, jsonParse };\n'
+        'from "std/mem" import { errIO };\n'
+        'from "std/test" import { testReset, testAssert, testEqualI64, testEqualStr, testFailed };\n'
+        'const main = (): I32 => {\n'
+        '    testReset();\n'
+        '    testEqualI64(actual = jsonParse<I8>(s = "-128"), expected = -128, msg = "json i8 min");\n'
+        '    testEqualI64(actual = jsonParse<U8>(s = "255"), expected = 255, msg = "json u8 max");\n'
+        '    testEqualI64(actual = jsonParse<I32>(s = "1e2"), expected = 100, msg = "json integer accepts exponent integer");\n'
+        '    testEqualI64(actual = jsonParse<I64>(s = "9223372036854775807"), expected = 9223372036854775807, msg = "json i64 max");\n'
+        '    testEqualI64(actual = jsonParse<U32>(s = "4294967295"), expected = 4294967295, msg = "json u32 max");\n'
+        '    testEqualStr(actual = jsonStringify<U64>(data = jsonParse<U64>(s = "18446744073709551615")), expected = "18446744073709551615", msg = "json u64 max");\n'
+        '    const plusErr = catch { const ignored = jsonParse<I32>(s = "+1"); };\n'
+        '    const i8OverflowErr = catch { const ignored = jsonParse<I8>(s = "128"); };\n'
+        '    const u8NegativeErr = catch { const ignored = jsonParse<U8>(s = "-1"); };\n'
+        '    const u8OverflowErr = catch { const ignored = jsonParse<U8>(s = "256"); };\n'
+        '    const zeroErr = catch { const ignored = jsonParse<I64>(s = "01"); };\n'
+        '    const overflowErr = catch { const ignored = jsonParse<I64>(s = "9223372036854775808"); };\n'
+        '    const negativeUnsignedErr = catch { const ignored = jsonParse<U32>(s = "-1"); };\n'
+        '    const u32OverflowErr = catch { const ignored = jsonParse<U32>(s = "4294967296"); };\n'
+        '    const u64OverflowErr = catch { const ignored = jsonParse<U64>(s = "18446744073709551616"); };\n'
+        '    const fractionErr = catch { const ignored = jsonParse<I64>(s = "1.5"); };\n'
+        '    const dotErr = catch { const ignored = jsonParse<F64>(s = "1."); };\n'
+        '    const f32Err = catch { const ignored = jsonParse<F32>(s = "1e+"); };\n'
+        '    const expErr = catch { const ignored = jsonParse<F64>(s = "1e+"); };\n'
+        '    const strErr = catch { const ignored = jsonParse<Str>(s = "42"); };\n'
+        '    testAssert(condition = i8OverflowErr.code == errIO && u8NegativeErr.code == errIO && u8OverflowErr.code == errIO, msg = "json 8-bit invalid throws errIO");\n'
+        '    testAssert(condition = plusErr.code == errIO && zeroErr.code == errIO && overflowErr.code == errIO && fractionErr.code == errIO, msg = "json integer invalid throws errIO");\n'
+        '    testAssert(condition = negativeUnsignedErr.code == errIO && u32OverflowErr.code == errIO && u64OverflowErr.code == errIO, msg = "json unsigned invalid throws errIO");\n'
+        '    testAssert(condition = dotErr.code == errIO && expErr.code == errIO && strErr.code == errIO, msg = "json scalar invalid throws errIO");\n'
+        '    testAssert(condition = f32Err.code == errIO, msg = "json f32 invalid throws errIO");\n'
+        '    return testFailed();\n'
+        '};\n',
+        encoding="utf-8",
+    )
+
+    assert ez.main(["run", "--project", str(project_toml)]) == 0
+
+
+def test_run_std_fmt_json_stringify_nonfinite_f64_as_json_null(tmp_path):
+    project_toml = write_project(
+        tmp_path,
+        os_name=ez._native_os(),
+        arch=ez._native_arch(),
+    )
+    (tmp_path / "src" / "index.ez").write_text(
+        'from "std/fmt" import { jsonStringify };\n'
+        'from "std/math" import { mathSqrt, mathLog };\n'
+        'from "std/test" import { testReset, testEqualStr, testFailed };\n'
+        'const main = (): I32 => {\n'
+        '    testReset();\n'
+        '    const nanv = mathSqrt(value = -1.0);\n'
+        '    const infv = mathLog(value = 0.0);\n'
+        '    testEqualStr(actual = jsonStringify<F64>(data = nanv), expected = "null", msg = "json stringify nan as null");\n'
+        '    testEqualStr(actual = jsonStringify<F64>(data = infv), expected = "null", msg = "json stringify infinity as null");\n'
+        '    return testFailed();\n'
+        '};\n',
+        encoding="utf-8",
+    )
+
+    assert ez.main(["run", "--project", str(project_toml)]) == 0
+
+
+def test_run_std_fmt_msgpack_decodes_standard_integer_and_float_variants(tmp_path):
+    project_toml = write_project(
+        tmp_path,
+        os_name=ez._native_os(),
+        arch=ez._native_arch(),
+    )
+    (tmp_path / "src" / "index.ez").write_text(
+        'from "std/fmt" import { b64Decode, msgpackDecode };\n'
+        'from "std/test" import { testReset, testAssert, testEqualI64, testFailed };\n'
+        'const main = (): I32 => {\n'
+        '    testReset();\n'
+        '    const fix_pos = b64Decode(s = "Kg==");\n'
+        '    const fix_neg = b64Decode(s = "/w==");\n'
+        '    const u8 = b64Decode(s = "zMg=");\n'
+        '    const i16 = b64Decode(s = "0c/H");\n'
+        '    const f32 = b64Decode(s = "ykBI9cM=");\n'
+        '    testAssert(condition = fix_pos.ok && fix_neg.ok && u8.ok && i16.ok && f32.ok, msg = "msgpack fixtures decode");\n'
+        '    testEqualI64(actual = msgpackDecode<I32>(data = fix_pos.value), expected = 42, msg = "msgpack positive fixint");\n'
+        '    testEqualI64(actual = msgpackDecode<I32>(data = fix_neg.value), expected = -1, msg = "msgpack negative fixint");\n'
+        '    testEqualI64(actual = msgpackDecode<I64>(data = u8.value), expected = 200, msg = "msgpack uint8");\n'
+        '    testEqualI64(actual = msgpackDecode<I64>(data = i16.value), expected = -12345, msg = "msgpack int16");\n'
+        '    const f = msgpackDecode<F64>(data = f32.value);\n'
+        '    testAssert(condition = f > 3.139 && f < 3.141, msg = "msgpack float32");\n'
+        '    return testFailed();\n'
+        '};\n',
+        encoding="utf-8",
+    )
+
+    assert ez.main(["run", "--project", str(project_toml)]) == 0
+
+
+def test_run_std_fmt_string_decoders_reject_invalid_payloads(tmp_path):
+    project_toml = write_project(
+        tmp_path,
+        os_name=ez._native_os(),
+        arch=ez._native_arch(),
+    )
+    (tmp_path / "src" / "index.ez").write_text(
+        'from "std/fmt" import { b64Decode, jsonParse, msgpackDecode, urlDecode };\n'
+        'from "std/mem" import { errIO };\n'
+        'from "std/test" import { testReset, testAssert, testEqualStr, testFailed };\n'
+        'const main = (): I32 => {\n'
+        '    testReset();\n'
+        '    const valid = b64Decode(s = "oXg=");\n'
+        '    const trailing = b64Decode(s = "oXj/");\n'
+        '    const invalid_utf8 = b64Decode(s = "of8=");\n'
+        '    const nul_str = b64Decode(s = "oQA=");\n'
+        '    const invalid_url = urlDecode(s = "%FF");\n'
+        '    const nul_url = urlDecode(s = "%00");\n'
+        '    testAssert(condition = valid.ok && trailing.ok && invalid_utf8.ok && nul_str.ok, msg = "msgpack str fixtures decode");\n'
+        '    testEqualStr(actual = msgpackDecode<Str>(data = valid.value), expected = "x", msg = "msgpack fixstr valid");\n'
+        '    testEqualStr(actual = msgpackDecode<Str>(data = trailing.value), expected = "", msg = "msgpack fixstr trailing rejected");\n'
+        '    testEqualStr(actual = msgpackDecode<Str>(data = invalid_utf8.value), expected = "", msg = "msgpack str invalid utf8 rejected");\n'
+        '    testEqualStr(actual = msgpackDecode<Str>(data = nul_str.value), expected = "", msg = "msgpack str nul rejected");\n'
+        '    testAssert(condition = !invalid_url.ok, msg = "urlDecode invalid utf8 rejected");\n'
+        '    testAssert(condition = !nul_url.ok, msg = "urlDecode nul rejected");\n'
+        '    const json_nul_err = catch { const ignored = jsonParse<Str>(s = "\\\"\\\\u0000\\\""); };\n'
+        '    testAssert(condition = json_nul_err.code == errIO, msg = "json string nul rejected");\n'
         '    return testFailed();\n'
         '};\n',
         encoding="utf-8",
@@ -718,6 +1797,10 @@ def test_run_links_std_str_basic_native_functions(tmp_path):
         '    set(dst = invalid_bytes, value = 255, count = 1);\n'
         '    const invalid = strFromBytes(data = invalid_bytes);\n'
         '    testAssert(condition = !invalid.ok, msg = "invalid utf8 rejected");\n'
+        '    const nul_bytes = allocRaw(size = 1);\n'
+        '    set(dst = nul_bytes, value = 0, count = 1);\n'
+        '    const nul = strFromBytes(data = nul_bytes);\n'
+        '    testAssert(condition = !nul.ok, msg = "nul byte rejected");\n'
         '    testAssert(condition = strContains(s = text, needle = "Ez") && strStartsWith(s = text, prefix = " ") && strEndsWith(s = text, suffix = " "), msg = "contains starts ends");\n'
         '    testEqualI64(actual = strIndexOf(s = text, needle = "语言"), expected = 3, msg = "index byte offset");\n'
         '    const parts = strSplit(s = "a,,b", sep = ",");\n'
@@ -728,9 +1811,11 @@ def test_run_links_std_str_basic_native_functions(tmp_path):
         '    testEqualI64(actual = listLen<Str>(list = chars), expected = 2, msg = "split empty separator by char");\n'
         '    testEqualStr(actual = chars[1], expected = "言", msg = "split unicode char");\n'
         '    testEqualStr(actual = strTrim(s = "  EzLang  "), expected = "EzLang", msg = "trim spaces");\n'
+        '    testEqualStr(actual = strTrim(s = "\u00A0\u3000EzLang\u2003\u202F"), expected = "EzLang", msg = "trim unicode spaces");\n'
+        '    testEqualStr(actual = strTrim(s = "\uFEFFEzLang\uFEFF"), expected = "\uFEFFEzLang\uFEFF", msg = "trim excludes bom");\n'
         '    testEqualStr(actual = strReplace(s = "Ez Ez", old = "Ez", newValue = "Easy"), expected = "Easy Easy", msg = "replace all");\n'
-        '    testEqualStr(actual = strToLower(s = "EzLANG"), expected = "ezlang", msg = "lower ascii");\n'
-        '    testEqualStr(actual = strToUpper(s = "EzLang"), expected = "EZLANG", msg = "upper ascii");\n'
+        '    testEqualStr(actual = strToLower(s = "EzLANG ÄÖÜ ΣЖ Ÿ"), expected = "ezlang äöü σж ÿ", msg = "lower unicode simple case");\n'
+        '    testEqualStr(actual = strToUpper(s = "EzLang äöü σςж ÿ ß"), expected = "EZLANG ÄÖÜ ΣΣЖ Ÿ ẞ", msg = "upper unicode simple case");\n'
         '    return testFailed();\n'
         '};\n',
         encoding="utf-8",
@@ -823,6 +1908,18 @@ def test_run_std_path_relative_and_file_url_edges(tmp_path):
         '    testEqualStr(actual = pathNormalize(path = "C:/Temp/../Ez/file.txt"), expected = "C:/Ez/file.txt", msg = "windows drive normalize");\n'
         '    testEqualStr(actual = pathNormalize(path = "//server/share/dir/.."), expected = "//server/share", msg = "windows unc normalize");\n'
         '    testAssert(condition = pathIsAbs(path = "/tmp") && pathIsAbs(path = "C:/Temp") && pathIsAbs(path = "//server/share") && !pathIsAbs(path = "a/b"), msg = "absolute path detection");\n'
+        '    testEqualStr(actual = pathDir(path = "/"), expected = "/", msg = "dir keeps posix root");\n'
+        '    testEqualStr(actual = pathBase(path = "/"), expected = "", msg = "base of posix root is empty");\n'
+        '    const parsed_root = pathParse(path = "/");\n'
+        '    testEqualStr(actual = parsed_root.root, expected = "/", msg = "parse posix root root");\n'
+        '    testEqualStr(actual = parsed_root.dir, expected = "/", msg = "parse posix root dir");\n'
+        '    testEqualStr(actual = parsed_root.base, expected = "", msg = "parse posix root base");\n'
+        '    testEqualStr(actual = parsed_root.name, expected = "", msg = "parse posix root name");\n'
+        '    testEqualStr(actual = parsed_root.ext, expected = "", msg = "parse posix root ext");\n'
+        '    testEqualStr(actual = pathDir(path = "C:/"), expected = "C:/", msg = "dir keeps windows drive root");\n'
+        '    testEqualStr(actual = pathBase(path = "C:/"), expected = "", msg = "base of windows drive root is empty");\n'
+        '    testEqualStr(actual = pathDir(path = "//server/share"), expected = "//server/share", msg = "dir keeps unc root");\n'
+        '    testEqualStr(actual = pathBase(path = "//server/share"), expected = "", msg = "base of unc root is empty");\n'
         '    testEqualStr(actual = pathDir(path = "/tmp/ez/main.ez"), expected = "/tmp/ez", msg = "dir posix");\n'
         '    testEqualStr(actual = pathBase(path = "/tmp/ez/main.ez"), expected = "main.ez", msg = "base posix");\n'
         '    testEqualStr(actual = pathExt(path = "/tmp/archive.tar.gz"), expected = ".gz", msg = "extension last suffix");\n'
@@ -838,9 +1935,13 @@ def test_run_std_path_relative_and_file_url_edges(tmp_path):
         '    testEqualStr(actual = pathRelative(fromPath = "/tmp/ez", toPath = "/tmp/ez"), expected = ".", msg = "relative same path");\n'
         '    testEqualStr(actual = pathRelative(fromPath = "C:/a/b", toPath = "D:/x"), expected = "D:/x", msg = "relative keeps different drive absolute");\n'
         '    testEqualStr(actual = pathToFileUrl(path = "/tmp/Ez Lang/main.ez"), expected = "file:///tmp/Ez%20Lang/main.ez", msg = "file url encodes spaces");\n'
+        '    testEqualStr(actual = pathToFileUrl(path = "C:/Temp/Ez Lang/main.ez"), expected = "file:///C:/Temp/Ez%20Lang/main.ez", msg = "file url encodes windows drive");\n'
         '    const decoded = pathFromFileUrl(url = "file:///tmp/Ez%20Lang/main.ez");\n'
         '    testAssert(condition = decoded.ok, msg = "file url decode ok");\n'
         '    testEqualStr(actual = decoded.value, expected = "/tmp/Ez Lang/main.ez", msg = "file url decodes spaces");\n'
+        '    const decoded_drive = pathFromFileUrl(url = "file:///C:/Temp/Ez%20Lang/main.ez");\n'
+        '    testAssert(condition = decoded_drive.ok, msg = "file url drive decode ok");\n'
+        '    testEqualStr(actual = decoded_drive.value, expected = "C:/Temp/Ez Lang/main.ez", msg = "file url decodes windows drive");\n'
         '    const invalid = pathFromFileUrl(url = "file:///tmp/%");\n'
         '    testAssert(condition = !invalid.ok, msg = "invalid file url percent rejected");\n'
         '    return testFailed();\n'
@@ -870,6 +1971,7 @@ def test_run_links_std_math_basic_native_functions(tmp_path):
         '    const swapped = mathClampI32(value = 1, minValue = 5, maxValue = 0);\n'
         '    const gcd = mathGcdI64(a = -18, b = 24);\n'
         '    const lcm = mathLcmI64(a = 6, b = 8);\n'
+        '    const lcm_neg = mathLcmI64(a = -6, b = 8);\n'
         '    const root = mathSqrt(value = 4.0);\n'
         '    const power = mathPow(base = 2.0, exp = 8.0);\n'
         '    const sinv = mathSin(value = mathPI);\n'
@@ -880,6 +1982,7 @@ def test_run_links_std_math_basic_native_functions(tmp_path):
         '    const floorv = mathFloor(value = 1.9);\n'
         '    const ceilv = mathCeil(value = 1.1);\n'
         '    const roundv = mathRound(value = 1.5);\n'
+        '    const round_neg = mathRound(value = -1.5);\n'
         '    const nanv = mathSqrt(value = -1.0);\n'
         '    const infv = mathLog(value = 0.0);\n'
         '    const sum = mathAddI64Checked(a = 1, b = 2);\n'
@@ -891,7 +1994,14 @@ def test_run_links_std_math_basic_native_functions(tmp_path):
         '    const div_zero = mathDivI64Checked(a = 1, b = 0);\n'
         '    const narrowed = mathF64ToI32(value = 42.0);\n'
         '    const narrowed_i64 = mathF64ToI64(value = 42.0);\n'
+        '    const max_i32 = mathF64ToI32(value = 2147483647.0);\n'
+        '    const min_i32 = mathF64ToI32(value = -2147483648.0);\n'
+        '    const trunc_i32_hi = mathF64ToI32(value = 2147483647.9);\n'
+        '    const trunc_i32_lo = mathF64ToI32(value = -2147483648.9);\n'
         '    const too_wide = mathF64ToI32(value = 2147483648.0);\n'
+        '    const too_low = mathF64ToI32(value = -2147483649.0);\n'
+        '    const min_i64 = mathF64ToI64(value = -9223372036854775808.0);\n'
+        '    const too_wide_i64 = mathF64ToI64(value = 9223372036854775808.0);\n'
         '    const back_to_f64 = mathI64ToF64(value = 42);\n'
         '    testEqualI64(actual = abs32, expected = 3, msg = "abs i32");\n'
         '    testEqualI64(actual = abs64, expected = 4, msg = "abs i64");\n'
@@ -901,6 +2011,7 @@ def test_run_links_std_math_basic_native_functions(tmp_path):
         '    testEqualI64(actual = swapped, expected = 1, msg = "clamp swapped bounds");\n'
         '    testEqualI64(actual = gcd, expected = 6, msg = "gcd");\n'
         '    testEqualI64(actual = lcm, expected = 24, msg = "lcm");\n'
+        '    testEqualI64(actual = lcm_neg, expected = 24, msg = "negative lcm");\n'
         '    testAssert(condition = root == 2.0, msg = "sqrt");\n'
         '    testAssert(condition = power == 256.0, msg = "pow");\n'
         '    testAssert(condition = sinv < 0.000001 && sinv > -0.000001, msg = "sin pi");\n'
@@ -911,6 +2022,7 @@ def test_run_links_std_math_basic_native_functions(tmp_path):
         '    testAssert(condition = floorv == 1.0, msg = "floor");\n'
         '    testAssert(condition = ceilv == 2.0, msg = "ceil");\n'
         '    testAssert(condition = roundv == 2.0, msg = "round");\n'
+        '    testAssert(condition = round_neg == -2.0, msg = "negative round half away from zero");\n'
         '    testAssert(condition = mathIsNaN(value = nanv), msg = "nan");\n'
         '    testAssert(condition = mathIsInf(value = infv), msg = "inf");\n'
         '    testAssert(condition = sum.ok && diff.ok && product.ok && quotient.ok, msg = "checked ok");\n'
@@ -919,9 +2031,15 @@ def test_run_links_std_math_basic_native_functions(tmp_path):
         '    testEqualI64(actual = product.value, expected = 6, msg = "checked mul");\n'
         '    testEqualI64(actual = quotient.value, expected = 2, msg = "checked div");\n'
         '    testAssert(condition = !add_overflow.ok && !mul_overflow.ok && !div_zero.ok, msg = "checked rejects invalid");\n'
-        '    testAssert(condition = narrowed.ok && narrowed_i64.ok && !too_wide.ok, msg = "float convert ok flags");\n'
+        '    testAssert(condition = narrowed.ok && narrowed_i64.ok && max_i32.ok && min_i32.ok && trunc_i32_hi.ok && trunc_i32_lo.ok && min_i64.ok, msg = "float convert ok flags");\n'
+        '    testAssert(condition = !too_wide.ok && !too_low.ok && !too_wide_i64.ok, msg = "float convert rejects out of range");\n'
         '    testEqualI64(actual = narrowed.value, expected = 42, msg = "f64 to i32");\n'
         '    testEqualI64(actual = narrowed_i64.value, expected = 42, msg = "f64 to i64");\n'
+        '    testEqualI64(actual = max_i32.value, expected = 2147483647, msg = "f64 to i32 max");\n'
+        '    testEqualI64(actual = min_i32.value, expected = -2147483648, msg = "f64 to i32 min");\n'
+        '    testEqualI64(actual = trunc_i32_hi.value, expected = 2147483647, msg = "f64 to i32 trunc high");\n'
+        '    testEqualI64(actual = trunc_i32_lo.value, expected = -2147483648, msg = "f64 to i32 trunc low");\n'
+        '    testAssert(condition = min_i64.value < 0, msg = "f64 to i64 min");\n'
         '    testAssert(condition = back_to_f64 == 42.0, msg = "i64 to f64");\n'
         '    return testFailed();\n'
         '};\n',
@@ -938,7 +2056,8 @@ def test_run_links_std_random_basic_native_functions(tmp_path):
         arch=ez._native_arch(),
     )
     (tmp_path / "src" / "index.ez").write_text(
-        'from "std/random" import { randomSeed, randomNextU32, randomNextU64, randomRangeI64, randomRangeF64, randomShuffleBytes, randomSecureBytes, randomSecureU64 };\n'
+        'from "std/random" import { randomSeed, randomNextU32, randomNextU64, randomRangeI64, randomRangeF64, randomShuffleBytes, randomShuffle, randomEntropy, randomSecureBytes, randomSecureU64 };\n'
+        'from "std/collections" import { listLen };\n'
         'from "std/test" import { testReset, testAssert, testEqualI64, testFailed };\n'
         'const main = (): I32 => {\n'
         '    testReset();\n'
@@ -950,9 +2069,15 @@ def test_run_links_std_random_basic_native_functions(tmp_path):
         '    const ranged_i = randomRangeI64(this = source, minValue = 10, maxValue = 1);\n'
         '    const ranged_f = randomRangeF64(this = source, minValue = 1.0, maxValue = 0.0);\n'
         '    const shuffled = randomShuffleBytes(this = source, data = Blob(data = "abcd", size = 4));\n'
+        '    let nums: List<I32> = [1, 2, 3, 4];\n'
+        '    let list_source = randomSeed(seed = 42);\n'
+        '    let shuffled_nums: List<I32> = randomShuffle<I32>(this = list_source, list = nums);\n'
         '    const empty_secure = randomSecureBytes(size = 0);\n'
         '    const bad_secure = randomSecureBytes(size = -1);\n'
         '    const secure = randomSecureBytes(size = 8);\n'
+        '    const empty_entropy = randomEntropy(size = 0);\n'
+        '    const bad_entropy = randomEntropy(size = -1);\n'
+        '    const entropy = randomEntropy(size = 8);\n'
         '    const secure64 = randomSecureU64();\n'
         '    testEqualI64(actual = n32, expected = 833678567, msg = "seeded u32 stable");\n'
         '    testEqualI64(actual = same_n32, expected = 833678567, msg = "same seed stable");\n'
@@ -960,8 +2085,17 @@ def test_run_links_std_random_basic_native_functions(tmp_path):
         '    testEqualI64(actual = ranged_i, expected = 10, msg = "range i64 swaps bounds");\n'
         '    testAssert(condition = ranged_f >= 0.0 && ranged_f < 1.0, msg = "range f64 swaps bounds");\n'
         '    testEqualI64(actual = shuffled.size, expected = 4, msg = "shuffle preserves byte count");\n'
+        '    testEqualI64(actual = listLen<I32>(list = nums), expected = 4, msg = "list shuffle keeps original length");\n'
+        '    testEqualI64(actual = listLen<I32>(list = shuffled_nums), expected = 4, msg = "list shuffle preserves length");\n'
+        '    testEqualI64(actual = nums[1], expected = 2, msg = "list shuffle leaves source list unchanged");\n'
+        '    testEqualI64(actual = shuffled_nums[0], expected = 1, msg = "list shuffle item 0");\n'
+        '    testEqualI64(actual = shuffled_nums[1], expected = 4, msg = "list shuffle item 1");\n'
+        '    testEqualI64(actual = shuffled_nums[2], expected = 2, msg = "list shuffle item 2");\n'
+        '    testEqualI64(actual = shuffled_nums[3], expected = 3, msg = "list shuffle item 3");\n'
         '    testAssert(condition = empty_secure.ok && empty_secure.value.size == 0 && !bad_secure.ok, msg = "secure byte edge sizes");\n'
         '    testAssert(condition = secure.ok && secure.value.size == 8, msg = "secure bytes from system entropy");\n'
+        '    testAssert(condition = empty_entropy.ok && empty_entropy.value.size == 0 && !bad_entropy.ok, msg = "entropy edge sizes");\n'
+        '    testAssert(condition = entropy.ok && entropy.value.size == 8, msg = "entropy from system source");\n'
         '    testAssert(condition = secure64.ok, msg = "secure u64 from system entropy");\n'
         '    return testFailed();\n'
         '};\n',
@@ -1102,8 +2236,74 @@ def test_run_std_uri_query_params_decode_keys_and_values(tmp_path):
         '    testEqualStr(actual = roundtrip.value, expected = "two words", msg = "query get encoded key value");\n'
         '    const appended = uriQuerySet(query = "", key = "city name", value = "北京");\n'
         '    testEqualStr(actual = appended, expected = "city+name=%E5%8C%97%E4%BA%AC", msg = "query set encodes unicode");\n'
+        '    const empty_missing = uriQueryGet(query = "a=1&&b=2&", key = "");\n'
+        '    testAssert(condition = !empty_missing.ok, msg = "query get ignores separator empty entries");\n'
+        '    const compact_append = uriQuerySet(query = "a=1&&b=2&", key = "c", value = "3");\n'
+        '    testEqualStr(actual = compact_append, expected = "a=1&b=2&c=3", msg = "query set drops separator empty entries when appending");\n'
+        '    const compact_replace = uriQuerySet(query = "a=1&&b=2&", key = "b", value = "x");\n'
+        '    testEqualStr(actual = compact_replace, expected = "a=1&b=x", msg = "query set drops separator empty entries when replacing");\n'
+        '    const explicit_empty = uriQueryGet(query = "=empty&a=1", key = "");\n'
+        '    testAssert(condition = explicit_empty.ok, msg = "query get explicit empty key ok");\n'
+        '    testEqualStr(actual = explicit_empty.value, expected = "empty", msg = "query get explicit empty key value");\n'
+        '    const unicode_raw = uriDecodeQuery(s = "城市");\n'
+        '    testAssert(condition = unicode_raw.ok, msg = "raw unicode decode ok");\n'
+        '    testEqualStr(actual = unicode_raw.value, expected = "城市", msg = "raw unicode decode preserved");\n'
         '    const invalid = uriDecodeQuery(s = "%zz");\n'
         '    testAssert(condition = !invalid.ok, msg = "invalid percent rejected");\n'
+        '    const invalid_utf8 = uriDecodeQuery(s = "%FF");\n'
+        '    testAssert(condition = !invalid_utf8.ok, msg = "invalid utf8 percent rejected");\n'
+        '    const invalid_nul = uriDecodeQuery(s = "%00");\n'
+        '    const invalid_query_nul = uriQueryGet(query = "a=%00", key = "a");\n'
+        '    testAssert(condition = !invalid_nul.ok && !invalid_query_nul.ok, msg = "nul percent rejected");\n'
+        '    return testFailed();\n'
+        '};\n',
+        encoding="utf-8",
+    )
+
+    assert ez.main(["run", "--project", str(project_toml)]) == 0
+
+
+def test_run_std_uri_rejects_invalid_ports(tmp_path):
+    project_toml = write_project(
+        tmp_path,
+        os_name=ez._native_os(),
+        arch=ez._native_arch(),
+    )
+    (tmp_path / "src" / "index.ez").write_text(
+        'from "std/uri" import { uriParse, uriPort };\n'
+        'from "std/test" import { testReset, testAssert, testFailed };\n'
+        'const main = (): I32 => {\n'
+        '    testReset();\n'
+        '    const valid = uriPort(url = "http://example.com:65535/");\n'
+        '    const alpha = uriParse(url = "http://example.com:abc/");\n'
+        '    const empty = uriParse(url = "http://example.com:/");\n'
+        '    const large = uriParse(url = "http://example.com:65536/");\n'
+        '    const ipv6_tail = uriParse(url = "http://[::1]x/");\n'
+        '    testAssert(condition = valid.ok && valid.value == 65535, msg = "valid max port");\n'
+        '    testAssert(condition = !alpha.ok && !empty.ok && !large.ok && !ipv6_tail.ok, msg = "invalid ports rejected");\n'
+        '    return testFailed();\n'
+        '};\n',
+        encoding="utf-8",
+    )
+
+    assert ez.main(["run", "--project", str(project_toml)]) == 0
+
+
+def test_run_std_uri_normalize_preserves_empty_authority_and_empty_path(tmp_path):
+    project_toml = write_project(
+        tmp_path,
+        os_name=ez._native_os(),
+        arch=ez._native_arch(),
+    )
+    (tmp_path / "src" / "index.ez").write_text(
+        'from "std/uri" import { uriNormalize };\n'
+        'from "std/test" import { testReset, testEqualStr, testFailed };\n'
+        'const main = (): I32 => {\n'
+        '    testReset();\n'
+        '    testEqualStr(actual = uriNormalize(url = "FILE:///tmp/./Ez/../main.ez"), expected = "file:///tmp/main.ez", msg = "empty file authority preserved");\n'
+        '    testEqualStr(actual = uriNormalize(url = "foo:"), expected = "foo:", msg = "empty opaque path preserved");\n'
+        '    testEqualStr(actual = uriNormalize(url = "foo:?q=1#top"), expected = "foo:?q=1#top", msg = "empty path with query preserved");\n'
+        '    testEqualStr(actual = uriNormalize(url = "https://EXAMPLE.com/a/../b"), expected = "https://example.com/b", msg = "authority path normalized");\n'
         '    return testFailed();\n'
         '};\n',
         encoding="utf-8",
@@ -1206,7 +2406,7 @@ def test_run_std_regex_matches_and_global_replace(tmp_path):
         arch=ez._native_arch(),
     )
     (tmp_path / "src" / "index.ez").write_text(
-        'from "std/regex" import { regexGlobal, regexCompile, regexIsValid, regexTest, regexFind, regexFindAll, regexReplace, regexSplit };\n'
+        'from "std/regex" import { regexGlobal, regexMultiline, regexCompile, regexIsValid, regexTest, regexFind, regexFindAll, regexReplace, regexSplit };\n'
         'from "std/test" import { testReset, testAssert, testEqualI64, testEqualStr, testFailed };\n'
         'const main = (): I32 => {\n'
         '    testReset();\n'
@@ -1219,18 +2419,176 @@ def test_run_std_regex_matches_and_global_replace(tmp_path):
         '    testEqualI64(actual = found.value.start, expected = 0, msg = "regex find start");\n'
         '    testEqualI64(actual = found.value.end, expected = 6, msg = "regex find end");\n'
         '    testEqualStr(actual = found.value.groups[0], expected = "EzLang", msg = "regex capture group");\n'
+        '    const utf = regexFind(regex = regexCompile(pattern = "(Ez)", flags = 0), input = "中Ez");\n'
+        '    testAssert(condition = utf.ok, msg = "regex utf find ok");\n'
+        '    testEqualI64(actual = utf.value.start, expected = 3, msg = "regex utf byte start");\n'
+        '    testEqualI64(actual = utf.value.end, expected = 5, msg = "regex utf byte end");\n'
+        '    testEqualStr(actual = utf.value.groups[0], expected = "Ez", msg = "regex utf capture group");\n'
         '    const all = regexFindAll(regex = word, input = "one two three");\n'
         '    testEqualI64(actual = all.length, expected = 3, msg = "regex find all length");\n'
         '    testEqualStr(actual = all[2], expected = "three", msg = "regex find all value");\n'
         '    const first_only = regexReplace(regex = regexCompile(pattern = "[[:digit:]]", flags = 0), input = "a1b2c3", replacement = "#");\n'
         '    testEqualStr(actual = first_only, expected = "a#b2c3", msg = "regex replace first");\n'
+        '    const literal = regexReplace(regex = regexCompile(pattern = "([A-Z]+)", flags = 0), input = "ABC DEF", replacement = "$1");\n'
+        '    testEqualStr(actual = literal, expected = "$1 DEF", msg = "regex replacement literal");\n'
+        '    const line_start = regexCompile(pattern = "^b", flags = regexMultiline);\n'
+        '    testAssert(condition = regexTest(regex = line_start, input = "a\\nb"), msg = "regex multiline anchor matches line start");\n'
+        '    const string_start = regexCompile(pattern = "^b", flags = 0);\n'
+        '    testAssert(condition = !regexTest(regex = string_start, input = "a\\nb"), msg = "regex non-multiline anchor only matches string start");\n'
+        '    const dot = regexCompile(pattern = "a.b", flags = 0);\n'
+        '    testAssert(condition = regexTest(regex = dot, input = "a b") && !regexTest(regex = dot, input = "a\\nb"), msg = "regex dot does not match newline");\n'
         '    const all_digits = regexReplace(regex = regexCompile(pattern = "[[:digit:]]", flags = regexGlobal), input = "a1b2c3", replacement = "#");\n'
         '    testEqualStr(actual = all_digits, expected = "a#b#c#", msg = "regex replace global");\n'
+        '    const exact_repeat = regexCompile(pattern = "ab{2}c", flags = 0);\n'
+        '    testAssert(condition = regexIsValid(regex = exact_repeat), msg = "regex exact interval valid");\n'
+        '    testAssert(condition = regexTest(regex = exact_repeat, input = "abbc") && !regexTest(regex = exact_repeat, input = "abc"), msg = "regex exact interval match");\n'
+        '    const ranged_repeat = regexCompile(pattern = "ab{2,4}c", flags = 0);\n'
+        '    testAssert(condition = regexIsValid(regex = ranged_repeat), msg = "regex ranged interval valid");\n'
+        '    testAssert(condition = regexTest(regex = ranged_repeat, input = "abbc") && regexTest(regex = ranged_repeat, input = "abbbbc") && !regexTest(regex = ranged_repeat, input = "abbbbbc"), msg = "regex ranged interval match");\n'
+        '    const open_repeat = regexCompile(pattern = "ab{2,}c", flags = 0);\n'
+        '    testAssert(condition = regexIsValid(regex = open_repeat), msg = "regex open interval valid");\n'
+        '    testAssert(condition = regexTest(regex = open_repeat, input = "abbc") && regexTest(regex = open_repeat, input = "abbbbbc") && !regexTest(regex = open_repeat, input = "abc"), msg = "regex open interval match");\n'
+        '    const repeat_group = regexFind(regex = regexCompile(pattern = "(ab){2,3}", flags = 0), input = "zababx");\n'
+        '    testAssert(condition = repeat_group.ok, msg = "regex interval group match");\n'
+        '    testEqualStr(actual = repeat_group.value.text, expected = "abab", msg = "regex interval group text");\n'
+        '    testEqualStr(actual = repeat_group.value.groups[0], expected = "ab", msg = "regex interval group capture");\n'
+        '    const invalid_repeat = regexCompile(pattern = "ab{4,2}c", flags = 0);\n'
+        '    testAssert(condition = !regexIsValid(regex = invalid_repeat), msg = "regex invalid interval rejected");\n'
         '    const parts = regexSplit(regex = regexCompile(pattern = ",", flags = regexGlobal), input = "a,b,c");\n'
         '    testEqualI64(actual = parts.length, expected = 3, msg = "regex split length");\n'
         '    testEqualStr(actual = parts[1], expected = "b", msg = "regex split middle");\n'
+        '    const captured_parts = regexSplit(regex = regexCompile(pattern = "([,])", flags = regexGlobal), input = "a,b,c");\n'
+        '    testEqualI64(actual = captured_parts.length, expected = 3, msg = "regex split ignores captured separators");\n'
+        '    testEqualStr(actual = captured_parts[1], expected = "b", msg = "regex split captured middle");\n'
         '    const invalid = regexCompile(pattern = "(", flags = 0);\n'
         '    testAssert(condition = !regexIsValid(regex = invalid), msg = "invalid regex rejected");\n'
+        '    return testFailed();\n'
+        '};\n',
+        encoding="utf-8",
+    )
+
+    assert ez.main(["run", "--project", str(project_toml)]) == 0
+
+
+def test_run_std_regex_global_zero_width_replace_preserves_input(tmp_path):
+    project_toml = write_project(
+        tmp_path,
+        os_name=ez._native_os(),
+        arch=ez._native_arch(),
+    )
+    (tmp_path / "src" / "index.ez").write_text(
+        'from "std/regex" import { regexGlobal, regexCompile, regexReplace };\n'
+        'from "std/test" import { testReset, testEqualStr, testFailed };\n'
+        'const main = (): I32 => {\n'
+        '    testReset();\n'
+        '    const boundary = regexCompile(pattern = "(^|$)", flags = regexGlobal);\n'
+        '    const out = regexReplace(regex = boundary, input = "ab", replacement = "|");\n'
+        '    testEqualStr(actual = out, expected = "|ab|", msg = "zero-width global replace preserves input");\n'
+        '    return testFailed();\n'
+        '};\n',
+        encoding="utf-8",
+    )
+
+    assert ez.main(["run", "--project", str(project_toml)]) == 0
+
+
+def test_run_std_regex_find_all_zero_width_anchors_once(tmp_path):
+    project_toml = write_project(
+        tmp_path,
+        os_name=ez._native_os(),
+        arch=ez._native_arch(),
+    )
+    (tmp_path / "src" / "index.ez").write_text(
+        'from "std/collections" import { listLen };\n'
+        'from "std/regex" import { regexCompile, regexFindAll };\n'
+        'from "std/test" import { testReset, testEqualI64, testFailed };\n'
+        'const main = (): I32 => {\n'
+        '    testReset();\n'
+        '    const boundary = regexCompile(pattern = "^", flags = 0);\n'
+        '    const found = regexFindAll(regex = boundary, input = "abc");\n'
+        '    testEqualI64(actual = listLen<Str>(list = found), expected = 1, msg = "find all start anchor once");\n'
+        '    return testFailed();\n'
+        '};\n',
+        encoding="utf-8",
+    )
+
+    assert ez.main(["run", "--project", str(project_toml)]) == 0
+
+
+def test_run_std_regex_find_all_zero_width_empty_input_once(tmp_path):
+    project_toml = write_project(
+        tmp_path,
+        os_name=ez._native_os(),
+        arch=ez._native_arch(),
+    )
+    (tmp_path / "src" / "index.ez").write_text(
+        'from "std/collections" import { listLen };\n'
+        'from "std/regex" import { regexCompile, regexFindAll };\n'
+        'from "std/test" import { testReset, testEqualI64, testFailed };\n'
+        'const main = (): I32 => {\n'
+        '    testReset();\n'
+        '    const starts = regexFindAll(regex = regexCompile(pattern = "^", flags = 0), input = "");\n'
+        '    const ends = regexFindAll(regex = regexCompile(pattern = "$", flags = 0), input = "");\n'
+        '    testEqualI64(actual = listLen<Str>(list = starts), expected = 1, msg = "find all start anchor on empty input once");\n'
+        '    testEqualI64(actual = listLen<Str>(list = ends), expected = 1, msg = "find all end anchor on empty input once");\n'
+        '    return testFailed();\n'
+        '};\n',
+        encoding="utf-8",
+    )
+
+    assert ez.main(["run", "--project", str(project_toml)]) == 0
+
+
+def test_run_std_regex_split_anchors_and_utf8_zero_width(tmp_path):
+    project_toml = write_project(
+        tmp_path,
+        os_name=ez._native_os(),
+        arch=ez._native_arch(),
+    )
+    (tmp_path / "src" / "index.ez").write_text(
+        'from "std/collections" import { listLen };\n'
+        'from "std/regex" import { regexCompile, regexSplit };\n'
+        'from "std/test" import { testReset, testEqualI64, testEqualStr, testFailed };\n'
+        'const main = (): I32 => {\n'
+        '    testReset();\n'
+        '    const anchored = regexSplit(regex = regexCompile(pattern = "^", flags = 0), input = "abc");\n'
+        '    testEqualI64(actual = listLen<Str>(list = anchored), expected = 2, msg = "split start anchor only at input start");\n'
+        '    testEqualStr(actual = anchored[0], expected = "", msg = "split start anchor prefix");\n'
+        '    testEqualStr(actual = anchored[1], expected = "bc", msg = "split start anchor suffix after zero-width progress");\n'
+        '    const utf = regexSplit(regex = regexCompile(pattern = "^", flags = 0), input = "中a");\n'
+        '    testEqualI64(actual = listLen<Str>(list = utf), expected = 2, msg = "split start anchor advances by UTF-8 scalar");\n'
+        '    testEqualStr(actual = utf[1], expected = "a", msg = "split start anchor skips one UTF-8 scalar");\n'
+        '    return testFailed();\n'
+        '};\n',
+        encoding="utf-8",
+    )
+
+    assert ez.main(["run", "--project", str(project_toml)]) == 0
+
+
+def test_run_std_regex_respects_invalid_regex_flag(tmp_path):
+    project_toml = write_project(
+        tmp_path,
+        os_name=ez._native_os(),
+        arch=ez._native_arch(),
+    )
+    (tmp_path / "src" / "index.ez").write_text(
+        'from "std/collections" import { listLen };\n'
+        'from "std/regex" import { Regex, regexIsValid, regexTest, regexFind, regexFindAll, regexReplace, regexSplit };\n'
+        'from "std/test" import { testReset, testAssert, testEqualI64, testEqualStr, testFailed };\n'
+        'const main = (): I32 => {\n'
+        '    testReset();\n'
+        '    const invalid = Regex(pattern = "a", flags = 0, ok = false);\n'
+        '    const found = regexFind(regex = invalid, input = "a");\n'
+        '    const all = regexFindAll(regex = invalid, input = "a");\n'
+        '    const replaced = regexReplace(regex = invalid, input = "a", replacement = "x");\n'
+        '    const parts = regexSplit(regex = invalid, input = "a");\n'
+        '    testAssert(condition = !regexIsValid(regex = invalid), msg = "invalid regex flag stays invalid");\n'
+        '    testAssert(condition = !regexTest(regex = invalid, input = "a") && !found.ok, msg = "invalid regex does not match");\n'
+        '    testEqualI64(actual = listLen<Str>(list = all), expected = 0, msg = "invalid regex find all empty");\n'
+        '    testEqualStr(actual = replaced, expected = "a", msg = "invalid regex replace returns input");\n'
+        '    testEqualI64(actual = listLen<Str>(list = parts), expected = 1, msg = "invalid regex split returns input list");\n'
+        '    testEqualStr(actual = parts[0], expected = "a", msg = "invalid regex split input value");\n'
         '    return testFailed();\n'
         '};\n',
         encoding="utf-8",
@@ -1271,8 +2629,6 @@ def test_run_links_std_crypto_basic_native_functions(tmp_path):
         '    testEqualStr(actual = debugHex(data = sha512.value), expected = "9b71d224bd62f3785d96d46ad3ea3d73319bfbc2890caadae2dff72519673ca72323c3d99ba5c11d7c7acc6e14b8c5da0c4663475c2e5c3adef46f73bcdec043", msg = "sha512 vector");\n'
         '    testEqualStr(actual = debugHex(data = h256.value), expected = "9307b3b915efb5171ff14d8cb55fbcc798c6c0ef1456d66ded1a6aa723a58b7b", msg = "hmac sha256 vector");\n'
         '    testEqualStr(actual = debugHex(data = h512.value), expected = "ff06ab36757777815c008d32c8e14a705b4e7bf310351a06a23b612dc4c7433e7757d20525a5593b71020ea2ee162d2311b247e9855862b270122419652c0c92", msg = "hmac sha512 vector");\n'
-        if ez._native_os() == "macos"
-        else '    testAssert(condition = !sha256.ok && !sha512.ok && !h256.ok && !h512.ok, msg = "crypto unavailable returns none");\n'
     )
     (tmp_path / "src" / "index.ez").write_text(
         'from "std/crypto" import { cryptoSha256, cryptoSha512, cryptoHmacSha256, cryptoHmacSha512 };\n'
@@ -1378,7 +2734,8 @@ def test_run_std_compress_roundtrip_and_invalid_inputs(tmp_path):
         arch=ez._native_arch(),
     )
     (tmp_path / "src" / "index.ez").write_text(
-        'from "std/compress" import { compressGzip, decompressGzip, compressZlib, decompressZlib, compressDeflate, decompressDeflate };\n'
+        'from "std/compress" import { compressGzip, decompressGzip, compressZlib, decompressZlib, compressDeflate, decompressDeflate, compressGzipStream, decompressGzipStream, compressZlibStream, decompressZlibStream, compressDeflateStream, decompressDeflateStream };\n'
+        'from "std/stream" import { streamFromBlob, streamToBlob, streamClose };\n'
         'from "std/str" import { strFromBytes };\n'
         'from "std/test" import { testReset, testAssert, testEqualStr, testFailed };\n'
         'const assertText = (data: Blob, expected: Str, label: Str): Void => {\n'
@@ -1404,6 +2761,51 @@ def test_run_std_compress_roundtrip_and_invalid_inputs(tmp_path):
         '    const raw_d = decompressDeflate(data = d.value);\n'
         '    testAssert(condition = raw_d.ok, msg = "deflate decompress ok");\n'
         '    assertText(data = raw_d.value, expected = "hello hello hello", label = "deflate roundtrip");\n'
+        '    const stream_src = streamFromBlob(data = plain);\n'
+        '    const compressed_dst = streamFromBlob(data = Blob(data = "", size = 0));\n'
+        '    const streamed = compressGzipStream(dst = compressed_dst.value, src = stream_src.value, bufferSize = 3);\n'
+        '    testAssert(condition = streamed > 0, msg = "gzip stream compress ok");\n'
+        '    const compressed_blob = streamToBlob(stream = compressed_dst.value);\n'
+        '    const compressed_src = streamFromBlob(data = compressed_blob.value);\n'
+        '    const restored_dst = streamFromBlob(data = Blob(data = "", size = 0));\n'
+        '    const restored = decompressGzipStream(dst = restored_dst.value, src = compressed_src.value, bufferSize = 2);\n'
+        '    testAssert(condition = restored == 17, msg = "gzip stream decompress ok");\n'
+        '    const restored_blob = streamToBlob(stream = restored_dst.value);\n'
+        '    assertText(data = restored_blob.value, expected = "hello hello hello", label = "gzip stream roundtrip");\n'
+        '    const z_src = streamFromBlob(data = plain);\n'
+        '    const z_dst = streamFromBlob(data = Blob(data = "", size = 0));\n'
+        '    const z_streamed = compressZlibStream(dst = z_dst.value, src = z_src.value, bufferSize = 3);\n'
+        '    testAssert(condition = z_streamed > 0, msg = "zlib stream compress ok");\n'
+        '    const z_blob = streamToBlob(stream = z_dst.value);\n'
+        '    const z_compressed_src = streamFromBlob(data = z_blob.value);\n'
+        '    const z_restored_dst = streamFromBlob(data = Blob(data = "", size = 0));\n'
+        '    const z_restored = decompressZlibStream(dst = z_restored_dst.value, src = z_compressed_src.value, bufferSize = 2);\n'
+        '    testAssert(condition = z_restored == 17, msg = "zlib stream decompress ok");\n'
+        '    const z_restored_blob = streamToBlob(stream = z_restored_dst.value);\n'
+        '    assertText(data = z_restored_blob.value, expected = "hello hello hello", label = "zlib stream roundtrip");\n'
+        '    const d_src = streamFromBlob(data = plain);\n'
+        '    const d_dst = streamFromBlob(data = Blob(data = "", size = 0));\n'
+        '    const d_streamed = compressDeflateStream(dst = d_dst.value, src = d_src.value, bufferSize = 3);\n'
+        '    testAssert(condition = d_streamed > 0, msg = "deflate stream compress ok");\n'
+        '    const d_blob = streamToBlob(stream = d_dst.value);\n'
+        '    const d_compressed_src = streamFromBlob(data = d_blob.value);\n'
+        '    const d_restored_dst = streamFromBlob(data = Blob(data = "", size = 0));\n'
+        '    const d_restored = decompressDeflateStream(dst = d_restored_dst.value, src = d_compressed_src.value, bufferSize = 2);\n'
+        '    testAssert(condition = d_restored == 17, msg = "deflate stream decompress ok");\n'
+        '    const d_restored_blob = streamToBlob(stream = d_restored_dst.value);\n'
+        '    assertText(data = d_restored_blob.value, expected = "hello hello hello", label = "deflate stream roundtrip");\n'
+        '    streamClose(stream = stream_src.value);\n'
+        '    streamClose(stream = compressed_dst.value);\n'
+        '    streamClose(stream = compressed_src.value);\n'
+        '    streamClose(stream = restored_dst.value);\n'
+        '    streamClose(stream = z_src.value);\n'
+        '    streamClose(stream = z_dst.value);\n'
+        '    streamClose(stream = z_compressed_src.value);\n'
+        '    streamClose(stream = z_restored_dst.value);\n'
+        '    streamClose(stream = d_src.value);\n'
+        '    streamClose(stream = d_dst.value);\n'
+        '    streamClose(stream = d_compressed_src.value);\n'
+        '    streamClose(stream = d_restored_dst.value);\n'
         '    const invalid = Blob(data = "not gzip", size = 8);\n'
         '    const bad_gz = decompressGzip(data = invalid);\n'
         '    const bad_z = decompressZlib(data = invalid);\n'
@@ -1435,6 +2837,37 @@ def test_run_links_std_stream_basic_native_functions(tmp_path):
         '    const flushed = streamFlush(stream = dst.value);\n'
         '    const closed = streamClose(stream = dst.value);\n'
         '    return (written == 2 && copied == 3 && out.value.size == 5 && flushed && closed) ? 0 : 1;\n'
+        '};\n',
+        encoding="utf-8",
+    )
+
+    assert ez.main(["run", "--project", str(project_toml)]) == 0
+
+
+def test_run_std_stream_rejects_invalid_blob_inputs(tmp_path):
+    project_toml = write_project(
+        tmp_path,
+        os_name=ez._native_os(),
+        arch=ez._native_arch(),
+    )
+    (tmp_path / "src" / "index.ez").write_text(
+        'from "std/stream" import { streamFromBlob, streamWrite, streamClose };\n'
+        'from "std/test" import { testReset, testAssert, testEqualI64, testFailed };\n'
+        'const main = (): I32 => {\n'
+        '    testReset();\n'
+        '    const invalid = Blob(data = "", size = -1);\n'
+        '    const empty = Blob(data = "", size = 0);\n'
+        '    const bad_source = streamFromBlob(data = invalid);\n'
+        '    const good_source = streamFromBlob(data = empty);\n'
+        '    testAssert(condition = !bad_source.ok, msg = "invalid blob stream rejected");\n'
+        '    testAssert(condition = good_source.ok, msg = "empty blob stream accepted");\n'
+        '    const wrote_bad = streamWrite(stream = good_source.value, data = invalid);\n'
+        '    const wrote_empty = streamWrite(stream = good_source.value, data = empty);\n'
+        '    testEqualI64(actual = wrote_bad, expected = -1, msg = "invalid blob write rejected");\n'
+        '    testEqualI64(actual = wrote_empty, expected = 0, msg = "empty blob write succeeds with zero bytes");\n'
+        '    const closed = streamClose(stream = good_source.value);\n'
+        '    testAssert(condition = closed, msg = "empty stream closed");\n'
+        '    return testFailed();\n'
         '};\n',
         encoding="utf-8",
     )
@@ -1501,7 +2934,8 @@ def test_run_std_net_native_wrappers_report_unsupported_without_success(tmp_path
         '    const listener = tcpListen(host = "127.0.0.1", port = 0);\n'
         '    const udp = udpBind(host = "127.0.0.1", port = 0);\n'
         '    const ws = wsConnect(url = "ws://127.0.0.1/");\n'
-        '    return (!resp.ok && server.handle == 0 && !tcp.ok && listener.ok && udp.ok && !ws.ok) ? 0 : 1;\n'
+        '    const stopped = server.handle != 0 ? { server.stop(); true } : false;\n'
+        '    return (!resp.ok && stopped && !tcp.ok && listener.ok && udp.ok && !ws.ok) ? 0 : 1;\n'
         '};\n',
         encoding="utf-8",
     )
@@ -1539,6 +2973,207 @@ def test_run_std_net_http_fetch_plain_http_success(tmp_path):
             f'    const resp = fetch(url = "http://127.0.0.1:{port}/hello");\n'
             '    resp.ok ? { testEqualStr(actual = resp.value.text(), expected = "ok", msg = "http response text"); };\n'
             '    return (resp.ok && resp.value.status == 200 && resp.value.body.size == 2) ? testFailed() : 1;\n'
+            '};\n',
+            encoding="utf-8",
+        )
+
+        assert ez.main(["run", "--project", str(project_toml)]) == 0
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+def test_run_std_net_http_response_text_rejects_nul_and_invalid_utf8(tmp_path):
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path == "/nul":
+                body = b"a\0b"
+            elif self.path == "/invalid":
+                body = b"\xff"
+            else:
+                body = b"ok"
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, format, *args):
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        project_toml = write_project(
+            tmp_path,
+            os_name=ez._native_os(),
+            arch=ez._native_arch(),
+        )
+        port = server.server_address[1]
+        (tmp_path / "src" / "index.ez").write_text(
+            'from "std/net/http" import { fetch };\n'
+            'from "std/test" import { testReset, testEqualStr, testFailed };\n'
+            'const main = (): I32 => {\n'
+            '    testReset();\n'
+            f'    const nul = fetch(url = "http://127.0.0.1:{port}/nul");\n'
+            f'    const invalid = fetch(url = "http://127.0.0.1:{port}/invalid");\n'
+            '    nul.ok ? { testEqualStr(actual = nul.value.text(), expected = "", msg = "nul response text"); };\n'
+            '    invalid.ok ? { testEqualStr(actual = invalid.value.text(), expected = "", msg = "invalid utf8 response text"); };\n'
+            '    return (nul.ok && invalid.ok && nul.value.body.size == 3 && invalid.value.body.size == 1) ? testFailed() : 1;\n'
+            '};\n',
+            encoding="utf-8",
+        )
+
+        assert ez.main(["run", "--project", str(project_toml)]) == 0
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+def test_run_std_net_http_fetch_preserves_root_query_and_strips_fragment(tmp_path):
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path != "/?q=ez":
+                self.send_response(400)
+                self.end_headers()
+                self.wfile.write(self.path.encode("utf-8"))
+                return
+            body = b"ok"
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, format, *args):
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        project_toml = write_project(
+            tmp_path,
+            os_name=ez._native_os(),
+            arch=ez._native_arch(),
+        )
+        port = server.server_address[1]
+        (tmp_path / "src" / "index.ez").write_text(
+            'from "std/net/http" import { fetch };\n'
+            'from "std/test" import { testReset, testEqualStr, testFailed };\n'
+            'const main = (): I32 => {\n'
+            '    testReset();\n'
+            f'    const resp = fetch(url = "http://127.0.0.1:{port}?q=ez#fragment");\n'
+            '    resp.ok ? { testEqualStr(actual = resp.value.text(), expected = "ok", msg = "http query response text"); };\n'
+            '    return (resp.ok && resp.value.status == 200) ? testFailed() : 1;\n'
+            '};\n',
+            encoding="utf-8",
+        )
+
+        assert ez.main(["run", "--project", str(project_toml)]) == 0
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+def test_run_std_net_http_fetch_validates_authority_and_host_header(tmp_path):
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            expected_host = f"127.0.0.1:{self.server.server_address[1]}"
+            if self.path != "/hello?q=ez" or self.headers.get("Host") != expected_host:
+                self.send_response(400)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            body = b"ok"
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, format, *args):
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        project_toml = write_project(
+            tmp_path,
+            os_name=ez._native_os(),
+            arch=ez._native_arch(),
+        )
+        port = server.server_address[1]
+        (tmp_path / "src" / "index.ez").write_text(
+            'from "std/net/http" import { fetch };\n'
+            'from "std/test" import { testReset, testEqualStr, testAssert, testFailed };\n'
+            'const main = (): I32 => {\n'
+            '    testReset();\n'
+            f'    const good = fetch(url = "http://user:pass@127.0.0.1:{port}/hello?q=ez#fragment");\n'
+            '    const alphaPort = fetch(url = "http://127.0.0.1:abc/");\n'
+            '    const emptyPort = fetch(url = "http://127.0.0.1:/");\n'
+            '    const largePort = fetch(url = "http://127.0.0.1:65536/");\n'
+            '    good.ok ? { testEqualStr(actual = good.value.text(), expected = "ok", msg = "userinfo fetch body"); };\n'
+            '    testAssert(condition = good.ok && good.value.status == 200, msg = "userinfo authority accepted");\n'
+            '    testAssert(condition = !alphaPort.ok && !emptyPort.ok && !largePort.ok, msg = "invalid http ports rejected");\n'
+            '    return testFailed();\n'
+            '};\n',
+            encoding="utf-8",
+        )
+
+        assert ez.main(["run", "--project", str(project_toml)]) == 0
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+def test_run_std_net_http_fetch_ipv6_literal(tmp_path):
+    class V6ThreadingHTTPServer(ThreadingHTTPServer):
+        address_family = socket.AF_INET6
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            expected_host = f"[::1]:{self.server.server_address[1]}"
+            if self.path != "/v6" or self.headers.get("Host") != expected_host:
+                self.send_response(400)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            body = b"v6"
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, format, *args):
+            return
+
+    try:
+        server = V6ThreadingHTTPServer(("::1", 0), Handler)
+    except OSError as exc:
+        pytest.skip(f"当前环境不支持 IPv6 loopback: {exc}")
+
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        project_toml = write_project(
+            tmp_path,
+            os_name=ez._native_os(),
+            arch=ez._native_arch(),
+        )
+        port = server.server_address[1]
+        (tmp_path / "src" / "index.ez").write_text(
+            'from "std/net/http" import { fetch };\n'
+            'from "std/test" import { testReset, testEqualStr, testAssert, testFailed };\n'
+            'const main = (): I32 => {\n'
+            '    testReset();\n'
+            f'    const resp = fetch(url = "http://[::1]:{port}/v6");\n'
+            '    resp.ok ? { testEqualStr(actual = resp.value.text(), expected = "v6", msg = "ipv6 response body"); };\n'
+            '    testAssert(condition = resp.ok && resp.value.status == 200, msg = "ipv6 literal fetch");\n'
+            '    return testFailed();\n'
             '};\n',
             encoding="utf-8",
         )
@@ -1599,6 +3234,119 @@ def test_run_std_net_http_fetch_ex_headers_roundtrip(tmp_path):
         thread.join(timeout=2)
 
 
+def test_run_std_net_http_fetch_decodes_chunked_response(tmp_path):
+    ready = threading.Event()
+    port_holder = []
+
+    def serve_once():
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
+            server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            server.bind(("127.0.0.1", 0))
+            server.listen(1)
+            port_holder.append(server.getsockname()[1])
+            ready.set()
+            conn, _ = server.accept()
+            with conn:
+                conn.settimeout(5)
+                conn.recv(2048)
+                conn.sendall(
+                    b"HTTP/1.1 200 OK\r\n"
+                    b"Transfer-Encoding: chunked\r\n"
+                    b"X-Ez: chunked\r\n"
+                    b"\r\n"
+                    b"2\r\nok\r\n"
+                    b"6;ignored=true\r\n chunk\r\n"
+                    b"0\r\n\r\n"
+                )
+
+    thread = threading.Thread(target=serve_once, daemon=True)
+    thread.start()
+    assert ready.wait(timeout=2)
+
+    project_toml = write_project(
+        tmp_path,
+        os_name=ez._native_os(),
+        arch=ez._native_arch(),
+    )
+    port = port_holder[0]
+    (tmp_path / "src" / "index.ez").write_text(
+        'from "std/net/http" import { fetch };\n'
+        'from "std/test" import { testReset, testEqualStr, testFailed };\n'
+        'const main = (): I32 => {\n'
+        '    testReset();\n'
+        f'    const resp = fetch(url = "http://127.0.0.1:{port}/chunked");\n'
+        '    resp.ok ? { testEqualStr(actual = resp.value.headers["Transfer-Encoding"], expected = "chunked", msg = "chunked response header"); };\n'
+        '    resp.ok ? { testEqualStr(actual = resp.value.text(), expected = "ok chunk", msg = "chunked response body"); };\n'
+        '    return (resp.ok && resp.value.status == 200 && resp.value.body.size == 8) ? testFailed() : 1;\n'
+        '};\n',
+        encoding="utf-8",
+    )
+
+    assert ez.main(["run", "--project", str(project_toml)]) == 0
+    thread.join(timeout=2)
+
+
+def test_run_std_net_http_server_handles_basic_route(tmp_path):
+    project_toml = write_project(
+        tmp_path,
+        os_name=ez._native_os(),
+        arch=ez._native_arch(),
+    )
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+
+    source = f'''
+from "std/net/http" import {{ createServer, HttpRequest, HttpResponse }};
+from "std/str" import {{ strEqual }};
+
+let server = createServer(host = "127.0.0.1", port = {port});
+const handler = (req: HttpRequest): HttpResponse => {{
+    const status = !strEqual(a = req.method, b = "POST") ? 410 : (!strEqual(a = req.url, b = "/hello?name=ez") ? 411 : (req.body.size != 4 ? 412 : (!strEqual(a = req.headers["X-Ez"], b = "ping") ? 413 : 201)));
+    server.stop();
+    return HttpResponse(status = status, headers = {{ "X-Ez": Str = "pong" }}, body = Blob(data = "ok", size = 2));
+}};
+server.on(path = "/hello", handler = handler);
+server.start();
+'''
+    (tmp_path / "src" / "index.ez").write_text(source, encoding="utf-8")
+
+    result = {}
+
+    def run_server():
+        result["code"] = ez.main(["run", "--project", str(project_toml)])
+
+    thread = threading.Thread(target=run_server, daemon=True)
+    thread.start()
+    deadline = time.time() + 10
+    response = b""
+    while time.time() < deadline:
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=0.2) as client:
+                client.sendall(
+                    b"POST /hello?name=ez HTTP/1.1\r\n"
+                    b"Host: 127.0.0.1\r\n"
+                    b"X-Ez: ping\r\n"
+                    b"Content-Length: 4\r\n"
+                    b"\r\n"
+                    b"data"
+                )
+                while True:
+                    chunk = client.recv(4096)
+                    if not chunk:
+                        break
+                    response += chunk
+                break
+        except OSError:
+            time.sleep(0.05)
+
+    thread.join(timeout=10)
+    assert result.get("code") == 0
+    assert b"HTTP/1.1 201 OK" in response
+    assert b"X-Ez: pong" in response
+    assert response.endswith(b"ok")
+
+
 def test_run_std_net_tcp_connect_success(tmp_path):
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
@@ -1632,6 +3380,30 @@ def test_run_std_net_tcp_connect_success(tmp_path):
         server.shutdown()
         server.server_close()
         thread.join(timeout=2)
+
+
+def test_run_std_net_tcp_udp_rejects_ports_above_65535(tmp_path):
+    project_toml = write_project(
+        tmp_path,
+        os_name=ez._native_os(),
+        arch=ez._native_arch(),
+    )
+    (tmp_path / "src" / "index.ez").write_text(
+        'from "std/net/tcp" import { tcpConnect, tcpListen, udpBind, udpSend, udpClose };\n'
+        'const main = (): I32 => {\n'
+        '    const tcp = tcpConnect(host = "127.0.0.1", port = 65536);\n'
+        '    const listener = tcpListen(host = "127.0.0.1", port = 65536);\n'
+        '    const udpHigh = udpBind(host = "127.0.0.1", port = 65536);\n'
+        '    const udp = udpBind(host = "127.0.0.1", port = 0);\n'
+        '    const sent = udpSend(socket = udp.value, host = "127.0.0.1", port = 65536, data = Blob(data = "u", size = 1));\n'
+        '    const sendFailed: I64 = -1;\n'
+        '    const closed = udpClose(socket = udp.value);\n'
+        '    return (!tcp.ok && !listener.ok && !udpHigh.ok && udp.ok && sent == sendFailed && closed) ? 0 : 1;\n'
+        '};\n',
+        encoding="utf-8",
+    )
+
+    assert ez.main(["run", "--project", str(project_toml)]) == 0
 
 
 def test_run_std_net_tcp_read_write_success(tmp_path):
@@ -1808,13 +3580,14 @@ def test_run_std_net_udp_send_recv_success(tmp_path):
     )
     port = port_holder[0]
     (tmp_path / "src" / "index.ez").write_text(
-        'from "std/net/tcp" import { udpBind, udpSend, udpRecv, udpClose };\n'
+        'from "std/net/tcp" import { udpBind, udpSend, udpRecvFrom, udpClose };\n'
+        'from "std/str" import { strByteLen };\n'
         'const main = (): I32 => {\n'
         '    const socket = udpBind(host = "127.0.0.1", port = 0);\n'
         f'    const sent = udpSend(socket = socket.value, host = "127.0.0.1", port = {port}, data = Blob(data = "u", size = 1));\n'
-        '    const chunk = udpRecv(socket = socket.value, maxBytes = 8);\n'
+        '    const packet = udpRecvFrom(socket = socket.value, maxBytes = 8);\n'
         '    const closed = udpClose(socket = socket.value);\n'
-        '    return (socket.ok && sent == 1 && chunk.ok && chunk.value.size == 3 && closed) ? 0 : 1;\n'
+        f'    return (socket.ok && sent == 1 && packet.ok && packet.value.data.size == 3 && packet.value.port == {port} && strByteLen(s = packet.value.host) > 0 && closed) ? 0 : 1;\n'
         '};\n',
         encoding="utf-8",
     )
@@ -1837,12 +3610,8 @@ def test_run_std_net_ws_connect_success(tmp_path):
             ready.set()
             conn, _ = server.accept()
             with conn:
-                conn.recv(2048)
-                conn.sendall(
-                    b"HTTP/1.1 101 Switching Protocols\r\n"
-                    b"Upgrade: websocket\r\n"
-                    b"Connection: Upgrade\r\n\r\n"
-                )
+                request = conn.recv(2048)
+                conn.sendall(_ws_handshake_response(request))
 
     thread = threading.Thread(target=serve_once, daemon=True)
     thread.start()
@@ -1859,6 +3628,194 @@ def test_run_std_net_ws_connect_success(tmp_path):
         'const main = (): I32 => {\n'
         f'    const conn = wsConnect(url = "ws://127.0.0.1:{port}/ws");\n'
         '    return (conn.ok && conn.value.handle != 0) ? 0 : 1;\n'
+        '};\n',
+        encoding="utf-8",
+    )
+
+    assert ez.main(["run", "--project", str(project_toml)]) == 0
+    thread.join(timeout=2)
+
+
+def test_run_std_net_ws_connect_preserves_root_query_and_strips_fragment(tmp_path):
+    ready = threading.Event()
+    port_holder = []
+    request_lines = []
+
+    def serve_once():
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
+            server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            server.bind(("127.0.0.1", 0))
+            server.listen(1)
+            port_holder.append(server.getsockname()[1])
+            ready.set()
+            conn, _ = server.accept()
+            with conn:
+                request = conn.recv(2048)
+                request_lines.append(request.split(b"\r\n", 1)[0])
+                conn.sendall(_ws_handshake_response(request))
+
+    thread = threading.Thread(target=serve_once, daemon=True)
+    thread.start()
+    assert ready.wait(timeout=2)
+
+    project_toml = write_project(
+        tmp_path,
+        os_name=ez._native_os(),
+        arch=ez._native_arch(),
+    )
+    port = port_holder[0]
+    (tmp_path / "src" / "index.ez").write_text(
+        'from "std/net/ws" import { wsConnect, wsClose };\n'
+        'const main = (): I32 => {\n'
+        f'    const conn = wsConnect(url = "ws://127.0.0.1:{port}?q=ez#fragment");\n'
+        '    const closed = conn.ok ? wsClose(conn = conn.value) : false;\n'
+        '    return (conn.ok && closed) ? 0 : 1;\n'
+        '};\n',
+        encoding="utf-8",
+    )
+
+    assert ez.main(["run", "--project", str(project_toml)]) == 0
+    thread.join(timeout=2)
+    assert request_lines == [b"GET /?q=ez HTTP/1.1"]
+
+
+def test_run_std_net_ws_connect_validates_authority_and_host_header(tmp_path):
+    ready = threading.Event()
+    port_holder = []
+    requests = []
+
+    def serve_once():
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
+            server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            server.bind(("127.0.0.1", 0))
+            server.listen(1)
+            port_holder.append(server.getsockname()[1])
+            ready.set()
+            conn, _ = server.accept()
+            with conn:
+                request = conn.recv(2048)
+                requests.append(request)
+                conn.sendall(_ws_handshake_response(request))
+
+    thread = threading.Thread(target=serve_once, daemon=True)
+    thread.start()
+    assert ready.wait(timeout=2)
+
+    project_toml = write_project(
+        tmp_path,
+        os_name=ez._native_os(),
+        arch=ez._native_arch(),
+    )
+    port = port_holder[0]
+    (tmp_path / "src" / "index.ez").write_text(
+        'from "std/net/ws" import { wsConnect, wsClose };\n'
+        'const main = (): I32 => {\n'
+        f'    const conn = wsConnect(url = "ws://user:pass@127.0.0.1:{port}/socket?q=ez#fragment");\n'
+        '    const alphaPort = wsConnect(url = "ws://127.0.0.1:abc/");\n'
+        '    const emptyPort = wsConnect(url = "ws://127.0.0.1:/");\n'
+        '    const largePort = wsConnect(url = "ws://127.0.0.1:65536/");\n'
+        '    const closed = conn.ok ? wsClose(conn = conn.value) : false;\n'
+        '    return (conn.ok && closed && !alphaPort.ok && !emptyPort.ok && !largePort.ok) ? 0 : 1;\n'
+        '};\n',
+        encoding="utf-8",
+    )
+
+    assert ez.main(["run", "--project", str(project_toml)]) == 0
+    thread.join(timeout=2)
+    assert requests
+    assert requests[0].split(b"\r\n", 1)[0] == b"GET /socket?q=ez HTTP/1.1"
+    assert f"Host: 127.0.0.1:{port}\r\n".encode("ascii") in requests[0]
+
+
+def test_run_std_net_ws_connect_ipv6_literal(tmp_path):
+    ready = threading.Event()
+    port_holder = []
+    requests = []
+
+    def serve_once():
+        with socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as server:
+            server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                server.bind(("::1", 0))
+            except OSError as exc:
+                ready.set()
+                port_holder.append(exc)
+                return
+            server.listen(1)
+            port_holder.append(server.getsockname()[1])
+            ready.set()
+            conn, _ = server.accept()
+            with conn:
+                request = conn.recv(2048)
+                requests.append(request)
+                conn.sendall(_ws_handshake_response(request))
+
+    thread = threading.Thread(target=serve_once, daemon=True)
+    thread.start()
+    assert ready.wait(timeout=2)
+    if port_holder and isinstance(port_holder[0], OSError):
+        thread.join(timeout=2)
+        pytest.skip(f"当前环境不支持 IPv6 loopback: {port_holder[0]}")
+
+    project_toml = write_project(
+        tmp_path,
+        os_name=ez._native_os(),
+        arch=ez._native_arch(),
+    )
+    port = port_holder[0]
+    (tmp_path / "src" / "index.ez").write_text(
+        'from "std/net/ws" import { wsConnect, wsClose };\n'
+        'const main = (): I32 => {\n'
+        f'    const conn = wsConnect(url = "ws://[::1]:{port}/v6");\n'
+        '    const closed = conn.ok ? wsClose(conn = conn.value) : false;\n'
+        '    return (conn.ok && closed) ? 0 : 1;\n'
+        '};\n',
+        encoding="utf-8",
+    )
+
+    assert ez.main(["run", "--project", str(project_toml)]) == 0
+    thread.join(timeout=2)
+    assert requests
+    assert requests[0].split(b"\r\n", 1)[0] == b"GET /v6 HTTP/1.1"
+    assert f"Host: [::1]:{port}\r\n".encode("ascii") in requests[0]
+
+
+def test_run_std_net_ws_connect_rejects_bad_accept_header(tmp_path):
+    ready = threading.Event()
+    port_holder = []
+
+    def serve_once():
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
+            server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            server.bind(("127.0.0.1", 0))
+            server.listen(1)
+            port_holder.append(server.getsockname()[1])
+            ready.set()
+            conn, _ = server.accept()
+            with conn:
+                conn.recv(2048)
+                conn.sendall(
+                    b"HTTP/1.1 101 Switching Protocols\r\n"
+                    b"Upgrade: websocket\r\n"
+                    b"Connection: Upgrade\r\n"
+                    b"Sec-WebSocket-Accept: invalid\r\n\r\n"
+                )
+
+    thread = threading.Thread(target=serve_once, daemon=True)
+    thread.start()
+    assert ready.wait(timeout=2)
+
+    project_toml = write_project(
+        tmp_path,
+        os_name=ez._native_os(),
+        arch=ez._native_arch(),
+    )
+    port = port_holder[0]
+    (tmp_path / "src" / "index.ez").write_text(
+        'from "std/net/ws" import { wsConnect };\n'
+        'const main = (): I32 => {\n'
+        f'    const conn = wsConnect(url = "ws://127.0.0.1:{port}/bad");\n'
+        '    return conn.ok ? 1 : 0;\n'
         '};\n',
         encoding="utf-8",
     )
@@ -1913,12 +3870,8 @@ def test_run_std_net_ws_send_recv_success(tmp_path):
             conn, _ = server.accept()
             with conn:
                 conn.settimeout(5)
-                conn.recv(2048)
-                conn.sendall(
-                    b"HTTP/1.1 101 Switching Protocols\r\n"
-                    b"Upgrade: websocket\r\n"
-                    b"Connection: Upgrade\r\n\r\n"
-                )
+                request = conn.recv(2048)
+                conn.sendall(_ws_handshake_response(request))
                 received.append(read_client_frame(conn))
                 send_server_frame(conn, b"pong")
                 read_client_frame(conn)
@@ -1948,6 +3901,99 @@ def test_run_std_net_ws_send_recv_success(tmp_path):
     assert ez.main(["run", "--project", str(project_toml)]) == 0
     thread.join(timeout=2)
     assert received == [b"ping"]
+
+
+def test_run_std_net_ws_fragments_ping_pong_and_random_masks(tmp_path):
+    ready = threading.Event()
+    port_holder = []
+    received = []
+    masks = []
+    pongs = []
+
+    def recv_exact(conn, size):
+        data = bytearray()
+        while len(data) < size:
+            chunk = conn.recv(size - len(data))
+            if not chunk:
+                raise OSError("connection closed")
+            data.extend(chunk)
+        return bytes(data)
+
+    def read_client_frame(conn):
+        header = recv_exact(conn, 2)
+        opcode = header[0] & 0x0F
+        length = header[1] & 0x7F
+        if length == 126:
+            length = int.from_bytes(recv_exact(conn, 2), "big")
+        elif length == 127:
+            length = int.from_bytes(recv_exact(conn, 8), "big")
+        mask = recv_exact(conn, 4)
+        payload = recv_exact(conn, length)
+        masks.append(mask)
+        return opcode, bytes(byte ^ mask[i % 4] for i, byte in enumerate(payload))
+
+    def send_server_frame(conn, opcode, payload, *, fin=True):
+        first = (0x80 if fin else 0) | opcode
+        header = bytearray([first])
+        if len(payload) <= 125:
+            header.append(len(payload))
+        elif len(payload) <= 0xFFFF:
+            header.extend([126, (len(payload) >> 8) & 0xFF, len(payload) & 0xFF])
+        else:
+            header.append(127)
+            header.extend(len(payload).to_bytes(8, "big"))
+        conn.sendall(bytes(header) + payload)
+
+    def serve_once():
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
+            server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            server.bind(("127.0.0.1", 0))
+            server.listen(1)
+            port_holder.append(server.getsockname()[1])
+            ready.set()
+            conn, _ = server.accept()
+            with conn:
+                conn.settimeout(5)
+                request = conn.recv(2048)
+                conn.sendall(_ws_handshake_response(request))
+                received.append(read_client_frame(conn)[1])
+                received.append(read_client_frame(conn)[1])
+                send_server_frame(conn, 0x9, b"?")
+                opcode, payload = read_client_frame(conn)
+                pongs.append((opcode, payload))
+                send_server_frame(conn, 0x2, b"po", fin=False)
+                send_server_frame(conn, 0x0, b"ng", fin=True)
+                read_client_frame(conn)
+
+    thread = threading.Thread(target=serve_once, daemon=True)
+    thread.start()
+    assert ready.wait(timeout=2)
+
+    project_toml = write_project(
+        tmp_path,
+        os_name=ez._native_os(),
+        arch=ez._native_arch(),
+    )
+    port = port_holder[0]
+    (tmp_path / "src" / "index.ez").write_text(
+        'from "std/net/ws" import { wsConnect, wsSend, wsRecv, wsClose };\n'
+        'const main = (): I32 => {\n'
+        f'    const conn = wsConnect(url = "ws://127.0.0.1:{port}/ws");\n'
+        '    const first = wsSend(conn = conn.value, data = Blob(data = "one", size = 3));\n'
+        '    const second = wsSend(conn = conn.value, data = Blob(data = "two", size = 3));\n'
+        '    const chunk = wsRecv(conn = conn.value, maxBytes = 8);\n'
+        '    const closed = wsClose(conn = conn.value);\n'
+        '    return (conn.ok && first == 3 && second == 3 && chunk.ok && chunk.value.size == 4 && closed) ? 0 : 1;\n'
+        '};\n',
+        encoding="utf-8",
+    )
+
+    assert ez.main(["run", "--project", str(project_toml)]) == 0
+    thread.join(timeout=2)
+    assert received == [b"one", b"two"]
+    assert len(masks) >= 3
+    assert masks[0] != masks[1]
+    assert pongs == [(0xA, b"?")]
 
 
 def test_run_flow_parallel_and_lock_hooks_link(tmp_path):
@@ -2032,6 +4078,28 @@ def test_run_flow_race_pl_returns_first_branch(tmp_path):
         '        return race(pl = [() => { return 7; }, () => { return 9; }], timeout = 10);\n'
         '    };\n'
         '    return value == 7 ? 0 : 1;\n'
+        '};\n',
+        encoding="utf-8",
+    )
+
+    assert ez.main(["run", "--project", str(project_toml)]) == 0
+
+
+def test_run_flow_race_pl_non_i32_uses_synchronous_fallback(tmp_path):
+    project_toml = write_project(
+        tmp_path,
+        os_name=ez._native_os(),
+        arch=ez._native_arch(),
+    )
+    (tmp_path / "src" / "index.ez").write_text(
+        'from "std/test" import { testReset, testEqualStr, testFailed };\n'
+        'const main = (): I32 => {\n'
+        '    testReset();\n'
+        '    const value = flow {\n'
+        '        return race(pl = [() => { return "a"; }, () => { return "b"; }], timeout = 10);\n'
+        '    };\n'
+        '    testEqualStr(actual = value, expected = "a", msg = "race str fallback");\n'
+        '    return testFailed();\n'
         '};\n',
         encoding="utf-8",
     )
@@ -2124,6 +4192,48 @@ def test_run_flow_parallel_read_waits_for_future(tmp_path):
         '        return p + local;\n'
         '    };\n'
         '    return value == 12 ? 0 : 1;\n'
+        '};\n',
+        encoding="utf-8",
+    )
+
+    assert ez.main(["run", "--project", str(project_toml)]) == 0
+
+
+def test_run_flow_parallel_typed_i32_read_waits_for_future(tmp_path):
+    project_toml = write_project(
+        tmp_path,
+        os_name=ez._native_os(),
+        arch=ez._native_arch(),
+    )
+    (tmp_path / "src" / "index.ez").write_text(
+        'from "std/time" import { sleep };\n'
+        'const main = (): I32 => {\n'
+        '    const value = flow {\n'
+        '        const p: I32 = parallel { sleep(ms = 10); return 7; };\n'
+        '        const local = 5;\n'
+        '        return p + local;\n'
+        '    };\n'
+        '    return value == 12 ? 0 : 1;\n'
+        '};\n',
+        encoding="utf-8",
+    )
+
+    assert ez.main(["run", "--project", str(project_toml)]) == 0
+
+
+def test_run_flow_parallel_combined_expression_evaluates_rhs(tmp_path):
+    project_toml = write_project(
+        tmp_path,
+        os_name=ez._native_os(),
+        arch=ez._native_arch(),
+    )
+    (tmp_path / "src" / "index.ez").write_text(
+        'const main = (): I32 => {\n'
+        '    const value = flow {\n'
+        '        const combined = parallel { return 7; } + 1;\n'
+        '        return combined;\n'
+        '    };\n'
+        '    return value == 8 ? 0 : 1;\n'
         '};\n',
         encoding="utf-8",
     )
@@ -2473,6 +4583,28 @@ def test_run_generic_struct_explicit_type_arguments(tmp_path):
         'const main = (): I32 => {\n'
         '    const p = Pair<I32, Str>(first = 42, second = "ez");\n'
         '    return (p.first == 42 && strEqual(a = p.second, b = "ez")) ? 0 : 1;\n'
+        '};\n',
+        encoding="utf-8",
+    )
+
+    assert ez.main(["run", "--project", str(project_toml)]) == 0
+
+
+def test_run_nested_generic_struct_adjacent_right_angles(tmp_path):
+    project_toml = write_project(
+        tmp_path,
+        os_name=ez._native_os(),
+        arch=ez._native_arch(),
+    )
+    (tmp_path / "src" / "index.ez").write_text(
+        'struct Box<T> { value: T; };\n'
+        'const unwrap = (box: Box<Box<U32>>): U32 => {\n'
+        '    return box.value.value;\n'
+        '};\n'
+        'const main = (): I32 => {\n'
+        '    const inner = Box<U32>(value = 42);\n'
+        '    const outer = Box<Box<U32>>(value = inner);\n'
+        '    return unwrap(box = outer) == 42 ? 0 : 1;\n'
         '};\n',
         encoding="utf-8",
     )
@@ -2964,18 +5096,104 @@ def test_run_links_std_process_basic_native_functions(tmp_path):
     )
     (tmp_path / "src" / "index.ez").write_text(
         'from "std/process" import { Command, Process, processExec, processSpawn, processWait, processTerminate, processCurrentPath };\n'
+        'from "std/str" import { strFromBytes };\n'
+        'from "std/test" import { testReset, testAssert, testEqualI64, testEqualStr, testFailed };\n'
         'const main = (): I32 => {\n'
+        '    testReset();\n'
         '    const args: Str[] = ["-c", "printf hello"];\n'
-        '    const exit_args: Str[] = ["-c", "exit 0"];\n'
+        '    const spawn_args: Str[] = ["-c", "cat; printf err >&2; exit 7"];\n'
         '    const envs: Str[] = ["EZLANG_PROCESS_TEST=1"];\n'
         '    const empty: Str[] = [];\n'
         '    const result = processExec(command = Command(program = "/bin/sh", args = args, cwd = "", env = envs, stdin = Blob(data = "", size = 0)));\n'
-        '    const stdout_size = result.value.stdout.size;\n'
+        '    testAssert(condition = result.ok && result.value.ok, msg = "processExec ok");\n'
+        '    const exec_stdout = strFromBytes(data = result.value.stdout);\n'
+        '    testAssert(condition = exec_stdout.ok, msg = "processExec stdout utf8");\n'
+        '    testEqualStr(actual = exec_stdout.value, expected = "hello", msg = "processExec captures stdout");\n'
         '    const current = processCurrentPath();\n'
-        '    const proc = processSpawn(command = Command(program = "/bin/sh", args = exit_args, cwd = "", env = empty, stdin = Blob(data = "", size = 0)));\n'
+        '    testAssert(condition = current.ok, msg = "current path available");\n'
+        '    const proc = processSpawn(command = Command(program = "/bin/sh", args = spawn_args, cwd = "", env = empty, stdin = Blob(data = "in", size = 2)));\n'
+        '    testAssert(condition = proc.ok, msg = "processSpawn ok");\n'
+        '    const spawn_result = processWait(process = proc.value);\n'
+        '    testAssert(condition = spawn_result.ok && !spawn_result.value.ok, msg = "processWait returns nonzero result");\n'
+        '    testEqualI64(actual = spawn_result.value.exitCode, expected = 7, msg = "processWait exit code");\n'
+        '    const spawn_stdout = strFromBytes(data = spawn_result.value.stdout);\n'
+        '    const spawn_stderr = strFromBytes(data = spawn_result.value.stderr);\n'
+        '    testAssert(condition = spawn_stdout.ok && spawn_stderr.ok, msg = "processWait streams utf8");\n'
+        '    testEqualStr(actual = spawn_stdout.value, expected = "in", msg = "processWait captures stdout");\n'
+        '    testEqualStr(actual = spawn_stderr.value, expected = "err", msg = "processWait captures stderr");\n'
         '    const waited = processWait(process = Process(handle = 0, pid = 0));\n'
+        '    testAssert(condition = !waited.ok, msg = "invalid process wait fails");\n'
         '    const killed = processTerminate(process = Process(handle = 0, pid = 0));\n'
-        '    return 0;\n'
+        '    testAssert(condition = !killed, msg = "invalid process terminate fails");\n'
+        '    return testFailed();\n'
+        '};\n',
+        encoding="utf-8",
+    )
+
+    assert ez.main(["run", "--project", str(project_toml)]) == 0
+
+
+def test_run_std_process_stream_pipes_success(tmp_path):
+    project_toml = write_project(
+        tmp_path,
+        os_name=ez._native_os(),
+        arch=ez._native_arch(),
+    )
+    (tmp_path / "src" / "index.ez").write_text(
+        'from "std/process" import { Command, processSpawn, processStdin, processStdout, processWait };\n'
+        'from "std/stream" import { streamWrite, streamRead, streamClose };\n'
+        'from "std/str" import { strFromBytes };\n'
+        'from "std/test" import { testReset, testAssert, testEqualI64, testEqualStr, testFailed };\n'
+        'const main = (): I32 => {\n'
+        '    testReset();\n'
+        '    const args: Str[] = ["-c", "cat"];\n'
+        '    const empty: Str[] = [];\n'
+        '    const proc = processSpawn(command = Command(program = "/bin/sh", args = args, cwd = "", env = empty, stdin = Blob(data = "", size = 0)));\n'
+        '    testAssert(condition = proc.ok, msg = "processSpawn ok");\n'
+        '    const input = processStdin(process = proc.value);\n'
+        '    const output = processStdout(process = proc.value);\n'
+        '    testAssert(condition = input.ok && output.ok, msg = "process pipe streams ok");\n'
+        '    const written = streamWrite(stream = input.value, data = Blob(data = "pipe", size = 4));\n'
+        '    testEqualI64(actual = written, expected = 4, msg = "stdin stream writes bytes");\n'
+        '    const closed_in = streamClose(stream = input.value);\n'
+        '    testAssert(condition = closed_in, msg = "stdin stream closes");\n'
+        '    const chunk = streamRead(stream = output.value, maxBytes = 4);\n'
+        '    testAssert(condition = chunk.ok, msg = "stdout stream reads");\n'
+        '    testEqualI64(actual = chunk.value.size, expected = 4, msg = "stdout stream size");\n'
+        '    const text = strFromBytes(data = chunk.value);\n'
+        '    testAssert(condition = text.ok, msg = "stdout stream utf8");\n'
+        '    testEqualStr(actual = text.value, expected = "pipe", msg = "stdout stream text");\n'
+        '    const closed_out = streamClose(stream = output.value);\n'
+        '    testAssert(condition = closed_out, msg = "stdout stream closes");\n'
+        '    const result = processWait(process = proc.value);\n'
+        '    testAssert(condition = result.ok && result.value.ok, msg = "processWait ok after transfer");\n'
+        '    testEqualI64(actual = result.value.stdout.size, expected = 0, msg = "transferred stdout omitted from wait");\n'
+        '    return testFailed();\n'
+        '};\n',
+        encoding="utf-8",
+    )
+
+    assert ez.main(["run", "--project", str(project_toml)]) == 0
+
+
+def test_run_std_process_rejects_invalid_stdin_blob(tmp_path):
+    project_toml = write_project(
+        tmp_path,
+        os_name=ez._native_os(),
+        arch=ez._native_arch(),
+    )
+    (tmp_path / "src" / "index.ez").write_text(
+        'from "std/process" import { Command, processExec, processSpawn };\n'
+        'from "std/test" import { testReset, testAssert, testFailed };\n'
+        'const main = (): I32 => {\n'
+        '    testReset();\n'
+        '    const args: Str[] = ["-c", "cat"];\n'
+        '    const empty: Str[] = [];\n'
+        '    const invalid = Blob(data = "", size = -1);\n'
+        '    const exec_result = processExec(command = Command(program = "/bin/sh", args = args, cwd = "", env = empty, stdin = invalid));\n'
+        '    const spawned = processSpawn(command = Command(program = "/bin/sh", args = args, cwd = "", env = empty, stdin = invalid));\n'
+        '    testAssert(condition = !exec_result.ok && !spawned.ok, msg = "invalid stdin blob rejects process calls");\n'
+        '    return testFailed();\n'
         '};\n',
         encoding="utf-8",
     )
@@ -3074,6 +5292,79 @@ def test_run_std_fs_empty_path_returns_failure_values(tmp_path):
     assert ez.main(["run", "--project", str(project_toml)]) == 0
 
 
+def test_run_std_fs_rejects_invalid_blob_writes(tmp_path):
+    project_toml = write_project(
+        tmp_path,
+        os_name=ez._native_os(),
+        arch=ez._native_arch(),
+    )
+    target = (tmp_path / "invalid-blob.bin").as_posix()
+    (tmp_path / "src" / "index.ez").write_text(
+        'from "std/fs" import { appendFile, exists, writeFile };\n'
+        'from "std/test" import { testReset, testAssert, testFailed };\n'
+        'const main = (): I32 => {\n'
+        '    testReset();\n'
+        '    const invalid = Blob(data = "", size = -1);\n'
+        f'    const wrote = writeFile(path = "{target}", content = invalid);\n'
+        f'    const appended = appendFile(path = "{target}", content = invalid);\n'
+        f'    testAssert(condition = !wrote && !appended && !exists(path = "{target}"), msg = "invalid blob writes fail without creating file");\n'
+        '    return testFailed();\n'
+        '};\n',
+        encoding="utf-8",
+    )
+
+    assert ez.main(["run", "--project", str(project_toml)]) == 0
+
+
+def test_run_std_fs_mkdir_existing_directory_is_success(tmp_path):
+    project_toml = write_project(
+        tmp_path,
+        os_name=ez._native_os(),
+        arch=ez._native_arch(),
+    )
+    target_dir = (tmp_path / "mkdir-existing").as_posix()
+    target_file = (tmp_path / "mkdir-file").as_posix()
+    (tmp_path / "src" / "index.ez").write_text(
+        'from "std/fs" import { isDir, mkdir, removeDir, writeFile };\n'
+        'from "std/test" import { testReset, testAssert, testFailed };\n'
+        'const main = (): I32 => {\n'
+        '    testReset();\n'
+        f'    const first = mkdir(path = "{target_dir}");\n'
+        f'    const second = mkdir(path = "{target_dir}");\n'
+        f'    const still_dir = isDir(path = "{target_dir}");\n'
+        f'    const wrote_file = writeFile(path = "{target_file}", content = Blob(data = "x", size = 1));\n'
+        f'    const file_as_dir = mkdir(path = "{target_file}");\n'
+        f'    const removed = removeDir(path = "{target_dir}", recursive = true);\n'
+        '    testAssert(condition = first && second && still_dir && wrote_file && !file_as_dir && removed, msg = "mkdir existing directory is success");\n'
+        '    return testFailed();\n'
+        '};\n',
+        encoding="utf-8",
+    )
+
+    assert ez.main(["run", "--project", str(project_toml)]) == 0
+
+
+def test_run_std_fs_abs_path_lexical_fallback_for_missing_path(tmp_path):
+    project_toml = write_project(
+        tmp_path,
+        os_name=ez._native_os(),
+        arch=ez._native_arch(),
+    )
+    (tmp_path / "src" / "index.ez").write_text(
+        'from "std/fs" import { absPath, exists };\n'
+        'from "std/path" import { pathIsAbs };\n'
+        'from "std/str" import { strContains, strStartsWith };\n'
+        'const main = (): I32 => {\n'
+        '    const missing = "missing-dir/../missing-file.txt";\n'
+        '    const full = absPath(path = missing);\n'
+        '    return (!exists(path = missing) && pathIsAbs(path = full) && !strContains(s = full, needle = "/../") && !strContains(s = full, needle = "\\\\..\\\\")) ? 0 : 1;\n'
+        '};\n',
+        encoding="utf-8",
+    )
+
+    assert ez.main(["run", "--project", str(project_toml)]) == 0
+
+
 def test_run_std_os_args_returns_process_arguments(tmp_path):
     project_toml = write_project(
         tmp_path,
@@ -3106,13 +5397,15 @@ def test_run_std_os_native_env_platform_and_process_info(tmp_path):
         'const main = (): I32 => {\n'
         '    const changed = setEnv(key = "EZLANG_OS_TEST", value = "ok");\n'
         '    const value = env(key = "EZLANG_OS_TEST");\n'
+        '    const empty_changed = setEnv(key = "", value = "bad");\n'
+        '    const empty_value = env(key = "");\n'
         '    const dir = cwd();\n'
         '    const proc = pid();\n'
         '    const os_name = platform();\n'
         '    const arch_name = arch();\n'
         f'    const os_ok = strEqual(a = os_name, b = "{ez._native_os()}");\n'
         f'    const arch_ok = strEqual(a = arch_name, b = "{ez._native_arch()}");\n'
-        '    return (changed && value.ok && strEqual(a = value.value, b = "ok") && dir != "" && proc > 0 && os_ok && arch_ok) ? 0 : 1;\n'
+        '    return (changed && value.ok && strEqual(a = value.value, b = "ok") && !empty_changed && !empty_value.ok && dir != "" && proc > 0 && os_ok && arch_ok) ? 0 : 1;\n'
         '};\n',
         encoding="utf-8",
     )
@@ -3290,6 +5583,37 @@ def test_build_emcc_uses_sdk_and_js_libraries(tmp_path, capsys):
     calls = (emcc.parent / "calls.txt").read_text(encoding="utf-8")
     assert "--js-library" in calls
     assert str(js_lib) in calls
+
+
+def test_build_emcc_flow_parallel_uses_synchronous_fallback(tmp_path, capsys):
+    project_toml = write_project(tmp_path, os_name="emcc", arch="wasm32")
+    sdk_dir = tmp_path / "emsdk"
+    emcc = sdk_dir / "emcc"
+    _write_fake_sdk_tool(emcc)
+    project_toml.write_text(
+        project_toml.read_text(encoding="utf-8").replace('dir = "dist/emcc"', f'dir = "dist/emcc"\nsdk = "{sdk_dir}"'),
+        encoding="utf-8",
+    )
+    (tmp_path / "src" / "index.ez").write_text(
+        'const main = (): I32 => {\n'
+        '    const result = flow {\n'
+        '        const p = parallel { return 7; };\n'
+        '        return p + race(pl = [() => { return 1; }, () => { return 2; }], timeout = 10);\n'
+        '    };\n'
+        '    return result == 8 ? 0 : 1;\n'
+        '};\n',
+        encoding="utf-8",
+    )
+
+    assert ez.main(["build", "--project", str(project_toml)]) == 0
+
+    out = capsys.readouterr().out
+    artifact = tmp_path / "dist" / "emcc" / "demo.js"
+    assert artifact.exists()
+    assert "sdk artifact:" in out
+    calls = (emcc.parent / "calls.txt").read_text(encoding="utf-8")
+    assert "runtime.c" not in calls
+    assert "pthread" not in calls
 
 
 def test_build_android_sdk_compiles_c_extern_and_links_artifact(tmp_path, capsys):
@@ -3534,6 +5858,45 @@ members = ["packages/*"]
     assert "workspace workspace" in out
 
 
+def test_root_install_script_supports_git_bootstrap_and_path_registration():
+    script = (ROOT / "install.sh").read_text(encoding="utf-8")
+    for marker in [
+        "https://github.com/ZYF93/EzLang.git",
+        "--local",
+        "EZLANG_REPO_URL",
+        "require_python",
+        "require_native_linker",
+        "git clone",
+        "remote set-url origin",
+        "remote add origin",
+        "git -C",
+        "-m venv",
+        "pip install -e",
+        "import llvmlite.binding",
+        "无需单独安装系统 LLVM",
+        "只有构建 os=\\\"emcc\\\" / wasm32 目标时才需要 Emscripten SDK",
+        "ez\" --version",
+        "ez\" install --project",
+        "ez\" build --project",
+        "<<'EOF'\nlet $code",
+        "EZLANG_REGISTER_PATH",
+        "export PATH=",
+    ]:
+        assert marker in script
+
+    ordered_markers = [
+        "git clone",
+        "-m venv",
+        "pip install -e",
+        "ez\" --version",
+        "ez\" install --project",
+        "ez\" build --project",
+        "PATH_LINE=",
+    ]
+    positions = [script.index(marker) for marker in ordered_markers]
+    assert positions == sorted(positions)
+
+
 
 def test_install_downloads_remote_version_dependency(tmp_path, capsys):
     registry = tmp_path / "registry"
@@ -3735,11 +6098,11 @@ def test_fmt_check_parses_ez_files(tmp_path, capsys):
 def test_fmt_rewrites_single_file(tmp_path, capsys):
     project_toml = write_project(tmp_path)
     source = tmp_path / "src" / "index.ez"
-    source.write_text("let   x:I32=1;\nconst main=():I32=>{return x;}\n", encoding="utf-8")
+    source.write_text("let   $x:I32=1;\nconst main=():I32=>{return $x;}\n", encoding="utf-8")
 
     assert ez.main(["fmt", "--project", str(project_toml), str(source)]) == 0
 
-    assert source.read_text(encoding="utf-8") == "let x: I32 = 1;\nconst main = (): I32 => {\n    return x;\n}\n"
+    assert source.read_text(encoding="utf-8") == "let $x: I32 = 1;\nconst main = (): I32 => {\n    return $x;\n}\n"
     out = capsys.readouterr().out
     assert "formatted 1 file" in out
 

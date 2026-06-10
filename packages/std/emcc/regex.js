@@ -54,6 +54,16 @@
     }
   }
 
+  function byteLengthPrefix(value, end) {
+    return lengthBytesUTF8(value.slice(0, end));
+  }
+
+  function advanceOne(value, index) {
+    if (index >= value.length) return index;
+    var code = value.codePointAt(index);
+    return index + (code > 0xffff ? 2 : 1);
+  }
+
   function writeMatch(ptr, match) {
     setValue(ptr, BigInt(match.start), 'i64');
     setValue(ptr + 8, BigInt(match.end), 'i64');
@@ -65,11 +75,51 @@
     var m = re.exec(input);
     if (!m) return null;
     return {
-      start: m.index,
-      end: m.index + m[0].length,
+      start: byteLengthPrefix(input, m.index),
+      end: byteLengthPrefix(input, m.index + m[0].length),
       text: m[0],
       groups: m.slice(1).map(function (value) { return value || ''; }),
     };
+  }
+
+  function replaceLiteral(input, re, replacement, replaceAll) {
+    if (!replaceAll) {
+      var first = re.exec(input);
+      if (!first) return input;
+      return input.slice(0, first.index) + replacement + input.slice(first.index + first[0].length);
+    }
+    var out = '';
+    var last = 0;
+    var m;
+    while ((m = re.exec(input)) !== null) {
+      out += input.slice(last, m.index) + replacement;
+      last = m.index + m[0].length;
+      if (m[0].length === 0) {
+        if (last >= input.length) break;
+        var next = advanceOne(input, last);
+        out += input.slice(last, next);
+        last = next;
+        re.lastIndex = last;
+      }
+    }
+    return out + input.slice(last);
+  }
+
+  function splitNoCaptures(input, re) {
+    var items = [];
+    var last = 0;
+    var m;
+    while ((m = re.exec(input)) !== null) {
+      items.push(input.slice(last, m.index));
+      last = m.index + m[0].length;
+      if (m[0].length === 0) {
+        if (last >= input.length) break;
+        last = advanceOne(input, last);
+        re.lastIndex = last;
+      }
+    }
+    items.push(input.slice(last));
+    return items;
   }
 
   mergeInto(LibraryManager.library, {
@@ -101,21 +151,25 @@
         var m;
         while ((m = re.exec(input)) !== null) {
           items.push(m[0]);
-          if (m[0].length === 0) re.lastIndex++;
+          if (m[0].length === 0) {
+            if (re.lastIndex >= input.length) break;
+            re.lastIndex = advanceOne(input, re.lastIndex);
+          }
         }
       }
       writeStrList(ret, items);
     },
     regexReplace: function (regexPtr, inputPtr, replacementPtr) {
       var regex = readRegex(regexPtr);
-      var re = compile(regex, (regex.flags & 4) !== 0);
+      var replaceAll = (regex.flags & 4) !== 0;
+      var re = compile(regex, replaceAll);
       var input = text(inputPtr);
-      return stringToNewUTF8(re ? input.replace(re, text(replacementPtr)) : input);
+      return stringToNewUTF8(re ? replaceLiteral(input, re, text(replacementPtr), replaceAll) : input);
     },
     regexSplit: function (ret, regexPtr, inputPtr) {
       var re = compile(readRegex(regexPtr), true);
       var input = text(inputPtr);
-      writeStrList(ret, re ? input.split(re) : [input]);
+      writeStrList(ret, re ? splitNoCaptures(input, re) : [input]);
     },
   });
 })();

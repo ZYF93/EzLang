@@ -54,8 +54,10 @@ int64_t mathLcmI64(int64_t a, int64_t b) {
     return mathAbsI64(result);
 #endif
 #endif
-    if (reduced != 0 && (b > INT64_MAX / reduced || b < INT64_MIN / reduced)) return INT64_MAX;
-    return mathAbsI64(reduced * b);
+    uint64_t left = reduced < 0 ? (uint64_t)(-(reduced + 1)) + 1 : (uint64_t)reduced;
+    uint64_t right = b < 0 ? (uint64_t)(-(b + 1)) + 1 : (uint64_t)b;
+    if (left != 0 && right > (uint64_t)INT64_MAX / left) return INT64_MAX;
+    return (int64_t)(left * right);
 }
 
 double mathSqrt(double value) { return sqrt(value); }
@@ -118,12 +120,12 @@ OptI64 mathDivI64Checked(int64_t a, int64_t b) {
 }
 
 OptI32 mathF64ToI32(double value) {
-    if (!isfinite(value) || value < (double)INT32_MIN || value > (double)INT32_MAX) return (OptI32){false, 0};
+    if (!isfinite(value) || value <= (double)INT32_MIN - 1.0 || value >= (double)INT32_MAX + 1.0) return (OptI32){false, 0};
     return (OptI32){true, (int32_t)value};
 }
 
 OptI64 mathF64ToI64(double value) {
-    if (!isfinite(value) || value < (double)INT64_MIN || value > (double)INT64_MAX) return (OptI64){false, 0};
+    if (!isfinite(value) || value < -0x1p63 || value >= 0x1p63) return (OptI64){false, 0};
     return (OptI64){true, (int64_t)value};
 }
 

@@ -44,6 +44,16 @@ def test_e2e_stdlib_documents_exported_declares():
             for doc_name, docs in documents.items():
                 if name not in docs:
                     missing_names.append(f"{doc_name} 缺少 {source.relative_to(ROOT)}:{name}")
+        for match in re.finditer(r"export\s+const\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*\(([^)]*)\)\s*:\s*([^=]+)=>", text):
+            name = match.group(1)
+            params = re.sub(r"\s+", " ", match.group(2).strip())
+            ret_type = match.group(3).strip()
+            expected = f"{name}({params}) -> {ret_type}"
+            for doc_name, docs in documents.items():
+                if name not in docs:
+                    missing_names.append(f"{doc_name} 缺少 {source.relative_to(ROOT)}:{name}")
+            if compact(expected) not in api_entries:
+                missing_signatures.append(f"docs/stdlib-api.md 缺少 {source.relative_to(ROOT)}:{expected}")
         for match in re.finditer(r"export\s+declare\s+const\s+([A-Za-z_][A-Za-z0-9_]*)\s*:\s*([^;]+);", text):
             name = match.group(1)
             source_sig = match.group(2).strip()
@@ -78,9 +88,9 @@ def test_e2e_stdlib_time_format_tokens_are_documented():
     """std/time format 的跨平台格式占位符应写入两份标准库文档。"""
     for doc_path in [ROOT / "docs" / "stdlib-api.md", ROOT / "docs" / "stdlib.md"]:
         text = doc_path.read_text(encoding="utf-8")
-        for token in ["YYYY", "MM", "DD", "HH", "SS", "%Y", "%m", "%d", "%H", "%M", "%S"]:
+        for token in ["YYYY", "MM", "DD", "HH", "mm", "SS", "%Y", "%m", "%d", "%H", "%M", "%S"]:
             assert token in text, f"{doc_path.relative_to(ROOT)} 缺少 time format token {token}"
-        assert "分钟使用 `%M`" in text
+        assert "分钟使用 `mm` 或 `%M`" in text
 
 
 def test_e2e_stdlib_mem_names_and_error_codes_are_documented():
@@ -161,6 +171,15 @@ def assert_native_optional_return(ir_text: str, name: str, value_type: str):
     assert f'%"_{name}_abi_ret" = alloca {internal_type}' in ir_text
 
 
+def assert_native_small_struct_return(ir_text: str, name: str, struct_name: str, abi_return: str):
+    """断言 native 小结构返回按当前架构桥接，并还原为 Ez 内部布局。"""
+    if ez._native_arch() in {"aarch64", "x86_64"}:
+        assert f'declare {abi_return} @"{name}"' in ir_text
+        assert f'%"_{name}_abi_ret" = alloca %"{struct_name}"' in ir_text
+    else:
+        assert f'declare %"{struct_name}" @"{name}"' in ir_text
+
+
 def test_e2e_hello_builds_and_runs(tmp_path):
     project_toml = write_project(tmp_path, ROOT / "examples" / "hello.ez")
 
@@ -215,6 +234,65 @@ def test_e2e_native_io_wrapper_uses_mobile_logs_and_empty_mobile_stdin():
     assert "OS_LOG_TYPE_ERROR" in io_c
     assert "#if defined(__ANDROID__) || (defined(__APPLE__) && TARGET_OS_IPHONE)" in io_c
     assert "return (OptStr){false, NULL};" in io_c
+    assert "static char buffer[4096]" not in io_c
+
+
+def test_e2e_native_io_readline_reads_long_crlf_lines(tmp_path):
+    """原生 readLine 读取完整行，并兼容 CRLF 行尾。"""
+    cc = shutil.which("cc")
+    if cc is None:
+        pytest.skip("需要 C 编译器验证原生 std/io wrapper")
+
+    harness = tmp_path / "readline_harness.c"
+    harness.write_text(
+        r'''
+#include <stdbool.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+typedef struct {
+    bool ok;
+    const char *value;
+} OptStr;
+
+OptStr readLine(void);
+
+int main(void) {
+    OptStr line = readLine();
+    if (!line.ok || line.value == NULL) return 2;
+    printf("%zu:%s", strlen(line.value), line.value);
+    free((void *)line.value);
+    return 0;
+}
+''',
+        encoding="utf-8",
+    )
+    exe = tmp_path / "readline_harness"
+    subprocess.run(
+        [
+            cc,
+            "-std=c11",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            str(harness),
+            str(ROOT / "packages" / "std" / "native" / "io.c"),
+            "-o",
+            str(exe),
+        ],
+        check=True,
+    )
+
+    line = "x" * 5000
+    result = subprocess.run(
+        [str(exe)],
+        input=(line + "\r\nignored").encode("utf-8"),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=True,
+    )
+    assert result.stdout.decode("utf-8") == f"5000:{line}"
 
 
 def test_e2e_std_fs_imports_and_builds(tmp_path):
@@ -351,13 +429,15 @@ def test_e2e_std_math_imports_and_builds(tmp_path):
 def test_e2e_std_random_imports_and_builds(tmp_path):
     source = tmp_path / "std_random.ez"
     source.write_text(
-        'from "std/random" import { RandomSource, randomSeed, randomNextU32, randomNextU64, randomRangeI64, randomRangeF64, randomShuffleBytes, randomEntropy, randomSecureBytes, randomSecureU64 };\n\n'
+        'from "std/random" import { RandomSource, randomSeed, randomNextU32, randomNextU64, randomRangeI64, randomRangeF64, randomShuffleBytes, randomShuffle, randomEntropy, randomSecureBytes, randomSecureU64 };\n\n'
         'let source = randomSeed(seed = 42);\n'
         'let n32 = randomNextU32(this = source);\n'
         'let n64 = randomNextU64(this = source);\n'
         'let ranged_i = randomRangeI64(this = source, minValue = 1, maxValue = 10);\n'
         'let ranged_f = randomRangeF64(this = source, minValue = 0.0, maxValue = 1.0);\n'
         'let shuffled = randomShuffleBytes(this = source, data = Blob(data = "abcd", size = 4));\n'
+        'let nums: List<I32> = [1, 2, 3, 4];\n'
+        'let shuffled_nums: List<I32> = randomShuffle<I32>(this = source, list = nums);\n'
         'let entropy = randomEntropy(size = 8);\n'
         'let secure = randomSecureBytes(size = 8);\n'
         'let secure64 = randomSecureU64();\n',
@@ -369,9 +449,12 @@ def test_e2e_std_random_imports_and_builds(tmp_path):
     ir_file = tmp_path / "dist" / "native" / "e2e.ll"
     ir_text = ir_file.read_text(encoding="utf-8")
     assert '%"RandomSource" = type {i64}' in ir_text
-    assert 'declare %"RandomSource" @"randomSeed"' in ir_text
+    assert_native_small_struct_return(ir_text, "randomSeed", "RandomSource", "i64")
     assert 'declare i32 @"randomNextU32"' in ir_text
-    assert 'declare %"Blob" @"randomShuffleBytes"' in ir_text
+    blob_abi = "[2 x i64]" if ez._native_arch() == "aarch64" else "{i8*, i64}"
+    assert_native_small_struct_return(ir_text, "randomShuffleBytes", "Blob", blob_abi)
+    assert 'randomShuffle_I32' not in ir_text
+    assert 'random_shuffle_cond' in ir_text
     assert 'declare void @"randomSecureBytes"({i1, %"Blob"}* sret({i1, %"Blob"})' in ir_text
     assert_native_optional_return(ir_text, "randomSecureU64", "i64")
 
@@ -381,6 +464,8 @@ def test_e2e_random_wrappers_use_secure_entropy_without_prng_fallback():
     emcc = (ROOT / "packages" / "std" / "emcc" / "random.js").read_text(encoding="utf-8")
 
     for marker in ["CryptGenRandom", "arc4random_buf", "getrandom", 'open("/dev/urandom"', "return (OptBlob){false"]:
+        assert marker in native
+    for marker in ["static bool ez_random_size", "requested < 0", "> (uint64_t)SIZE_MAX", "UINT32_MAX", "offset == size"]:
         assert marker in native
     secure_read = native[native.index("static bool ez_random_read_system"):native.index("OptBlob randomSecureBytes")]
     assert "ez_random_next" not in secure_read
@@ -393,7 +478,290 @@ def test_e2e_random_wrappers_use_secure_entropy_without_prng_fallback():
     assert "mixSeed" not in secure_bytes
 
 
+def test_e2e_random_range_i64_preserves_cross_platform_sequence(tmp_path):
+    """randomRangeI64 的拒绝采样不能因平台实现差异多消耗随机数。"""
+    cc = shutil.which("cc")
+    if cc is None:
+        pytest.skip("需要 C 编译器验证 std/random 确定性序列")
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("需要 Node 验证 std/random emcc wrapper")
+
+    native = (ROOT / "packages" / "std" / "native" / "random.c").read_text(encoding="utf-8")
+    emcc = (ROOT / "packages" / "std" / "emcc" / "random.js").read_text(encoding="utf-8")
+    assert "threshold = (uint64_t)(0ULL - span) % span" in native
+    assert "var threshold = (MOD64 - span) % span" in emcc
+    assert "value < threshold" in emcc
+    assert "MOD64 - (MOD64 % span)" not in emcc
+
+    source = ROOT / "compiler" / "tests" / "fixtures" / "random_determinism_check.c"
+    exe = tmp_path / "random_determinism_check"
+    subprocess.run([cc, "-std=c11", "-Wall", "-Wextra", "-Werror", str(source), "-o", str(exe)], check=True)
+    result = subprocess.run([str(exe)], check=True, text=True, capture_output=True)
+    assert result.stdout.splitlines() == ["1", "10418571485319073430"]
+
+    script = r'''
+const assert = require('assert');
+const fs = require('fs');
+const vm = require('vm');
+
+const code = fs.readFileSync(process.argv[1], 'utf8');
+const memory = new ArrayBuffer(65536);
+const HEAPU8 = new Uint8Array(memory);
+const HEAP32 = new Int32Array(memory);
+const HEAP64 = new BigInt64Array(memory);
+const library = {};
+
+vm.runInNewContext(code, {
+  BigInt,
+  BigInt64Array,
+  Uint8Array,
+  HEAPU8,
+  HEAP64,
+  LibraryManager: { library },
+  mergeInto(target, source) { Object.assign(target, source); },
+}, { filename: process.argv[1] });
+
+const source = 8;
+HEAP64[source >> 3] = BigInt.asIntN(64, 0xA8D395BE4B19CCE8n);
+const ranged = library.randomRangeI64(source, 0n, 1n);
+const next = library.randomNextU64(source);
+
+assert.strictEqual(ranged, 1n);
+assert.strictEqual(BigInt.asUintN(64, next).toString(), '10418571485319073430');
+'''
+    subprocess.run([node, "-e", script, str(ROOT / "packages" / "std" / "emcc" / "random.js")], check=True)
+
+
+def test_e2e_random_shuffle_bytes_rejects_invalid_blob_inputs(tmp_path):
+    """randomShuffleBytes 遇到非法 Blob ABI 应返回空 Blob，不能读越界或截断。"""
+    cc = shutil.which("cc")
+    if cc is None:
+        pytest.skip("需要 C 编译器验证 std/random wrapper")
+
+    harness = tmp_path / "random_invalid_blob_harness.c"
+    harness.write_text(
+        r'''
+#include <stdint.h>
+
+typedef struct { uint8_t *data; int64_t size; } Blob;
+typedef struct { uint64_t state; } RandomSource;
+
+RandomSource randomSeed(uint64_t seed);
+Blob randomShuffleBytes(RandomSource *source, const Blob *data);
+
+int main(void) {
+    uint8_t one = 1;
+    RandomSource source = randomSeed(1);
+    Blob missing = {0, 1};
+    Blob negative = {0, -1};
+    Blob huge = {&one, INT64_MAX};
+    Blob empty = {0, 0};
+    Blob ok = {&one, 1};
+
+    if (randomShuffleBytes(&source, 0).size != 0) return 2;
+    if (randomShuffleBytes(&source, &missing).size != 0) return 3;
+    if (randomShuffleBytes(&source, &negative).size != 0) return 4;
+    if (randomShuffleBytes(&source, &huge).size != 0) return 5;
+    if (randomShuffleBytes(&source, &empty).size != 0) return 6;
+    Blob shuffled = randomShuffleBytes(&source, &ok);
+    if (shuffled.size != 1 || !shuffled.data || shuffled.data[0] != 1) return 7;
+    return 0;
+}
+''',
+        encoding="utf-8",
+    )
+    exe = tmp_path / "random_invalid_blob_harness"
+    subprocess.run(
+        [
+            cc,
+            "-std=c11",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            str(harness),
+            str(ROOT / "packages" / "std" / "native" / "random.c"),
+            "-o",
+            str(exe),
+        ],
+        check=True,
+    )
+    subprocess.run([str(exe)], check=True)
+
+
+def test_e2e_emcc_random_shuffle_bytes_rejects_invalid_blob_inputs():
+    """emcc randomShuffleBytes 应拒绝越界 Blob，不能把它截断成短输入。"""
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("需要 Node 验证 std/random emcc wrapper")
+    script = r'''
+const assert = require('assert');
+const fs = require('fs');
+const vm = require('vm');
+
+const code = fs.readFileSync(process.argv[1], 'utf8');
+const memory = new ArrayBuffer(65536);
+const HEAPU8 = new Uint8Array(memory);
+const HEAP64 = new BigInt64Array(memory);
+const view = new DataView(memory);
+let heap = 1024;
+
+function align(value) { return (value + 7) & ~7; }
+function _malloc(size) {
+  const ptr = heap;
+  heap = align(heap + Math.max(1, size));
+  if (heap > HEAPU8.length) throw new Error('oom');
+  return ptr;
+}
+function getValue(ptr, type) {
+  if (type === '*') return view.getUint32(ptr, true);
+  if (type === 'i64') return Number(view.getBigInt64(ptr, true));
+  throw new Error('unsupported getValue type ' + type);
+}
+function setValue(ptr, value, type) {
+  if (type === '*') { view.setUint32(ptr, Number(value), true); return; }
+  if (type === 'i64') { view.setBigInt64(ptr, BigInt(value), true); return; }
+  throw new Error('unsupported setValue type ' + type);
+}
+
+const library = {};
+vm.runInNewContext(code, {
+  BigInt,
+  BigInt64Array,
+  Uint8Array,
+  HEAPU8,
+  HEAP64,
+  _malloc,
+  getValue,
+  setValue,
+  LibraryManager: { library },
+  mergeInto(target, source) { Object.assign(target, source); },
+}, { filename: process.argv[1] });
+
+function blob(dataPtr, size) {
+  const ptr = _malloc(16);
+  setValue(ptr, dataPtr, '*');
+  setValue(ptr + 8, size, 'i64');
+  return ptr;
+}
+function shuffle(blobPtr) {
+  const source = _malloc(8);
+  const ret = _malloc(16);
+  library.randomSeed(source, 1n);
+  library.randomShuffleBytes(ret, source, blobPtr);
+  return { ptr: getValue(ret, '*'), size: getValue(ret + 8, 'i64') };
+}
+
+const data = _malloc(2);
+HEAPU8[data] = 1;
+HEAPU8[data + 1] = 2;
+
+assert.strictEqual(shuffle(0).size, 0);
+assert.strictEqual(shuffle(blob(0, -1)).size, 0);
+assert.strictEqual(shuffle(blob(0, 1)).size, 0);
+assert.strictEqual(shuffle(blob(HEAPU8.length - 1, 2)).size, 0);
+const ok = shuffle(blob(data, 2));
+assert.strictEqual(ok.size, 2);
+assert.notStrictEqual(ok.ptr, 0);
+assert.deepStrictEqual(Array.from(HEAPU8.slice(ok.ptr, ok.ptr + ok.size)).sort(), [1, 2]);
+'''
+    subprocess.run([node, "-e", script, str(ROOT / "packages" / "std" / "emcc" / "random.js")], check=True)
+
+
+def test_e2e_emcc_random_secure_entropy_sources_and_failures():
+    """emcc 安全随机应使用真实熵源，不可用时返回空可选值。"""
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("需要 Node 验证 std/random emcc wrapper")
+    script = r'''
+const assert = require('assert');
+const fs = require('fs');
+const vm = require('vm');
+
+const code = fs.readFileSync(process.argv[1], 'utf8');
+
+function loadLibrary(extra = {}) {
+  const memory = new ArrayBuffer(65536);
+  const HEAPU8 = new Uint8Array(memory);
+  const HEAP64 = new BigInt64Array(memory);
+  const view = new DataView(memory);
+  let heap = 1024;
+
+  function align(value) { return (value + 7) & ~7; }
+  function _malloc(size) {
+    const ptr = heap;
+    heap = align(heap + Math.max(1, size));
+    if (heap > HEAPU8.length) throw new Error('oom');
+    return ptr;
+  }
+  function setValue(ptr, value, type) {
+    if (type === '*') { view.setUint32(ptr, Number(value), true); return; }
+    if (type === 'i64') { view.setBigInt64(ptr, BigInt(value), true); return; }
+    throw new Error('unsupported setValue type ' + type);
+  }
+  const library = {};
+  vm.runInNewContext(code, Object.assign({
+    BigInt,
+    BigInt64Array,
+    Uint8Array,
+    HEAPU8,
+    HEAP64,
+    _malloc,
+    setValue,
+    LibraryManager: { library },
+    mergeInto(target, source) { Object.assign(target, source); },
+  }, extra), { filename: process.argv[1] });
+  return { library, HEAPU8, view, malloc: _malloc };
+}
+
+function optBlob(env, fn, size) {
+  const ret = env.malloc(32);
+  env.library[fn](ret, BigInt(size));
+  const ok = env.HEAPU8[ret] === 1;
+  const ptr = env.view.getUint32(ret + 8, true);
+  const length = Number(env.view.getBigInt64(ret + 16, true));
+  return { ok, ptr, length, bytes: Array.from(env.HEAPU8.slice(ptr, ptr + length)) };
+}
+
+function optU64(env) {
+  const ret = env.malloc(16);
+  env.library.randomSecureU64(ret);
+  return { ok: env.HEAPU8[ret] === 1, value: env.view.getBigInt64(ret + 8, true) };
+}
+
+const unavailable = loadLibrary();
+assert.deepStrictEqual(optBlob(unavailable, 'randomSecureBytes', 4), { ok: false, ptr: 0, length: 0, bytes: [] });
+assert.deepStrictEqual(optBlob(unavailable, 'randomEntropy', 4), { ok: false, ptr: 0, length: 0, bytes: [] });
+assert.deepStrictEqual(optU64(unavailable), { ok: false, value: 0n });
+
+let counter = 1;
+const available = loadLibrary({
+  crypto: {
+    getRandomValues(target) {
+      for (let i = 0; i < target.length; i++) target[i] = counter++ & 0xff;
+      return target;
+    },
+  },
+});
+const secureBytes = optBlob(available, 'randomSecureBytes', 4);
+assert.strictEqual(secureBytes.ok, true);
+assert.notStrictEqual(secureBytes.ptr, 0);
+assert.strictEqual(secureBytes.length, 4);
+assert.deepStrictEqual(secureBytes.bytes, [1, 2, 3, 4]);
+const entropyBytes = optBlob(available, 'randomEntropy', 4);
+assert.strictEqual(entropyBytes.ok, true);
+assert.notStrictEqual(entropyBytes.ptr, 0);
+assert.strictEqual(entropyBytes.length, 4);
+assert.deepStrictEqual(entropyBytes.bytes, [5, 6, 7, 8]);
+assert.deepStrictEqual(optBlob(available, 'randomSecureBytes', 0), { ok: true, ptr: 0, length: 0, bytes: [] });
+assert.deepStrictEqual(optBlob(available, 'randomEntropy', -1), { ok: false, ptr: 0, length: 0, bytes: [] });
+assert.deepStrictEqual(optU64(available), { ok: true, value: 0x100f0e0d0c0b0a09n });
+'''
+    subprocess.run([node, "-e", script, str(ROOT / "packages" / "std" / "emcc" / "random.js")], check=True)
+
+
 def test_e2e_std_hash_imports_and_builds(tmp_path):
+    docs = (ROOT / "docs" / "stdlib.md").read_text(encoding="utf-8")
     source = tmp_path / "std_hash.ez"
     source.write_text(
         'from "std/hash" import { hashFnv1a32, hashFnv1a64, hashStrFnv1a32, hashStrFnv1a64, hashCombineU64, crc32, crc32Str };\n\n'
@@ -417,6 +785,137 @@ def test_e2e_std_hash_imports_and_builds(tmp_path):
     assert 'declare i32 @"hashStrFnv1a32"' in ir_text
     assert 'declare i64 @"hashCombineU64"' in ir_text
     assert 'declare i32 @"crc32Str"' in ir_text
+    assert "SHA-2、HMAC 等安全算法由 `std/crypto` 独立提供" in docs
+    assert "后续 `std/crypto`" not in docs
+
+
+def test_e2e_hash_invalid_blob_inputs_are_treated_as_empty(tmp_path):
+    """非可选 hash Blob API 遇到非法 Blob 时按空输入计算。"""
+    cc = shutil.which("cc")
+    if cc is None:
+        pytest.skip("需要 C 编译器验证 std/hash wrapper")
+
+    harness = tmp_path / "hash_invalid_blob_harness.c"
+    harness.write_text(
+        r'''
+#include <stdint.h>
+
+typedef struct { uint8_t *data; int64_t size; } Blob;
+
+uint32_t hashFnv1a32(const Blob *data);
+uint64_t hashFnv1a64(const Blob *data);
+uint32_t crc32(const Blob *data);
+
+int main(void) {
+    uint8_t one = 1;
+    Blob missing = {0, 1};
+    Blob negative = {0, -1};
+    Blob empty = {0, 0};
+
+    uint32_t empty32 = hashFnv1a32(&empty);
+    uint64_t empty64 = hashFnv1a64(&empty);
+    uint32_t empty_crc = crc32(&empty);
+    if (empty32 != 2166136261u) return 2;
+    if (empty64 != 14695981039346656037ULL) return 3;
+    if (empty_crc != 0u) return 4;
+    Blob one_byte = {&one, 1};
+    if (hashFnv1a32(0) != empty32 || hashFnv1a32(&missing) != empty32 || hashFnv1a32(&negative) != empty32) return 5;
+    if (hashFnv1a64(0) != empty64 || hashFnv1a64(&missing) != empty64 || hashFnv1a64(&negative) != empty64) return 6;
+    if (crc32(0) != empty_crc || crc32(&missing) != empty_crc || crc32(&negative) != empty_crc) return 7;
+    if (hashFnv1a32(&one_byte) == empty32 || hashFnv1a64(&one_byte) == empty64 || crc32(&one_byte) == empty_crc) return 8;
+    return 0;
+}
+''',
+        encoding="utf-8",
+    )
+    exe = tmp_path / "hash_invalid_blob_harness"
+    subprocess.run(
+        [
+            cc,
+            "-std=c11",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            str(harness),
+            str(ROOT / "packages" / "std" / "native" / "hash.c"),
+            "-o",
+            str(exe),
+        ],
+        check=True,
+    )
+    subprocess.run([str(exe)], check=True)
+
+
+def test_e2e_emcc_hash_invalid_blob_inputs_are_treated_as_empty():
+    """emcc hash Blob API 遇到越界 Blob 时也按空输入计算。"""
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("需要 Node 验证 std/hash emcc wrapper")
+    script = r'''
+const assert = require('assert');
+const fs = require('fs');
+const vm = require('vm');
+
+const code = fs.readFileSync(process.argv[1], 'utf8');
+const memory = new ArrayBuffer(65536);
+const HEAPU8 = new Uint8Array(memory);
+const view = new DataView(memory);
+let heap = 1024;
+
+function align(value) { return (value + 7) & ~7; }
+function _malloc(size) {
+  const ptr = heap;
+  heap = align(heap + Math.max(1, size));
+  if (heap > HEAPU8.length) throw new Error('oom');
+  return ptr;
+}
+function getValue(ptr, type) {
+  if (type === '*') return view.getUint32(ptr, true);
+  if (type === 'i64') return Number(view.getBigInt64(ptr, true));
+  throw new Error('unsupported getValue type ' + type);
+}
+function setValue(ptr, value, type) {
+  if (type === '*') { view.setUint32(ptr, Number(value), true); return; }
+  if (type === 'i64') { view.setBigInt64(ptr, BigInt(value), true); return; }
+  throw new Error('unsupported setValue type ' + type);
+}
+
+const library = {};
+vm.runInNewContext(code, {
+  BigInt,
+  Uint8Array,
+  HEAPU8,
+  getValue,
+  setValue,
+  LibraryManager: { library },
+  mergeInto(target, source) { Object.assign(target, source); },
+}, { filename: process.argv[1] });
+
+function blob(dataPtr, size) {
+  const ptr = _malloc(16);
+  setValue(ptr, dataPtr, '*');
+  setValue(ptr + 8, size, 'i64');
+  return ptr;
+}
+
+const empty = blob(0, 0);
+const missing = blob(0, 1);
+const negative = blob(0, -1);
+const outOfBounds = blob(HEAPU8.length - 1, 2);
+const empty32 = library.hashFnv1a32(empty);
+const empty64 = library.hashFnv1a64(empty);
+const emptyCrc = library.crc32(empty);
+
+assert.strictEqual(empty32 >>> 0, 2166136261);
+assert.strictEqual(empty64, BigInt.asIntN(64, 14695981039346656037n));
+assert.strictEqual(emptyCrc, 0);
+for (const ptr of [0, missing, negative, outOfBounds]) {
+  assert.strictEqual(library.hashFnv1a32(ptr), empty32);
+  assert.strictEqual(library.hashFnv1a64(ptr), empty64);
+  assert.strictEqual(library.crc32(ptr), emptyCrc);
+}
+'''
+    subprocess.run([node, "-e", script, str(ROOT / "packages" / "std" / "emcc" / "hash.js")], check=True)
 
 
 def test_e2e_std_platform_imports_and_builds(tmp_path):
@@ -455,16 +954,64 @@ def test_e2e_platform_wrappers_probe_native_and_emcc_capabilities():
     emcc = (ROOT / "packages" / "std" / "emcc" / "platform.js").read_text(encoding="utf-8")
     for marker in ["GetSystemInfo", "GlobalMemoryStatusEx", "sysconf(_SC_PAGESIZE)", "sysconf(_SC_NPROCESSORS_ONLN)", "sysctlbyname(\"hw.memsize\""]:
         assert marker in native
+    assert "INT64_MAX / (uint64_t)page_size" in native
     assert "TARGET_OS_IPHONE" in native
     assert "return false;" in native[native.index("bool platformHasSubprocess"):]
-    for marker in ["stringToNewUTF8('emcc')", "stringToNewUTF8('wasm32')", "return 65536n", "SharedArrayBuffer", "typeof FS", "typeof fetch", "getRandomValues", "typeof document", "return 0;"]:
+    for marker in ["stringToNewUTF8('emcc')", "stringToNewUTF8('wasm32')", "return 65536n", "requireNodeModule('os')", "Math.min(cpus.length, 2147483647)", "Math.floor(concurrency)", "SharedArrayBuffer", "typeof FS", "typeof fetch", "getRandomValues", "requireNodeModule('crypto')", "typeof document", "spawnSync"]:
         assert marker in emcc
+    assert "navigator.hardwareConcurrency) return navigator.hardwareConcurrency | 0" not in emcc
+
+
+def test_e2e_emcc_platform_probes_node_capabilities_and_browser_fallback():
+    """emcc platform 能力查询应反映 Node 同步运行时能力，浏览器环境保持保守。"""
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("需要 Node 验证 std/platform emcc wrapper")
+    script = r'''
+const assert = require('assert');
+const fs = require('fs');
+const os = require('os');
+const vm = require('vm');
+
+const code = fs.readFileSync(process.argv[1], 'utf8');
+
+function makeRuntime(extra) {
+  const library = {};
+  vm.runInNewContext(code, Object.assign({
+    BigInt,
+    stringToNewUTF8(text) { return String(text); },
+    LibraryManager: { library },
+    mergeInto(target, source) { Object.assign(target, source); },
+  }, extra || {}), { filename: process.argv[1] });
+  return library;
+}
+
+let library = makeRuntime({ require });
+assert.strictEqual(library.platformOS(), 'emcc');
+assert.strictEqual(library.platformArch(), 'wasm32');
+assert.strictEqual(library.platformCpuCount(), Math.min(os.cpus().length, 2147483647));
+assert.strictEqual(library.platformMemoryLimit(), BigInt(os.totalmem()));
+assert.strictEqual(library.platformHasCrypto(), 1);
+assert.strictEqual(library.platformHasSubprocess(), 1);
+
+library = makeRuntime({});
+assert.strictEqual(library.platformHasSubprocess(), 0);
+assert.strictEqual(library.platformMemoryLimit(), -1n);
+
+library = makeRuntime({ navigator: { hardwareConcurrency: 9007199254740991 } });
+assert.strictEqual(library.platformCpuCount(), 2147483647);
+library = makeRuntime({ navigator: { hardwareConcurrency: 3.9 } });
+assert.strictEqual(library.platformCpuCount(), 3);
+library = makeRuntime({ navigator: { hardwareConcurrency: 0 } });
+assert.strictEqual(library.platformCpuCount(), 1);
+'''
+    subprocess.run([node, "-e", script, str(ROOT / "packages" / "std" / "emcc" / "platform.js")], check=True)
 
 
 def test_e2e_std_process_imports_and_builds(tmp_path):
     source = tmp_path / "std_process.ez"
     source.write_text(
-        'from "std/process" import { Command, Process, ProcessResult, processExec, processSpawn, processWait, processTerminate, processCurrentPath };\n\n'
+        'from "std/process" import { Command, Process, ProcessResult, processExec, processSpawn, processWait, processTerminate, processStdin, processStdout, processStderr, processCurrentPath };\n\n'
         'let args: Str[] = ["-c", "printf hello"];\n'
         'let envs: Str[] = ["EZLANG_PROCESS_TEST=1"];\n'
         'let empty: Str[] = [];\n'
@@ -473,6 +1020,9 @@ def test_e2e_std_process_imports_and_builds(tmp_path):
         'let spawned = processSpawn(command = Command(program = "/bin/sh", args = args, cwd = "", env = empty, stdin = Blob(data = "", size = 0)));\n'
         'let waited = processWait(process = Process(handle = 0, pid = 0));\n'
         'let killed = processTerminate(process = Process(handle = 0, pid = 0));\n'
+        'let stdin_stream = processStdin(process = Process(handle = 0, pid = 0));\n'
+        'let stdout_stream = processStdout(process = Process(handle = 0, pid = 0));\n'
+        'let stderr_stream = processStderr(process = Process(handle = 0, pid = 0));\n'
         'let current = processCurrentPath();\n',
         encoding="utf-8",
     )
@@ -483,22 +1033,396 @@ def test_e2e_std_process_imports_and_builds(tmp_path):
     ir_text = ir_file.read_text(encoding="utf-8")
     assert '%"Command" = type' in ir_text
     assert '%"ProcessResult" = type' in ir_text
+    assert '%"Stream" = type' in ir_text
     assert 'declare void @"processExec"({i1, %"ProcessResult"}* sret({i1, %"ProcessResult"})' in ir_text
     assert 'declare void @"processSpawn"({i1, %"Process"}* sret({i1, %"Process"})' in ir_text
+    assert 'declare void @"processStdin"({i1, %"Stream"}* sret({i1, %"Stream"})' in ir_text
+    assert 'declare void @"processStdout"({i1, %"Stream"}* sret({i1, %"Stream"})' in ir_text
+    assert 'declare void @"processStderr"({i1, %"Stream"}* sret({i1, %"Stream"})' in ir_text
     assert_native_optional_return(ir_text, "processCurrentPath", "i8*")
 
 
 def test_e2e_process_wrappers_cover_windows_and_unsupported_targets():
     native = (ROOT / "packages" / "std" / "native" / "process.c").read_text(encoding="utf-8")
     emcc = (ROOT / "packages" / "std" / "emcc" / "process.js").read_text(encoding="utf-8")
+    stdlib_doc = (ROOT / "docs" / "stdlib.md").read_text(encoding="utf-8")
+    stdlib_api_doc = (ROOT / "docs" / "stdlib-api.md").read_text(encoding="utf-8")
     for marker in ["CreateProcessW", "WaitForSingleObject", "TerminateProcess", "GetModuleFileNameW"]:
         assert marker in native
-    assert "#if !defined(_WIN32) && !defined(__ANDROID__) && !(defined(__APPLE__) && TARGET_OS_IPHONE)" in native
+    for marker in ["processStdin", "processStdout", "processStderr", "STREAM_KIND_PROCESS_STDIN", "STREAM_KIND_PROCESS_STDOUT", "STREAM_KIND_PROCESS_STDERR"]:
+        assert marker in native
+    assert "EZ_PROCESS_POSIX_SUPPORTED" in native
+    assert "#if defined(_WIN32)" in native
+    assert "#elif EZ_PROCESS_POSIX_SUPPORTED" in native
     assert "return (OptProcessResult){false, {0}};" in native
     assert "return (OptProcess){false, {0}};" in native
-    assert "writeOptProcessResult(ret, false)" in emcc
-    assert "writeOptProcess(ret, false)" in emcc
-    assert "writeOptStr(ret, null)" in emcc
+    for marker in ["child_process", "spawnSync", "completed[handle]", "process.execPath", "浏览器缺少同步子进程能力时显式失败"]:
+        assert marker in emcc
+    for marker in ["processStdin", "processStdout", "processStderr", "__ez_stream_bridge", "takeCompletedStream"]:
+        assert marker in emcc
+    assert "保留 `stdin`/`stdout`/`stderr` 管道" not in stdlib_doc
+    assert "processWait` 捕获" in stdlib_doc
+    assert "进程管道流" in stdlib_doc
+    assert "processWait` 写入 `Command.stdin` 并返回捕获的 `stdout`/`stderr`" in stdlib_api_doc
+
+
+def test_e2e_emcc_process_terminate_does_not_drop_completed_spawn_result():
+    """emcc processSpawn 是同步结果句柄，terminate 不能伪装成功或删除结果。"""
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("需要 Node 验证 std/process emcc wrapper")
+    script = r'''
+const assert = require('assert');
+const fs = require('fs');
+const vm = require('vm');
+
+const code = fs.readFileSync(process.argv[1], 'utf8');
+const memory = new ArrayBuffer(65536);
+const HEAPU8 = new Uint8Array(memory);
+const view = new DataView(memory);
+let heap = 1024;
+
+function align(value) { return (value + 7) & ~7; }
+function _malloc(size) {
+  const ptr = heap;
+  heap = align(heap + Math.max(1, size));
+  if (heap > HEAPU8.length) throw new Error('oom');
+  return ptr;
+}
+function getValue(ptr, type) {
+  if (type === '*') return view.getUint32(ptr, true);
+  if (type === 'i64') return Number(view.getBigInt64(ptr, true));
+  throw new Error('unsupported getValue type ' + type);
+}
+function setValue(ptr, value, type) {
+  if (type === '*') { view.setUint32(ptr, Number(value), true); return; }
+  if (type === 'i32') { view.setInt32(ptr, Number(value), true); return; }
+  if (type === 'i64') { view.setBigInt64(ptr, BigInt(value), true); return; }
+  throw new Error('unsupported setValue type ' + type);
+}
+function stringToNewUTF8(text) {
+  const bytes = Buffer.from(text, 'utf8');
+  const ptr = _malloc(bytes.length + 1);
+  HEAPU8.set(bytes, ptr);
+  HEAPU8[ptr + bytes.length] = 0;
+  return ptr;
+}
+function stringToUTF8(text, ptr, maxBytes) {
+  const bytes = Buffer.from(String(text || ''), 'utf8');
+  const size = Math.max(0, Math.min(bytes.length, maxBytes - 1));
+  HEAPU8.set(bytes.slice(0, size), ptr);
+  HEAPU8[ptr + size] = 0;
+}
+function lengthBytesUTF8(text) {
+  return Buffer.byteLength(String(text || ''), 'utf8');
+}
+function UTF8ToString(ptr) {
+  if (!ptr) return '';
+  let end = ptr;
+  while (HEAPU8[end] !== 0) end++;
+  return Buffer.from(HEAPU8.slice(ptr, end)).toString('utf8');
+}
+function writeList(ptr, values) {
+  const pages = values.length === 0 ? 0 : _malloc(4);
+  if (values.length > 0) {
+    const page = _malloc(32);
+    setValue(pages, page, '*');
+    values.forEach((value, index) => setValue(page + index * 4, stringToNewUTF8(value), '*'));
+  }
+  setValue(ptr, pages, '*');
+  setValue(ptr + 8, values.length, 'i64');
+  setValue(ptr + 16, values.length === 0 ? 0 : 8, 'i64');
+  setValue(ptr + 24, values.length === 0 ? 0 : 1, 'i64');
+}
+
+let spawnCalls = 0;
+const fakeChildProcess = {
+  spawnSync(program, args, options) {
+    spawnCalls += 1;
+    assert.strictEqual(program, 'tool');
+    assert.deepStrictEqual(Array.from(args), ['arg']);
+    assert.strictEqual(Buffer.from(options.input).toString('utf8'), 'in');
+    return { status: 0, stdout: Buffer.from('out'), stderr: Buffer.from(''), error: null };
+  },
+};
+
+const library = {};
+vm.runInNewContext(code, {
+  BigInt,
+  Buffer,
+  HEAPU8,
+  _malloc,
+  getValue,
+  setValue,
+  lengthBytesUTF8,
+  stringToUTF8,
+  UTF8ToString,
+  stringToNewUTF8,
+  require(name) { return name === 'child_process' ? fakeChildProcess : null; },
+  LibraryManager: { library },
+  mergeInto(target, source) { Object.assign(target, source); },
+}, { filename: process.argv[1] });
+
+const input = stringToNewUTF8('in');
+const command = _malloc(96);
+setValue(command, stringToNewUTF8('tool'), '*');
+writeList(command + 8, ['arg']);
+setValue(command + 40, 0, '*');
+writeList(command + 48, []);
+setValue(command + 80, input, '*');
+setValue(command + 88, 2, 'i64');
+
+const spawned = _malloc(32);
+library.processSpawn(spawned, command);
+assert.strictEqual(HEAPU8[spawned], 1);
+assert.strictEqual(spawnCalls, 1);
+assert.strictEqual(library.processTerminate(spawned + 8), 0);
+
+const waited = _malloc(80);
+library.processWait(waited, spawned + 8);
+assert.strictEqual(HEAPU8[waited], 1);
+assert.strictEqual(view.getInt32(waited + 8, true), 0);
+assert.strictEqual(HEAPU8[waited + 48], 1);
+const stdoutPtr = getValue(waited + 16, '*');
+const stdoutSize = getValue(waited + 24, 'i64');
+assert.strictEqual(Buffer.from(HEAPU8.slice(stdoutPtr, stdoutPtr + stdoutSize)).toString('utf8'), 'out');
+'''
+    subprocess.run([node, "-e", script, str(ROOT / "packages" / "std" / "emcc" / "process.js")], check=True)
+
+
+def test_e2e_emcc_process_rejects_invalid_stdin_blob_before_spawn():
+    """emcc processExec/processSpawn 遇到非法 stdin Blob 应失败，不能把它当空输入执行。"""
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("需要 Node 验证 std/process emcc wrapper")
+    script = r'''
+const assert = require('assert');
+const fs = require('fs');
+const vm = require('vm');
+
+const code = fs.readFileSync(process.argv[1], 'utf8');
+const memory = new ArrayBuffer(65536);
+const HEAPU8 = new Uint8Array(memory);
+const view = new DataView(memory);
+let heap = 1024;
+
+function align(value) { return (value + 7) & ~7; }
+function _malloc(size) {
+  const ptr = heap;
+  heap = align(heap + Math.max(1, size));
+  if (heap > HEAPU8.length) throw new Error('oom');
+  return ptr;
+}
+function getValue(ptr, type) {
+  if (type === '*') return view.getUint32(ptr, true);
+  if (type === 'i64') return Number(view.getBigInt64(ptr, true));
+  throw new Error('unsupported getValue type ' + type);
+}
+function setValue(ptr, value, type) {
+  if (type === '*') { view.setUint32(ptr, Number(value), true); return; }
+  if (type === 'i32') { view.setInt32(ptr, Number(value), true); return; }
+  if (type === 'i64') { view.setBigInt64(ptr, BigInt(value), true); return; }
+  throw new Error('unsupported setValue type ' + type);
+}
+function stringToNewUTF8(text) {
+  const bytes = Buffer.from(text, 'utf8');
+  const ptr = _malloc(bytes.length + 1);
+  HEAPU8.set(bytes, ptr);
+  HEAPU8[ptr + bytes.length] = 0;
+  return ptr;
+}
+function UTF8ToString(ptr) {
+  if (!ptr) return '';
+  let end = ptr;
+  while (HEAPU8[end] !== 0) end++;
+  return Buffer.from(HEAPU8.slice(ptr, end)).toString('utf8');
+}
+function writeList(ptr, values) {
+  const pages = values.length === 0 ? 0 : _malloc(4);
+  if (values.length > 0) {
+    const page = _malloc(32);
+    setValue(pages, page, '*');
+    values.forEach((value, index) => setValue(page + index * 4, stringToNewUTF8(value), '*'));
+  }
+  setValue(ptr, pages, '*');
+  setValue(ptr + 8, values.length, 'i64');
+  setValue(ptr + 16, values.length === 0 ? 0 : 8, 'i64');
+  setValue(ptr + 24, values.length === 0 ? 0 : 1, 'i64');
+}
+
+let spawnCalls = 0;
+const fakeChildProcess = {
+  spawnSync() { spawnCalls += 1; return { status: 0, stdout: Buffer.from(''), stderr: Buffer.from(''), error: null }; },
+};
+
+const library = {};
+vm.runInNewContext(code, {
+  BigInt,
+  Buffer,
+  HEAPU8,
+  _malloc,
+  getValue,
+  setValue,
+  UTF8ToString,
+  stringToNewUTF8,
+  require(name) { return name === 'child_process' ? fakeChildProcess : null; },
+  LibraryManager: { library },
+  mergeInto(target, source) { Object.assign(target, source); },
+}, { filename: process.argv[1] });
+
+const command = _malloc(96);
+setValue(command, stringToNewUTF8('tool'), '*');
+writeList(command + 8, []);
+setValue(command + 40, 0, '*');
+writeList(command + 48, []);
+setValue(command + 80, 0, '*');
+setValue(command + 88, -1, 'i64');
+
+const execRet = _malloc(80);
+library.processExec(execRet, command);
+assert.strictEqual(HEAPU8[execRet], 0);
+
+const spawnRet = _malloc(32);
+library.processSpawn(spawnRet, command);
+assert.strictEqual(HEAPU8[spawnRet], 0);
+assert.strictEqual(spawnCalls, 0);
+
+setValue(command + 80, HEAPU8.length - 1, '*');
+setValue(command + 88, 2, 'i64');
+library.processExec(execRet, command);
+assert.strictEqual(HEAPU8[execRet], 0);
+library.processSpawn(spawnRet, command);
+assert.strictEqual(HEAPU8[spawnRet], 0);
+assert.strictEqual(spawnCalls, 0);
+'''
+    subprocess.run([node, "-e", script, str(ROOT / "packages" / "std" / "emcc" / "process.js")], check=True)
+
+
+def test_e2e_emcc_process_stdout_can_transfer_to_stream():
+    """emcc processStdout 可把同步 spawn 结果转交给 std/stream。"""
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("需要 Node 验证 std/process emcc wrapper")
+    script = r'''
+const assert = require('assert');
+const fs = require('fs');
+const vm = require('vm');
+
+const streamCode = fs.readFileSync(process.argv[1], 'utf8');
+const processCode = fs.readFileSync(process.argv[2], 'utf8');
+const memory = new ArrayBuffer(65536);
+const HEAPU8 = new Uint8Array(memory);
+const view = new DataView(memory);
+let heap = 1024;
+
+function align(value) { return (value + 7) & ~7; }
+function _malloc(size) {
+  const ptr = heap;
+  heap = align(heap + Math.max(1, size));
+  if (heap > HEAPU8.length) throw new Error('oom');
+  return ptr;
+}
+function _free() {}
+function getValue(ptr, type) {
+  if (type === '*') return view.getUint32(ptr, true);
+  if (type === 'i32') return view.getInt32(ptr, true);
+  if (type === 'i64') return Number(view.getBigInt64(ptr, true));
+  throw new Error('unsupported getValue type ' + type);
+}
+function setValue(ptr, value, type) {
+  if (type === '*') { view.setUint32(ptr, Number(value), true); return; }
+  if (type === 'i32') { view.setInt32(ptr, Number(value), true); return; }
+  if (type === 'i64') { view.setBigInt64(ptr, BigInt(value), true); return; }
+  throw new Error('unsupported setValue type ' + type);
+}
+function stringToNewUTF8(text) {
+  const bytes = Buffer.from(text, 'utf8');
+  const ptr = _malloc(bytes.length + 1);
+  HEAPU8.set(bytes, ptr);
+  HEAPU8[ptr + bytes.length] = 0;
+  return ptr;
+}
+function UTF8ToString(ptr) {
+  if (!ptr) return '';
+  let end = ptr;
+  while (HEAPU8[end] !== 0) end++;
+  return Buffer.from(HEAPU8.slice(ptr, end)).toString('utf8');
+}
+function writeList(ptr, values) {
+  const pages = values.length === 0 ? 0 : _malloc(4);
+  if (values.length > 0) {
+    const page = _malloc(32);
+    setValue(pages, page, '*');
+    values.forEach((value, index) => setValue(page + index * 4, stringToNewUTF8(value), '*'));
+  }
+  setValue(ptr, pages, '*');
+  setValue(ptr + 8, values.length, 'i64');
+  setValue(ptr + 16, values.length === 0 ? 0 : 8, 'i64');
+  setValue(ptr + 24, values.length === 0 ? 0 : 1, 'i64');
+}
+
+const fakeChildProcess = {
+  spawnSync() { return { status: 0, stdout: Buffer.from('pipe'), stderr: Buffer.from('err'), error: null }; },
+};
+
+const library = {};
+const context = {
+  BigInt,
+  Buffer,
+  HEAPU8,
+  FS: {},
+  _malloc,
+  _free,
+  getValue,
+  setValue,
+  UTF8ToString,
+  stringToNewUTF8,
+  require(name) { return name === 'child_process' ? fakeChildProcess : null; },
+  LibraryManager: { library },
+  mergeInto(target, source) { Object.assign(target, source); },
+};
+vm.runInNewContext(streamCode, context, { filename: process.argv[1] });
+vm.runInNewContext(processCode, context, { filename: process.argv[2] });
+
+const command = _malloc(96);
+setValue(command, stringToNewUTF8('tool'), '*');
+writeList(command + 8, []);
+setValue(command + 40, 0, '*');
+writeList(command + 48, []);
+setValue(command + 80, 0, '*');
+setValue(command + 88, 0, 'i64');
+
+const spawned = _malloc(32);
+library.processSpawn(spawned, command);
+assert.strictEqual(HEAPU8[spawned], 1);
+
+const stdinOpt = _malloc(24);
+library.processStdin(stdinOpt, spawned + 8);
+assert.strictEqual(HEAPU8[stdinOpt], 0);
+
+const streamOpt = _malloc(24);
+library.processStdout(streamOpt, spawned + 8);
+assert.strictEqual(HEAPU8[streamOpt], 1);
+assert.strictEqual(getValue(streamOpt + 16, 'i32'), 6);
+
+const chunk = _malloc(24);
+library.streamRead(chunk, streamOpt + 8, 4);
+assert.strictEqual(HEAPU8[chunk], 1);
+const dataPtr = getValue(chunk + 8, '*');
+const size = getValue(chunk + 16, 'i64');
+assert.strictEqual(Buffer.from(HEAPU8.slice(dataPtr, dataPtr + size)).toString('utf8'), 'pipe');
+assert.strictEqual(library.streamClose(streamOpt + 8), 1);
+
+const waited = _malloc(80);
+library.processWait(waited, spawned + 8);
+assert.strictEqual(HEAPU8[waited], 1);
+assert.strictEqual(getValue(waited + 24, 'i64'), 0);
+assert.strictEqual(getValue(waited + 40, 'i64'), 3);
+'''
+    subprocess.run(
+        [node, "-e", script, str(ROOT / "packages" / "std" / "emcc" / "stream.js"), str(ROOT / "packages" / "std" / "emcc" / "process.js")],
+        check=True,
+    )
 
 
 def test_e2e_std_uri_imports_and_builds(tmp_path):
@@ -539,14 +1463,301 @@ def test_e2e_std_uri_imports_and_builds(tmp_path):
 def test_e2e_uri_wrappers_cover_parsing_percent_encoding_and_query_ops():
     native = (ROOT / "packages" / "std" / "native" / "uri.c").read_text(encoding="utf-8")
     emcc = (ROOT / "packages" / "std" / "emcc" / "uri.js").read_text(encoding="utf-8")
+    docs = (ROOT / "docs" / "stdlib.md").read_text(encoding="utf-8")
     for marker in ["ez_scheme_valid", "ez_percent_encode", "ez_percent_decode", "ez_normalize_path", "uriQueryGet", "uriQuerySet"]:
         assert marker in native
+    assert "ez_utf8_validate_len" in native
+    assert "ez_parse_port" in native
+    assert "byte == 0" in native
+    assert "atoi(" not in native
     assert "query_mode && ch == ' '" in native
     assert "ez_query_key_matches" in native
-    for marker in ["validScheme", "percentEncodeString", "percentDecodeString", "normalizePath", "queryKeyMatches", "querySet"]:
+    for marker in ["validScheme", "percentEncodeString", "percentDecodeString", "normalizePath", "hasAuthorityMarker", "queryKeyMatches", "querySet"]:
         assert marker in emcc
+    assert "appendCodePointUtf8" in emcc
+    assert "validUtf8Bytes(bytes)" in emcc
+    assert "parsePort" in emcc
+    assert "bytes.indexOf(0) >= 0" in emcc
+    assert "Number.parseInt" not in emcc
+    assert "完整 URL 解析、构造和查询参数处理由 `std/uri` 模块承担" in docs
+    assert "后续 `std/uri`" not in docs
     assert "queryMode && ch === '+'" in emcc
     assert "entries.push(encodedKey + '=' + encodedValue)" in emcc
+
+
+def test_e2e_emcc_uri_normalize_preserves_empty_authority_and_empty_path():
+    """emcc uriNormalize 应保留原 URL 的空 authority 和无 authority 空 path 语义。"""
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("需要 Node 验证 std/uri emcc wrapper")
+    script = r'''
+const assert = require('assert');
+const fs = require('fs');
+const vm = require('vm');
+
+const code = fs.readFileSync(process.argv[1], 'utf8');
+const memory = new ArrayBuffer(65536);
+const HEAPU8 = new Uint8Array(memory);
+let heap = 1024;
+
+function align(value) { return (value + 7) & ~7; }
+function _malloc(size) {
+  const ptr = heap;
+  heap = align(heap + Math.max(1, size));
+  if (heap > HEAPU8.length) throw new Error('oom');
+  return ptr;
+}
+function stringToNewUTF8(text) {
+  const bytes = Buffer.from(text, 'utf8');
+  const ptr = _malloc(bytes.length + 1);
+  HEAPU8.set(bytes, ptr);
+  HEAPU8[ptr + bytes.length] = 0;
+  return ptr;
+}
+function UTF8ToString(ptr) {
+  if (!ptr) return '';
+  let end = ptr;
+  while (HEAPU8[end] !== 0) end++;
+  return Buffer.from(HEAPU8.slice(ptr, end)).toString('utf8');
+}
+function getValue() { throw new Error('getValue not used'); }
+function setValue() { throw new Error('setValue not used'); }
+
+const library = {};
+vm.runInNewContext(code, {
+  HEAPU8,
+  POINTER_SIZE: 4,
+  _malloc,
+  getValue,
+  setValue,
+  UTF8ToString,
+  stringToNewUTF8,
+  LibraryManager: { library },
+  mergeInto(target, source) { Object.assign(target, source); },
+}, { filename: process.argv[1] });
+
+function normalize(url) {
+  return UTF8ToString(library.uriNormalize(stringToNewUTF8(url)));
+}
+
+assert.strictEqual(normalize('FILE:///tmp/./Ez/../main.ez'), 'file:///tmp/main.ez');
+assert.strictEqual(normalize('foo:'), 'foo:');
+assert.strictEqual(normalize('foo:?q=1#top'), 'foo:?q=1#top');
+assert.strictEqual(normalize('https://EXAMPLE.com/a/../b'), 'https://example.com/b');
+'''
+    subprocess.run([node, "-e", script, str(ROOT / "packages" / "std" / "emcc" / "uri.js")], check=True)
+
+
+def test_e2e_emcc_uri_decode_rejects_nul_percent_bytes():
+    """emcc URI 百分号解码拒绝 Ez Str ABI 无法表达的 NUL。"""
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("需要 Node 验证 std/uri emcc wrapper")
+    script = r'''
+const assert = require('assert');
+const fs = require('fs');
+const vm = require('vm');
+
+const code = fs.readFileSync(process.argv[1], 'utf8');
+const memory = new ArrayBuffer(65536);
+const HEAPU8 = new Uint8Array(memory);
+const view = new DataView(memory);
+let heap = 1024;
+
+function align(value) { return (value + 7) & ~7; }
+function _malloc(size) {
+  const ptr = heap;
+  heap = align(heap + Math.max(1, size));
+  if (heap > HEAPU8.length) throw new Error('oom');
+  return ptr;
+}
+function getValue(ptr, type) {
+  if (type === '*') return view.getUint32(ptr, true);
+  throw new Error('unsupported getValue type ' + type);
+}
+function setValue(ptr, value, type) {
+  if (type === '*') { view.setUint32(ptr, Number(value), true); return; }
+  if (type === 'i32') { view.setInt32(ptr, Number(value), true); return; }
+  throw new Error('unsupported setValue type ' + type);
+}
+function stringToNewUTF8(text) {
+  const bytes = Buffer.from(text, 'utf8');
+  const ptr = _malloc(bytes.length + 1);
+  HEAPU8.set(bytes, ptr);
+  HEAPU8[ptr + bytes.length] = 0;
+  return ptr;
+}
+function stringToUTF8(text, ptr, maxBytes) {
+  const bytes = Buffer.from(String(text || ''), 'utf8');
+  const size = Math.max(0, Math.min(bytes.length, maxBytes - 1));
+  HEAPU8.set(bytes.slice(0, size), ptr);
+  HEAPU8[ptr + size] = 0;
+}
+function lengthBytesUTF8(text) {
+  return Buffer.byteLength(String(text || ''), 'utf8');
+}
+function UTF8ToString(ptr) {
+  if (!ptr) return '';
+  let end = ptr;
+  while (HEAPU8[end] !== 0) end++;
+  return Buffer.from(HEAPU8.slice(ptr, end)).toString('utf8');
+}
+
+const library = {};
+vm.runInNewContext(code, {
+  HEAPU8,
+  POINTER_SIZE: 4,
+  _malloc,
+  getValue,
+  setValue,
+  lengthBytesUTF8,
+  stringToUTF8,
+  UTF8ToString,
+  stringToNewUTF8,
+  LibraryManager: { library },
+  mergeInto(target, source) { Object.assign(target, source); },
+}, { filename: process.argv[1] });
+
+function optString(call, args) {
+  const ret = _malloc(16);
+  library[call](ret, ...args.map(stringToNewUTF8));
+  return { ok: HEAPU8[ret] === 1, value: UTF8ToString(getValue(ret + 8, '*')) };
+}
+
+function querySet(query, key, value) {
+  return UTF8ToString(library.uriQuerySet(stringToNewUTF8(query), stringToNewUTF8(key), stringToNewUTF8(value)));
+}
+
+assert.deepStrictEqual(optString('uriDecodeQuery', ['two+words']), { ok: true, value: 'two words' });
+assert.deepStrictEqual(optString('uriDecodePathSegment', ['%E4%B8%AD']), { ok: true, value: '中' });
+assert.strictEqual(optString('uriDecodeQuery', ['%00']).ok, false);
+assert.strictEqual(optString('uriDecodePathSegment', ['a%00b']).ok, false);
+assert.strictEqual(optString('uriQueryGet', ['a=%00', 'a']).ok, false);
+assert.strictEqual(optString('uriQueryGet', ['a=1&&b=2&', '']).ok, false);
+assert.deepStrictEqual(optString('uriQueryGet', ['=empty&a=1', '']), { ok: true, value: 'empty' });
+assert.strictEqual(querySet('a=1&&b=2&', 'c', '3'), 'a=1&b=2&c=3');
+assert.strictEqual(querySet('a=1&&b=2&', 'b', 'x'), 'a=1&b=x');
+'''
+    subprocess.run([node, "-e", script, str(ROOT / "packages" / "std" / "emcc" / "uri.js")], check=True)
+
+
+def test_e2e_native_uri_query_set_grows_when_replacing_short_value(tmp_path):
+    """native uriQuerySet 替换短参数时必须动态扩容，不能按原 query 长度写溢出。"""
+    cc = shutil.which("cc")
+    if cc is None:
+        pytest.skip("需要 C 编译器验证原生 std/uri wrapper")
+
+    harness = tmp_path / "uri_query_set_harness.c"
+    harness.write_text(
+        r'''
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+
+const char *uriQuerySet(const char *query, const char *key, const char *value);
+
+int main(void) {
+    const char *long_value = "two words / and symbols";
+    const char *replaced = uriQuerySet("a=1&b=x", "b", long_value);
+    if (!replaced) return 2;
+    if (strcmp(replaced, "a=1&b=two+words+%2F+and+symbols") != 0) {
+        fprintf(stderr, "%s\n", replaced);
+        return 3;
+    }
+
+    const char *added = uriQuerySet("a=1", "space key", "v/v");
+    if (!added) return 4;
+    if (strcmp(added, "a=1&space+key=v%2Fv") != 0) {
+        fprintf(stderr, "%s\n", added);
+        return 5;
+    }
+    return 0;
+}
+''',
+        encoding="utf-8",
+    )
+    exe = tmp_path / "uri_query_set_harness"
+    subprocess.run(
+        [
+            cc,
+            "-std=c11",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            str(harness),
+            str(ROOT / "packages" / "std" / "native" / "uri.c"),
+            "-o",
+            str(exe),
+        ],
+        check=True,
+    )
+    subprocess.run([str(exe)], check=True)
+
+
+def test_e2e_native_uri_decode_rejects_nul_percent_bytes(tmp_path):
+    """native URI 百分号解码拒绝 Ez Str ABI 无法表达的 NUL。"""
+    cc = shutil.which("cc")
+    if cc is None:
+        pytest.skip("需要 C 编译器验证原生 std/uri wrapper")
+
+    harness = tmp_path / "uri_decode_harness.c"
+    harness.write_text(
+        r'''
+#include <stdbool.h>
+#include <stdlib.h>
+#include <string.h>
+
+typedef struct { bool ok; const char *value; } OptStr;
+
+OptStr uriDecodeQuery(const char *s);
+OptStr uriDecodePathSegment(const char *s);
+OptStr uriQueryGet(const char *query, const char *key);
+
+static int expect_value(OptStr got, const char *expected, int code) {
+    if (!got.ok || !got.value) return code;
+    if (strcmp(got.value, expected) != 0) return code + 1;
+    free((void *)got.value);
+    return 0;
+}
+
+static int expect_empty(OptStr got, int code) {
+    if (got.ok || got.value) return code;
+    return 0;
+}
+
+int main(void) {
+    int err = expect_value(uriDecodeQuery("two+words"), "two words", 2);
+    if (err != 0) return err;
+    err = expect_value(uriDecodePathSegment("%E4%B8%AD"), "\xE4\xB8\xAD", 4);
+    if (err != 0) return err;
+
+    err = expect_empty(uriDecodeQuery("%00"), 6);
+    if (err != 0) return err;
+    err = expect_empty(uriDecodePathSegment("a%00b"), 7);
+    if (err != 0) return err;
+    err = expect_empty(uriQueryGet("a=%00", "a"), 8);
+    if (err != 0) return err;
+    return 0;
+}
+''',
+        encoding="utf-8",
+    )
+    exe = tmp_path / "uri_decode_harness"
+    subprocess.run(
+        [
+            cc,
+            "-std=c11",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            str(harness),
+            str(ROOT / "packages" / "std" / "native" / "uri.c"),
+            "-o",
+            str(exe),
+        ],
+        check=True,
+    )
+    subprocess.run([str(exe)], check=True)
 
 
 def test_e2e_std_debug_imports_and_builds(tmp_path):
@@ -575,11 +1786,130 @@ def test_e2e_std_debug_imports_and_builds(tmp_path):
 def test_e2e_debug_wrappers_cover_crash_hex_and_stack_paths():
     native = (ROOT / "packages" / "std" / "native" / "debug.c").read_text(encoding="utf-8")
     emcc = (ROOT / "packages" / "std" / "emcc" / "debug.js").read_text(encoding="utf-8")
-    for marker in ["abort();", "backtrace(frames", "backtrace_symbols", "ezlang native/windows", "ezlang native/linux"]:
+    ez = (ROOT / "packages" / "std" / "debug.ez").read_text(encoding="utf-8")
+    for marker in ["abort();", "backtrace(frames", "backtrace_symbols", "CaptureStackBackTrace", "SymFromAddr", "ezlang native/windows", "ezlang native/linux"]:
         assert marker in native
+    for marker in ["EZ_DEBUG_HAS_EXECINFO 0", "ezlang native/ios", "return (OptStr){false, NULL};"]:
+        assert marker in native
+    assert 'extern "dbghelp" for windows;' in ez
     assert 'static const char hex[] = "0123456789abcdef"' in native
-    for marker in ["console.error", "throw new Error", "new Error().stack", "padStart(2, '0')", "ezlang emcc/wasm32"]:
+    for marker in ["console.error", "throw new Error", "new Error().stack", "padStart(2, '0')", "ezlang emcc/wasm32", "HEAPU8.length - dataPtr"]:
         assert marker in emcc
+    assert "stack.length > 0" in emcc
+
+
+def test_e2e_emcc_debug_stack_returns_none_without_stack_text():
+    """emcc debugStack 没有可捕获堆栈文本时应返回空可选值。"""
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("需要 Node 验证 std/debug emcc wrapper")
+    script = r'''
+const assert = require('assert');
+const fs = require('fs');
+const vm = require('vm');
+
+const code = fs.readFileSync(process.argv[1], 'utf8');
+
+function makeRuntime(ErrorCtor) {
+  const memory = new ArrayBuffer(65536);
+  const HEAPU8 = new Uint8Array(memory);
+  const view = new DataView(memory);
+  let heap = 1024;
+
+  function align(value) { return (value + 7) & ~7; }
+  function _malloc(size) {
+    const ptr = heap;
+    heap = align(heap + Math.max(1, size));
+    if (heap > HEAPU8.length) throw new Error('oom');
+    return ptr;
+  }
+  function getValue(ptr, type) {
+    if (type === '*') return view.getUint32(ptr, true);
+    if (type === 'i64') return Number(view.getBigInt64(ptr, true));
+    throw new Error('unsupported getValue type ' + type);
+  }
+  function setValue(ptr, value, type) {
+    if (type === '*') { view.setUint32(ptr, Number(value), true); return; }
+    if (type === 'i64') { view.setBigInt64(ptr, BigInt(value), true); return; }
+    throw new Error('unsupported setValue type ' + type);
+  }
+  function stringToNewUTF8(text) {
+    const bytes = Buffer.from(text, 'utf8');
+    const ptr = _malloc(bytes.length + 1);
+    HEAPU8.set(bytes, ptr);
+    HEAPU8[ptr + bytes.length] = 0;
+    return ptr;
+  }
+  function UTF8ToString(ptr) {
+    if (!ptr) return '';
+    let end = ptr;
+    while (HEAPU8[end] !== 0) end++;
+    return Buffer.from(HEAPU8.slice(ptr, end)).toString('utf8');
+  }
+
+  const library = {};
+  vm.runInNewContext(code, {
+    Buffer,
+    Error: ErrorCtor || Error,
+    HEAPU8,
+    _malloc,
+    getValue,
+    setValue,
+    UTF8ToString,
+    stringToNewUTF8,
+    console: { error() {} },
+    LibraryManager: { library },
+    mergeInto(target, source) { Object.assign(target, source); },
+  }, { filename: process.argv[1] });
+  return { library, HEAPU8, view, _malloc, UTF8ToString };
+}
+
+function debugStack(runtime) {
+  const ret = runtime._malloc(16);
+  runtime.library.debugStack(ret);
+  const ok = runtime.HEAPU8[ret] !== 0;
+  const valuePtr = runtime.view.getUint32(ret + 8, true);
+  return { ok, valuePtr };
+}
+
+function makeBlob(runtime, dataPtr, size) {
+  const blob = runtime._malloc(16);
+  runtime.view.setUint32(blob, dataPtr, true);
+  runtime.view.setBigInt64(blob + 8, BigInt(size), true);
+  return blob;
+}
+
+function makeByteBlob(runtime, bytes) {
+  const data = runtime._malloc(bytes.length);
+  runtime.HEAPU8.set(bytes, data);
+  return makeBlob(runtime, data, bytes.length);
+}
+
+function debugHex(runtime, blob) {
+  return runtime.library.debugHex(blob);
+}
+
+let runtime = makeRuntime();
+assert.strictEqual(runtime.UTF8ToString(debugHex(runtime, makeByteBlob(runtime, [0xab, 0xcd]))), 'abcd');
+assert.strictEqual(runtime.UTF8ToString(debugHex(runtime, makeBlob(runtime, 0, 1))), '');
+assert.strictEqual(runtime.UTF8ToString(debugHex(runtime, makeBlob(runtime, runtime.HEAPU8.length - 1, 2))), '');
+
+let result = debugStack(runtime);
+assert.strictEqual(result.ok, true);
+assert.notStrictEqual(result.valuePtr, 0);
+
+function EmptyStackError(message) {
+  this.message = message || '';
+  this.stack = '';
+}
+EmptyStackError.prototype = Object.create(Error.prototype);
+EmptyStackError.prototype.constructor = EmptyStackError;
+
+result = debugStack(makeRuntime(EmptyStackError));
+assert.strictEqual(result.ok, false);
+assert.strictEqual(result.valuePtr, 0);
+'''
+    subprocess.run([node, "-e", script, str(ROOT / "packages" / "std" / "emcc" / "debug.js")], check=True)
 
 
 def test_e2e_std_log_imports_and_builds(tmp_path):
@@ -645,6 +1975,68 @@ def test_e2e_std_test_supports_exceptions_parameters_and_diagnostics(tmp_path):
         assert marker in native
     for marker in ["var tests = []", "testRegisterParam", "testName", "currentTest"]:
         assert marker in emcc
+    assert "function i64Value" in emcc
+
+
+def test_e2e_emcc_test_i64_assertions_compare_bigint_exactly():
+    """emcc testEqualI64/testNotEqualI64 不能把 I64 降成 Number 后比较。"""
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("需要 Node 验证 std/test emcc wrapper")
+    script = r'''
+const assert = require('assert');
+const fs = require('fs');
+const vm = require('vm');
+
+const code = fs.readFileSync(process.argv[1], 'utf8');
+const memory = new ArrayBuffer(65536);
+const HEAPU8 = new Uint8Array(memory);
+let heap = 1024;
+
+function align(value) { return (value + 7) & ~7; }
+function _malloc(size) {
+  const ptr = heap;
+  heap = align(heap + Math.max(1, size));
+  if (heap > HEAPU8.length) throw new Error('oom');
+  return ptr;
+}
+function stringToNewUTF8(text) {
+  const bytes = Buffer.from(text, 'utf8');
+  const ptr = _malloc(bytes.length + 1);
+  HEAPU8.set(bytes, ptr);
+  HEAPU8[ptr + bytes.length] = 0;
+  return ptr;
+}
+function UTF8ToString(ptr) {
+  if (!ptr) return '';
+  let end = ptr;
+  while (HEAPU8[end] !== 0) end++;
+  return Buffer.from(HEAPU8.slice(ptr, end)).toString('utf8');
+}
+
+const errors = [];
+const library = {};
+vm.runInNewContext(code, {
+  BigInt,
+  Buffer,
+  HEAPU8,
+  UTF8ToString,
+  stringToNewUTF8,
+  console: { error(msg) { errors.push(String(msg)); }, warn() {} },
+  LibraryManager: { library },
+  mergeInto(target, source) { Object.assign(target, source); },
+}, { filename: process.argv[1] });
+
+const label = stringToNewUTF8('wide i64');
+library.testReset();
+library.testEqualI64(9007199254740993n, 9007199254740993n, label);
+library.testNotEqualI64(9007199254740992n, 9007199254740993n, label);
+assert.strictEqual(library.testPassed(), 2);
+
+assert.throws(() => library.testEqualI64(9007199254740992n, 9007199254740993n, label), /wide i64/);
+assert.ok(errors[0].includes('expected 9007199254740993, got 9007199254740992'));
+'''
+    subprocess.run([node, "-e", script, str(ROOT / "packages" / "std" / "emcc" / "test.js")], check=True)
 
 
 def test_e2e_log_wrappers_cover_file_target_mobile_logs_and_emcc_console():
@@ -657,11 +2049,113 @@ def test_e2e_log_wrappers_cover_file_target_mobile_logs_and_emcc_console():
         assert marker in native
     assert "__android_log_write" in native
     assert "os_log_with_type" in native
-    assert "WebAssembly 同步日志不支持本地文件目标" in emcc
-    assert "return 0;" in emcc_js_function_body(emcc, "logSetFile")
-    assert "console.error" in emcc and "console.warn" in emcc and "console.log" in emcc
+    assert "appendFileSync" in emcc
+    assert "FS.writeFile" in emcc
+    assert "config.target = TARGET_FILE" in emcc_js_function_body(emcc, "logSetFile")
+    assert "function runtimeConsole" in emcc
+    assert "out.error" in emcc and "out.warn" in emcc and "out.log" in emcc
     assert "原生平台支持 stderr/stdout/file" in docs
+    assert "Emscripten FS 或 Node 同步文件系统" in docs
     assert "移动端非文件目标同步写系统日志" in docs
+
+
+def test_e2e_emcc_log_set_file_supports_node_fs_and_browser_fallback(tmp_path):
+    """emcc 日志在 Node 下同步追加写文件；无同步文件系统时显式失败。"""
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("需要 Node 验证 std/log emcc wrapper")
+    log_path = tmp_path / "runtime.log"
+    script = r'''
+const assert = require('assert');
+const fs = require('fs');
+const vm = require('vm');
+
+const code = fs.readFileSync(process.argv[1], 'utf8');
+const logPath = process.argv[2];
+
+function makeRuntime(extra) {
+  const memory = new ArrayBuffer(65536);
+  const HEAPU8 = new Uint8Array(memory);
+  const view = new DataView(memory);
+  let heap = 1024;
+  function align(value) { return (value + 7) & ~7; }
+  function _malloc(size) {
+    const ptr = heap;
+    heap = align(heap + Math.max(1, size));
+    if (heap > HEAPU8.length) throw new Error('oom');
+    return ptr;
+  }
+  function getValue(ptr, type) {
+    if (type === '*') return view.getUint32(ptr, true);
+    if (type === 'i64') return Number(view.getBigInt64(ptr, true));
+    if (type === 'i32') return view.getInt32(ptr, true);
+    throw new Error('unsupported getValue type ' + type);
+  }
+  function setValue(ptr, value, type) {
+    if (type === '*') { view.setUint32(ptr, Number(value), true); return; }
+    if (type === 'i64') { view.setBigInt64(ptr, BigInt(value), true); return; }
+    if (type === 'i32') { view.setInt32(ptr, Number(value), true); return; }
+    throw new Error('unsupported setValue type ' + type);
+  }
+  function stringToNewUTF8(text) {
+    const bytes = Buffer.from(text, 'utf8');
+    const ptr = _malloc(bytes.length + 1);
+    HEAPU8.set(bytes, ptr);
+    HEAPU8[ptr + bytes.length] = 0;
+    return ptr;
+  }
+  function UTF8ToString(ptr) {
+    if (!ptr) return '';
+    let end = ptr;
+    while (HEAPU8[end] !== 0) end++;
+    return Buffer.from(HEAPU8.slice(ptr, end)).toString('utf8');
+  }
+  const library = {};
+  const context = Object.assign({
+    Buffer,
+    HEAPU8,
+    POINTER_SIZE: 4,
+    _malloc,
+    getValue,
+    setValue,
+    UTF8ToString,
+    stringToNewUTF8,
+    console: { log() {}, warn() {}, error() {} },
+    LibraryManager: { library },
+    mergeInto(target, source) { Object.assign(target, source); },
+  }, extra || {});
+  vm.runInNewContext(code, context, { filename: process.argv[1] });
+  return { library, HEAPU8, _malloc, setValue, stringToNewUTF8 };
+}
+
+let runtime = makeRuntime({ require });
+const cfg = runtime._malloc(16);
+runtime.setValue(cfg, 0, 'i32');
+runtime.setValue(cfg + 4, 3, 'i32');
+runtime.HEAPU8[cfg + 8] = 0;
+runtime.HEAPU8[cfg + 9] = 1;
+assert.strictEqual(runtime.library.logSetFile(runtime.stringToNewUTF8(logPath)), 1);
+runtime.library.logConfigure(cfg);
+runtime.library.logWriteAt(
+  4,
+  runtime.stringToNewUTF8('err'),
+  runtime.stringToNewUTF8('main.ez'),
+  1,
+  2,
+  0
+);
+assert.strictEqual(fs.readFileSync(logPath, 'utf8'), 'ERROR err @ main.ez:1:2\n');
+
+runtime = makeRuntime({});
+assert.strictEqual(runtime.library.logSetFile(runtime.stringToNewUTF8(logPath + '.browser')), 0);
+
+runtime = makeRuntime({ console: undefined });
+assert.doesNotThrow(() => runtime.library.logWrite(4, runtime.stringToNewUTF8('without console')));
+'''
+    subprocess.run(
+        [node, "-e", script, str(ROOT / "packages" / "std" / "emcc" / "log.js"), str(log_path)],
+        check=True,
+    )
 
 
 def test_e2e_std_regex_imports_and_builds(tmp_path):
@@ -711,17 +2205,106 @@ def test_e2e_std_crypto_imports_and_builds(tmp_path):
     assert 'declare void @"cryptoHmacSha256"({i1, %"Blob"}* sret({i1, %"Blob"})' in ir_text
 
 
+def test_e2e_crypto_wrappers_provide_sync_fallbacks():
+    native = (ROOT / "packages" / "std" / "native" / "crypto.c").read_text(encoding="utf-8")
+    portable = (ROOT / "packages" / "std" / "native" / "crypto_portable.inc").read_text(encoding="utf-8")
+    emcc = (ROOT / "packages" / "std" / "emcc" / "crypto.js").read_text(encoding="utf-8")
+    for marker in ["CommonCrypto", "dlopen", "EVP_sha256", "HMAC", "bcrypt.h", "EZ_CRYPTO_HAS_PORTABLE", "crypto_portable.inc"]:
+        assert marker in native
+    for marker in ["EZ_CRYPTO_FORCE_PORTABLE", "ez_sha256_transform", "ez_sha512_transform", "ez_hmac_sha512_alloc", "ez_rotr64"]:
+        assert marker in native or marker in portable
+    for marker in ["require('crypto')", "createHash", "createHmac", "sha256Bytes", "sha512Bytes", "hmacBytes", "HEAPU8.length - dataPtr"]:
+        assert marker in emcc
+
+
+def test_e2e_native_crypto_platform_vectors(tmp_path):
+    cc = shutil.which("cc")
+    if cc is None:
+        pytest.skip("需要 C 编译器验证 std/crypto 平台库封装")
+    source = ROOT / "compiler" / "tests" / "fixtures" / "crypto_platform_check.c"
+    exe = tmp_path / "crypto_platform_check"
+    cmd = [cc, "-std=c11", "-Wall", "-Wextra", "-Werror", str(source), "-o", str(exe)]
+    if sys.platform.startswith("linux"):
+        cmd.append("-lcrypto")
+    elif sys.platform == "win32":
+        cmd.append("-lbcrypt")
+    elif sys.platform != "darwin":
+        pytest.skip("当前平台没有 std/crypto 原生平台库向量测试配置")
+    subprocess.run(cmd, check=True)
+    result = subprocess.run([str(exe)], check=True, text=True, capture_output=True)
+    assert result.stdout.splitlines() == [
+        "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",
+        "9b71d224bd62f3785d96d46ad3ea3d73319bfbc2890caadae2dff72519673ca72323c3d99ba5c11d7c7acc6e14b8c5da0c4663475c2e5c3adef46f73bcdec043",
+        "9307b3b915efb5171ff14d8cb55fbcc798c6c0ef1456d66ded1a6aa723a58b7b",
+        "ff06ab36757777815c008d32c8e14a705b4e7bf310351a06a23b612dc4c7433e7757d20525a5593b71020ea2ee162d2311b247e9855862b270122419652c0c92",
+    ]
+
+
+def test_e2e_native_crypto_portable_vectors(tmp_path):
+    cc = shutil.which("cc")
+    if cc is None:
+        pytest.skip("需要 C 编译器验证 std/crypto portable fallback")
+    source = ROOT / "compiler" / "tests" / "fixtures" / "crypto_portable_check.c"
+    exe = tmp_path / "crypto_portable_check"
+    subprocess.run([cc, "-std=c11", "-Wall", "-Wextra", "-Werror", str(source), "-o", str(exe)], check=True)
+    result = subprocess.run([str(exe)], check=True, text=True, capture_output=True)
+    assert result.stdout.splitlines() == [
+        "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",
+        "9b71d224bd62f3785d96d46ad3ea3d73319bfbc2890caadae2dff72519673ca72323c3d99ba5c11d7c7acc6e14b8c5da0c4663475c2e5c3adef46f73bcdec043",
+        "9307b3b915efb5171ff14d8cb55fbcc798c6c0ef1456d66ded1a6aa723a58b7b",
+        "ff06ab36757777815c008d32c8e14a705b4e7bf310351a06a23b612dc4c7433e7757d20525a5593b71020ea2ee162d2311b247e9855862b270122419652c0c92",
+    ]
+
+
+def test_e2e_native_crypto_linux_dlopen_failure_uses_portable_vectors(tmp_path):
+    if not sys.platform.startswith("linux"):
+        pytest.skip("Linux 动态 OpenSSL fallback 测试仅在 Linux 运行")
+    cc = shutil.which("cc")
+    if cc is None:
+        pytest.skip("需要 C 编译器验证 std/crypto Linux fallback")
+    source = ROOT / "compiler" / "tests" / "fixtures" / "crypto_platform_check.c"
+    exe = tmp_path / "crypto_linux_fallback_check"
+    subprocess.run([
+        cc,
+        "-std=c11",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+        "-DEZ_CRYPTO_TEST_NO_OPENSSL_DLOPEN=1",
+        str(source),
+        "-ldl",
+        "-o",
+        str(exe),
+    ], check=True)
+    result = subprocess.run([str(exe)], check=True, text=True, capture_output=True)
+    assert result.stdout.splitlines() == [
+        "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",
+        "9b71d224bd62f3785d96d46ad3ea3d73319bfbc2890caadae2dff72519673ca72323c3d99ba5c11d7c7acc6e14b8c5da0c4663475c2e5c3adef46f73bcdec043",
+        "9307b3b915efb5171ff14d8cb55fbcc798c6c0ef1456d66ded1a6aa723a58b7b",
+        "ff06ab36757777815c008d32c8e14a705b4e7bf310351a06a23b612dc4c7433e7757d20525a5593b71020ea2ee162d2311b247e9855862b270122419652c0c92",
+    ]
+
+
 def test_e2e_std_compress_imports_and_builds(tmp_path):
     source = tmp_path / "std_compress.ez"
     source.write_text(
-        'from "std/compress" import { compressGzip, decompressGzip, compressZlib, decompressZlib, compressDeflate, decompressDeflate };\n\n'
+        'from "std/compress" import { compressGzip, decompressGzip, compressZlib, decompressZlib, compressDeflate, decompressDeflate, compressGzipStream, decompressGzipStream, compressZlibStream, decompressZlibStream, compressDeflateStream, decompressDeflateStream };\n'
+        'from "std/stream" import { streamFromBlob };\n\n'
         'let data = Blob(data = "hello", size = 5);\n'
         'let gz = compressGzip(data = data);\n'
         'let raw_gz = decompressGzip(data = gz.value);\n'
         'let z = compressZlib(data = data);\n'
         'let raw_z = decompressZlib(data = z.value);\n'
         'let d = compressDeflate(data = data);\n'
-        'let raw_d = decompressDeflate(data = d.value);\n',
+        'let raw_d = decompressDeflate(data = d.value);\n'
+        'let src = streamFromBlob(data = data);\n'
+        'let dst = streamFromBlob(data = Blob(data = "", size = 0));\n'
+        'let streamed_gz = compressGzipStream(dst = dst.value, src = src.value, bufferSize = 2);\n'
+        'let streamed_raw_gz = decompressGzipStream(dst = dst.value, src = src.value, bufferSize = 2);\n'
+        'let streamed_z = compressZlibStream(dst = dst.value, src = src.value, bufferSize = 2);\n'
+        'let streamed_raw_z = decompressZlibStream(dst = dst.value, src = src.value, bufferSize = 2);\n'
+        'let streamed_d = compressDeflateStream(dst = dst.value, src = src.value, bufferSize = 2);\n'
+        'let streamed_raw_d = decompressDeflateStream(dst = dst.value, src = src.value, bufferSize = 2);\n',
         encoding="utf-8",
     )
     project_toml = write_project(tmp_path, source)
@@ -732,6 +2315,211 @@ def test_e2e_std_compress_imports_and_builds(tmp_path):
     assert 'declare void @"compressGzip"({i1, %"Blob"}* sret({i1, %"Blob"})' in ir_text
     assert 'declare void @"decompressGzip"({i1, %"Blob"}* sret({i1, %"Blob"})' in ir_text
     assert 'declare void @"compressDeflate"({i1, %"Blob"}* sret({i1, %"Blob"})' in ir_text
+    assert 'declare i64 @"compressGzipStream"(%"Stream"*' in ir_text
+
+
+def test_e2e_compress_wrappers_use_zlib_and_reject_invalid_blobs():
+    native = (ROOT / "packages" / "std" / "native" / "compress.c").read_text(encoding="utf-8")
+    emcc = (ROOT / "packages" / "std" / "emcc" / "compress.js").read_text(encoding="utf-8")
+    stream_interface = (ROOT / "packages" / "std" / "stream.ez").read_text(encoding="utf-8")
+    docs = (ROOT / "docs" / "stdlib.md").read_text(encoding="utf-8")
+    api_docs = (ROOT / "docs" / "stdlib-api.md").read_text(encoding="utf-8")
+    architecture_docs = (ROOT / "docs" / "compiler-architecture.md").read_text(encoding="utf-8")
+
+    for marker in ["defined(_WIN32)", "#include <zlib.h>", "deflateInit2", "inflateInit2", "!ez_blob_bytes", "ez_zlib_stream_run", "streamRead", "streamWrite"]:
+        assert marker in native
+    for marker in ["require('zlib')", "gzipSync", "inflateRawSync", "input === null", "writeOptBlob", "HEAPU8.length - dataPtr", "runStream", "streamRead", "streamWrite"]:
+        assert marker in emcc
+    assert "Windows native 当前返回空可选值" not in api_docs
+    assert "Windows native 当前返回空可选值" not in docs
+    assert "流式压缩接口等待" not in api_docs
+    assert "流式压缩接口等待" not in docs
+    for text in [stream_interface, docs, api_docs, architecture_docs]:
+        assert "压缩流后续" not in text
+        assert "后续进程管道和压缩流" not in text
+    assert "compressGzipStream" in api_docs
+    assert "compressGzipStream" in docs
+    assert "std/compress" in stream_interface
+    assert "std/compress" in api_docs
+    assert "| `std/stream` | 运行时 ABI 封装 | 内存/Blob、文件流、TCP 流" in docs
+    assert "native 目标使用系统 zlib" in api_docs
+
+
+def test_e2e_native_compress_zlib_vectors(tmp_path):
+    cc = shutil.which("cc")
+    if cc is None:
+        pytest.skip("需要 C 编译器验证 std/compress zlib 封装")
+    source = ROOT / "compiler" / "tests" / "fixtures" / "compress_zlib_check.c"
+    exe = tmp_path / "compress_zlib_check"
+    subprocess.run([cc, "-std=c11", "-Wall", "-Wextra", "-Werror", str(source), str(ROOT / "packages" / "std" / "native" / "stream.c"), "-o", str(exe), "-lz"], check=True)
+    result = subprocess.run([str(exe)], check=True, text=True, capture_output=True)
+    lines = result.stdout.splitlines()
+    assert len(lines) == 2
+    assert all(re.fullmatch(r"[0-9a-f]+", line) for line in lines)
+
+
+def test_e2e_emcc_compress_node_zlib_vectors():
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("需要 Node 验证 std/compress emcc wrapper")
+    script = r'''
+const assert = require('assert');
+const fs = require('fs');
+const vm = require('vm');
+const zlib = require('zlib');
+
+const code = fs.readFileSync(process.argv[1], 'utf8');
+const memory = new ArrayBuffer(65536);
+const HEAPU8 = new Uint8Array(memory);
+const view = new DataView(memory);
+let heap = 1024;
+
+function align(value) { return (value + 7) & ~7; }
+function _malloc(size) {
+  const ptr = heap;
+  heap = align(heap + Math.max(0, size));
+  if (heap > HEAPU8.length) throw new Error('oom');
+  return ptr;
+}
+function getValue(ptr, type) {
+  if (type === '*') return view.getUint32(ptr, true);
+  if (type === 'i64') return Number(view.getBigInt64(ptr, true));
+  if (type === 'i32') return view.getInt32(ptr, true);
+  throw new Error('unsupported getValue type ' + type);
+}
+function setValue(ptr, value, type) {
+  if (type === '*') { view.setUint32(ptr, Number(value), true); return; }
+  if (type === 'i64') { view.setBigInt64(ptr, BigInt(value), true); return; }
+  if (type === 'i32') { view.setInt32(ptr, Number(value), true); return; }
+  throw new Error('unsupported setValue type ' + type);
+}
+
+const library = {};
+vm.runInNewContext(code, {
+  require,
+  Buffer,
+  Uint8Array,
+  HEAPU8,
+  _malloc,
+  getValue,
+  setValue,
+  LibraryManager: { library },
+  mergeInto(target, source) { Object.assign(target, source); },
+}, { filename: process.argv[1] });
+
+function allocBlob(bytes) {
+  const blob = _malloc(16);
+  let dataPtr = 0;
+  if (bytes.length > 0) {
+    dataPtr = _malloc(bytes.length);
+    HEAPU8.set(bytes, dataPtr);
+  }
+  setValue(blob, dataPtr, '*');
+  setValue(blob + 8, bytes.length, 'i64');
+  return blob;
+}
+function call(name, blob) {
+  const ret = _malloc(32);
+  library[name](ret, blob);
+  const ok = HEAPU8[ret] !== 0;
+  const dataPtr = getValue(ret + 8, '*');
+  const size = getValue(ret + 16, 'i64');
+  return { ok, bytes: HEAPU8.slice(dataPtr, dataPtr + size) };
+}
+function text(result) { return Buffer.from(result.bytes).toString('utf8'); }
+const streamSources = new Map();
+function allocStream(bytes) {
+  const stream = _malloc(16);
+  const data = Buffer.from(bytes || []);
+  streamSources.set(stream, { data, cursor: 0 });
+  return { ptr: stream, chunks: [] };
+}
+function streamBytes(stream) {
+  return Buffer.concat(stream.chunks.map((chunk) => Buffer.from(chunk)));
+}
+
+const plain = Buffer.from('hello hello hello');
+const plainBlob = allocBlob(plain);
+const gz = call('compressGzip', plainBlob);
+const z = call('compressZlib', plainBlob);
+const raw = call('compressDeflate', plainBlob);
+assert(gz.ok && z.ok && raw.ok);
+assert.strictEqual(zlib.gunzipSync(Buffer.from(gz.bytes)).toString('utf8'), 'hello hello hello');
+assert.strictEqual(zlib.inflateSync(Buffer.from(z.bytes)).toString('utf8'), 'hello hello hello');
+assert.strictEqual(zlib.inflateRawSync(Buffer.from(raw.bytes)).toString('utf8'), 'hello hello hello');
+
+assert.strictEqual(text(call('decompressGzip', allocBlob(zlib.gzipSync(plain)))), 'hello hello hello');
+assert.strictEqual(text(call('decompressZlib', allocBlob(zlib.deflateSync(plain)))), 'hello hello hello');
+assert.strictEqual(text(call('decompressDeflate', allocBlob(zlib.deflateRawSync(plain)))), 'hello hello hello');
+
+const invalidData = allocBlob(Buffer.from('not gzip'));
+assert.strictEqual(call('decompressGzip', invalidData).ok, false);
+assert.strictEqual(call('decompressZlib', invalidData).ok, false);
+assert.strictEqual(call('decompressDeflate', invalidData).ok, false);
+const invalidBlob = _malloc(16);
+setValue(invalidBlob, 0, '*');
+setValue(invalidBlob + 8, 1, 'i64');
+const outOfBoundsBlob = _malloc(16);
+setValue(outOfBoundsBlob, HEAPU8.length - 1, '*');
+setValue(outOfBoundsBlob + 8, 2, 'i64');
+assert.strictEqual(call('compressGzip', invalidBlob).ok, false);
+assert.strictEqual(call('compressZlib', invalidBlob).ok, false);
+assert.strictEqual(call('compressDeflate', invalidBlob).ok, false);
+assert.strictEqual(call('compressGzip', outOfBoundsBlob).ok, false);
+assert.strictEqual(call('compressZlib', outOfBoundsBlob).ok, false);
+assert.strictEqual(call('compressDeflate', outOfBoundsBlob).ok, false);
+
+library.streamRead = function (ret, srcPtr, maxBytes) {
+  const source = streamSources.get(srcPtr);
+  if (!source) {
+    HEAPU8[ret] = 0;
+    setValue(ret + 8, 0, '*');
+    setValue(ret + 16, 0, 'i64');
+    return;
+  }
+  const cursor = source.cursor;
+  const size = source.data.length;
+  const count = Math.min(Math.max(Number(maxBytes), 0), Math.max(size - cursor, 0));
+  const outPtr = count > 0 ? _malloc(count) : 0;
+  if (count > 0) HEAPU8.set(source.data.slice(cursor, cursor + count), outPtr);
+  source.cursor += count;
+  HEAPU8[ret] = 1;
+  setValue(ret + 8, outPtr, '*');
+  setValue(ret + 16, count, 'i64');
+};
+const streamSinks = new Map();
+library.streamWrite = function (dstPtr, blobPtr) {
+  const dataPtr = getValue(blobPtr, '*');
+  const size = getValue(blobPtr + 8, 'i64');
+  if (size < 0 || (size > 0 && !dataPtr)) return -1;
+  const sink = streamSinks.get(dstPtr);
+  if (!sink) return -1;
+  sink.chunks.push(HEAPU8.slice(dataPtr, dataPtr + size));
+  return size;
+};
+library.streamFlush = function (dstPtr) {
+  return streamSinks.has(dstPtr) ? 1 : 0;
+};
+function callStream(compressName, decompressName, nodeDecode) {
+  const src = allocStream(plain);
+  const compressed = allocStream([]);
+  streamSinks.set(compressed.ptr, compressed);
+  const written = library[compressName](compressed.ptr, src.ptr, 3);
+  assert(written > 0, compressName);
+  const compressedBytes = streamBytes(compressed);
+  assert.strictEqual(nodeDecode(compressedBytes).toString('utf8'), 'hello hello hello');
+  const roundtripSrc = allocStream(compressedBytes);
+  const restored = allocStream([]);
+  streamSinks.set(restored.ptr, restored);
+  assert.strictEqual(library[decompressName](restored.ptr, roundtripSrc.ptr, 2), plain.length, decompressName);
+  assert.strictEqual(streamBytes(restored).toString('utf8'), 'hello hello hello');
+}
+callStream('compressGzipStream', 'decompressGzipStream', (bytes) => zlib.gunzipSync(bytes));
+callStream('compressZlibStream', 'decompressZlibStream', (bytes) => zlib.inflateSync(bytes));
+callStream('compressDeflateStream', 'decompressDeflateStream', (bytes) => zlib.inflateRawSync(bytes));
+assert.strictEqual(library.decompressGzipStream(allocStream([]).ptr, allocStream(Buffer.from('not gzip')).ptr, 2), -1);
+'''
+    subprocess.run([node, "-e", script, str(ROOT / "packages" / "std" / "emcc" / "compress.js")], check=True)
 
 
 def test_e2e_std_os_imports_and_builds(tmp_path):
@@ -758,7 +2546,7 @@ def test_e2e_std_os_imports_and_builds(tmp_path):
 def test_e2e_std_time_imports_and_builds(tmp_path):
     source = tmp_path / "std_time.ez"
     source.write_text(
-        'from "std/time" import { now, timestamp, sleep, getYear, getMonth, getDay, getHour, getMinute, getSecond, add, sub, format };\n\nlet current = now();\nlet ts = timestamp();\nsleep(ms = 1);\nlet year = getYear(this = current);\nlet month = getMonth(this = current);\nlet day = getDay(this = current);\nlet hour = getHour(this = current);\nlet minute = getMinute(this = current);\nlet second = getSecond(this = current);\nadd(this = current, year = 1, month = 0, day = 0, hour = 0, minute = 0, second = 0);\nsub(this = current, year = 0, month = 1, day = 0, hour = 0, minute = 0, second = 0);\nlet formatted = format(this = current, fmt = "YYYY-MM-DD");\n',
+        'from "std/time" import { Duration, durationToString, now, timestamp, sleep, getYear, getMonth, getDay, getHour, getMinute, getSecond, add, sub, format };\n\nlet seconds = Duration.fromSec(s = 2);\nlet minutes = Duration.fromMin(m = 1);\nlet duration_text = seconds.toString();\nlet duration_fn_text = durationToString(value = minutes);\nlet current = now();\nlet ts = timestamp();\nsleep(ms = 1);\nlet year = getYear(this = current);\nlet month = getMonth(this = current);\nlet day = getDay(this = current);\nlet hour = getHour(this = current);\nlet minute = getMinute(this = current);\nlet second = getSecond(this = current);\nadd(this = current, year = 1, month = 0, day = 0, hour = 0, minute = 0, second = 0);\nsub(this = current, year = 0, month = 1, day = 0, hour = 0, minute = 0, second = 0);\nlet formatted = format(this = current, fmt = "YYYY-MM-DD");\n',
         encoding="utf-8",
     )
     project_toml = write_project(tmp_path, source)
@@ -766,21 +2554,24 @@ def test_e2e_std_time_imports_and_builds(tmp_path):
     assert ez.main(["build", "--project", str(project_toml)]) == 0
     ir_file = tmp_path / "dist" / "native" / "e2e.ll"
     ir_text = ir_file.read_text(encoding="utf-8")
-    assert 'declare %"Date" @"now"' in ir_text
+    assert_native_small_struct_return(ir_text, "now", "Date", "i64")
     assert 'declare i64 @"timestamp"' in ir_text
     assert 'declare void @"sleep"' in ir_text
     assert 'declare i32 @"getYear"' in ir_text
     assert 'declare i32 @"getHour"' in ir_text
     assert 'declare void @"add"' in ir_text
     assert 'declare i8* @"format"' in ir_text
+    assert 'define %"Duration" @"Duration_fromSec"' in ir_text
+    assert 'define i8* @"Duration_toString"' in ir_text
+    assert 'declare i8* @"__durationToString"' in ir_text
 
 
 def test_e2e_time_wrappers_use_millisecond_clock_sleep_and_utc_fields():
     native = (ROOT / "packages" / "std" / "native" / "time.c").read_text(encoding="utf-8")
     emcc = (ROOT / "packages" / "std" / "emcc" / "time.js").read_text(encoding="utf-8")
-    for marker in ["/ 10000ULL", "gettimeofday", "nanosleep", "gmtime_r", "timegm", "ez_format_percent_token"]:
+    for marker in ["/ 10000ULL", "gettimeofday", "nanosleep", "gmtime_r", "timegm", "ez_reserve", "ez_format_percent_token", "__durationToString"]:
         assert marker in native
-    for marker in ["Date.now()", "Atomics.wait", "while (Date.now() < end)", "getUTCFullYear", "setUTCFullYear", ".replace(/%Y|YYYY/g"]:
+    for marker in ["__durationToString", "Date.now()", "Atomics.wait", "while (Date.now() < end)", "getUTCFullYear", "setUTCFullYear", "percentToken", "namedToken"]:
         assert marker in emcc
 
 
@@ -820,8 +2611,8 @@ def test_e2e_std_net_http_server_imports_and_builds(tmp_path):
     assert 'stop' in ir_text
 
 
-def test_e2e_std_net_http_marks_server_unsupported_and_client_supported():
-    """HTTP 客户端有实现；服务端接口必须明确标记为不支持。"""
+def test_e2e_std_net_http_native_server_and_client_support_are_explicit():
+    """HTTP 原生客户端/服务端有实现；emcc 服务端仍明确不支持。"""
     native = (ROOT / "packages" / "std" / "native" / "net" / "http.c").read_text(encoding="utf-8")
     emcc = (ROOT / "packages" / "std" / "emcc" / "net" / "http.js").read_text(encoding="utf-8")
     interface = (ROOT / "packages" / "std" / "net" / "http.ez").read_text(encoding="utf-8")
@@ -831,12 +2622,77 @@ def test_e2e_std_net_http_marks_server_unsupported_and_client_supported():
     assert "getaddrinfo" in native
     assert "send(sock" in native
     assert "recv(sock" in native
+    assert "ez_decode_chunked_body" in native
+    assert "fragment_start" in native
+    assert "*authority_end == '?'" in native
+    assert "ez_parse_http_port" in native
+    assert "ez_make_host_header" in native
+    assert "memchr(host_start, ']'" in native
+    for marker in ["XMLHttpRequest", "xhr.open(req.method || 'GET', req.url, false)", "parseResponseHeaders", "writeOptResponse"]:
+        assert marker in emcc
     assert "HTTP_SERVER_UNSUPPORTED_HANDLE" in emcc
-    assert "EZ_HTTP_SERVER_UNSUPPORTED_HANDLE" in native
-    assert "`createServer` 返回 `handle = 0`" in docs
-    assert "HTTP 服务端当前明确不支持" in interface
-    assert "return (HttpServer){0};" not in native
+    for marker in ["HttpServer_on", "HttpServer_start", "HttpServer_stop", "ez_http_handle_client", "ez_http_listen_socket"]:
+        assert marker in native
+    assert "HTTP 服务端当前明确不支持" not in interface
+    assert "原生桌面平台支持基础阻塞式 HTTP 服务端" in docs
+    assert "| `std/net/http` | 原生/JS 封装 | 明文 HTTP 客户端；基础服务端 | 明文 HTTP 客户端；基础服务端" in docs
+    assert 'extern "ws2_32" for windows;' in interface
+    assert "chunked 响应体" in docs
+    assert "后续接入真实网络实现" not in docs
+    assert "后续接入 TLS、超时配置和完整异步 flow 挂起" in docs
+    create_server_body = native[native.index("HttpServer createServer"):native.index("void HttpServer_on")]
+    assert "calloc" in create_server_body
+    assert "return (HttpServer){(int64_t)(uintptr_t)server};" in create_server_body
     assert "return 0n;" not in emcc
+
+
+def test_e2e_native_http_fetch_ex_rejects_invalid_body_blob_before_connect(tmp_path):
+    """fetchEx 遇到非法请求体 Blob 应直接失败，不发起网络连接。"""
+    cc = shutil.which("cc")
+    if cc is None:
+        pytest.skip("需要 C 编译器验证原生 std/net/http wrapper")
+
+    harness = tmp_path / "http_invalid_body_harness.c"
+    harness.write_text(
+        r'''
+#include <stdbool.h>
+#include <stdint.h>
+#include <stddef.h>
+
+typedef struct { uint8_t *data; int64_t size; } Blob;
+typedef struct { char ***key_pages; char ***value_pages; int32_t count; int32_t capacity; int32_t page_count; } Dict;
+typedef struct { int32_t status; Dict headers; Blob body; } HttpResponse;
+typedef struct { const char *method; const char *url; Dict headers; Blob body; } HttpRequest;
+typedef struct { bool ok; HttpResponse value; } OptHttpResponse;
+
+OptHttpResponse fetchEx(const HttpRequest *req);
+
+int main(void) {
+    HttpRequest negative = {"POST", "http://127.0.0.1:1/", {0}, {0, -1}};
+    HttpRequest missing_data = {"POST", "http://127.0.0.1:1/", {0}, {0, 1}};
+    if (fetchEx(&negative).ok) return 2;
+    if (fetchEx(&missing_data).ok) return 3;
+    return 0;
+}
+''',
+        encoding="utf-8",
+    )
+    exe = tmp_path / "http_invalid_body_harness"
+    subprocess.run(
+        [
+            cc,
+            "-std=c11",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            str(harness),
+            str(ROOT / "packages" / "std" / "native" / "net" / "http.c"),
+            "-o",
+            str(exe),
+        ],
+        check=True,
+    )
+    subprocess.run([str(exe)], check=True)
 
 
 def test_e2e_std_net_tcp_udp_ws_support_boundaries_are_explicit():
@@ -848,11 +2704,24 @@ def test_e2e_std_net_tcp_udp_ws_support_boundaries_are_explicit():
     tcp_interface = (ROOT / "packages" / "std" / "net" / "tcp.ez").read_text(encoding="utf-8")
     ws_interface = (ROOT / "packages" / "std" / "net" / "ws.ez").read_text(encoding="utf-8")
     api_docs = (ROOT / "docs" / "stdlib-api.md").read_text(encoding="utf-8")
+    stdlib_docs = (ROOT / "docs" / "stdlib.md").read_text(encoding="utf-8")
 
     for marker in ["socket(", "connect(", "bind(", "listen(", "accept(", "recv(", "send(", "sendto(", "recvfrom("]:
         assert marker in tcp_native
-    for marker in ["ws://", "Sec-WebSocket-Key", "0x82", "opcode", "0x8"]:
+    for marker in ["UdpPacket", "udpRecvFrom", "sockaddr_storage", "getnameinfo", "NI_NUMERICHOST", "NI_NUMERICSERV"]:
+        assert marker in tcp_native
+    for marker in ["ws://", "Sec-WebSocket-Key", "ez_ws_send_frame", "ez_ws_handle_control_frame", "opcode", "0x8"]:
         assert marker in ws_native
+    for marker in ["Sec-WebSocket-Accept", "ez_ws_expected_accept", "ez_ws_handshake_response_valid", "ez_ws_sha1_final"]:
+        assert marker in ws_native
+    assert "fragment_start" in ws_native
+    assert "*authority_end == '?'" in ws_native
+    assert "ez_parse_ws_port" in ws_native
+    assert "ez_make_ws_host_header" in ws_native
+    assert "memchr(host_start, ']'" in ws_native
+    assert 'extern "ws2_32" for windows;' in tcp_interface
+    assert 'extern "ws2_32" for windows;' in ws_interface
+    assert 'extern "bcrypt" for windows;' in ws_interface
     assert 'const char *prefix = "ws://";' in ws_native
     assert 'const char *prefix = "wss://";' not in ws_native
 
@@ -860,9 +2729,16 @@ def test_e2e_std_net_tcp_udp_ws_support_boundaries_are_explicit():
         assert marker in tcp_emcc
         assert marker in ws_emcc
     assert "emcc 明确不支持" in tcp_interface
-    assert "wss://、分片帧和 emcc" in ws_interface
+    assert "UdpPacket" in tcp_interface
+    assert "udpRecvFrom" in tcp_interface
+    assert "客户端掩码、分片重组和 ping/pong" in ws_interface
     assert "emcc 当前明确不支持 TCP/UDP" in api_docs
-    assert "`wss://`、分片帧" in api_docs
+    assert "udpRecvFrom(socket: UdpSocket, maxBytes: I64) -> UdpPacket?" in api_docs
+    assert "当前接口不提供超时、TLS 或异步 flow 挂起" in api_docs
+    assert "当前接口不返回远端地址" not in api_docs
+    assert "接收数据及来源地址" in stdlib_docs
+    assert "当前接收接口不返回远端地址" not in stdlib_docs
+    assert "`wss://` 与 emcc 同步 WebSocket 明确不支持" in api_docs
 
 
 def test_e2e_cli_build_links_externs_and_records_emcc_js_libraries():
@@ -1035,6 +2911,127 @@ def test_e2e_std_collections_higher_order_and_dict_build(tmp_path):
     assert 'dictHas_Str_Str' not in ir_text
 
 
+def test_e2e_dict_literal_string_and_expression_keys_build(tmp_path):
+    source = tmp_path / "dict_keys.ez"
+    source.write_text(
+        'from "std/collections" import { dictHas, dictLen };\n'
+        'from "std/str" import { strEqual };\n\n'
+        'let headerName = "Accept";\n'
+        'let headers = { "Content-Type" = "text/plain", [headerName] = "application/json" };\n'
+        'let contentType = headers["Content-Type"];\n'
+        'let accept = headers[headerName];\n'
+        'let hasAccept = dictHas<Str, Str>(dict = headers, key = "Accept");\n'
+        'let count = dictLen<Str, Str>(dict = headers);\n'
+        'let ok = strEqual(a = contentType, b = "text/plain") && strEqual(a = accept, b = "application/json") && hasAccept && count == 2;\n',
+        encoding="utf-8",
+    )
+    project_toml = write_project(tmp_path, source)
+
+    assert ez.main(["build", "--project", str(project_toml)]) == 0
+    ir_text = (tmp_path / "dist" / "native" / "e2e.ll").read_text(encoding="utf-8")
+    assert "Content-Type" in ir_text
+    assert "dict_find_cond" in ir_text
+    assert "dict_insert" in ir_text
+
+
+def test_e2e_native_stream_tcp_supports_windows_handles():
+    native = (ROOT / "packages" / "std" / "native" / "stream.c").read_text(encoding="utf-8")
+    interface = (ROOT / "packages" / "std" / "stream.ez").read_text(encoding="utf-8")
+    api_docs = (ROOT / "docs" / "stdlib-api.md").read_text(encoding="utf-8")
+    architecture = (ROOT / "docs" / "compiler-architecture.md").read_text(encoding="utf-8")
+    assert "STREAM_TCP_UNSUPPORTED" not in native
+    for marker in ["winsock2.h", "typedef SOCKET stream_socket_t", "recv(sock, (char *)data", "send(sock, (const char *)data->data"]:
+        assert marker in native
+    assert 'extern "ws2_32" for windows;' in interface
+    assert "文件读写流与 TCP 连接流" in api_docs
+    assert "内存/Blob 流、文件流和 TCP 连接流" in architecture
+
+
+def test_e2e_native_stream_write_empty_blob_requires_valid_stream(tmp_path):
+    """原生 streamWrite 写合法空 Blob 时仍必须先确认目标流有效。"""
+    cc = shutil.which("cc")
+    if cc is None:
+        pytest.skip("需要 C 编译器验证原生 std/stream wrapper")
+
+    harness = tmp_path / "stream_empty_write_harness.c"
+    harness.write_text(
+        r'''
+#include <stdbool.h>
+#include <stdint.h>
+#include <stddef.h>
+
+typedef struct { uint8_t *data; int64_t size; } Blob;
+typedef struct { int64_t handle; int32_t kind; } Stream;
+typedef struct { bool ok; Stream value; } OptStream;
+typedef struct { bool ok; Blob value; } OptBlob;
+
+OptStream streamFromBlob(const Blob *data);
+OptStream streamOpenFileRead(const char *path);
+OptStream streamOpenFileWrite(const char *path);
+OptBlob streamRead(const Stream *stream_value, int64_t maxBytes);
+int64_t streamWrite(const Stream *stream_value, const Blob *data);
+OptBlob streamToBlob(const Stream *stream_value);
+bool streamFlush(const Stream *stream_value);
+bool streamClose(const Stream *stream_value);
+
+int main(void) {
+    Blob empty = {NULL, 0};
+    uint8_t one = 1;
+    Blob huge = {&one, INT64_MAX};
+    Stream zero = {0, 0};
+    Stream memory_without_handle = {0, 1};
+
+    if (streamWrite(NULL, &empty) != -1) return 2;
+    if (streamWrite(&zero, &empty) != -1) return 3;
+    if (streamWrite(&memory_without_handle, &empty) != -1) return 4;
+    if (streamFromBlob(&huge).ok) return 5;
+
+    OptStream stream = streamFromBlob(&empty);
+    if (!stream.ok) return 6;
+    if (streamWrite(&stream.value, &empty) != 0) return 7;
+    if (streamWrite(&stream.value, &huge) != -1) return 8;
+    if (!streamClose(&stream.value)) return 9;
+    if (streamWrite(&stream.value, &empty) != -1) return 10;
+    if (streamRead(&stream.value, 1).ok) return 11;
+    if (streamToBlob(&stream.value).ok) return 12;
+    if (streamFlush(&stream.value)) return 13;
+    if (streamClose(&stream.value)) return 14;
+
+    OptStream file = streamOpenFileWrite("stream-close-tombstone.bin");
+    if (!file.ok) return 15;
+    if (!streamClose(&file.value)) return 16;
+    if (streamWrite(&file.value, &empty) != -1) return 17;
+    if (streamFlush(&file.value)) return 18;
+    if (streamClose(&file.value)) return 19;
+
+    OptStream reader = streamOpenFileRead("stream-close-tombstone.bin");
+    if (!reader.ok) return 20;
+    if (streamRead(&reader.value, INT64_MAX).ok) return 21;
+    if (!streamClose(&reader.value)) return 22;
+
+    return 0;
+}
+''',
+        encoding="utf-8",
+    )
+    exe = tmp_path / "stream_empty_write_harness"
+    subprocess.run(
+        [
+            cc,
+            "-std=c11",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            str(harness),
+            str(ROOT / "packages" / "std" / "native" / "stream.c"),
+            "-o",
+            str(exe),
+        ],
+        check=True,
+    )
+    subprocess.run([str(exe)], check=True, cwd=tmp_path)
+
+
 def test_e2e_std_fmt_imports_and_builds(tmp_path):
     source = tmp_path / "std_fmt.ez"
     source.write_text(
@@ -1055,6 +3052,8 @@ def test_e2e_std_fmt_imports_and_builds(tmp_path):
     assert 'declare i8* @"b64Encode"' in ir_text
     assert 'declare i8* @"jsonStringify_I32"' in ir_text
     assert 'declare i32 @"jsonParse_I32"' in ir_text
+    assert 'declare i1 @"__ez_json_valid_I32"' in ir_text
+    assert 'call i1 @"__ez_json_valid_I32"' in ir_text
     assert 'declare i8* @"urlEncode"' in ir_text
     assert_native_optional_return(ir_text, "urlDecode", "i8*")
 
@@ -1062,13 +3061,717 @@ def test_e2e_std_fmt_imports_and_builds(tmp_path):
 def test_e2e_fmt_wrappers_implement_parse_format_encoding_json_and_msgpack():
     native = (ROOT / "packages" / "std" / "native" / "fmt.c").read_text(encoding="utf-8")
     emcc = (ROOT / "packages" / "std" / "emcc" / "fmt.js").read_text(encoding="utf-8")
-    for marker in ["strtol", "strtoll", "strtod", "ez_b64_is_valid_input", "jsonStringify_Str", "jsonParse_Str", "msgpackEncode_I64", "msgpackDecode_Str", "urlEncode", "urlDecode"]:
+    for marker in ["ez_parse_decimal_i64_span", "ez_parse_trim_span", "strtod", "ez_b64_is_valid_input", "jsonStringify_Str", "jsonParse_Str", "jsonStringify_I8", "jsonParse_U8", "jsonStringify_U64", "jsonParse_U64", "msgpackEncode_U8", "msgpackDecode_U8", "msgpackEncode_U64", "msgpackDecode_U64", "msgpackDecode_Str", "urlEncode", "urlDecode"]:
+        assert marker in native
+    for marker in ["ez_json_append_utf8", "ez_json_hex4", "ez_utf8_validate_len", "esc == 'u'", "0xD800", "0x10FFFF"]:
+        assert marker in native
+    assert "ez_contains_nul_byte" in native
+    assert "byte == 0" in native
+    for marker in ["ez_json_number_span", "ez_json_parse_integer_value", "ez_json_parse_unsigned_integer_value", "ez_json_trim_span"]:
+        assert marker in native
+    for marker in ["__ez_json_valid_I8", "__ez_json_valid_I32", "__ez_json_valid_U8", "__ez_json_valid_U64", "__ez_json_valid_Str", "ez_json_parse_string_span"]:
+        assert marker in native
+    assert 'isfinite(value) ? toString_F64(value) : ez_strdup_safe("null")' in native
+    for marker in ["ez_msgpack_decode_integer", "ez_msgpack_decode_unsigned_integer", "0xCC", "0xCF", "0xD0", "0xCA"]:
         assert marker in native
     assert "ez_list_get(args, arg_index++)" in native
     assert "EZ_B64" in native
-    for marker in ["Number.parseInt", "BigInt(text)", "isStrictBase64", "JSON.stringify", "JSON.parse", "msgpackEncode_I64", "msgpackDecode_Str", "encodeURIComponent", "decodeURIComponent"]:
+    for marker in ["parseDecimalInteger", "I8_MIN", "U8_MAX", "I64_MAX", "U64_MAX", "isStrictBase64", "JSON.stringify", "JSON.parse", "msgpackEncode_U8", "msgpackDecode_U8", "msgpackEncode_U64", "msgpackDecode_U64", "msgpackDecode_Str", "encodeURIComponent", "decodeURIComponent"]:
+        assert marker in emcc
+    assert "Number.parseInt" not in emcc
+    for marker in ["decodeInteger", "decodeUnsignedInteger", "tag === 0xcc", "tag === 0xcf", "tag === 0xd0", "getFloat32"]:
+        assert marker in emcc
+    for marker in ["jsonNumberSyntax", "parseJsonInteger", "typeof value === 'string'", "validUtf8Bytes"]:
+        assert marker in emcc
+    assert "hasNulString" in emcc
+    assert "hasNulBytes" in emcc
+    for marker in ["__ez_json_valid_I8", "__ez_json_valid_I32", "__ez_json_valid_U8", "__ez_json_valid_U64", "__ez_json_valid_Str", "jsonStringSyntax"]:
         assert marker in emcc
     assert "listGet(argsPtr, index++)" in emcc
+
+    codegen = (ROOT / "compiler" / "src" / "codegen" / "llvm_codegen.py").read_text(encoding="utf-8")
+    assert "_json_parse_validate_or_throw" in codegen
+
+
+def test_e2e_native_fmt_b64encode_rejects_invalid_blob_without_null_string(tmp_path):
+    """b64Encode 返回 Str，非法 Blob 不能把 NULL 暴露给语言侧。"""
+    cc = shutil.which("cc")
+    if cc is None:
+        pytest.skip("需要 C 编译器验证原生 std/fmt wrapper")
+
+    harness = tmp_path / "fmt_b64_harness.c"
+    harness.write_text(
+        r'''
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+typedef struct {
+    uint8_t *data;
+    int64_t size;
+} Blob;
+
+const char *b64Encode(const Blob *data);
+
+static int expect(const char *got, const char *expected) {
+    int ok = got != NULL && strcmp(got, expected) == 0;
+    free((void *)got);
+    return ok ? 0 : 1;
+}
+
+int main(void) {
+    uint8_t hello[] = {'h', 'e', 'l', 'l', 'o'};
+    Blob valid = {hello, 5};
+    Blob empty = {NULL, 0};
+    Blob bad_negative = {NULL, -1};
+    Blob bad_missing_data = {NULL, 1};
+
+    if (expect(b64Encode(&valid), "aGVsbG8=") != 0) return 2;
+    if (expect(b64Encode(&empty), "") != 0) return 3;
+    if (expect(b64Encode(&bad_negative), "") != 0) return 4;
+    if (expect(b64Encode(&bad_missing_data), "") != 0) return 5;
+    return 0;
+}
+''',
+        encoding="utf-8",
+    )
+    exe = tmp_path / "fmt_b64_harness"
+    subprocess.run(
+        [
+            cc,
+            "-std=c11",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            str(harness),
+            str(ROOT / "packages" / "std" / "native" / "fmt.c"),
+            "-lm",
+            "-o",
+            str(exe),
+        ],
+        check=True,
+    )
+    subprocess.run([str(exe)], check=True)
+
+
+def test_e2e_native_fmt_parse_f64_uses_decimal_syntax(tmp_path):
+    """原生 parseF64 应和 emcc 一样只接受十进制浮点语法。"""
+    cc = shutil.which("cc")
+    if cc is None:
+        pytest.skip("需要 C 编译器验证原生 std/fmt wrapper")
+
+    harness = tmp_path / "fmt_parse_f64_harness.c"
+    harness.write_text(
+        r'''
+#include <stdbool.h>
+#include <math.h>
+
+typedef struct { bool ok; double value; } OptF64;
+
+OptF64 parseF64(const char *s);
+
+static int expect_ok(const char *text, double expected) {
+    OptF64 got = parseF64(text);
+    return got.ok && fabs(got.value - expected) < 0.0000001 ? 0 : 1;
+}
+
+static int expect_bad(const char *text) {
+    OptF64 got = parseF64(text);
+    return got.ok ? 1 : 0;
+}
+
+int main(void) {
+    if (expect_ok("3.5", 3.5) != 0) return 2;
+    if (expect_ok("+3.5", 3.5) != 0) return 3;
+    if (expect_ok(" +.5 ", 0.5) != 0) return 4;
+    if (expect_ok("\xC2\xA0+.5\xE3\x80\x80", 0.5) != 0) return 17;
+    if (expect_ok("1.", 1.0) != 0) return 5;
+    if (expect_ok("1e+2", 100.0) != 0) return 6;
+    if (expect_ok("1e-3", 0.001) != 0) return 7;
+    if (expect_ok("1e-4000", 0.0) != 0) return 8;
+    if (expect_bad("0x1p2") != 0) return 9;
+    if (expect_bad("nan") != 0) return 10;
+    if (expect_bad("inf") != 0) return 11;
+    if (expect_bad("1e+") != 0) return 12;
+    if (expect_bad(".") != 0) return 13;
+    if (expect_bad("+") != 0) return 14;
+    if (expect_bad("3.5x") != 0) return 15;
+    if (expect_bad("1e309") != 0) return 16;
+    if (expect_bad("\xEF\xBB\xBF" "3.5") != 0) return 18;
+    return 0;
+}
+''',
+        encoding="utf-8",
+    )
+    exe = tmp_path / "fmt_parse_f64_harness"
+    subprocess.run(
+        [
+            cc,
+            "-std=c11",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            str(harness),
+            str(ROOT / "packages" / "std" / "native" / "fmt.c"),
+            "-lm",
+            "-o",
+            str(exe),
+        ],
+        check=True,
+    )
+    subprocess.run([str(exe)], check=True)
+
+
+def test_e2e_native_fmt_string_decoders_reject_nul_bytes(tmp_path):
+    """native fmt 的字符串解码入口不能返回包含 NUL 的 Ez Str。"""
+    cc = shutil.which("cc")
+    if cc is None:
+        pytest.skip("需要 C 编译器验证原生 std/fmt wrapper")
+
+    harness = tmp_path / "fmt_string_nul_harness.c"
+    harness.write_text(
+        r'''
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+
+typedef struct { uint8_t *data; int64_t size; } Blob;
+typedef struct { bool ok; const char *value; } OptStr;
+
+bool __ez_json_valid_Str(const char *s);
+const char *jsonParse_Str(const char *s);
+const char *msgpackDecode_Str(const Blob *data);
+OptStr urlDecode(const char *s);
+
+static int expect_string(const char *got, const char *expected, int code) {
+    if (!got) return code;
+    if (strcmp(got, expected) != 0) return code + 1;
+    free((void *)got);
+    return 0;
+}
+
+int main(void) {
+    uint8_t msgpack_valid[] = {0xA1, 'x'};
+    uint8_t msgpack_nul[] = {0xA1, 0x00};
+    Blob valid = {msgpack_valid, 2};
+    Blob nul = {msgpack_nul, 2};
+
+    if (!__ez_json_valid_Str("\"x\"")) return 2;
+    if (__ez_json_valid_Str("\"\\u0000\"")) return 3;
+    int err = expect_string(jsonParse_Str("\"x\""), "x", 4);
+    if (err != 0) return err;
+    err = expect_string(jsonParse_Str("\"\\u0000\""), "", 6);
+    if (err != 0) return err;
+    err = expect_string(msgpackDecode_Str(&valid), "x", 8);
+    if (err != 0) return err;
+    err = expect_string(msgpackDecode_Str(&nul), "", 10);
+    if (err != 0) return err;
+
+    OptStr decoded = urlDecode("a%20b");
+    if (!decoded.ok || !decoded.value || strcmp(decoded.value, "a b") != 0) return 12;
+    free((void *)decoded.value);
+    OptStr decoded_nul = urlDecode("%00");
+    if (decoded_nul.ok || decoded_nul.value) return 13;
+    return 0;
+}
+''',
+        encoding="utf-8",
+    )
+    exe = tmp_path / "fmt_string_nul_harness"
+    subprocess.run(
+        [
+            cc,
+            "-std=c11",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            str(harness),
+            str(ROOT / "packages" / "std" / "native" / "fmt.c"),
+            "-lm",
+            "-o",
+            str(exe),
+        ],
+        check=True,
+    )
+    subprocess.run([str(exe)], check=True)
+
+
+def test_e2e_emcc_fmt_scalar_wrappers_handle_edges():
+    """emcc fmt 标量 wrapper 应严格处理整数、布尔字符串化和 MessagePack 字符串边界。"""
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("需要 Node 验证 std/fmt emcc wrapper")
+    script = r'''
+const assert = require('assert');
+const fs = require('fs');
+const vm = require('vm');
+
+const code = fs.readFileSync(process.argv[1], 'utf8');
+const memory = new ArrayBuffer(65536);
+const HEAPU8 = new Uint8Array(memory);
+const HEAP32 = new Int32Array(memory);
+const HEAP64 = new BigInt64Array(memory);
+const HEAPF64 = new Float64Array(memory);
+const view = new DataView(memory);
+let heap = 1024;
+
+function align(value) { return (value + 7) & ~7; }
+function _malloc(size) {
+  const ptr = heap;
+  heap = align(heap + Math.max(1, size));
+  if (heap > HEAPU8.length) throw new Error('oom');
+  return ptr;
+}
+function getValue(ptr, type) {
+  if (type === '*') return view.getUint32(ptr, true);
+  if (type === 'i64') return Number(view.getBigInt64(ptr, true));
+  if (type === 'i32') return view.getInt32(ptr, true);
+  throw new Error('unsupported getValue type ' + type);
+}
+function setValue(ptr, value, type) {
+  if (type === '*') { view.setUint32(ptr, Number(value), true); return; }
+  if (type === 'i64') { view.setBigInt64(ptr, BigInt(value), true); return; }
+  if (type === 'i32') { view.setInt32(ptr, Number(value), true); return; }
+  throw new Error('unsupported setValue type ' + type);
+}
+function stringToNewUTF8(text) {
+  const bytes = Buffer.from(text, 'utf8');
+  const ptr = _malloc(bytes.length + 1);
+  HEAPU8.set(bytes, ptr);
+  HEAPU8[ptr + bytes.length] = 0;
+  return ptr;
+}
+function UTF8ToString(ptr) {
+  if (!ptr) return '';
+  let end = ptr;
+  while (HEAPU8[end] !== 0) end++;
+  return Buffer.from(HEAPU8.slice(ptr, end)).toString('utf8');
+}
+
+const library = {};
+vm.runInNewContext(code, {
+  BigInt,
+  Buffer,
+  DataView,
+  Uint8Array,
+  HEAPU8,
+  HEAP32,
+  HEAP64,
+  HEAPF64,
+  _malloc,
+  getValue,
+  setValue,
+  UTF8ToString,
+  stringToNewUTF8,
+  lengthBytesUTF8(text) { return Buffer.byteLength(text, 'utf8'); },
+  UTF8ArrayToString(bytes) { return Buffer.from(bytes).toString('utf8'); },
+  btoa(text) { return Buffer.from(text, 'binary').toString('base64'); },
+  atob(text) { return Buffer.from(text, 'base64').toString('binary'); },
+  LibraryManager: { library },
+  mergeInto(target, source) { Object.assign(target, source); },
+}, { filename: process.argv[1] });
+
+function parseI32(text) {
+  const ret = _malloc(16);
+  library.parseInt(ret, stringToNewUTF8(text));
+  return { ok: HEAPU8[ret] !== 0, value: HEAP32[(ret + 4) >> 2] };
+}
+function parseI64(text) {
+  const ret = _malloc(16);
+  library.parseI64(ret, stringToNewUTF8(text));
+  return { ok: HEAPU8[ret] !== 0, value: HEAP64[(ret + 8) >> 3] };
+}
+function parseF64(text) {
+  const ret = _malloc(16);
+  library.parseF64(ret, stringToNewUTF8(text));
+  return { ok: HEAPU8[ret] !== 0, value: HEAPF64[(ret + 8) >> 3] };
+}
+
+function toStringBool(value) {
+  return UTF8ToString(library.toString_I1(value ? 1 : 0));
+}
+
+function makeBlob(bytes) {
+  const blob = _malloc(16);
+  const data = _malloc(bytes.length || 1);
+  HEAPU8.set(bytes, data);
+  setValue(blob, data, '*');
+  setValue(blob + 8, bytes.length, 'i64');
+  return blob;
+}
+
+function makeRawBlob(dataPtr, size) {
+  const blob = _malloc(16);
+  setValue(blob, dataPtr, '*');
+  setValue(blob + 8, size, 'i64');
+  return blob;
+}
+
+function blobBytes(blob) {
+  const data = getValue(blob, '*');
+  const size = getValue(blob + 8, 'i64');
+  return Array.from(HEAPU8.slice(data, data + size));
+}
+
+function msgpackStr(bytes) {
+  return UTF8ToString(library.msgpackDecode_Str(makeBlob(Uint8Array.from(bytes))));
+}
+
+function jsonStr(text) {
+  return UTF8ToString(library.jsonParse_Str(stringToNewUTF8(text)));
+}
+
+function jsonValidStr(text) {
+  return library.__ez_json_valid_Str(stringToNewUTF8(text));
+}
+
+function urlDecode(text) {
+  const ret = _malloc(16);
+  library.urlDecode(ret, stringToNewUTF8(text));
+  return { ok: HEAPU8[ret] !== 0, value: UTF8ToString(getValue(ret + 8, '*')) };
+}
+
+function msgpackF32(value) {
+  const ret = _malloc(16);
+  library.msgpackEncode_F32(ret, value);
+  return blobBytes(ret);
+}
+
+function msgpackI8(value) {
+  const ret = _malloc(16);
+  library.msgpackEncode_I8(ret, value);
+  return blobBytes(ret);
+}
+
+function msgpackU8(value) {
+  const ret = _malloc(16);
+  library.msgpackEncode_U8(ret, value);
+  return blobBytes(ret);
+}
+
+function msgpackU64(value) {
+  const ret = _malloc(16);
+  library.msgpackEncode_U64(ret, value);
+  return blobBytes(ret);
+}
+
+assert.strictEqual(toStringBool(true), 'true');
+assert.strictEqual(toStringBool(false), 'false');
+assert.strictEqual(UTF8ToString(library.jsonStringify_F32(1.5)), '1.5');
+assert.strictEqual(UTF8ToString(library.toString_I8(0x80)), '-128');
+assert.strictEqual(UTF8ToString(library.toString_U8(0xff)), '255');
+assert.strictEqual(UTF8ToString(library.jsonStringify_I8(0x80)), '-128');
+assert.strictEqual(UTF8ToString(library.jsonStringify_U8(0xff)), '255');
+assert.strictEqual(UTF8ToString(library.toString_U32(0xffffffff)), '4294967295');
+assert.strictEqual(UTF8ToString(library.toString_U64(18446744073709551615n)), '18446744073709551615');
+assert.strictEqual(UTF8ToString(library.jsonStringify_U64(18446744073709551615n)), '18446744073709551615');
+assert.strictEqual(UTF8ToString(library.b64Encode(makeBlob(Uint8Array.from([0x68, 0x69])))), 'aGk=');
+assert.strictEqual(UTF8ToString(library.b64Encode(makeRawBlob(0, 1))), '');
+assert.strictEqual(UTF8ToString(library.b64Encode(makeRawBlob(HEAPU8.length - 1, 2))), '');
+assert.strictEqual(library.__ez_json_valid_F32(stringToNewUTF8('1.5')), 1);
+assert.strictEqual(library.__ez_json_valid_F32(stringToNewUTF8('1e+')), 0);
+assert.strictEqual(library.__ez_json_valid_I8(stringToNewUTF8('-128')), 1);
+assert.strictEqual(library.__ez_json_valid_I8(stringToNewUTF8('128')), 0);
+assert.strictEqual(library.__ez_json_valid_U8(stringToNewUTF8('255')), 1);
+assert.strictEqual(library.__ez_json_valid_U8(stringToNewUTF8('256')), 0);
+assert.strictEqual(library.__ez_json_valid_U8(stringToNewUTF8('-1')), 0);
+assert.strictEqual(library.__ez_json_valid_U32(stringToNewUTF8('4294967295')), 1);
+assert.strictEqual(library.__ez_json_valid_U32(stringToNewUTF8('4294967296')), 0);
+assert.strictEqual(library.__ez_json_valid_U64(stringToNewUTF8('18446744073709551615')), 1);
+assert.strictEqual(library.__ez_json_valid_U64(stringToNewUTF8('-1')), 0);
+assert.strictEqual(library.__ez_json_valid_U64(stringToNewUTF8('18446744073709551616')), 0);
+assert.strictEqual(jsonValidStr('"x"'), 1);
+assert.strictEqual(jsonValidStr('"\\u0000"'), 0);
+assert.strictEqual(library.jsonParse_F32(stringToNewUTF8('1.5')), 1.5);
+assert.strictEqual(library.jsonParse_I8(stringToNewUTF8('-128')), -128);
+assert.strictEqual(library.jsonParse_U8(stringToNewUTF8('255')), 255);
+assert.strictEqual(library.jsonParse_U32(stringToNewUTF8('4294967295')), 0xffffffff);
+assert.strictEqual(library.jsonParse_U64(stringToNewUTF8('18446744073709551615')), 18446744073709551615n);
+assert.strictEqual(jsonStr('"x"'), 'x');
+assert.strictEqual(jsonStr('"\\u0000"'), '');
+assert.deepStrictEqual(msgpackF32(1.5), [0xca, 0x3f, 0xc0, 0x00, 0x00]);
+assert.deepStrictEqual(msgpackI8(-128), [0xd0, 0x80]);
+assert.deepStrictEqual(msgpackU8(255), [0xcc, 0xff]);
+assert.deepStrictEqual(msgpackU64(18446744073709551615n), [0xcf, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff]);
+assert.strictEqual(library.msgpackDecode_F32(makeBlob(Uint8Array.from([0xca, 0x3f, 0xc0, 0x00, 0x00]))), 1.5);
+assert.strictEqual(library.msgpackDecode_I8(makeBlob(Uint8Array.from([0xd0, 0x80]))), -128);
+assert.strictEqual(library.msgpackDecode_I8(makeBlob(Uint8Array.from([0xcc, 0x80]))), 0);
+assert.strictEqual(library.msgpackDecode_U8(makeBlob(Uint8Array.from([0xcc, 0xff]))), 255);
+assert.strictEqual(library.msgpackDecode_U8(makeBlob(Uint8Array.from([0xd0, 0xff]))), 0);
+assert.strictEqual(library.msgpackDecode_U32(makeBlob(Uint8Array.from([0xce, 0xff, 0xff, 0xff, 0xff]))), 0xffffffff);
+assert.strictEqual(library.msgpackDecode_U32(makeBlob(Uint8Array.from([0xcf, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00]))), 0);
+assert.strictEqual(library.msgpackDecode_U64(makeBlob(Uint8Array.from([0xcf, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff]))), 18446744073709551615n);
+assert.strictEqual(library.msgpackDecode_U64(makeBlob(Uint8Array.from([0xd0, 0xff]))), 0n);
+assert.strictEqual(msgpackStr([0xa1, 0x78]), 'x');
+assert.strictEqual(msgpackStr([0xa1, 0x78, 0xff]), '');
+assert.strictEqual(msgpackStr([0xa1, 0xff]), '');
+assert.strictEqual(msgpackStr([0xa1, 0x00]), '');
+assert.deepStrictEqual(urlDecode('a%20b'), { ok: true, value: 'a b' });
+assert.deepStrictEqual(urlDecode('%00'), { ok: false, value: '' });
+
+assert.deepStrictEqual(parseI32('2147483647'), { ok: true, value: 2147483647 });
+assert.deepStrictEqual(parseI32('2147483648'), { ok: false, value: 0 });
+assert.deepStrictEqual(parseI32('-2147483648'), { ok: true, value: -2147483648 });
+assert.deepStrictEqual(parseI32('-2147483649'), { ok: false, value: 0 });
+assert.strictEqual(parseI32('9007199254740993').ok, false);
+assert.deepStrictEqual(parseI32('\u00A0+42\u3000'), { ok: true, value: 42 });
+assert.strictEqual(parseI32('\uFEFF42').ok, false);
+assert.strictEqual(parseI32('0x10').ok, false);
+
+assert.deepStrictEqual(parseI64('9223372036854775807'), { ok: true, value: 9223372036854775807n });
+assert.deepStrictEqual(parseI64('9223372036854775808'), { ok: false, value: 0n });
+assert.deepStrictEqual(parseI64('-9223372036854775808'), { ok: true, value: -9223372036854775808n });
+assert.deepStrictEqual(parseI64('-9223372036854775809'), { ok: false, value: 0n });
+assert.strictEqual(parseI64('+42').value, 42n);
+assert.strictEqual(parseI64('42x').ok, false);
+assert.deepStrictEqual(parseI64('\u2007-123456789\u202F'), { ok: true, value: -123456789n });
+assert.strictEqual(parseI64('42.0').ok, false);
+
+assert.strictEqual(parseF64('\u205F+.5\u3000').ok, true);
+assert.strictEqual(parseF64('\u205F+.5\u3000').value, 0.5);
+assert.strictEqual(parseF64('\uFEFF3.5').ok, false);
+assert.strictEqual(parseF64('0x1p2').ok, false);
+assert.strictEqual(parseF64('nan').ok, false);
+'''
+    subprocess.run([node, "-e", script, str(ROOT / "packages" / "std" / "emcc" / "fmt.js")], check=True)
+
+
+def test_e2e_string_literal_decoding_is_shared_by_semantic_and_codegen():
+    semantic = (ROOT / "compiler" / "src" / "semantic" / "analyzer.py").read_text(encoding="utf-8")
+    codegen = (ROOT / "compiler" / "src" / "codegen" / "llvm_codegen.py").read_text(encoding="utf-8")
+    helper = (ROOT / "compiler" / "src" / "parser" / "string_literals.py").read_text(encoding="utf-8")
+    from parser.string_literals import decode_string_literal_token
+
+    assert "decode_string_literal_token" in semantic
+    assert "decode_string_literal_token" in codegen
+    for marker in ["0xD800", "0xDBFF", "0xDC00", "0xDFFF"]:
+        assert marker in helper
+    decoded = decode_string_literal_token('"\\uD800\\U0000DFFF"')
+    assert decoded == "\uFFFD\uFFFD"
+    decoded.encode("utf-8")
+
+
+def test_e2e_regex_wrappers_preserve_input_on_zero_width_global_replace():
+    native = (ROOT / "packages" / "std" / "native" / "regex.c").read_text(encoding="utf-8")
+    emcc = (ROOT / "packages" / "std" / "emcc" / "regex.js").read_text(encoding="utf-8")
+    for marker in ["ez_utf8_advance_one", "ez_regex_has_end_anchor", "REG_NOTBOL"]:
+        assert marker in native
+    assert native.count("REG_NOTBOL") >= 2
+    for marker in ["replaceLiteral", "byteLengthPrefix", "advanceOne", "splitNoCaptures", "m[0].length === 0"]:
+        assert marker in emcc
+
+
+def test_e2e_emcc_regex_matches_native_literal_replace_and_byte_offsets():
+    """emcc regex 应匹配 native 的字面替换、字节偏移和 split 规则。"""
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("需要 Node 验证 std/regex emcc wrapper")
+    script = r'''
+const assert = require('assert');
+const fs = require('fs');
+const vm = require('vm');
+
+const code = fs.readFileSync(process.argv[1], 'utf8');
+const memory = new ArrayBuffer(65536);
+const HEAPU8 = new Uint8Array(memory);
+const view = new DataView(memory);
+let heap = 1024;
+
+function align(value) { return (value + 7) & ~7; }
+function _malloc(size) {
+  const ptr = heap;
+  heap = align(heap + Math.max(1, size));
+  if (heap > HEAPU8.length) throw new Error('oom');
+  return ptr;
+}
+function getValue(ptr, type) {
+  if (type === '*') return view.getUint32(ptr, true);
+  if (type === 'i32') return view.getInt32(ptr, true);
+  if (type === 'i64') return Number(view.getBigInt64(ptr, true));
+  throw new Error('unsupported getValue type ' + type);
+}
+function setValue(ptr, value, type) {
+  if (type === '*') { view.setUint32(ptr, Number(value), true); return; }
+  if (type === 'i32') { view.setInt32(ptr, Number(value), true); return; }
+  if (type === 'i64') { view.setBigInt64(ptr, BigInt(value), true); return; }
+  throw new Error('unsupported setValue type ' + type);
+}
+function lengthBytesUTF8(text) { return Buffer.byteLength(text, 'utf8'); }
+function stringToUTF8(text, ptr, maxBytes) {
+  const bytes = Buffer.from(text, 'utf8');
+  HEAPU8.set(bytes.slice(0, Math.max(0, maxBytes - 1)), ptr);
+  HEAPU8[ptr + Math.min(bytes.length, Math.max(0, maxBytes - 1))] = 0;
+}
+function stringToNewUTF8(text) {
+  const len = lengthBytesUTF8(text);
+  const ptr = _malloc(len + 1);
+  stringToUTF8(text, ptr, len + 1);
+  return ptr;
+}
+function UTF8ToString(ptr) {
+  if (!ptr) return '';
+  let end = ptr;
+  while (HEAPU8[end] !== 0) end++;
+  return Buffer.from(HEAPU8.slice(ptr, end)).toString('utf8');
+}
+
+const library = {};
+vm.runInNewContext(code, {
+  BigInt,
+  Buffer,
+  HEAPU8,
+  _malloc,
+  getValue,
+  setValue,
+  UTF8ToString,
+  lengthBytesUTF8,
+  stringToNewUTF8,
+  LibraryManager: { library },
+  mergeInto(target, source) { Object.assign(target, source); },
+}, { filename: process.argv[1] });
+
+function compile(pattern, flags) {
+  const ret = _malloc(16);
+  library.regexCompile(ret, stringToNewUTF8(pattern), flags);
+  assert.strictEqual(HEAPU8[ret + 8], 1, 'regex should compile');
+  return ret;
+}
+function replace(pattern, flags, input, replacement) {
+  return UTF8ToString(library.regexReplace(compile(pattern, flags), stringToNewUTF8(input), stringToNewUTF8(replacement)));
+}
+function find(pattern, flags, input) {
+  const ret = _malloc(72);
+  library.regexFind(ret, compile(pattern, flags), stringToNewUTF8(input));
+  const groupPages = getValue(ret + 32, '*');
+  const groupLength = getValue(ret + 40, 'i64');
+  const firstGroupPage = groupPages ? getValue(groupPages, '*') : 0;
+  return {
+    ok: HEAPU8[ret] !== 0,
+    start: getValue(ret + 8, 'i64'),
+    end: getValue(ret + 16, 'i64'),
+    text: UTF8ToString(getValue(ret + 24, '*')),
+    group0: groupLength > 0 && firstGroupPage ? UTF8ToString(getValue(firstGroupPage, '*')) : '',
+  };
+}
+function split(pattern, flags, input) {
+  const ret = _malloc(32);
+  library.regexSplit(ret, compile(pattern, flags), stringToNewUTF8(input));
+  const pages = getValue(ret, '*');
+  const length = getValue(ret + 8, 'i64');
+  const out = [];
+  for (let i = 0; i < length; i++) {
+    const page = getValue(pages + Math.floor(i / 8) * 4, '*');
+    out.push(UTF8ToString(getValue(page + (i % 8) * 4, '*')));
+  }
+  return out;
+}
+
+assert.strictEqual(replace('([A-Z]+)', 0, 'ABC DEF', '$1'), '$1 DEF');
+assert.strictEqual(replace('[0-9]', 4, 'a1b2c3', '$&'), 'a$&b$&c$&');
+assert.deepStrictEqual(find('(Ez)', 0, '中Ez'), { ok: true, start: 3, end: 5, text: 'Ez', group0: 'Ez' });
+assert.deepStrictEqual(split('([,])', 4, 'a,b,c'), ['a', 'b', 'c']);
+assert.strictEqual(find('^b', 2, 'a\nb').ok, true);
+assert.strictEqual(find('^b', 0, 'a\nb').ok, false);
+assert.strictEqual(find('a.b', 0, 'a b').ok, true);
+assert.strictEqual(find('a.b', 0, 'a\nb').ok, false);
+'''
+    subprocess.run([node, "-e", script, str(ROOT / "packages" / "std" / "emcc" / "regex.js")], check=True)
+
+
+def test_e2e_native_regex_portable_fallback_vectors(tmp_path):
+    cc = shutil.which("cc")
+    if cc is None:
+        pytest.skip("需要 C 编译器验证 std/regex portable fallback")
+    native = (ROOT / "packages" / "std" / "native" / "regex.c").read_text(encoding="utf-8")
+    docs = (ROOT / "docs" / "stdlib.md").read_text(encoding="utf-8")
+    for marker in ["EZ_REGEX_USE_PORTABLE", "ez_rx_compile_pattern", "ez_rx_search", "ez_rx_find_portable"]:
+        assert marker in native
+    assert "Windows 原生目标使用内置同步轻量正则 fallback" in docs
+    assert "Windows 原生目标当前显式返回不可用结果" not in docs
+
+    source = ROOT / "compiler" / "tests" / "fixtures" / "regex_portable_check.c"
+    exe = tmp_path / "regex_portable_check"
+    subprocess.run([cc, "-std=c11", "-Wall", "-Wextra", "-Werror", str(source), "-o", str(exe)], check=True)
+    result = subprocess.run([str(exe)], check=True, text=True, capture_output=True)
+    assert result.stdout.splitlines() == ["EzLang", "a#b#c#", "|ab|"]
+
+
+def test_e2e_std_str_emcc_matches_native_edge_cases():
+    emcc = (ROOT / "packages" / "std" / "emcc" / "str.js").read_text(encoding="utf-8")
+    assert "oldText === ''" in emcc
+    assert "Math.max(0, Number(start))" in emcc
+    assert "if (finish < begin) finish = begin" in emcc
+
+
+def test_e2e_std_math_float_to_int_uses_truncation_bounds():
+    native = (ROOT / "packages" / "std" / "native" / "math.c").read_text(encoding="utf-8")
+    emcc = (ROOT / "packages" / "std" / "emcc" / "math.js").read_text(encoding="utf-8")
+    assert "value <= (double)INT32_MIN - 1.0" in native
+    assert "value >= (double)INT32_MAX + 1.0" in native
+    assert "value < -0x1p63" in native
+    assert "value >= 0x1p63" in native
+    assert "Math.trunc(value)" in emcc
+    assert "value > I32_MIN - 1 && value < I32_MAX + 1" in emcc
+    assert "value >= I64_MIN_F64 && value < I64_LIMIT_F64" in emcc
+    assert "Math.round(value)" not in emcc
+    assert "value < 0 ? -Math.floor(-value + 0.5) : Math.floor(value + 0.5)" in emcc
+
+
+def test_e2e_emcc_math_round_and_lcm_match_native_edges():
+    """emcc mathRound 应匹配 C round 的 half-away-from-zero 语义。"""
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("需要 Node 验证 std/math emcc wrapper")
+    script = r'''
+const assert = require('assert');
+const fs = require('fs');
+const vm = require('vm');
+
+const code = fs.readFileSync(process.argv[1], 'utf8');
+const memory = new ArrayBuffer(65536);
+const HEAPU8 = new Uint8Array(memory);
+const HEAP32 = new Int32Array(memory);
+const HEAP64 = new BigInt64Array(memory);
+const library = {};
+
+vm.runInNewContext(code, {
+  HEAPU8,
+  HEAP32,
+  HEAP64,
+  LibraryManager: { library },
+  mergeInto(target, source) { Object.assign(target, source); },
+}, { filename: process.argv[1] });
+
+assert.strictEqual(library.mathRound(1.5), 2);
+assert.strictEqual(library.mathRound(-1.5), -2);
+assert.strictEqual(library.mathRound(-1.4), -1);
+assert.strictEqual(library.mathGcdI64(-(1n << 63n), 2n), 2n);
+assert.strictEqual(library.mathLcmI64(-6n, 8n), 24n);
+assert.strictEqual(library.mathLcmI64(3037000500n, 3037000500n), 3037000500n);
+
+function optI32(value) {
+  library.mathF64ToI32(0, value);
+  return { ok: HEAPU8[0] === 1, value: HEAP32[1] };
+}
+
+function optI64(value) {
+  library.mathF64ToI64(16, value);
+  return { ok: HEAPU8[16] === 1, value: HEAP64[3] };
+}
+
+assert.deepStrictEqual(optI32(2147483647.0), { ok: true, value: 2147483647 });
+assert.deepStrictEqual(optI32(-2147483648.0), { ok: true, value: -2147483648 });
+assert.deepStrictEqual(optI32(2147483647.9), { ok: true, value: 2147483647 });
+assert.deepStrictEqual(optI32(-2147483648.9), { ok: true, value: -2147483648 });
+assert.deepStrictEqual(optI32(42.9), { ok: true, value: 42 });
+assert.deepStrictEqual(optI32(2147483648.0), { ok: false, value: 0 });
+assert.deepStrictEqual(optI32(-2147483649.0), { ok: false, value: 0 });
+assert.deepStrictEqual(optI64(-9223372036854775808.0), { ok: true, value: -9223372036854775808n });
+assert.deepStrictEqual(optI64(9223372036854775808.0), { ok: false, value: 0n });
+'''
+    subprocess.run([node, "-e", script, str(ROOT / "packages" / "std" / "emcc" / "math.js")], check=True)
 
 
 def test_e2e_flow_example_builds_with_runtime_hooks(tmp_path):
@@ -1263,6 +3966,54 @@ int main(void) {
     assert subprocess.run([str(exe)]).returncode == 0
 
 
+def test_e2e_native_runtime_race_timeout_cancels_slow_branches(tmp_path):
+    cc = shutil.which("cc")
+    if cc is None:
+        pytest.skip("需要 C 编译器验证 native runtime race 超时")
+    source = tmp_path / "race_timeout.c"
+    source.write_text(
+        r'''
+#include <stdint.h>
+#include <sys/time.h>
+#include <unistd.h>
+
+typedef int32_t (*EzRaceI32Branch)(void);
+
+int32_t __ezrt_race_i32(EzRaceI32Branch *branches, int32_t count, int32_t timeout_ms, int32_t *timed_out);
+
+static int32_t slow_a(void) {
+    usleep(300000);
+    return 1;
+}
+
+static int32_t slow_b(void) {
+    usleep(300000);
+    return 2;
+}
+
+static int64_t now_ms(void) {
+    struct timeval tv;
+    gettimeofday(&tv, 0);
+    return (int64_t)tv.tv_sec * 1000 + tv.tv_usec / 1000;
+}
+
+int main(void) {
+    EzRaceI32Branch branches[2] = { slow_a, slow_b };
+    int32_t timed_out = 0;
+    int64_t start = now_ms();
+    int32_t result = __ezrt_race_i32(branches, 2, 20, &timed_out);
+    int64_t elapsed = now_ms() - start;
+    return (result == 0 && timed_out == 1 && elapsed < 180) ? 0 : 1;
+}
+''',
+        encoding="utf-8",
+    )
+    exe = tmp_path / "race_timeout"
+    runtime = ROOT / "packages" / "std" / "native" / "runtime.c"
+    subprocess.run([cc, str(source), str(runtime), "-pthread", "-o", str(exe)], check=True)
+    assert subprocess.run([str(exe)]).returncode == 0
+
+
 
 def test_e2e_multiplatform_build_outputs_ir(tmp_path):
     src_dir = tmp_path / "src"
@@ -1335,9 +4086,358 @@ def test_e2e_emcc_fs_wrapper_uses_memfs_and_idbfs():
     assert "FS.mkdirTree" in fs_js
     assert "IDBFS" in fs_js
     assert "FS.syncfs" in fs_js
+    assert "lexicalAbsPath" in fs_js
+    assert "Math.floor(size) !== size" in fs_js
+    assert "size > HEAPU8.length - dataPtr" in fs_js
+    assert "throw new Error('invalid blob')" in fs_js
     assert "readFile: function (ret, path)" in fs_js
     assert "listDir: function (ret, path)" in fs_js
     assert "stat: function (ret, path)" in fs_js
+
+
+def test_e2e_emcc_fs_rejects_invalid_blob_writes():
+    """emcc writeFile/appendFile 对非法 Blob ABI 应返回失败且不创建文件。"""
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("需要 Node 验证 std/fs emcc wrapper")
+    script = r'''
+const assert = require('assert');
+const fs = require('fs');
+const vm = require('vm');
+
+const code = fs.readFileSync(process.argv[1], 'utf8');
+const memory = new ArrayBuffer(65536);
+const HEAPU8 = new Uint8Array(memory);
+const view = new DataView(memory);
+let heap = 1024;
+
+function align(value) { return (value + 7) & ~7; }
+function _malloc(size) {
+  const ptr = heap;
+  heap = align(heap + Math.max(1, size));
+  if (heap > HEAPU8.length) throw new Error('oom');
+  return ptr;
+}
+function getValue(ptr, type) {
+  if (type === '*') return view.getUint32(ptr, true);
+  if (type === 'i64') return Number(view.getBigInt64(ptr, true));
+  throw new Error('unsupported getValue type ' + type);
+}
+function setValue(ptr, value, type) {
+  if (type === '*') { view.setUint32(ptr, Number(value), true); return; }
+  if (type === 'i64') { view.setBigInt64(ptr, BigInt(value), true); return; }
+  throw new Error('unsupported setValue type ' + type);
+}
+function stringToNewUTF8(text) {
+  const bytes = Buffer.from(text, 'utf8');
+  const ptr = _malloc(bytes.length + 1);
+  HEAPU8.set(bytes, ptr);
+  HEAPU8[ptr + bytes.length] = 0;
+  return ptr;
+}
+function UTF8ToString(ptr) {
+  if (!ptr) return '';
+  let end = ptr;
+  while (HEAPU8[end] !== 0) end++;
+  return Buffer.from(HEAPU8.slice(ptr, end)).toString('utf8');
+}
+
+const files = new Map();
+const FS = {
+  writeFile(path, data) { files.set(path, Uint8Array.from(data)); },
+  readFile(path) { if (!files.has(path)) throw new Error('missing'); return files.get(path); },
+  mkdir() {},
+  mkdirTree() {},
+  stat(path) { if (!files.has(path)) throw new Error('missing'); return { mode: 0, size: files.get(path).length }; },
+  isDir() { return false; },
+};
+
+const library = {};
+vm.runInNewContext(code, {
+  HEAPU8,
+  POINTER_SIZE: 4,
+  FS,
+  _malloc,
+  getValue,
+  setValue,
+  UTF8ToString,
+  stringToNewUTF8,
+  LibraryManager: { library },
+  mergeInto(target, source) { Object.assign(target, source); },
+}, { filename: process.argv[1] });
+
+function blob(dataPtr, size) {
+  const ptr = _malloc(16);
+  setValue(ptr, dataPtr, '*');
+  setValue(ptr + 8, size, 'i64');
+  return ptr;
+}
+
+const path = stringToNewUTF8('/bad.bin');
+assert.strictEqual(library.writeFile(path, blob(0, -1)), 0);
+assert.strictEqual(library.appendFile(path, blob(0, 1)), 0);
+assert.strictEqual(library.writeFile(path, blob(HEAPU8.length - 1, 2)), 0);
+assert.strictEqual(files.has('/bad.bin'), false);
+'''
+    subprocess.run([node, "-e", script, str(ROOT / "packages" / "std" / "emcc" / "fs.js")], check=True)
+
+
+def test_e2e_emcc_fs_abs_path_normalizes_missing_paths():
+    """emcc absPath 对不存在路径也应返回词法规范化绝对路径。"""
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("需要 Node 验证 std/fs emcc wrapper")
+    script = r'''
+const assert = require('assert');
+const fs = require('fs');
+const vm = require('vm');
+
+const code = fs.readFileSync(process.argv[1], 'utf8');
+const memory = new ArrayBuffer(65536);
+const HEAPU8 = new Uint8Array(memory);
+const view = new DataView(memory);
+let heap = 1024;
+
+function align(value) { return (value + 7) & ~7; }
+function _malloc(size) {
+  const ptr = heap;
+  heap = align(heap + Math.max(1, size));
+  if (heap > HEAPU8.length) throw new Error('oom');
+  return ptr;
+}
+function getValue(ptr, type) {
+  if (type === '*') return view.getUint32(ptr, true);
+  if (type === 'i64') return Number(view.getBigInt64(ptr, true));
+  throw new Error('unsupported getValue type ' + type);
+}
+function setValue(ptr, value, type) {
+  if (type === '*') { view.setUint32(ptr, Number(value), true); return; }
+  if (type === 'i64') { view.setBigInt64(ptr, BigInt(value), true); return; }
+  if (type === 'i8') { view.setInt8(ptr, Number(value)); return; }
+  throw new Error('unsupported setValue type ' + type);
+}
+function stringToNewUTF8(text) {
+  const bytes = Buffer.from(text, 'utf8');
+  const ptr = _malloc(bytes.length + 1);
+  HEAPU8.set(bytes, ptr);
+  HEAPU8[ptr + bytes.length] = 0;
+  return ptr;
+}
+function UTF8ToString(ptr) {
+  if (!ptr) return '';
+  let end = ptr;
+  while (HEAPU8[end] !== 0) end++;
+  return Buffer.from(HEAPU8.slice(ptr, end)).toString('utf8');
+}
+
+const library = {};
+vm.runInNewContext(code, {
+  HEAPU8,
+  POINTER_SIZE: 4,
+  FS: {},
+  IDBFS: undefined,
+  _malloc,
+  getValue,
+  setValue,
+  UTF8ToString,
+  stringToNewUTF8,
+  LibraryManager: { library },
+  mergeInto(target, source) { Object.assign(target, source); },
+}, { filename: process.argv[1] });
+
+function absPath(path) {
+  return UTF8ToString(library.absPath(stringToNewUTF8(path)));
+}
+
+assert.strictEqual(absPath('a/../b'), '/b');
+assert.strictEqual(absPath('/tmp/./x/../y'), '/tmp/y');
+assert.strictEqual(absPath(''), '');
+'''
+    subprocess.run([node, "-e", script, str(ROOT / "packages" / "std" / "emcc" / "fs.js")], check=True)
+
+
+def test_e2e_emcc_stream_flush_calls_fs_flush_hooks():
+    """emcc 文件写流 flush 应尝试刷新 Emscripten FS，而不是只返回成功。"""
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("需要 Node 验证 std/stream emcc wrapper")
+    script = r'''
+const assert = require('assert');
+const fs = require('fs');
+const vm = require('vm');
+
+const code = fs.readFileSync(process.argv[1], 'utf8');
+const memory = new ArrayBuffer(65536);
+const HEAPU8 = new Uint8Array(memory);
+const view = new DataView(memory);
+let heap = 1024;
+
+function align(value) { return (value + 7) & ~7; }
+function _malloc(size) {
+  const ptr = heap;
+  heap = align(heap + Math.max(1, size));
+  if (heap > HEAPU8.length) throw new Error('oom');
+  return ptr;
+}
+function getValue(ptr, type) {
+  if (type === '*') return view.getUint32(ptr, true);
+  if (type === 'i32') return view.getInt32(ptr, true);
+  if (type === 'i64') return Number(view.getBigInt64(ptr, true));
+  throw new Error('unsupported getValue type ' + type);
+}
+function setValue(ptr, value, type) {
+  if (type === '*') { view.setUint32(ptr, Number(value), true); return; }
+  if (type === 'i32') { view.setInt32(ptr, Number(value), true); return; }
+  if (type === 'i64') { view.setBigInt64(ptr, BigInt(value), true); return; }
+  throw new Error('unsupported setValue type ' + type);
+}
+function lengthBytesUTF8(text) { return Buffer.byteLength(text, 'utf8'); }
+function stringToUTF8(text, ptr, maxBytes) {
+  const bytes = Buffer.from(text, 'utf8');
+  HEAPU8.set(bytes.slice(0, Math.max(0, maxBytes - 1)), ptr);
+  HEAPU8[ptr + Math.min(bytes.length, Math.max(0, maxBytes - 1))] = 0;
+}
+function stringToNewUTF8(text) {
+  const len = lengthBytesUTF8(text);
+  const ptr = _malloc(len + 1);
+  stringToUTF8(text, ptr, len + 1);
+  return ptr;
+}
+function UTF8ToString(ptr) {
+  if (!ptr) return '';
+  let end = ptr;
+  while (HEAPU8[end] !== 0) end++;
+  return Buffer.from(HEAPU8.slice(ptr, end)).toString('utf8');
+}
+
+let fsyncCalls = 0;
+let syncfsCalls = 0;
+const fakeFS = {
+  mkdir(path) {},
+  open(path, mode) { return { path, mode }; },
+  fsync(file) { fsyncCalls += 1; assert.strictEqual(file.path, '/tmp/out.bin'); },
+  syncfs(populate, cb) { syncfsCalls += 1; assert.strictEqual(populate, false); if (cb) cb(); },
+};
+
+const library = {};
+vm.runInNewContext(code, {
+  BigInt,
+  Buffer,
+  HEAPU8,
+  FS: fakeFS,
+  _malloc,
+  getValue,
+  setValue,
+  UTF8ToString,
+  stringToNewUTF8,
+  LibraryManager: { library },
+  mergeInto(target, source) { Object.assign(target, source); },
+}, { filename: process.argv[1] });
+
+const writeOpt = _malloc(24);
+library.streamOpenFileWrite(writeOpt, stringToNewUTF8('/tmp/out.bin'));
+assert.strictEqual(HEAPU8[writeOpt], 1);
+assert.strictEqual(library.streamFlush(writeOpt + 8), 1);
+assert.strictEqual(fsyncCalls, 1);
+assert.strictEqual(syncfsCalls, 1);
+
+const readOpt = _malloc(24);
+library.streamOpenFileRead(readOpt, stringToNewUTF8('/tmp/in.bin'));
+assert.strictEqual(HEAPU8[readOpt], 1);
+assert.strictEqual(library.streamFlush(readOpt + 8), 0);
+
+const blob = _malloc(16);
+setValue(blob, 0, '*');
+setValue(blob + 8, 0, 'i64');
+const memOpt = _malloc(24);
+library.streamFromBlob(memOpt, blob);
+assert.strictEqual(HEAPU8[memOpt], 1);
+assert.strictEqual(library.streamFlush(memOpt + 8), 1);
+'''
+    subprocess.run([node, "-e", script, str(ROOT / "packages" / "std" / "emcc" / "stream.js")], check=True)
+
+
+def test_e2e_emcc_stream_rejects_invalid_blob_inputs():
+    """emcc streamFromBlob/streamWrite 应拒绝非法 Blob ABI，但接受合法空 Blob。"""
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("需要 Node 验证 std/stream emcc wrapper")
+    script = r'''
+const assert = require('assert');
+const fs = require('fs');
+const vm = require('vm');
+
+const code = fs.readFileSync(process.argv[1], 'utf8');
+const memory = new ArrayBuffer(65536);
+const HEAPU8 = new Uint8Array(memory);
+const view = new DataView(memory);
+let heap = 1024;
+
+function align(value) { return (value + 7) & ~7; }
+function _malloc(size) {
+  const ptr = heap;
+  heap = align(heap + Math.max(1, size));
+  if (heap > HEAPU8.length) throw new Error('oom');
+  return ptr;
+}
+function _free() {}
+function getValue(ptr, type) {
+  if (type === '*') return view.getUint32(ptr, true);
+  if (type === 'i32') return view.getInt32(ptr, true);
+  if (type === 'i64') return Number(view.getBigInt64(ptr, true));
+  throw new Error('unsupported getValue type ' + type);
+}
+function setValue(ptr, value, type) {
+  if (type === '*') { view.setUint32(ptr, Number(value), true); return; }
+  if (type === 'i32') { view.setInt32(ptr, Number(value), true); return; }
+  if (type === 'i64') { view.setBigInt64(ptr, BigInt(value), true); return; }
+  throw new Error('unsupported setValue type ' + type);
+}
+function UTF8ToString() { return ''; }
+
+const library = {};
+vm.runInNewContext(code, {
+  HEAPU8,
+  POINTER_SIZE: 4,
+  _malloc,
+  _free,
+  getValue,
+  setValue,
+  UTF8ToString,
+  LibraryManager: { library },
+  mergeInto(target, source) { Object.assign(target, source); },
+}, { filename: process.argv[1] });
+
+function blob(dataPtr, size) {
+  const ptr = _malloc(16);
+  setValue(ptr, dataPtr, '*');
+  setValue(ptr + 8, size, 'i64');
+  return ptr;
+}
+function streamFromBlob(blobPtr) {
+  const ret = _malloc(24);
+  library.streamFromBlob(ret, blobPtr);
+  return ret;
+}
+
+const invalidNegative = blob(0, -1);
+const invalidMissingData = blob(0, 1);
+const invalidOutOfBounds = blob(HEAPU8.length - 1, 2);
+const empty = blob(0, 0);
+const bad = streamFromBlob(invalidNegative);
+assert.strictEqual(HEAPU8[bad], 0);
+assert.strictEqual(HEAPU8[streamFromBlob(invalidOutOfBounds)], 0);
+
+const good = streamFromBlob(empty);
+assert.strictEqual(HEAPU8[good], 1);
+const streamPtr = good + 8;
+assert.strictEqual(library.streamWrite(streamPtr, invalidNegative), -1);
+assert.strictEqual(library.streamWrite(streamPtr, invalidMissingData), -1);
+assert.strictEqual(library.streamWrite(streamPtr, invalidOutOfBounds), -1);
+assert.strictEqual(library.streamWrite(streamPtr, empty), 0);
+assert.strictEqual(library.streamClose(streamPtr), 1);
+'''
+    subprocess.run([node, "-e", script, str(ROOT / "packages" / "std" / "emcc" / "stream.js")], check=True)
 
 
 def test_e2e_native_fs_wrapper_covers_windows_and_mobile_branches():
@@ -1375,17 +4475,281 @@ def test_e2e_path_wrappers_cover_platform_path_edges():
         "ez_normalize_raw",
         "pathToFileUrl",
         "pathFromFileUrl",
+        "byte == 0",
     ]:
         assert marker in native_path
     for marker in [
         "/^[A-Za-z]:[\\\\/]/",
         "/^[\\\\/]{2}/",
         "return stringToNewUTF8('/');",
-        "encodeURIComponent",
-        "decodeURIComponent",
+        "fileUrlByte",
+        "codePointAt",
+        "hexValue",
+        "cStringFromBytes",
+        "bytes.indexOf(0) >= 0",
         "writePathParts",
     ]:
         assert marker in emcc_path
+    assert "encodeURIComponent" not in emcc_path
+    assert "decodeURIComponent" not in emcc_path
+
+
+def test_e2e_emcc_path_from_file_url_decodes_percent_bytes():
+    """emcc pathFromFileUrl 应按路径字节解码百分号，不按 UTF-8 URI 解码拒绝原始字节。"""
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("需要 Node 验证 std/path emcc wrapper")
+    script = r'''
+const assert = require('assert');
+const fs = require('fs');
+const vm = require('vm');
+
+const code = fs.readFileSync(process.argv[1], 'utf8');
+const memory = new ArrayBuffer(65536);
+const HEAPU8 = new Uint8Array(memory);
+const view = new DataView(memory);
+let heap = 1024;
+
+function align(value) { return (value + 7) & ~7; }
+function _malloc(size) {
+  const ptr = heap;
+  heap = align(heap + Math.max(1, size));
+  if (heap > HEAPU8.length) throw new Error('oom');
+  return ptr;
+}
+function getValue(ptr, type) {
+  if (type === '*') return view.getUint32(ptr, true);
+  if (type === 'i64') return Number(view.getBigInt64(ptr, true));
+  throw new Error('unsupported getValue type ' + type);
+}
+function setValue(ptr, value, type) {
+  if (type === '*') { view.setUint32(ptr, Number(value), true); return; }
+  if (type === 'i64') { view.setBigInt64(ptr, BigInt(value), true); return; }
+  throw new Error('unsupported setValue type ' + type);
+}
+function stringToNewUTF8(text) {
+  const bytes = Buffer.from(text, 'utf8');
+  const ptr = _malloc(bytes.length + 1);
+  HEAPU8.set(bytes, ptr);
+  HEAPU8[ptr + bytes.length] = 0;
+  return ptr;
+}
+function UTF8ToString(ptr) {
+  if (!ptr) return '';
+  let end = ptr;
+  while (HEAPU8[end] !== 0) end++;
+  return Buffer.from(HEAPU8.slice(ptr, end)).toString('utf8');
+}
+
+const library = {};
+vm.runInNewContext(code, {
+  HEAPU8,
+  POINTER_SIZE: 4,
+  _malloc,
+  getValue,
+  setValue,
+  UTF8ToString,
+  stringToNewUTF8,
+  LibraryManager: { library },
+  mergeInto(target, source) { Object.assign(target, source); },
+}, { filename: process.argv[1] });
+
+function fromFileUrl(url) {
+  const ret = _malloc(16);
+  library.pathFromFileUrl(ret, stringToNewUTF8(url));
+  const ok = HEAPU8[ret] !== 0;
+  const dataPtr = view.getUint32(ret + 8, true);
+  const bytes = [];
+  if (dataPtr) {
+    for (let i = dataPtr; HEAPU8[i] !== 0; i++) bytes.push(HEAPU8[i]);
+  }
+  return { ok, dataPtr, bytes };
+}
+function toFileUrl(path) {
+  return UTF8ToString(library.pathToFileUrl(stringToNewUTF8(path)));
+}
+
+assert.strictEqual(toFileUrl('/tmp/😀.txt'), 'file:///tmp/%F0%9F%98%80.txt');
+assert.strictEqual(toFileUrl('/tmp/中 space.txt'), 'file:///tmp/%E4%B8%AD%20space.txt');
+assert.strictEqual(toFileUrl('C:/Temp/中 space.txt'), 'file:///C:/Temp/%E4%B8%AD%20space.txt');
+
+let decoded = fromFileUrl('file:///%FF');
+assert.strictEqual(decoded.ok, true);
+assert.deepStrictEqual(decoded.bytes, [0x2f, 0xff]);
+
+decoded = fromFileUrl('file:///tmp/%E4%B8%AD');
+assert.strictEqual(decoded.ok, true);
+assert.deepStrictEqual(decoded.bytes, Array.from(Buffer.from('/tmp/中', 'utf8')));
+
+decoded = fromFileUrl('file:///C:/Temp/%E4%B8%AD');
+assert.strictEqual(decoded.ok, true);
+assert.deepStrictEqual(decoded.bytes, Array.from(Buffer.from('C:/Temp/中', 'utf8')));
+
+let invalid = fromFileUrl('file:///tmp/%');
+assert.strictEqual(invalid.ok, false);
+assert.strictEqual(invalid.dataPtr, 0);
+
+invalid = fromFileUrl('file:///tmp/%00x');
+assert.strictEqual(invalid.ok, false);
+assert.strictEqual(invalid.dataPtr, 0);
+'''
+    subprocess.run([node, "-e", script, str(ROOT / "packages" / "std" / "emcc" / "path.js")], check=True)
+
+
+def test_e2e_emcc_path_root_parts_match_native_contract():
+    """emcc path 根路径拆分应和 native 词法契约一致。"""
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("需要 Node 验证 std/path emcc wrapper")
+    script = r'''
+const assert = require('assert');
+const fs = require('fs');
+const vm = require('vm');
+
+const code = fs.readFileSync(process.argv[1], 'utf8');
+const memory = new ArrayBuffer(65536);
+const HEAPU8 = new Uint8Array(memory);
+const view = new DataView(memory);
+let heap = 1024;
+
+function align(value) { return (value + 7) & ~7; }
+function _malloc(size) {
+  const ptr = heap;
+  heap = align(heap + Math.max(1, size));
+  if (heap > HEAPU8.length) throw new Error('oom');
+  return ptr;
+}
+function getValue(ptr, type) {
+  if (type === '*') return view.getUint32(ptr, true);
+  if (type === 'i64') return Number(view.getBigInt64(ptr, true));
+  throw new Error('unsupported getValue type ' + type);
+}
+function setValue(ptr, value, type) {
+  if (type === '*') { view.setUint32(ptr, Number(value), true); return; }
+  if (type === 'i64') { view.setBigInt64(ptr, BigInt(value), true); return; }
+  throw new Error('unsupported setValue type ' + type);
+}
+function stringToNewUTF8(text) {
+  const bytes = Buffer.from(text, 'utf8');
+  const ptr = _malloc(bytes.length + 1);
+  HEAPU8.set(bytes, ptr);
+  HEAPU8[ptr + bytes.length] = 0;
+  return ptr;
+}
+function UTF8ToString(ptr) {
+  if (!ptr) return '';
+  let end = ptr;
+  while (HEAPU8[end] !== 0) end++;
+  return Buffer.from(HEAPU8.slice(ptr, end)).toString('utf8');
+}
+
+const library = {};
+vm.runInNewContext(code, {
+  HEAPU8,
+  POINTER_SIZE: 4,
+  _malloc,
+  getValue,
+  setValue,
+  UTF8ToString,
+  stringToNewUTF8,
+  LibraryManager: { library },
+  mergeInto(target, source) { Object.assign(target, source); },
+}, { filename: process.argv[1] });
+
+function callStr(name, text) {
+  return UTF8ToString(library[name](stringToNewUTF8(text)));
+}
+
+function parse(path) {
+  const ret = _malloc(20);
+  library.pathParse(ret, stringToNewUTF8(path));
+  return {
+    root: UTF8ToString(getValue(ret, '*')),
+    dir: UTF8ToString(getValue(ret + 4, '*')),
+    base: UTF8ToString(getValue(ret + 8, '*')),
+    name: UTF8ToString(getValue(ret + 12, '*')),
+    ext: UTF8ToString(getValue(ret + 16, '*')),
+  };
+}
+
+assert.strictEqual(callStr('pathDir', '/'), '/');
+assert.strictEqual(callStr('pathBase', '/'), '');
+assert.deepStrictEqual(parse('/'), { root: '/', dir: '/', base: '', name: '', ext: '' });
+
+assert.strictEqual(callStr('pathDir', 'C:/'), 'C:/');
+assert.strictEqual(callStr('pathBase', 'C:/'), '');
+assert.deepStrictEqual(parse('C:/'), { root: 'C:/', dir: 'C:/', base: '', name: '', ext: '' });
+
+assert.strictEqual(callStr('pathDir', '//server/share'), '//server/share');
+assert.strictEqual(callStr('pathBase', '//server/share'), '');
+assert.deepStrictEqual(parse('//server/share'), {
+  root: '//server/share',
+  dir: '//server/share',
+  base: '',
+  name: '',
+  ext: '',
+});
+'''
+    subprocess.run([node, "-e", script, str(ROOT / "packages" / "std" / "emcc" / "path.js")], check=True)
+
+
+def test_e2e_native_path_from_file_url_decodes_percent_bytes_and_rejects_nul(tmp_path):
+    """native pathFromFileUrl 按字节解码百分号，但拒绝 Ez Str 无法表达的 NUL。"""
+    cc = shutil.which("cc")
+    if cc is None:
+        pytest.skip("需要 C 编译器验证 std/path native wrapper")
+
+    harness = tmp_path / "path_file_url_harness.c"
+    harness.write_text(
+        r'''
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdlib.h>
+
+#if defined(_WIN32)
+#define EXPECTED_SEP '\\'
+#else
+#define EXPECTED_SEP '/'
+#endif
+
+typedef struct { bool ok; const char *value; } OptStr;
+
+OptStr pathFromFileUrl(const char *url);
+
+int main(void) {
+    OptStr raw = pathFromFileUrl("file:///%FF");
+    if (!raw.ok || !raw.value) return 2;
+    if ((unsigned char)raw.value[0] != (unsigned char)EXPECTED_SEP) return 3;
+    if ((unsigned char)raw.value[1] != 0xff) return 4;
+    if (raw.value[2] != '\0') return 5;
+    free((void *)raw.value);
+
+    OptStr nul = pathFromFileUrl("file:///tmp/%00x");
+    if (nul.ok || nul.value) return 6;
+
+    OptStr invalid = pathFromFileUrl("file:///tmp/%");
+    if (invalid.ok || invalid.value) return 7;
+    return 0;
+}
+''',
+        encoding="utf-8",
+    )
+    exe = tmp_path / "path_file_url_harness"
+    subprocess.run(
+        [
+            cc,
+            "-std=c11",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            str(harness),
+            str(ROOT / "packages" / "std" / "native" / "path.c"),
+            "-o",
+            str(exe),
+        ],
+        check=True,
+    )
+    subprocess.run([str(exe)], check=True)
 
 
 def test_e2e_str_wrappers_validate_utf8_bytes():
@@ -1394,6 +4758,7 @@ def test_e2e_str_wrappers_validate_utf8_bytes():
 
     for marker in [
         "ez_utf8_validate_len",
+        "memchr(data->data, 0",
         "if (width < 0 || i + (size_t)width > len) return false;",
         "if (ch == 0xED && b1 >= 0xA0) return false;",
         "if (ch == 0xF4 && b1 > 0x8F) return false;",
@@ -1401,12 +4766,200 @@ def test_e2e_str_wrappers_validate_utf8_bytes():
         assert marker in native_str
     for marker in [
         "function validUtf8Bytes",
+        "function unicodeCase",
+        "latinExtACasePairs",
+        "function byteLengthPrefix",
         "else return false;",
         "if (width === 3 && ch === 0xed && bytes[i + 1] >= 0xa0) return false;",
         "if (width === 4 && ch === 0xf4 && bytes[i + 1] > 0x8f) return false;",
+        "bytes.indexOf(0) >= 0",
         "HEAPU8[ret] = 0;",
     ]:
         assert marker in emcc_str
+
+
+def test_e2e_emcc_str_matches_native_unicode_case_and_byte_index():
+    """emcc str 大小写转换和 strIndexOf 应匹配 native 的 Unicode simple case/字节偏移规则。"""
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("需要 Node 验证 std/str emcc wrapper")
+    script = r'''
+const assert = require('assert');
+const fs = require('fs');
+const vm = require('vm');
+
+const code = fs.readFileSync(process.argv[1], 'utf8');
+const memory = new ArrayBuffer(65536);
+const HEAPU8 = new Uint8Array(memory);
+const view = new DataView(memory);
+let heap = 1024;
+
+function align(value) { return (value + 7) & ~7; }
+function _malloc(size) {
+  const ptr = heap;
+  heap = align(heap + Math.max(1, size));
+  if (heap > HEAPU8.length) throw new Error('oom');
+  return ptr;
+}
+function getValue(ptr, type) {
+  if (type === '*') return view.getUint32(ptr, true);
+  if (type === 'i64') return Number(view.getBigInt64(ptr, true));
+  throw new Error('unsupported getValue type ' + type);
+}
+function setValue(ptr, value, type) {
+  if (type === '*') { view.setUint32(ptr, Number(value), true); return; }
+  if (type === 'i64') { view.setBigInt64(ptr, BigInt(value), true); return; }
+  throw new Error('unsupported setValue type ' + type);
+}
+function lengthBytesUTF8(text) { return Buffer.byteLength(text, 'utf8'); }
+function stringToUTF8(text, ptr, maxBytes) {
+  const bytes = Buffer.from(text, 'utf8');
+  HEAPU8.set(bytes.slice(0, Math.max(0, maxBytes - 1)), ptr);
+  HEAPU8[ptr + Math.min(bytes.length, Math.max(0, maxBytes - 1))] = 0;
+}
+function stringToNewUTF8(text) {
+  const len = lengthBytesUTF8(text);
+  const ptr = _malloc(len + 1);
+  stringToUTF8(text, ptr, len + 1);
+  return ptr;
+}
+function UTF8ToString(ptr) {
+  if (!ptr) return '';
+  let end = ptr;
+  while (HEAPU8[end] !== 0) end++;
+  return Buffer.from(HEAPU8.slice(ptr, end)).toString('utf8');
+}
+function UTF8ArrayToString(bytes) {
+  return Buffer.from(bytes).toString('utf8');
+}
+
+const library = {};
+vm.runInNewContext(code, {
+  BigInt,
+  Buffer,
+  HEAPU8,
+  _malloc,
+  getValue,
+  setValue,
+  UTF8ToString,
+  UTF8ArrayToString,
+  lengthBytesUTF8,
+  stringToUTF8,
+  stringToNewUTF8,
+  LibraryManager: { library },
+  mergeInto(target, source) { Object.assign(target, source); },
+}, { filename: process.argv[1] });
+
+function lower(text) { return UTF8ToString(library.strToLower(stringToNewUTF8(text))); }
+function upper(text) { return UTF8ToString(library.strToUpper(stringToNewUTF8(text))); }
+function trim(text) { return UTF8ToString(library.strTrim(stringToNewUTF8(text))); }
+function indexOf(text, needle) { return library.strIndexOf(stringToNewUTF8(text), stringToNewUTF8(needle)); }
+function makeBlob(dataPtr, size) {
+  const blob = _malloc(16);
+  setValue(blob, dataPtr, '*');
+  setValue(blob + 8, size, 'i64');
+  return blob;
+}
+function makeByteBlob(bytes) {
+  const data = _malloc(bytes.length);
+  HEAPU8.set(bytes, data);
+  return makeBlob(data, bytes.length);
+}
+function strFromBlob(blob) {
+  const ret = _malloc(16);
+  library.strFromBytes(ret, blob);
+  const ok = HEAPU8[ret] !== 0;
+  return { ok, value: ok ? UTF8ToString(getValue(ret + 8, '*')) : '' };
+}
+
+assert.strictEqual(lower('Ä中Ez ΣЖ Ÿ'), 'ä中ez σж ÿ');
+assert.strictEqual(upper('ä中Ez σςж ÿ ß'), 'Ä中EZ ΣΣЖ Ÿ ẞ');
+assert.strictEqual(trim('\u00A0\u3000EzLang\u2003\u202F'), 'EzLang');
+assert.strictEqual(trim('\uFEFFEzLang\uFEFF'), '\uFEFFEzLang\uFEFF');
+assert.strictEqual(indexOf('中Ez', 'Ez'), 3);
+assert.strictEqual(indexOf('中Ez', 'missing'), -1);
+assert.deepStrictEqual(strFromBlob(makeBlob(0, 0)), { ok: true, value: '' });
+assert.deepStrictEqual(strFromBlob(makeByteBlob([0xe4, 0xb8, 0xad])), { ok: true, value: '中' });
+assert.deepStrictEqual(strFromBlob(makeByteBlob([0])), { ok: false, value: '' });
+assert.deepStrictEqual(strFromBlob(makeByteBlob([0x61, 0, 0x62])), { ok: false, value: '' });
+assert.deepStrictEqual(strFromBlob(makeBlob(0, -1)), { ok: false, value: '' });
+assert.deepStrictEqual(strFromBlob(makeBlob(0, 1)), { ok: false, value: '' });
+assert.deepStrictEqual(strFromBlob(makeBlob(HEAPU8.length - 1, 2)), { ok: false, value: '' });
+'''
+    subprocess.run([node, "-e", script, str(ROOT / "packages" / "std" / "emcc" / "str.js")], check=True)
+
+
+def test_e2e_native_str_from_bytes_rejects_nul_bytes(tmp_path):
+    """native strFromBytes 校验 UTF-8 后仍要拒绝 Str ABI 无法表达的 NUL。"""
+    cc = shutil.which("cc")
+    if cc is None:
+        pytest.skip("需要 C 编译器验证原生 std/str wrapper")
+
+    harness = tmp_path / "str_from_bytes_harness.c"
+    harness.write_text(
+        r'''
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+
+typedef struct { uint8_t *data; int64_t size; } Blob;
+typedef struct { bool ok; const char *value; } OptStr;
+
+OptStr strFromBytes(const Blob *data);
+
+static int expect_value(Blob blob, const char *expected, int code) {
+    OptStr got = strFromBytes(&blob);
+    if (!got.ok || !got.value) return code;
+    if (strcmp(got.value, expected) != 0) return code + 1;
+    free((void *)got.value);
+    return 0;
+}
+
+static int expect_empty(Blob blob, int code) {
+    OptStr got = strFromBytes(&blob);
+    if (got.ok || got.value) return code;
+    return 0;
+}
+
+int main(void) {
+    uint8_t valid_utf8[] = {0xE4, 0xB8, 0xAD};
+    uint8_t one_nul[] = {0};
+    uint8_t inner_nul[] = {'a', 0, 'b'};
+    uint8_t invalid_utf8[] = {0xFF};
+    Blob empty = {NULL, 0};
+
+    int err = expect_value(empty, "", 2);
+    if (err != 0) return err;
+    err = expect_value((Blob){valid_utf8, 3}, "\xE4\xB8\xAD", 4);
+    if (err != 0) return err;
+    err = expect_empty((Blob){one_nul, 1}, 6);
+    if (err != 0) return err;
+    err = expect_empty((Blob){inner_nul, 3}, 7);
+    if (err != 0) return err;
+    err = expect_empty((Blob){invalid_utf8, 1}, 8);
+    if (err != 0) return err;
+    return 0;
+}
+''',
+        encoding="utf-8",
+    )
+    exe = tmp_path / "str_from_bytes_harness"
+    subprocess.run(
+        [
+            cc,
+            "-std=c11",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            str(harness),
+            str(ROOT / "packages" / "std" / "native" / "str.c"),
+            "-o",
+            str(exe),
+        ],
+        check=True,
+    )
+    subprocess.run([str(exe)], check=True)
 
 
 def test_e2e_math_wrappers_cover_checked_edges_and_emcc_bigint():
@@ -1436,6 +4989,7 @@ def test_e2e_math_wrappers_cover_checked_edges_and_emcc_bigint():
 def test_e2e_emcc_fmt_wrapper_covers_f32_and_strict_f64_parse():
     fmt_js = (ROOT / "packages" / "std" / "emcc" / "fmt.js").read_text(encoding="utf-8")
     assert "toString_F32: function" in fmt_js
+    assert "toString_I1: function" in fmt_js
     assert "Number.parseFloat" not in fmt_js
     assert "Number(text)" in fmt_js
     for name in ["msgpackEncode_I1", "msgpackDecode_I1", "msgpackEncode_Str", "msgpackDecode_Str", "msgpackEncode_F64", "msgpackDecode_F64"]:
@@ -1444,8 +4998,93 @@ def test_e2e_emcc_fmt_wrapper_covers_f32_and_strict_f64_parse():
 
 def test_e2e_emcc_time_wrapper_covers_named_and_percent_format_tokens():
     time_js = (ROOT / "packages" / "std" / "emcc" / "time.js").read_text(encoding="utf-8")
-    for token in ["%Y|YYYY", "%m|MM", "%d|DD", "%H|HH", "%M", "%S|SS"]:
+    for token in ["'YYYY'", "'mm'", "ch === 'Y'", "ch === 'm'", "ch === 'd'", "ch === 'H'", "ch === 'M'", "ch === 'S'", "ch === '%'", "'%' + ch"]:
         assert token in time_js
+
+
+def test_e2e_emcc_time_format_matches_native_token_scanner():
+    """emcc time.format 应和 native 一样逐 token 解析，包含 %% 与负时间戳。"""
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("需要 Node 验证 std/time emcc wrapper")
+    script = r'''
+const assert = require('assert');
+const fs = require('fs');
+const vm = require('vm');
+
+const code = fs.readFileSync(process.argv[1], 'utf8');
+const memory = new ArrayBuffer(65536);
+const HEAPU8 = new Uint8Array(memory);
+const HEAP32 = new Int32Array(memory);
+const HEAP64 = new BigInt64Array(memory);
+let heap = 1024;
+
+function align(value) { return (value + 7) & ~7; }
+function _malloc(size) {
+  const ptr = heap;
+  heap = align(heap + Math.max(1, size));
+  if (heap > HEAPU8.length) throw new Error('oom');
+  return ptr;
+}
+function stringToNewUTF8(text) {
+  const bytes = Buffer.from(text, 'utf8');
+  const ptr = _malloc(bytes.length + 1);
+  HEAPU8.set(bytes, ptr);
+  HEAPU8[ptr + bytes.length] = 0;
+  return ptr;
+}
+function UTF8ToString(ptr) {
+  if (!ptr) return '';
+  let end = ptr;
+  while (HEAPU8[end] !== 0) end++;
+  return Buffer.from(HEAPU8.slice(ptr, end)).toString('utf8');
+}
+
+const library = {};
+vm.runInNewContext(code, {
+  BigInt,
+  Buffer,
+  Date,
+  Int32Array,
+  SharedArrayBuffer,
+  Atomics,
+  HEAPU8,
+  HEAP32,
+  HEAP64,
+  stringToNewUTF8,
+  UTF8ToString,
+  LibraryManager: { library },
+  mergeInto(target, source) { Object.assign(target, source); },
+}, { filename: process.argv[1] });
+
+function datePtr(ms) {
+  const ptr = _malloc(8);
+  HEAP64[ptr >> 3] = BigInt(ms);
+  return ptr;
+}
+function optI32(value) {
+  const ptr = _malloc(8);
+  HEAPU8[ptr] = 1;
+  HEAP32[(ptr + 4) >> 2] = value;
+  return ptr;
+}
+function format(ms, fmt) {
+  return UTF8ToString(library.format(datePtr(ms), stringToNewUTF8(fmt)));
+}
+
+assert.strictEqual(format(0, 'YYYY-MM-DD HH:%M:SS'), '1970-01-01 00:00:00');
+assert.strictEqual(format(0, 'YYYY-MM-DD HH:mm:SS'), '1970-01-01 00:00:00');
+assert.strictEqual(format(0, '%Y-%m-%d %% %Q'), '1970-01-01 % %Q');
+assert.strictEqual(format(-1, '%Y-%m-%d %H:%M:%S'), '1969-12-31 23:59:59');
+assert.strictEqual(format(0, 'x'.repeat(160) + 'YYYY-MM-DD'), 'x'.repeat(160) + '1970-01-01');
+
+const mutable = datePtr(0);
+library.add(mutable, optI32(1), 0, 0, 0, 0, 0);
+assert.strictEqual(UTF8ToString(library.format(mutable, stringToNewUTF8('%Y-%m-%d'))), '1971-01-01');
+library.sub(mutable, optI32(1), 0, 0, 0, 0, 0);
+assert.strictEqual(UTF8ToString(library.format(mutable, stringToNewUTF8('%Y-%m-%d'))), '1970-01-01');
+'''
+    subprocess.run([node, "-e", script, str(ROOT / "packages" / "std" / "emcc" / "time.js")], check=True)
 
 
 def test_e2e_emcc_os_args_use_runtime_arguments():
@@ -1456,31 +5095,227 @@ def test_e2e_emcc_os_args_use_runtime_arguments():
     assert "writeStrList(ret, runtimeArgs())" in os_js
     assert "function nodeProcess" in os_js
     assert "proc.env" in os_js
+    assert "if (!name)" in os_js
+    assert "proc.cwd()" in emcc_js_function_body(os_js, "cwd")
     assert "proc.pid" in os_js
     assert "return proc && proc.pid ? proc.pid | 0 : -1;" in emcc_js_function_body(os_js, "pid")
 
 
-def test_e2e_emcc_io_readline_returns_empty_optional():
-    """WebAssembly 目标不支持同步 stdin 时，readLine 应显式返回空可选值。"""
+def test_e2e_native_os_cwd_uses_dynamic_buffer():
+    native = (ROOT / "packages" / "std" / "native" / "os.c").read_text(encoding="utf-8")
+    body = native[native.index("const char *cwd(void)"):native.index("void exit")]
+    assert "getcwd(NULL, 0)" in body
+    assert "while (cap <= 1024 * 1024)" in body
+    assert "errno != ERANGE" in body
+    assert "malloc(4096)" not in body
+    assert 'return ez_strdup_safe("")' in body
+
+
+def test_e2e_native_os_env_returns_allocated_snapshot(tmp_path):
+    """原生 env 返回的字符串应由封装层复制，不能暴露 getenv 的内部存储。"""
+    cc = shutil.which("cc")
+    if cc is None:
+        pytest.skip("需要 C 编译器验证原生 std/os wrapper")
+    harness = tmp_path / "os_env_harness.c"
+    harness.write_text(
+        r'''
+#include <stdbool.h>
+#include <string.h>
+
+typedef struct { bool ok; const char *value; } OptStr;
+
+OptStr env(const char *key);
+bool setEnv(const char *key, const char *value);
+
+int main(void) {
+    const char *key = "EZLANG_OS_ENV_COPY_TEST";
+    if (!setEnv(key, "first")) return 1;
+    OptStr first = env(key);
+    if (!first.ok || !first.value || strcmp(first.value, "first") != 0) return 2;
+    if (!setEnv(key, "second-longer-value")) return 3;
+    if (strcmp(first.value, "first") != 0) return 4;
+    OptStr second = env(key);
+    if (!second.ok || !second.value || strcmp(second.value, "second-longer-value") != 0) return 5;
+    return 0;
+}
+''',
+        encoding="utf-8",
+    )
+    exe = tmp_path / "os_env_harness"
+    subprocess.run(
+        [cc, "-std=c11", "-Wall", "-Wextra", "-Werror", str(harness), str(ROOT / "packages" / "std" / "native" / "os.c"), "-o", str(exe)],
+        check=True,
+    )
+    subprocess.run([str(exe)], check=True)
+
+
+def test_e2e_emcc_os_cwd_uses_node_process_and_browser_root():
+    """emcc Node 运行时返回真实 cwd；浏览器风格环境返回虚拟根目录。"""
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("需要 Node 验证 std/os emcc wrapper")
+    script = r'''
+const assert = require('assert');
+const fs = require('fs');
+const vm = require('vm');
+
+const code = fs.readFileSync(process.argv[1], 'utf8');
+
+function makeRuntime(extra) {
+  const memory = new ArrayBuffer(65536);
+  const HEAPU8 = new Uint8Array(memory);
+  const view = new DataView(memory);
+  let heap = 1024;
+  function align(value) { return (value + 7) & ~7; }
+  function _malloc(size) {
+    const ptr = heap;
+    heap = align(heap + Math.max(1, size));
+    if (heap > HEAPU8.length) throw new Error('oom');
+    return ptr;
+  }
+  function setValue(ptr, value, type) {
+    if (type === '*') { view.setUint32(ptr, Number(value), true); return; }
+    if (type === 'i64') { view.setBigInt64(ptr, BigInt(value), true); return; }
+    throw new Error('unsupported setValue type ' + type);
+  }
+  function stringToNewUTF8(text) {
+    const bytes = Buffer.from(text, 'utf8');
+    const ptr = _malloc(bytes.length + 1);
+    HEAPU8.set(bytes, ptr);
+    HEAPU8[ptr + bytes.length] = 0;
+    return ptr;
+  }
+  function UTF8ToString(ptr) {
+    if (!ptr) return '';
+    let end = ptr;
+    while (HEAPU8[end] !== 0) end++;
+    return Buffer.from(HEAPU8.slice(ptr, end)).toString('utf8');
+  }
+  const library = {};
+  vm.runInNewContext(code, Object.assign({
+    Buffer,
+    HEAPU8,
+    _malloc,
+    setValue,
+    UTF8ToString,
+    stringToNewUTF8,
+    LibraryManager: { library },
+    mergeInto(target, source) { Object.assign(target, source); },
+  }, extra || {}), { filename: process.argv[1] });
+  return { library, UTF8ToString, stringToNewUTF8, _malloc, HEAPU8, view };
+}
+
+let runtime = makeRuntime({ process });
+assert.strictEqual(runtime.UTF8ToString(runtime.library.cwd()), process.cwd());
+let ret = runtime._malloc(16);
+assert.strictEqual(runtime.library.setEnv(runtime.stringToNewUTF8(''), runtime.stringToNewUTF8('bad')), 0);
+runtime.library.env(ret, runtime.stringToNewUTF8(''));
+assert.strictEqual(runtime.HEAPU8[ret], 0);
+assert.strictEqual(runtime.view.getUint32(ret + 8, true), 0);
+assert.strictEqual(Object.prototype.hasOwnProperty.call(process.env, ''), false);
+
+runtime = makeRuntime({});
+assert.strictEqual(runtime.UTF8ToString(runtime.library.cwd()), '/');
+'''
+    subprocess.run([node, "-e", script, str(ROOT / "packages" / "std" / "emcc" / "os.js")], check=True)
+
+
+def test_e2e_emcc_io_readline_supports_node_stdin_and_browser_fallback():
+    """Node 风格 emcc 运行时同步读取 stdin；浏览器无同步 stdin 时显式返回空可选值。"""
     io_js = (ROOT / "packages" / "std" / "emcc" / "io.js").read_text(encoding="utf-8")
     body = emcc_js_function_body(io_js, "readLine")
-    assert "HEAPU8[ret] = 0;" in body
-    assert "setValue(ret + 8, 0, '*');" in body
+    for marker in ["writeStdout", "process.stdout.write", "stdoutPending"]:
+        assert marker in io_js
+    for marker in ["loadStdinLines", "fs.readFileSync(0, 'utf8')", "stdinIndex++", "writeOptStr(ret, true"]:
+        assert marker in io_js if marker == "loadStdinLines" or marker == "fs.readFileSync(0, 'utf8')" else marker in body
+    assert "writeOptStr(ret, false" in body
+
+
+def test_e2e_emcc_io_print_preserves_no_newline_when_stdout_write_exists():
+    """emcc print 和 println 应保留无换行/有换行差异。"""
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("需要 Node 验证 std/io emcc wrapper")
+    stdlib_doc = (ROOT / "docs" / "stdlib.md").read_text(encoding="utf-8")
+    stdlib_api_doc = (ROOT / "docs" / "stdlib-api.md").read_text(encoding="utf-8")
+    assert "Node `stdout.write` 无换行" in stdlib_doc
+    assert "连续 `print` 内容并在下一次 `println`" in stdlib_api_doc
+    assert "| `print`    | 向 stdout 输出字符串           | logcat / os_log      | `console.log`" not in stdlib_doc
+    script = r'''
+const assert = require('assert');
+const fs = require('fs');
+const vm = require('vm');
+
+const code = fs.readFileSync(process.argv[1], 'utf8');
+
+function makeRuntime(extra) {
+  const memory = new ArrayBuffer(65536);
+  const HEAPU8 = new Uint8Array(memory);
+  const view = new DataView(memory);
+  let heap = 1024;
+  function align(value) { return (value + 7) & ~7; }
+  function _malloc(size) {
+    const ptr = heap;
+    heap = align(heap + Math.max(1, size));
+    if (heap > HEAPU8.length) throw new Error('oom');
+    return ptr;
+  }
+  function setValue(ptr, value, type) {
+    if (type === '*') { view.setUint32(ptr, Number(value), true); return; }
+    throw new Error('unsupported setValue type ' + type);
+  }
+  function stringToNewUTF8(text) {
+    const bytes = Buffer.from(text, 'utf8');
+    const ptr = _malloc(bytes.length + 1);
+    HEAPU8.set(bytes, ptr);
+    HEAPU8[ptr + bytes.length] = 0;
+    return ptr;
+  }
+  function UTF8ToString(ptr) {
+    if (!ptr) return '';
+    let end = ptr;
+    while (HEAPU8[end] !== 0) end++;
+    return Buffer.from(HEAPU8.slice(ptr, end)).toString('utf8');
+  }
+  const library = {};
+  vm.runInNewContext(code, Object.assign({
+    HEAPU8,
+    _malloc,
+    setValue,
+    UTF8ToString,
+    stringToNewUTF8,
+    LibraryManager: { library },
+    mergeInto(target, source) { Object.assign(target, source); },
+  }, extra || {}), { filename: process.argv[1] });
+  return { library, stringToNewUTF8 };
+}
+
+let stdout = '';
+let runtime = makeRuntime({ process: { stdout: { write(value) { stdout += value; } } } });
+runtime.library.print(runtime.stringToNewUTF8('a'));
+runtime.library.println(runtime.stringToNewUTF8('b'));
+assert.strictEqual(stdout, 'ab\n');
+
+const lines = [];
+runtime = makeRuntime({ out(value) { lines.push(value); } });
+runtime.library.print(runtime.stringToNewUTF8('x'));
+runtime.library.print(runtime.stringToNewUTF8('y'));
+assert.deepStrictEqual(lines, []);
+runtime.library.println(runtime.stringToNewUTF8('z'));
+assert.deepStrictEqual(lines, ['xyz']);
+'''
+    subprocess.run([node, "-e", script, str(ROOT / "packages" / "std" / "emcc" / "io.js")], check=True)
 
 
 def test_e2e_emcc_stub_wrappers_are_marked_unsupported():
     """公开 wrapper 只有失败占位时，必须写明平台不支持。"""
     cases = {
-        "packages/std/emcc/io.js": ["readLine"],
-        "packages/std/emcc/net/http.js": ["fetch", "fetchEx", "createServer"],
+        "packages/std/emcc/net/http.js": ["createServer"],
         "packages/std/emcc/net/tcp.js": [
             "tcpConnect", "tcpListen", "tcpAccept", "tcpRead", "tcpWrite", "tcpClose",
-            "tcpListenerClose", "udpBind", "udpSend", "udpRecv", "udpClose",
+            "tcpListenerClose", "udpBind", "udpSend", "udpRecvFrom", "udpRecv", "udpClose",
         ],
         "packages/std/emcc/net/ws.js": ["wsConnect", "wsSend", "wsRecv", "wsClose"],
-        "packages/std/emcc/process.js": [
-            "processExec", "processSpawn", "processWait", "processTerminate", "processCurrentPath",
-        ],
     }
     unsupported_marker = re.compile(r"不支持|不可用|unsupported|unavailable", re.I)
     failure_markers = [
@@ -1553,7 +5388,212 @@ def test_e2e_emcc_net_wrappers_use_optional_sret():
     assert "tcpConnect: function (ret, host, port)" in tcp_js
     assert "tcpListen: function (ret, host, port)" in tcp_js
     assert "udpBind: function (ret, host, port)" in tcp_js
+    assert "udpRecvFrom: function (ret, socket, maxBytes)" in tcp_js
     assert "wsConnect: function (ret, url)" in ws_js
+
+
+def test_e2e_emcc_http_fetch_ex_rejects_invalid_body_blob_before_xhr():
+    """emcc fetchEx 遇到非法请求体 Blob 应失败，不能调用 XHR.send。"""
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("需要 Node 验证 std/net/http emcc wrapper")
+    script = r'''
+const assert = require('assert');
+const fs = require('fs');
+const vm = require('vm');
+
+const code = fs.readFileSync(process.argv[1], 'utf8');
+const memory = new ArrayBuffer(65536);
+const HEAPU8 = new Uint8Array(memory);
+const view = new DataView(memory);
+let heap = 1024;
+let sendCalls = [];
+
+function align(value) { return (value + 7) & ~7; }
+function _malloc(size) {
+  const ptr = heap;
+  heap = align(heap + Math.max(1, size));
+  if (heap > HEAPU8.length) throw new Error('oom');
+  return ptr;
+}
+function getValue(ptr, type) {
+  if (type === '*') return view.getUint32(ptr, true);
+  if (type === 'i32') return view.getInt32(ptr, true);
+  if (type === 'i64') return Number(view.getBigInt64(ptr, true));
+  throw new Error('unsupported getValue type ' + type);
+}
+function setValue(ptr, value, type) {
+  if (type === '*') { view.setUint32(ptr, Number(value), true); return; }
+  if (type === 'i32') { view.setInt32(ptr, Number(value), true); return; }
+  if (type === 'i64') { view.setBigInt64(ptr, BigInt(value), true); return; }
+  throw new Error('unsupported setValue type ' + type);
+}
+function stringToNewUTF8(text) {
+  const bytes = Buffer.from(text, 'utf8');
+  const ptr = _malloc(bytes.length + 1);
+  HEAPU8.set(bytes, ptr);
+  HEAPU8[ptr + bytes.length] = 0;
+  return ptr;
+}
+function UTF8ToString(ptr) {
+  if (!ptr) return '';
+  let end = ptr;
+  while (HEAPU8[end] !== 0) end++;
+  return Buffer.from(HEAPU8.slice(ptr, end)).toString('utf8');
+}
+
+class FakeXHR {
+  open(method, url, sync) {
+    this.method = method;
+    this.url = url;
+    this.sync = sync;
+    this.status = 200;
+    this.response = new ArrayBuffer(0);
+    this.responseText = '';
+  }
+  setRequestHeader() {}
+  getAllResponseHeaders() { return ''; }
+  send(body) { sendCalls.push(body); }
+}
+
+const library = {};
+vm.runInNewContext(code, {
+  BigInt,
+  ArrayBuffer,
+  TextDecoder,
+  TextEncoder,
+  Uint8Array,
+  HEAPU8,
+  _malloc,
+  getValue,
+  setValue,
+  UTF8ToString,
+  stringToNewUTF8,
+  XMLHttpRequest: FakeXHR,
+  LibraryManager: { library },
+  mergeInto(target, source) { Object.assign(target, source); },
+}, { filename: process.argv[1] });
+
+function makeRequest(bodyPtr, bodySize) {
+  const req = _malloc(56);
+  setValue(req, stringToNewUTF8('POST'), '*');
+  setValue(req + 8, stringToNewUTF8('http://example.test/'), '*');
+  setValue(req + 16, 0, '*');
+  setValue(req + 24, 0, '*');
+  setValue(req + 32, 0, 'i32');
+  setValue(req + 36, 0, 'i32');
+  setValue(req + 40, 0, 'i32');
+  setValue(req + 40, bodyPtr, '*');
+  setValue(req + 48, bodySize, 'i64');
+  return req;
+}
+function fetchEx(req) {
+  const ret = _malloc(64);
+  library.fetchEx(ret, req);
+  return HEAPU8[ret] !== 0;
+}
+
+assert.strictEqual(fetchEx(makeRequest(0, -1)), false);
+assert.strictEqual(fetchEx(makeRequest(0, 1)), false);
+assert.strictEqual(fetchEx(makeRequest(HEAPU8.length - 1, 2)), false);
+assert.deepStrictEqual(sendCalls, []);
+assert.strictEqual(fetchEx(makeRequest(0, 0)), true);
+assert.strictEqual(sendCalls.length, 1);
+assert.strictEqual(sendCalls[0], null);
+'''
+    subprocess.run([node, "-e", script, str(ROOT / "packages" / "std" / "emcc" / "net" / "http.js")], check=True)
+
+
+def test_e2e_emcc_http_response_text_rejects_nul_and_invalid_utf8():
+    """emcc HttpResponse.text 遇到不能表示为 Str 的响应体应返回空字符串。"""
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("需要 Node 验证 std/net/http emcc wrapper")
+    script = r'''
+const assert = require('assert');
+const fs = require('fs');
+const vm = require('vm');
+
+const code = fs.readFileSync(process.argv[1], 'utf8');
+const memory = new ArrayBuffer(65536);
+const HEAPU8 = new Uint8Array(memory);
+const view = new DataView(memory);
+let heap = 1024;
+
+function align(value) { return (value + 7) & ~7; }
+function _malloc(size) {
+  const ptr = heap;
+  heap = align(heap + Math.max(1, size));
+  if (heap > HEAPU8.length) throw new Error('oom');
+  return ptr;
+}
+function getValue(ptr, type) {
+  if (type === '*') return view.getUint32(ptr, true);
+  if (type === 'i32') return view.getInt32(ptr, true);
+  if (type === 'i64') return Number(view.getBigInt64(ptr, true));
+  throw new Error('unsupported getValue type ' + type);
+}
+function setValue(ptr, value, type) {
+  if (type === '*') { view.setUint32(ptr, Number(value), true); return; }
+  if (type === 'i32') { view.setInt32(ptr, Number(value), true); return; }
+  if (type === 'i64') { view.setBigInt64(ptr, BigInt(value), true); return; }
+  throw new Error('unsupported setValue type ' + type);
+}
+function stringToNewUTF8(text) {
+  const bytes = Buffer.from(text, 'utf8');
+  const ptr = _malloc(bytes.length + 1);
+  HEAPU8.set(bytes, ptr);
+  HEAPU8[ptr + bytes.length] = 0;
+  return ptr;
+}
+function UTF8ToString(ptr) {
+  if (!ptr) return '';
+  let end = ptr;
+  while (HEAPU8[end] !== 0) end++;
+  return Buffer.from(HEAPU8.slice(ptr, end)).toString('utf8');
+}
+
+const library = {};
+vm.runInNewContext(code, {
+  BigInt,
+  ArrayBuffer,
+  DataView,
+  TextDecoder,
+  TextEncoder,
+  Uint8Array,
+  HEAPU8,
+  _malloc,
+  getValue,
+  setValue,
+  UTF8ToString,
+  stringToNewUTF8,
+  LibraryManager: { library },
+  mergeInto(target, source) { Object.assign(target, source); },
+}, { filename: process.argv[1] });
+
+function makeResponse(bytes) {
+  const resp = _malloc(48);
+  const body = _malloc(bytes.length || 1);
+  HEAPU8.set(bytes, body);
+  setValue(resp, 200, 'i32');
+  setValue(resp + 8, 0, '*');
+  setValue(resp + 16, 0, '*');
+  setValue(resp + 24, 0, 'i32');
+  setValue(resp + 28, 0, 'i32');
+  setValue(resp + 32, 0, 'i32');
+  setValue(resp + 32, body, '*');
+  setValue(resp + 40, bytes.length, 'i64');
+  return resp;
+}
+function text(bytes) {
+  return UTF8ToString(library.HttpResponse_text(makeResponse(Uint8Array.from(bytes))));
+}
+
+assert.strictEqual(text([111, 107]), 'ok');
+assert.strictEqual(text([97, 0, 98]), '');
+assert.strictEqual(text([255]), '');
+'''
+    subprocess.run([node, "-e", script, str(ROOT / "packages" / "std" / "emcc" / "net" / "http.js")], check=True)
 
 
 def emcc_js_function_body(text: str, name: str) -> str:
@@ -1568,7 +5608,7 @@ def test_e2e_emcc_tcp_udp_ws_wrappers_fail_explicitly():
     tcp_js = (ROOT / "packages" / "std" / "emcc" / "net" / "tcp.js").read_text(encoding="utf-8")
     ws_js = (ROOT / "packages" / "std" / "emcc" / "net" / "ws.js").read_text(encoding="utf-8")
 
-    for name in ["tcpConnect", "tcpListen", "tcpAccept", "tcpRead", "udpBind", "udpRecv"]:
+    for name in ["tcpConnect", "tcpListen", "tcpAccept", "tcpRead", "udpBind", "udpRecvFrom", "udpRecv"]:
         assert "HEAPU8[ret] = 0;" in emcc_js_function_body(tcp_js, name)
     assert "HEAPU8[ret] = 0;" in emcc_js_function_body(ws_js, "wsConnect")
     assert "HEAPU8[ret] = 0;" in emcc_js_function_body(ws_js, "wsRecv")
@@ -1580,6 +5620,188 @@ def test_e2e_emcc_tcp_udp_ws_wrappers_fail_explicitly():
     for name in ["tcpClose", "tcpListenerClose", "udpClose"]:
         assert "return 0;" in emcc_js_function_body(tcp_js, name)
     assert "return 0;" in emcc_js_function_body(ws_js, "wsClose")
+
+
+def test_e2e_native_tcp_udp_write_accepts_empty_blob_and_rejects_invalid_blob(tmp_path):
+    """原生 TCP/UDP 写入应接受合法空 Blob，并拒绝非法 Blob ABI。"""
+    cc = shutil.which("cc")
+    if cc is None:
+        pytest.skip("需要 C 编译器验证原生 std/net/tcp wrapper")
+
+    harness = tmp_path / "tcp_empty_blob_harness.c"
+    harness.write_text(
+        r'''
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+#if !defined(_WIN32)
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
+#endif
+
+typedef struct { int64_t handle; } TcpConn;
+typedef struct { int64_t handle; } UdpSocket;
+typedef struct { uint8_t *data; int64_t size; } Blob;
+typedef struct { Blob data; const char *host; int32_t port; } UdpPacket;
+typedef struct { bool ok; UdpSocket value; } OptUdpSocket;
+typedef struct { bool ok; UdpPacket value; } OptUdpPacket;
+
+int64_t tcpWrite(const TcpConn *conn, const Blob *data);
+OptUdpSocket udpBind(const char *host, int32_t port);
+int64_t udpSend(const UdpSocket *socket_value, const char *host, int32_t port, const Blob *data);
+OptUdpPacket udpRecvFrom(const UdpSocket *socket_value, int64_t maxBytes);
+bool udpClose(const UdpSocket *socket_value);
+
+int main(void) {
+#if defined(_WIN32)
+    return 0;
+#else
+    int pair[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, pair) != 0) return 2;
+
+    TcpConn conn = {(int64_t)pair[0]};
+    Blob empty = {NULL, 0};
+    Blob bad_negative = {NULL, -1};
+    Blob bad_missing_data = {NULL, 1};
+
+    if (tcpWrite(&conn, &empty) != 0) return 3;
+    if (tcpWrite(&conn, &bad_negative) != -1) return 4;
+    if (tcpWrite(&conn, &bad_missing_data) != -1) return 5;
+
+    close(pair[0]);
+    close(pair[1]);
+
+    OptUdpSocket udp = udpBind("127.0.0.1", 0);
+    if (!udp.ok || udp.value.handle == 0) return 6;
+    if (udpSend(&udp.value, "127.0.0.1", 9, &empty) != 0) return 7;
+    if (udpSend(&udp.value, "127.0.0.1", 9, &bad_negative) != -1) return 8;
+    if (udpSend(&udp.value, "127.0.0.1", 9, &bad_missing_data) != -1) return 9;
+
+    OptUdpSocket peer = udpBind("127.0.0.1", 0);
+    if (!peer.ok || peer.value.handle == 0) return 10;
+    struct sockaddr_storage addr;
+    socklen_t addr_len = sizeof(addr);
+    if (getsockname((int)udp.value.handle, (struct sockaddr *)&addr, &addr_len) != 0) return 11;
+    uint16_t udp_port = ntohs(((struct sockaddr_in *)&addr)->sin_port);
+    addr_len = sizeof(addr);
+    if (getsockname((int)peer.value.handle, (struct sockaddr *)&addr, &addr_len) != 0) return 12;
+    uint16_t peer_port = ntohs(((struct sockaddr_in *)&addr)->sin_port);
+    Blob payload = {(uint8_t *)"ab", 2};
+    if (udpSend(&peer.value, "127.0.0.1", udp_port, &payload) != 2) return 13;
+    OptUdpPacket packet = udpRecvFrom(&udp.value, 8);
+    if (!packet.ok) return 14;
+    if (!packet.value.data.data || packet.value.data.size != 2) return 15;
+    if (packet.value.data.data[0] != 'a' || packet.value.data.data[1] != 'b') return 16;
+    if (!packet.value.host || packet.value.host[0] == '\0') return 17;
+    if (packet.value.port != (int32_t)peer_port) return 18;
+    free(packet.value.data.data);
+    free((void *)packet.value.host);
+    if (!udpClose(&peer.value)) return 19;
+    if (!udpClose(&udp.value)) return 20;
+
+    return 0;
+#endif
+}
+''',
+        encoding="utf-8",
+    )
+    exe = tmp_path / "tcp_empty_blob_harness"
+    subprocess.run(
+        [
+            cc,
+            "-std=c11",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            str(harness),
+            str(ROOT / "packages" / "std" / "native" / "net" / "tcp.c"),
+            "-o",
+            str(exe),
+        ],
+        check=True,
+    )
+    subprocess.run([str(exe)], check=True)
+
+
+def test_e2e_native_ws_send_accepts_empty_blob_and_rejects_invalid_blob(tmp_path):
+    """wsSend 应入口拒绝非法 Blob，避免向对端写出半个帧。"""
+    cc = shutil.which("cc")
+    if cc is None:
+        pytest.skip("需要 C 编译器验证原生 std/net/ws wrapper")
+
+    harness = tmp_path / "ws_empty_blob_harness.c"
+    harness.write_text(
+        r'''
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+
+#if !defined(_WIN32)
+#include <sys/socket.h>
+#include <unistd.h>
+#endif
+
+typedef struct { int64_t handle; } WsConn;
+typedef struct { uint8_t *data; int64_t size; } Blob;
+
+int64_t wsSend(const WsConn *conn, const Blob *data);
+
+int main(void) {
+#if defined(_WIN32)
+    return 0;
+#else
+    int pair[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, pair) != 0) return 2;
+
+    WsConn conn = {(int64_t)pair[0]};
+    Blob empty = {NULL, 0};
+    Blob bad_negative = {NULL, -1};
+    Blob bad_missing_data = {NULL, 1};
+
+    if (wsSend(&conn, &empty) != 0) return 3;
+    unsigned char frame[6];
+    ssize_t got = recv(pair[1], frame, sizeof(frame), 0);
+    if (got != 6) return 4;
+    if ((frame[0] & 0x0f) != 0x2 || (frame[1] & 0x7f) != 0 || (frame[1] & 0x80) == 0) return 5;
+
+    if (wsSend(&conn, &bad_negative) != -1) return 6;
+    if (wsSend(&conn, &bad_missing_data) != -1) return 7;
+
+    struct timeval timeout;
+    timeout.tv_sec = 0;
+    timeout.tv_usec = 10000;
+    setsockopt(pair[1], SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+    got = recv(pair[1], frame, sizeof(frame), 0);
+    if (got > 0) return 8;
+
+    close(pair[0]);
+    close(pair[1]);
+    return 0;
+#endif
+}
+''',
+        encoding="utf-8",
+    )
+    exe = tmp_path / "ws_empty_blob_harness"
+    subprocess.run(
+        [
+            cc,
+            "-std=c11",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            str(harness),
+            str(ROOT / "packages" / "std" / "native" / "net" / "ws.c"),
+            "-o",
+            str(exe),
+        ],
+        check=True,
+    )
+    subprocess.run([str(exe)], check=True)
 
 
 def test_e2e_public_emcc_wrappers_do_not_use_legacy_null_stubs():
@@ -1727,7 +5949,7 @@ def test_e2e_std_platform_externs_cover_mobile_and_emcc(tmp_path, capsys):
         ("regex", 'from "std/regex" import { regexCompile, regexTest };\nlet re = regexCompile(pattern = "a+", flags = 0);\nlet ok = regexTest(regex = re, input = "aaa");\n', ["native/regex.c", "emcc/regex.js"]),
         ("crypto", 'from "std/crypto" import { cryptoSha256 };\nlet data = Blob(data = "hello", size = 5);\nlet digest = cryptoSha256(data = data);\n', ["native/crypto.c", "emcc/crypto.js"]),
         ("compress", 'from "std/compress" import { compressGzip };\nlet data = Blob(data = "hello", size = 5);\nlet compressed = compressGzip(data = data);\n', ["native/compress.c", "emcc/compress.js"]),
-        ("process", 'from "std/process" import { processCurrentPath };\nlet path = processCurrentPath();\n', ["native/process.c", "emcc/process.js"]),
+        ("process", 'from "std/process" import { processCurrentPath };\nlet path = processCurrentPath();\n', ["native/stream.c", "native/process.c", "emcc/stream.js", "emcc/process.js"]),
         ("stream", 'from "std/stream" import { streamFromBlob };\nlet s = streamFromBlob(data = Blob(data = "", size = 0));\n', ["native/stream.c", "emcc/stream.js"]),
         ("test", 'from "std/test" import { testAssert, testRegisterParam, testName };\ntestRegisterParam(name = "case", param = "1");\ntestAssert(condition = testName(index = 0) == "case[1]", msg = "ok");\n', ["native/test.c", "emcc/test.js"]),
     ]

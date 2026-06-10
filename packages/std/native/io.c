@@ -61,14 +61,35 @@ OptStr readLine(void) {
 #if defined(__ANDROID__) || (defined(__APPLE__) && TARGET_OS_IPHONE)
     return (OptStr){false, NULL};
 #else
-    static char buffer[4096];
-    if (fgets(buffer, sizeof(buffer), stdin) == NULL) {
+    size_t cap = 128;
+    size_t len = 0;
+    char *buffer = (char *)malloc(cap);
+    if (!buffer) return (OptStr){false, NULL};
+    int ch = 0;
+    while ((ch = fgetc(stdin)) != EOF) {
+        if (ch == '\n') break;
+        if (len + 1 >= cap) {
+            if (cap > ((size_t)-1) / 2) {
+                free(buffer);
+                return (OptStr){false, NULL};
+            }
+            size_t next_cap = cap * 2;
+            char *next = (char *)realloc(buffer, next_cap);
+            if (!next) {
+                free(buffer);
+                return (OptStr){false, NULL};
+            }
+            buffer = next;
+            cap = next_cap;
+        }
+        buffer[len++] = (char)ch;
+    }
+    if (ch == EOF && len == 0) {
+        free(buffer);
         return (OptStr){false, NULL};
     }
-    size_t len = strlen(buffer);
-    if (len > 0 && buffer[len - 1] == '\n') {
-        buffer[len - 1] = '\0';
-    }
+    if (len > 0 && buffer[len - 1] == '\r') len--;
+    buffer[len] = '\0';
     return (OptStr){true, buffer};
 #endif
 }

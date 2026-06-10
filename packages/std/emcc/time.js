@@ -1,12 +1,6 @@
 // EzLang std/time Emscripten JS 封装层
-mergeInto(LibraryManager.library, {
-  now: function (ret) {
-    HEAP64[ret >> 3] = BigInt(Date.now());
-  },
-  timestamp: function () {
-    return BigInt(Date.now());
-  },
-  sleep: function (ms) {
+(function () {
+  function sleepMs(ms) {
     var delay = Number(ms);
     if (!Number.isFinite(delay) || delay <= 0) return;
     if (typeof SharedArrayBuffer !== 'undefined' && typeof Atomics !== 'undefined') {
@@ -17,6 +11,23 @@ mergeInto(LibraryManager.library, {
     // 浏览器主线程没有可移植同步 sleep 原语，短时忙等用于保持 ABI 语义。
     var end = Date.now() + delay;
     while (Date.now() < end) {}
+  }
+
+  mergeInto(LibraryManager.library, {
+  __durationToString: function (ms) {
+    return stringToNewUTF8(String(ms) + 'ms');
+  },
+  now: function (ret) {
+    HEAP64[ret >> 3] = BigInt(Date.now());
+  },
+  timestamp: function () {
+    return BigInt(Date.now());
+  },
+  sleep: function (ms) {
+    sleepMs(ms);
+  },
+  __ezrt_emcc_sleep: function (ms) {
+    sleepMs(ms);
   },
   getYear: function (datePtr) {
     return new Date(Number(HEAP64[datePtr >> 3])).getUTCFullYear();
@@ -62,13 +73,39 @@ mergeInto(LibraryManager.library, {
     var date = new Date(Number(HEAP64[datePtr >> 3]));
     var fmt = UTF8ToString(fmtPtr || 0) || '%Y-%m-%dT%H:%M:%SZ';
     function pad(v) { return String(v).padStart(2, '0'); }
-    var text = fmt
-      .replace(/%Y|YYYY/g, String(date.getUTCFullYear()))
-      .replace(/%m|MM/g, pad(date.getUTCMonth() + 1))
-      .replace(/%d|DD/g, pad(date.getUTCDate()))
-      .replace(/%H|HH/g, pad(date.getUTCHours()))
-      .replace(/%M/g, pad(date.getUTCMinutes()))
-      .replace(/%S|SS/g, pad(date.getUTCSeconds()));
-    return stringToNewUTF8(text);
+    function namedToken(index) {
+      if (fmt.slice(index, index + 4) === 'YYYY') return [String(date.getUTCFullYear()), 4];
+      if (fmt.slice(index, index + 2) === 'MM') return [pad(date.getUTCMonth() + 1), 2];
+      if (fmt.slice(index, index + 2) === 'mm') return [pad(date.getUTCMinutes()), 2];
+      if (fmt.slice(index, index + 2) === 'DD') return [pad(date.getUTCDate()), 2];
+      if (fmt.slice(index, index + 2) === 'HH') return [pad(date.getUTCHours()), 2];
+      if (fmt.slice(index, index + 2) === 'SS') return [pad(date.getUTCSeconds()), 2];
+      return null;
+    }
+    function percentToken(index) {
+      if (index + 1 >= fmt.length) return ['%', 1];
+      var ch = fmt.charAt(index + 1);
+      if (ch === 'Y') return [String(date.getUTCFullYear()), 2];
+      if (ch === 'm') return [pad(date.getUTCMonth() + 1), 2];
+      if (ch === 'd') return [pad(date.getUTCDate()), 2];
+      if (ch === 'H') return [pad(date.getUTCHours()), 2];
+      if (ch === 'M') return [pad(date.getUTCMinutes()), 2];
+      if (ch === 'S') return [pad(date.getUTCSeconds()), 2];
+      if (ch === '%') return ['%', 2];
+      return ['%' + ch, 2];
+    }
+    var out = '';
+    for (var i = 0; i < fmt.length;) {
+      var token = fmt.charAt(i) === '%' ? percentToken(i) : namedToken(i);
+      if (token) {
+        out += token[0];
+        i += token[1];
+      } else {
+        out += fmt.charAt(i);
+        i++;
+      }
+    }
+    return stringToNewUTF8(out);
   },
-});
+  });
+})();

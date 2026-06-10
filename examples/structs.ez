@@ -1,17 +1,31 @@
-// structs.ez - 验证结构体
+from "std/fmt" import { format, toString };
+from "std/io" import { println };
+
 struct Point {
     x: I32;
     y: I32 = 0;
 };
 
 struct Point3D {
-    ...Point; // 字段展开
+    ...Point;
     z: I32;
 };
 
-const run = () => {
-    let p1 = Point(x = 10);
-    let p2 = Point(...p1, y = 20);
-    let p3 = Point3D(...p1, z = 3);
-    return p2.y;
+struct Counter {
+    value: I32;
+    set = (this: Counter, value: I32): Void => {
+        this.value = value;
+    };
+};
+
+const main = (): I32 => {
+    const p1 = Point(x = 10);
+    const p2 = Point(...p1, y = 20);
+    const p3 = Point3D(...p2, z = 12);
+    let counter = Counter(value = 1);
+    counter.set(value = p2.x + p2.y + p3.z);
+    const args: Str[] = [toString<I32>(value = p2.x), toString<I32>(value = p2.y), toString<I32>(value = counter.value)];
+
+    println(msg = format(template = "structs: x={}, y={}, counter={}", args = args));
+    return counter.value == 42 ? 0 : 1;
 };

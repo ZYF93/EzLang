@@ -8,9 +8,29 @@ extern "@std/native/time.c" for android;
 extern "@std/native/time.c" for ios;
 extern "@std/emcc/time.js" for emcc;
 
+declare const __durationToString: (ms: I64) => Str;
+
 // === 时间间隔结构体 ===
 export struct Duration {
     ms: I64;
+
+    fromSec = (s: I64): Duration => {
+        const msPerSec: I64 = 1000;
+        return Duration(ms = s * msPerSec);
+    };
+
+    fromMin = (m: I64): Duration => {
+        const msPerMin: I64 = 60000;
+        return Duration(ms = m * msPerMin);
+    };
+
+    toString = (this: Duration): Str => {
+        return __durationToString(ms = this.ms);
+    };
+};
+
+export const durationToString = (value: Duration): Str => {
+    return __durationToString(ms = value.ms);
 };
 
 // === 时间函数 ===

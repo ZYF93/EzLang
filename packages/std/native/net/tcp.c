@@ -11,6 +11,7 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 typedef SOCKET ez_socket_t;
+typedef int ez_socklen_t;
 #define EZ_INVALID_SOCKET INVALID_SOCKET
 #define ez_close_socket closesocket
 #else
@@ -18,6 +19,7 @@ typedef SOCKET ez_socket_t;
 #include <sys/socket.h>
 #include <unistd.h>
 typedef int ez_socket_t;
+typedef socklen_t ez_socklen_t;
 #define EZ_INVALID_SOCKET (-1)
 #define ez_close_socket close
 #endif
@@ -26,10 +28,12 @@ typedef struct { int64_t handle; } TcpConn;
 typedef struct { int64_t handle; } TcpListener;
 typedef struct { int64_t handle; } UdpSocket;
 typedef struct { uint8_t *data; int64_t size; } Blob;
+typedef struct { Blob data; const char *host; int32_t port; } UdpPacket;
 typedef struct { bool ok; TcpConn value; } OptTcpConn;
 typedef struct { bool ok; TcpListener value; } OptTcpListener;
 typedef struct { bool ok; UdpSocket value; } OptUdpSocket;
 typedef struct { bool ok; Blob value; } OptBlob;
+typedef struct { bool ok; UdpPacket value; } OptUdpPacket;
 
 static bool ez_net_init(void) {
 #if defined(_WIN32)
@@ -59,8 +63,20 @@ static OptBlob ez_empty_blob(void) {
     return (OptBlob){true, {NULL, 0}};
 }
 
+static OptUdpPacket ez_none_udp_packet(void) {
+    return (OptUdpPacket){false, {{NULL, 0}, NULL, 0}};
+}
+
+static bool ez_blob_valid(const Blob *data) {
+    return data && data->size >= 0 && (data->size == 0 || data->data);
+}
+
+static bool ez_port_valid(int32_t port) {
+    return port >= 0 && port <= 65535;
+}
+
 static ez_socket_t ez_connect_socket(const char *host, int32_t port, int socktype) {
-    if (!host || port < 0 || !ez_net_init()) return EZ_INVALID_SOCKET;
+    if (!host || !ez_port_valid(port) || !ez_net_init()) return EZ_INVALID_SOCKET;
     char port_text[16];
     snprintf(port_text, sizeof(port_text), "%d", port);
 
@@ -84,7 +100,7 @@ static ez_socket_t ez_connect_socket(const char *host, int32_t port, int socktyp
 }
 
 static ez_socket_t ez_bind_socket(const char *host, int32_t port, int socktype, bool listen_socket) {
-    if (!host || port < 0 || !ez_net_init()) return EZ_INVALID_SOCKET;
+    if (!host || !ez_port_valid(port) || !ez_net_init()) return EZ_INVALID_SOCKET;
     char port_text[16];
     snprintf(port_text, sizeof(port_text), "%d", port);
 
@@ -164,9 +180,10 @@ OptBlob tcpRead(const TcpConn *conn, int64_t maxBytes) {
 }
 
 int64_t tcpWrite(const TcpConn *conn, const Blob *data) {
-    if (!conn || !data || !data->data || data->size < 0 || !ez_net_init()) return -1;
+    if (!conn || !ez_blob_valid(data) || !ez_net_init()) return -1;
     ez_socket_t sock = ez_socket_from_handle(conn->handle);
     if (sock == EZ_INVALID_SOCKET) return -1;
+    if (data->size == 0) return 0;
     int64_t written = 0;
     while (written < data->size) {
         int64_t remaining = data->size - written;
@@ -198,7 +215,7 @@ bool tcpListenerClose(const TcpListener *listener) {
 }
 
 int64_t udpSend(const UdpSocket *socket_value, const char *host, int32_t port, const Blob *data) {
-    if (!socket_value || !host || !data || !data->data || data->size < 0 || port < 0 || !ez_net_init()) return -1;
+    if (!socket_value || !host || !ez_blob_valid(data) || !ez_port_valid(port) || !ez_net_init()) return -1;
     ez_socket_t sock = ez_socket_from_handle(socket_value->handle);
     if (sock == EZ_INVALID_SOCKET) return -1;
 
@@ -212,13 +229,16 @@ int64_t udpSend(const UdpSocket *socket_value, const char *host, int32_t port, c
     if (getaddrinfo(host, port_text, &hints, &result) != 0) return -1;
 
     int64_t sent = -1;
+    const uint8_t empty_payload = 0;
     for (struct addrinfo *it = result; it; it = it->ai_next) {
         int64_t size = data->size;
 #if defined(_WIN32)
         if (size > INT32_MAX) size = INT32_MAX;
-        int n = sendto(sock, (const char *)data->data, (int)size, 0, it->ai_addr, (int)it->ai_addrlen);
+        const char *payload = size == 0 ? (const char *)&empty_payload : (const char *)data->data;
+        int n = sendto(sock, payload, (int)size, 0, it->ai_addr, (int)it->ai_addrlen);
 #else
-        ssize_t n = sendto(sock, data->data, (size_t)size, 0, it->ai_addr, it->ai_addrlen);
+        const uint8_t *payload = size == 0 ? &empty_payload : data->data;
+        ssize_t n = sendto(sock, payload, (size_t)size, 0, it->ai_addr, it->ai_addrlen);
 #endif
         if (n >= 0) {
             sent = (int64_t)n;
@@ -229,28 +249,59 @@ int64_t udpSend(const UdpSocket *socket_value, const char *host, int32_t port, c
     return sent;
 }
 
-OptBlob udpRecv(const UdpSocket *socket_value, int64_t maxBytes) {
-    if (!socket_value || maxBytes < 0 || !ez_net_init()) return ez_none_blob();
-    if (maxBytes == 0) return ez_empty_blob();
+OptUdpPacket udpRecvFrom(const UdpSocket *socket_value, int64_t maxBytes) {
+    if (!socket_value || maxBytes < 0 || !ez_net_init()) return ez_none_udp_packet();
+    if (maxBytes == 0) return (OptUdpPacket){true, {{NULL, 0}, NULL, 0}};
     ez_socket_t sock = ez_socket_from_handle(socket_value->handle);
-    if (sock == EZ_INVALID_SOCKET) return ez_none_blob();
+    if (sock == EZ_INVALID_SOCKET) return ez_none_udp_packet();
     if (maxBytes > 1024 * 1024 * 16) maxBytes = 1024 * 1024 * 16;
     uint8_t *data = (uint8_t *)malloc((size_t)maxBytes);
-    if (!data) return ez_none_blob();
+    if (!data) return ez_none_udp_packet();
+    struct sockaddr_storage addr;
+    ez_socklen_t addr_len = (ez_socklen_t)sizeof(addr);
 #if defined(_WIN32)
-    int got = recvfrom(sock, (char *)data, (int)maxBytes, 0, NULL, NULL);
+    int got = recvfrom(sock, (char *)data, (int)maxBytes, 0, (struct sockaddr *)&addr, &addr_len);
 #else
-    ssize_t got = recvfrom(sock, data, (size_t)maxBytes, 0, NULL, NULL);
+    ssize_t got = recvfrom(sock, data, (size_t)maxBytes, 0, (struct sockaddr *)&addr, &addr_len);
 #endif
     if (got < 0) {
         free(data);
-        return ez_none_blob();
+        return ez_none_udp_packet();
     }
     if (got == 0) {
         free(data);
-        return ez_empty_blob();
+        data = NULL;
     }
-    return (OptBlob){true, {data, (int64_t)got}};
+
+    char host[NI_MAXHOST];
+    char service[NI_MAXSERV];
+    int info = getnameinfo((struct sockaddr *)&addr, addr_len, host, sizeof(host), service, sizeof(service), NI_NUMERICHOST | NI_NUMERICSERV);
+    if (info != 0) {
+        free(data);
+        return ez_none_udp_packet();
+    }
+    char *host_copy = (char *)malloc(strlen(host) + 1);
+    if (!host_copy) {
+        free(data);
+        return ez_none_udp_packet();
+    }
+    strcpy(host_copy, host);
+    char *end = NULL;
+    long port_value = strtol(service, &end, 10);
+    if (!end || *end != '\0' || port_value < 0 || port_value > 65535) {
+        free(host_copy);
+        free(data);
+        return ez_none_udp_packet();
+    }
+    return (OptUdpPacket){true, {{data, (int64_t)got}, host_copy, (int32_t)port_value}};
+}
+
+OptBlob udpRecv(const UdpSocket *socket_value, int64_t maxBytes) {
+    OptUdpPacket packet = udpRecvFrom(socket_value, maxBytes);
+    if (!packet.ok) return ez_none_blob();
+    Blob data = packet.value.data;
+    free((void *)packet.value.host);
+    return (OptBlob){true, data};
 }
 
 bool udpClose(const UdpSocket *socket_value) {

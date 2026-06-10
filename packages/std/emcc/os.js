@@ -41,19 +41,30 @@
     env: function (ret, key) {
       var proc = nodeProcess();
       var name = UTF8ToString(key || 0);
+      if (!name) {
+        HEAPU8[ret] = 0;
+        setValue(ret + 8, 0, '*');
+        return;
+      }
       var value = proc && proc.env ? proc.env[name] : undefined;
       HEAPU8[ret] = value !== undefined ? 1 : 0;
       setValue(ret + 8, value !== undefined ? stringToNewUTF8(String(value)) : 0, '*');
     },
     setEnv: function (key, value) {
       var proc = nodeProcess();
+      var name = UTF8ToString(key || 0);
+      if (!name) return 0;
       if (proc && proc.env) {
-        proc.env[UTF8ToString(key || 0)] = UTF8ToString(value || 0);
+        proc.env[name] = UTF8ToString(value || 0);
         return 1;
       }
       return 0;
     },
     cwd: function () {
+      var proc = nodeProcess();
+      if (proc && typeof proc.cwd === 'function') {
+        try { return stringToNewUTF8(proc.cwd()); } catch (e) {}
+      }
       return stringToNewUTF8('/');
     },
     exit: function (code) {

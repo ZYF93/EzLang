@@ -1,6 +1,19 @@
-// 测试模块导入的简单库
-const pi: F64 = 3.14159;
+from "std/fmt" import { format, toString };
+from "std/io" import { println };
 
-const add = (a: I32, b: I32): I32 => {
+export const pi: F64 = 3.14159;
+
+export const add = (a: I32, b: I32): I32 => {
     return a + b;
+};
+
+const square = (value: I32): I32 => {
+    return value * value;
+};
+
+const main = (): I32 => {
+    const value = square(value = add(a = 3, b = 4));
+    const args: Str[] = [toString<I32>(value = value)];
+    println(msg = format(template = "test_lib: square={}", args = args));
+    return value == 49 ? 0 : 1;
 };

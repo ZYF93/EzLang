@@ -9,6 +9,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 
 from semantic.analyzer import SemanticAnalyzer, analyze
 from semantic.symbols import SymbolKind
+from cli import ez
 
 
 ROOT = Path(__file__).parent.parent.parent
@@ -41,6 +42,13 @@ DOC_SEMANTIC_SKIP = {
 
 
 def analyze_file(filepath: str) -> SemanticAnalyzer:
+    path = Path(filepath).resolve()
+    if path.is_relative_to(ROOT / 'examples'):
+        config = ez.load_project(ROOT / 'project.toml', require_main=False)
+        config.main = path
+        source_plan = ez.discover_sources(config)
+        source = "\n".join(ez._strip_imports(p.read_text(encoding='utf-8')) for p in source_plan)
+        return analyze(source, base_dir=path.parent, compile_target=ez._native_os())
     with open(filepath, 'r', encoding='utf-8') as f:
         return analyze(f.read())
 
@@ -56,20 +64,11 @@ class TestSemantic:
         """变量声明和引用检查"""
         anal = analyze_file(
             str(Path(__file__).parent.parent.parent / 'examples' / 'vars.ez'))
-        # vars.ez 定义了 count, pi, global_val
-        count = anal.symbols.resolve('count')
-        assert count is not None
-        assert count.kind == SymbolKind.VARIABLE
-        assert count.mutable
-
-        pi = anal.symbols.resolve('pi')
-        assert pi is not None
-        assert pi.kind == SymbolKind.CONSTANT
-        assert not pi.mutable
-
-        global_val = anal.symbols.resolve('global_val')
+        global_val = anal.symbols.resolve('globalVal')
         assert global_val is not None
         assert global_val.kind == SymbolKind.STATIC
+        main = anal.symbols.resolve('main')
+        assert main is not None
 
     def test_variable_decl_without_initializer_keeps_annotated_type(self):
         """无初始化器变量应使用显式标注类型。"""
@@ -81,6 +80,13 @@ class TestSemantic:
         assert count is not None and count.type.name == 'I32'
         assert arr is not None and arr.type.kind.name == 'OPTIONAL'
         assert ptr is not None and ptr.type.kind.name == 'POINTER'
+
+    def test_variable_identifier_can_start_with_dollar(self):
+        """$ 开头变量名应和普通变量一样进入符号表并可被引用。"""
+        anal = analyze('let $count: I32 = 1; let total: I32 = $count + 1;')
+        assert not anal.symbols.has_errors(), f'语义错误: {anal.symbols.errors}'
+        symbol = anal.symbols.resolve('$count')
+        assert symbol is not None and symbol.type.name == 'I32'
 
     def test_placeholder_expression_requires_call_argument_context(self):
         """独立 ? 不能静默编译为 0，只能用于调用参数占位。"""
@@ -99,9 +105,7 @@ class TestSemantic:
             str(Path(__file__).parent.parent.parent / 'examples' / 'basics.ez'))
         assert not anal.symbols.has_errors(), f'错误: {anal.symbols.errors}'
 
-        # 验证变量声明
-        x = anal.symbols.resolve('x')
-        assert x is not None
+        assert anal.symbols.resolve('main') is not None
 
     def test_types(self):
         """类型系统语义检查"""
@@ -140,8 +144,8 @@ class TestSemantic:
         """流程控制语义检查"""
         anal = analyze_file(
             str(Path(__file__).parent.parent.parent / 'examples' / 'control.ez'))
-        assert anal.symbols.resolve('x') is not None
-        assert anal.symbols.resolve('fetchData') is not None
+        assert not anal.symbols.has_errors(), f'错误: {anal.symbols.errors}'
+        assert anal.symbols.resolve('main') is not None
 
     def test_modules(self):
         """模块系统语义检查"""
@@ -242,9 +246,15 @@ class TestSemantic:
         """移位右操作数必须显式为无符号整数。"""
         ok = analyze('let shift: U32 = 1; let x = 1 << shift;')
         assert not ok.symbols.has_errors(), f'不应有语义错误: {ok.symbols.errors}'
+        sym = ok.symbols.resolve('x')
+        assert sym is not None
+        assert sym.type.name == 'I32'
 
         bad = analyze('let x = 1 << 1;')
         assert any('移位右操作数' in e for e in bad.symbols.errors), f'应有移位类型错误: {bad.symbols.errors}'
+
+        bad_lhs = analyze('let shift: U32 = 1; let x = 1.5 << shift;')
+        assert any('移位左操作数' in e for e in bad_lhs.symbols.errors), f'应有移位左操作数类型错误: {bad_lhs.symbols.errors}'
 
     def test_comparison_returns_bool(self):
         """比较运算返回 Bool"""
@@ -413,6 +423,26 @@ class TestSemantic:
         const r = add(b = 2);
         ''')
         assert any('缺少必填参数' in e for e in anal.symbols.errors), f'应有缺少参数错误: {anal.symbols.errors}'
+
+    def test_pipeline_expression_uses_function_return_type_and_named_args(self):
+        """管道表达式应按目标函数签名检查参数，并返回目标函数返回类型。"""
+        anal = analyze('''
+        const gt = (a: I32, b: I32 = 0): Bool => {
+            return a > b;
+        };
+        const sub = (a: I32, b: I32): I32 => {
+            return a - b;
+        };
+        let ok: Bool = 1 -> gt();
+        let ordered: I32 = 10 -> sub(b = %, a = 20);
+        let missing = 1 -> sub(a = %);
+        let unknown = 1 -> sub(c = %);
+        let bad: Str = 1 -> gt();
+        ''')
+        assert any('缺少必填参数' in e and "'b'" in e for e in anal.symbols.errors), anal.symbols.errors
+        assert any('未知参数' in e and "'c'" in e for e in anal.symbols.errors), anal.symbols.errors
+        assert any('类型不匹配' in e and "Str" in e and "Bool" in e for e in anal.symbols.errors), anal.symbols.errors
+        assert not any('ok' in e for e in anal.symbols.errors), anal.symbols.errors
 
     def test_string_interpolation_checks_inner_expr(self):
         """字符串插值应分析内部表达式"""
@@ -732,6 +762,24 @@ class TestSemantic:
         assert not anal.symbols.errors, f'不应产生语义错误: {anal.symbols.errors}'
         assert not anal.symbols.warnings, f'不应产生语义警告: {anal.symbols.warnings}'
 
+    def test_static_struct_method_call_does_not_require_this(self):
+        """StructName.method() 类型级方法不应被当成实例方法注入 this。"""
+        anal = analyze('''
+        struct Duration {
+            ms: I64;
+            fromSec = (s: I64): Duration => {
+                return Duration(ms = s);
+            };
+        };
+        const main = (): I32 => {
+            const seconds = Duration.fromSec(s = 2);
+            let ms: I64 = seconds.ms;
+            return 0;
+        };
+        ''')
+        assert not anal.symbols.errors, f'不应产生语义错误: {anal.symbols.errors}'
+        assert not anal.symbols.warnings, f'不应产生语义警告: {anal.symbols.warnings}'
+
     def test_optional_member_access_returns_optional_field_type(self):
         """opt?.field 应返回字段类型的可选值。"""
         anal = analyze('''
@@ -832,9 +880,8 @@ class TestSemantic:
             str(Path(__file__).parent.parent.parent / 'examples' / 'flow.ez'))
         assert not anal.symbols.has_errors(), f'语义错误: {anal.symbols.errors}'
         assert len(anal.flow_blocks) == 1
-        assert {p['name'] for p in anal.suspend_points} >= {'fetch', 'readFile', 'sleep'}
+        assert {p['name'] for p in anal.suspend_points} >= {'sleep'}
         assert len(anal.race_calls) == 1
-        assert any(dep['name'] == 'a' and dep['source'] == 'fetch' for dep in anal.flow_dependencies)
 
     def test_flow_block_detection(self):
         """flow 块检测应记录起止行号"""
@@ -848,6 +895,59 @@ class TestSemantic:
         block = anal.flow_blocks[0]
         assert block['start_line'] > 0
         assert block['end_line'] >= block['start_line']
+
+    def test_flow_expression_infers_return_type(self):
+        """flow { return ... } 应作为表达式暴露返回类型。"""
+        anal = analyze('''
+        const result: I32 = flow {
+            return 42;
+        };
+        ''')
+        assert not anal.symbols.has_errors(), f'语义错误: {anal.symbols.errors}'
+        sym = anal.symbols.resolve('result')
+        assert sym is not None
+        assert sym.type.name == 'I32'
+
+    def test_flow_result_ignores_nested_function_return(self):
+        """嵌套函数字面量的 return 不应成为外层 flow 的表达式类型。"""
+        anal = analyze('''
+        const result: Void = flow {
+            const f = (): I32 => { return 1; };
+        };
+        ''')
+        assert not anal.symbols.has_errors(), f'语义错误: {anal.symbols.errors}'
+        sym = anal.symbols.resolve('result')
+        assert sym is not None
+        assert sym.type.name == 'Void'
+
+    def test_flow_and_parallel_infer_nested_return_type(self):
+        """flow/parallel 应从块内嵌套控制流 return 推断表达式类型。"""
+        anal = analyze('''
+        const flowValue: Str = flow {
+            (true) ? { return "flow"; };
+        };
+        const parallelValue: Str = parallel {
+            { return "parallel"; };
+        };
+        ''')
+        assert not anal.symbols.has_errors(), f'语义错误: {anal.symbols.errors}'
+        assert anal.symbols.resolve('flowValue').type.name == 'Str'
+        assert anal.symbols.resolve('parallelValue').type.name == 'Str'
+
+    def test_flow_and_parallel_reject_mismatched_return_types(self):
+        """同一 flow/parallel 表达式块内多个 return 类型必须一致。"""
+        anal = analyze('''
+        const flowValue = flow {
+            (true) ? { return "flow"; };
+            return 1;
+        };
+        const parallelValue = parallel {
+            (true) ? { return "parallel"; };
+            return 2;
+        };
+        ''')
+        assert any('flow 块 返回类型不一致' in e for e in anal.symbols.errors)
+        assert any('parallel 块 返回类型不一致' in e for e in anal.symbols.errors)
 
     def test_suspend_points_only_marked_in_flow(self):
         """阻塞调用仅在 flow 内标记为 suspend point"""
@@ -874,6 +974,27 @@ class TestSemantic:
         ''')
         assert not anal.symbols.has_errors(), f'语义错误: {anal.symbols.errors}'
         assert len(anal.race_calls) == 1
+
+    def test_race_pl_infers_non_i32_return_type(self):
+        """race(pl) 应从分支函数推断返回类型，不能固定为 I32。"""
+        anal = analyze('''
+        const r: Str = flow {
+            return race(pl = [() => { return "a"; }, () => { return "b"; }], timeout = 10);
+        };
+        ''')
+        assert not anal.symbols.has_errors(), f'语义错误: {anal.symbols.errors}'
+        sym = anal.symbols.resolve('r')
+        assert sym is not None
+        assert sym.type.name == 'Str'
+
+    def test_race_pl_rejects_mismatched_branch_return_types(self):
+        """race(pl) 分支返回类型不一致时应给出语义错误。"""
+        anal = analyze('''
+        const r = flow {
+            return race(pl = [() => { return "a"; }, () => { return 1; }], timeout = 10);
+        };
+        ''')
+        assert any('race(pl) 分支返回类型不一致' in e for e in anal.symbols.errors)
 
     def test_flow_dependency_records_reads(self):
         """读取 suspend 结果应记录数据流依赖"""
@@ -916,13 +1037,14 @@ class TestSemantic:
             const accepted = accept(this = listener);
             const data = read(this = conn, size = 1024);
             const sent = write(this = conn, data = data);
+            const packet_with_addr = udpRecvFrom(socket = udp, maxBytes = 1024);
             const packet = recv(this = udp, size = 1024);
             send(this = udp, data = packet, host = "127.0.0.1", port = 5353);
             return sent;
         };
         ''')
         assert {p['name'] for p in anal.suspend_points} >= {
-            'tcpConnect', 'tcpListen', 'udpBind', 'accept', 'read', 'write', 'recv', 'send'
+            'tcpConnect', 'tcpListen', 'udpBind', 'udpRecvFrom', 'accept', 'read', 'write', 'recv', 'send'
         }
 
     def test_ws_calls_mark_suspend_points_in_flow(self):

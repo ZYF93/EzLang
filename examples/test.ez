@@ -1,2 +1,10 @@
-let x = 1;
-x + 2;
+from "std/io" import { println };
+from "std/test" import { testAssert, testEqualI64, testFailed, testReset };
+
+const main = (): I32 => {
+    testReset();
+    testAssert(condition = true, msg = "true is true");
+    testEqualI64(actual = 21 + 21, expected = 42, msg = "math still works");
+    println(msg = "test: assertions executed");
+    return testFailed();
+};

@@ -2,6 +2,7 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <limits.h>
 #include <stdlib.h>
 
 #if defined(_WIN32)
@@ -92,6 +93,7 @@ int64_t platformMemoryLimit(void) {
     long pages = sysconf(_SC_PHYS_PAGES);
     long page_size = sysconf(_SC_PAGESIZE);
     if (pages <= 0 || page_size <= 0) return -1;
+    if ((uint64_t)pages > (uint64_t)INT64_MAX / (uint64_t)page_size) return -1;
     return (int64_t)pages * (int64_t)page_size;
 #else
     return -1;

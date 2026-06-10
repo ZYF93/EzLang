@@ -4,7 +4,8 @@
     if (!blobPtr) return new Uint8Array(0);
     var dataPtr = getValue(blobPtr, '*');
     var size = Number(getValue(blobPtr + 8, 'i64'));
-    if (!dataPtr || size <= 0) return new Uint8Array(0);
+    if (!Number.isFinite(size) || size <= 0 || Math.floor(size) !== size) return new Uint8Array(0);
+    if (!dataPtr || dataPtr < 0 || dataPtr > HEAPU8.length || size > HEAPU8.length - dataPtr) return new Uint8Array(0);
     return HEAPU8.slice(dataPtr, dataPtr + size);
   }
 

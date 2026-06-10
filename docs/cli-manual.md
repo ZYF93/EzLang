@@ -17,6 +17,7 @@ ez build --help
 [project]
 name = "demo"
 version = "0.1.0"
+# main 可省略；省略时自动查找 src/main.ez、src/index.ez、main.ez 或 index.ez
 main = "src/index.ez"
 optimize = 2
 public = true
@@ -69,7 +70,7 @@ ez run --project project.toml
 ez run path/to/file.ez
 ```
 
-未传文件时，`run` 读取 `project.toml` 的 `[project].main`。传入 `.ez` 文件时，CLI 会直接把该文件作为入口运行；若当前目录存在 `project.toml`，会复用项目依赖、extern 和优化配置，并把输出写到 `.ez/run/<文件名>/`。`run` 只支持本机可执行产物，项目模式下会优先选择本机 `os` + `arch` 输出目标。
+未传文件时，`run` 优先读取 `project.toml` 的 `[project].main`；未配置时自动查找 `src/main.ez`、`src/index.ez`、`main.ez` 或 `index.ez`。传入 `.ez` 文件时，CLI 会直接把该文件作为入口运行；若当前目录存在 `project.toml`，会复用项目依赖、extern 和优化配置，并把输出写到 `.ez/run/<文件名>/`。`run` 只支持本机可执行产物，项目模式下会优先选择本机 `os` + `arch` 输出目标。
 
 ## 测试
 
