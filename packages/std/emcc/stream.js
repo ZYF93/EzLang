@@ -12,6 +12,17 @@
   var root = typeof Module !== 'undefined' && Module ? Module : (typeof globalThis !== 'undefined' ? globalThis : this);
   var bridge = root.__ez_stream_bridge || (root.__ez_stream_bridge = {});
 
+  function hasAsyncify() {
+    return typeof Asyncify !== 'undefined' && Asyncify && typeof Asyncify.handleSleep === 'function';
+  }
+
+  function suspendStream(fn) {
+    if (!hasAsyncify() || typeof setTimeout !== 'function') return fn();
+    return Asyncify.handleSleep(function (wakeUp) {
+      setTimeout(function () { wakeUp(fn()); }, 0);
+    });
+  }
+
   function pathText(path) {
     return UTF8ToString(path || 0);
   }
@@ -87,6 +98,93 @@
     }
   }
 
+  function streamReadImpl(ret, streamPtr, maxBytes) {
+    var max = Number(maxBytes);
+    var stream = readStream(streamPtr, STREAM_KIND_MEMORY);
+    if (!stream) stream = readStream(streamPtr, STREAM_KIND_FILE_READ);
+    if (!stream) stream = readStream(streamPtr, STREAM_KIND_PROCESS_STDOUT);
+    if (!stream) stream = readStream(streamPtr, STREAM_KIND_PROCESS_STDERR);
+    if (!stream && streamPtr && (getValue(streamPtr + 8, 'i32') | 0) === STREAM_KIND_TCP) {
+      return writeOptBlob(ret, false, new Uint8Array(0));
+    }
+    if (!stream || stream.closed || max < 0) return writeOptBlob(ret, false, new Uint8Array(0));
+    if (max === 0) return writeOptBlob(ret, true, new Uint8Array(0));
+    if (stream.kind === STREAM_KIND_MEMORY || stream.kind === STREAM_KIND_PROCESS_STDOUT || stream.kind === STREAM_KIND_PROCESS_STDERR) {
+      var remaining = stream.data.length - stream.cursor;
+      var count = Math.min(remaining, max);
+      if (count <= 0) return writeOptBlob(ret, true, new Uint8Array(0));
+      var out = stream.data.slice(stream.cursor, stream.cursor + count);
+      stream.cursor += count;
+      return writeOptBlob(ret, true, out);
+    }
+    try {
+      var bytes = new Uint8Array(max);
+      var read = FS.read(stream.file, bytes, 0, max, null);
+      writeOptBlob(ret, true, read > 0 ? bytes.slice(0, read) : new Uint8Array(0));
+    } catch (e) {
+      writeOptBlob(ret, false, new Uint8Array(0));
+    }
+  }
+
+  function streamWriteImpl(streamPtr, dataPtr) {
+    var stream = readStream(streamPtr, STREAM_KIND_MEMORY);
+    if (!stream) stream = readStream(streamPtr, STREAM_KIND_FILE_WRITE);
+    if (!stream && streamPtr && (getValue(streamPtr + 8, 'i32') | 0) === STREAM_KIND_TCP) return -1;
+    if (!stream || stream.closed) return -1;
+    var bytes = readBlob(dataPtr);
+    if (bytes === null) return -1;
+    if (bytes.length === 0) return 0;
+    if (stream.kind === STREAM_KIND_MEMORY) return appendBytes(stream, bytes);
+    try {
+      var written = FS.write(stream.file, bytes, 0, bytes.length, null);
+      return written === bytes.length ? written : -1;
+    } catch (e) {
+      return -1;
+    }
+  }
+
+  function streamCopyImpl(dstPtr, srcPtr, bufferSize) {
+    var copied = 0;
+    var chunk = Number(bufferSize) > 0 ? Number(bufferSize) : 4096;
+    var tmpBlob = _malloc(16);
+    var tmpOpt = _malloc(24);
+    try {
+      while (true) {
+        streamReadImpl(tmpOpt, srcPtr, chunk);
+        if (!HEAPU8[tmpOpt]) return -1;
+        var dataPtr = getValue(tmpOpt + 8, '*');
+        var size = Number(getValue(tmpOpt + 16, 'i64'));
+        if (size === 0) {
+          if (dataPtr) _free(dataPtr);
+          return copied;
+        }
+        setValue(tmpBlob, dataPtr, '*');
+        setValue(tmpBlob + 8, size, 'i64');
+        var written = streamWriteImpl(dstPtr, tmpBlob);
+        _free(dataPtr);
+        if (written !== size) return -1;
+        copied += written;
+      }
+    } finally {
+      _free(tmpBlob);
+      _free(tmpOpt);
+    }
+  }
+
+  bridge.read = streamReadImpl;
+  bridge.write = streamWriteImpl;
+  bridge.flush = function (streamPtr) {
+    var stream = readStream(streamPtr, STREAM_KIND_MEMORY);
+    if (stream) return stream.closed ? 0 : 1;
+    stream = readStream(streamPtr, STREAM_KIND_FILE_WRITE);
+    if (!stream) stream = readStream(streamPtr, STREAM_KIND_PROCESS_STDIN);
+    if (!stream) stream = readStream(streamPtr, STREAM_KIND_PROCESS_STDOUT);
+    if (!stream) stream = readStream(streamPtr, STREAM_KIND_PROCESS_STDERR);
+    if (stream && (stream.kind === STREAM_KIND_PROCESS_STDIN || stream.kind === STREAM_KIND_PROCESS_STDOUT || stream.kind === STREAM_KIND_PROCESS_STDERR)) return stream.closed ? 0 : 1;
+    if (!stream && streamPtr && (getValue(streamPtr + 8, 'i32') | 0) === STREAM_KIND_TCP) return 0;
+    return flushFileStream(stream);
+  };
+
   mergeInto(LibraryManager.library, {
     streamFromBlob: function (ret, dataPtr) {
       var data = readBlob(dataPtr);
@@ -103,140 +201,84 @@
     streamFromTcpHandle: function (ret, handle) {
       writeStream(ret, Number(handle), STREAM_KIND_TCP);
     },
+    streamOpenFileRead__async: 'auto',
     streamOpenFileRead: function (ret, pathPtr) {
-      try {
-        if (typeof FS === 'undefined') throw new Error('FS unavailable');
-        var path = pathText(pathPtr);
-        if (!path) throw new Error('empty path');
-        var handle = nextHandle++;
-        streams[handle] = { kind: STREAM_KIND_FILE_READ, file: FS.open(path, 'r'), closed: false };
-        HEAPU8[ret] = 1;
-        writeStream(ret + 8, handle, STREAM_KIND_FILE_READ);
-      } catch (e) {
-        HEAPU8[ret] = 0;
-        writeStream(ret + 8, 0, 0);
-      }
-    },
-    streamOpenFileWrite: function (ret, pathPtr) {
-      try {
-        if (typeof FS === 'undefined') throw new Error('FS unavailable');
-        var path = pathText(pathPtr);
-        if (!path) throw new Error('empty path');
-        var parts = path.split('/');
-        parts.pop();
-        var current = path.charAt(0) === '/' ? '/' : '';
-        for (var i = 0; i < parts.length; i++) {
-          var part = parts[i];
-          if (!part) continue;
-          current = current === '/' ? '/' + part : current + '/' + part;
-          try { FS.mkdir(current); } catch (ignored) {}
+      return suspendStream(function () {
+        try {
+          if (typeof FS === 'undefined') throw new Error('FS unavailable');
+          var path = pathText(pathPtr);
+          if (!path) throw new Error('empty path');
+          var handle = nextHandle++;
+          streams[handle] = { kind: STREAM_KIND_FILE_READ, file: FS.open(path, 'r'), closed: false };
+          HEAPU8[ret] = 1;
+          writeStream(ret + 8, handle, STREAM_KIND_FILE_READ);
+        } catch (e) {
+          HEAPU8[ret] = 0;
+          writeStream(ret + 8, 0, 0);
         }
-        var handle = nextHandle++;
-        streams[handle] = { kind: STREAM_KIND_FILE_WRITE, file: FS.open(path, 'w'), closed: false };
-        HEAPU8[ret] = 1;
-        writeStream(ret + 8, handle, STREAM_KIND_FILE_WRITE);
-      } catch (e) {
-        HEAPU8[ret] = 0;
-        writeStream(ret + 8, 0, 0);
-      }
+      });
     },
+    streamOpenFileWrite__async: 'auto',
+    streamOpenFileWrite: function (ret, pathPtr) {
+      return suspendStream(function () {
+        try {
+          if (typeof FS === 'undefined') throw new Error('FS unavailable');
+          var path = pathText(pathPtr);
+          if (!path) throw new Error('empty path');
+          var parts = path.split('/');
+          parts.pop();
+          var current = path.charAt(0) === '/' ? '/' : '';
+          for (var i = 0; i < parts.length; i++) {
+            var part = parts[i];
+            if (!part) continue;
+            current = current === '/' ? '/' + part : current + '/' + part;
+            try { FS.mkdir(current); } catch (ignored) {}
+          }
+          var handle = nextHandle++;
+          streams[handle] = { kind: STREAM_KIND_FILE_WRITE, file: FS.open(path, 'w'), closed: false };
+          HEAPU8[ret] = 1;
+          writeStream(ret + 8, handle, STREAM_KIND_FILE_WRITE);
+        } catch (e) {
+          HEAPU8[ret] = 0;
+          writeStream(ret + 8, 0, 0);
+        }
+      });
+    },
+    streamRead__async: 'auto',
     streamRead: function (ret, streamPtr, maxBytes) {
-      var max = Number(maxBytes);
-      var stream = readStream(streamPtr, STREAM_KIND_MEMORY);
-      if (!stream) stream = readStream(streamPtr, STREAM_KIND_FILE_READ);
-      if (!stream) stream = readStream(streamPtr, STREAM_KIND_PROCESS_STDOUT);
-      if (!stream) stream = readStream(streamPtr, STREAM_KIND_PROCESS_STDERR);
-      if (!stream && streamPtr && (getValue(streamPtr + 8, 'i32') | 0) === STREAM_KIND_TCP) {
-        return writeOptBlob(ret, false, new Uint8Array(0));
-      }
-      if (!stream || stream.closed || max < 0) return writeOptBlob(ret, false, new Uint8Array(0));
-      if (max === 0) return writeOptBlob(ret, true, new Uint8Array(0));
-      if (stream.kind === STREAM_KIND_MEMORY || stream.kind === STREAM_KIND_PROCESS_STDOUT || stream.kind === STREAM_KIND_PROCESS_STDERR) {
-        var remaining = stream.data.length - stream.cursor;
-        var count = Math.min(remaining, max);
-        if (count <= 0) return writeOptBlob(ret, true, new Uint8Array(0));
-        var out = stream.data.slice(stream.cursor, stream.cursor + count);
-        stream.cursor += count;
-        return writeOptBlob(ret, true, out);
-      }
-      try {
-        var bytes = new Uint8Array(max);
-        var read = FS.read(stream.file, bytes, 0, max, null);
-        writeOptBlob(ret, true, read > 0 ? bytes.slice(0, read) : new Uint8Array(0));
-      } catch (e) {
-        writeOptBlob(ret, false, new Uint8Array(0));
-      }
+      return suspendStream(function () { return streamReadImpl(ret, streamPtr, maxBytes); });
     },
+    streamWrite__async: 'auto',
     streamWrite: function (streamPtr, dataPtr) {
-      var stream = readStream(streamPtr, STREAM_KIND_MEMORY);
-      if (!stream) stream = readStream(streamPtr, STREAM_KIND_FILE_WRITE);
-      if (!stream && streamPtr && (getValue(streamPtr + 8, 'i32') | 0) === STREAM_KIND_TCP) return -1;
-      if (!stream || stream.closed) return -1;
-      var bytes = readBlob(dataPtr);
-      if (bytes === null) return -1;
-      if (bytes.length === 0) return 0;
-      if (stream.kind === STREAM_KIND_MEMORY) return appendBytes(stream, bytes);
-      try {
-        var written = FS.write(stream.file, bytes, 0, bytes.length, null);
-        return written === bytes.length ? written : -1;
-      } catch (e) {
-        return -1;
-      }
+      return suspendStream(function () { return streamWriteImpl(streamPtr, dataPtr); });
     },
     streamToBlob: function (ret, streamPtr) {
       var stream = readStream(streamPtr, STREAM_KIND_MEMORY);
       if (!stream || stream.closed) return writeOptBlob(ret, false, new Uint8Array(0));
       writeOptBlob(ret, true, stream.data.slice(0));
     },
+    streamCopy__async: 'auto',
     streamCopy: function (dstPtr, srcPtr, bufferSize) {
-      var copied = 0;
-      var chunk = Number(bufferSize) > 0 ? Number(bufferSize) : 4096;
-      var tmpBlob = _malloc(16);
-      var tmpOpt = _malloc(24);
-      try {
-        while (true) {
-          streamRead(tmpOpt, srcPtr, chunk);
-          if (!HEAPU8[tmpOpt]) return -1;
-          var dataPtr = getValue(tmpOpt + 8, '*');
-          var size = Number(getValue(tmpOpt + 16, 'i64'));
-          if (size === 0) {
-            if (dataPtr) _free(dataPtr);
-            return copied;
-          }
-          setValue(tmpBlob, dataPtr, '*');
-          setValue(tmpBlob + 8, size, 'i64');
-          var written = streamWrite(dstPtr, tmpBlob);
-          _free(dataPtr);
-          if (written !== size) return -1;
-          copied += written;
-        }
-      } finally {
-        _free(tmpBlob);
-        _free(tmpOpt);
-      }
+      return suspendStream(function () { return streamCopyImpl(dstPtr, srcPtr, bufferSize); });
     },
+    streamFlush__async: 'auto',
     streamFlush: function (streamPtr) {
-      var stream = readStream(streamPtr, STREAM_KIND_MEMORY);
-      if (stream) return stream.closed ? 0 : 1;
-      stream = readStream(streamPtr, STREAM_KIND_FILE_WRITE);
-      if (!stream) stream = readStream(streamPtr, STREAM_KIND_PROCESS_STDIN);
-      if (!stream) stream = readStream(streamPtr, STREAM_KIND_PROCESS_STDOUT);
-      if (!stream) stream = readStream(streamPtr, STREAM_KIND_PROCESS_STDERR);
-      if (stream && (stream.kind === STREAM_KIND_PROCESS_STDIN || stream.kind === STREAM_KIND_PROCESS_STDOUT || stream.kind === STREAM_KIND_PROCESS_STDERR)) return stream.closed ? 0 : 1;
-      if (!stream && streamPtr && (getValue(streamPtr + 8, 'i32') | 0) === STREAM_KIND_TCP) return 0;
-      return flushFileStream(stream);
+      return suspendStream(function () { return bridge.flush(streamPtr); });
     },
+    streamClose__async: 'auto',
     streamClose: function (streamPtr) {
-      var handle = streamPtr ? Number(getValue(streamPtr, 'i64')) : 0;
-      var stream = streams[handle];
-      if (!stream && streamPtr && (getValue(streamPtr + 8, 'i32') | 0) === STREAM_KIND_TCP) return 0;
-      if (!stream || stream.closed) return 0;
-      if (stream.file) {
-        try { FS.close(stream.file); } catch (e) { return 0; }
-      }
-      stream.closed = true;
-      delete streams[handle];
-      return 1;
+      return suspendStream(function () {
+        var handle = streamPtr ? Number(getValue(streamPtr, 'i64')) : 0;
+        var stream = streams[handle];
+        if (!stream && streamPtr && (getValue(streamPtr + 8, 'i32') | 0) === STREAM_KIND_TCP) return 0;
+        if (!stream || stream.closed) return 0;
+        if (stream.file) {
+          try { FS.close(stream.file); } catch (e) { return 0; }
+        }
+        stream.closed = true;
+        delete streams[handle];
+        return 1;
+      });
     },
   });
 })();

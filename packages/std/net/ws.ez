@@ -14,7 +14,7 @@ export struct WsConn {
     handle: I64;
 };
 
-// 原生目标支持 ws:// 握手、客户端掩码、分片重组和 ping/pong；wss:// 与 emcc 同步 WebSocket 明确不支持。
+// 原生目标支持 ws:// 握手、客户端掩码、分片重组和 ping/pong；wss:// 与 emcc WebSocket 桥接当前明确不支持。
 export declare const wsConnect: (url: Str) => WsConn?;
 export declare const wsSend: (conn: WsConn, data: Blob) => I64;
 export declare const wsRecv: (conn: WsConn, maxBytes: I64) => Blob?;

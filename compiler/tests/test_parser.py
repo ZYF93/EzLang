@@ -164,6 +164,16 @@ class TestParser:
             str(Path(__file__).parent.parent.parent / 'examples' / 'flow.ez'))
         assert len(errors) == 0, f'解析错误: {errors}'
 
+    def test_for_range_loop_is_not_loop_syntax(self):
+        """循环只接受 loop，for 仅用于 extern 目标限定。"""
+        _, errors = parse_source('''
+        let total: I32 = 0;
+        for i in 0...3 {
+            total = total + i;
+        };
+        ''')
+        assert errors, 'for 不应作为循环语法被接受'
+
     def test_modules(self):
         """测试 modules.ez - 模块系统"""
         tree, errors = parse_file(

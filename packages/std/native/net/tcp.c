@@ -1,5 +1,5 @@
 // EzLang std/net/tcp 原生封装层
-// 当前提供阻塞式本机 socket 基础能力；异步 flow 挂起和超时后续接入运行时。
+// 当前提供阻塞式本机 socket 基础能力；native 事件源式 flow 挂起和超时后续接入运行时。
 
 #include <stdbool.h>
 #include <stdint.h>

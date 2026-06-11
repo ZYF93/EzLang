@@ -1,7 +1,11 @@
 // EzLang std/net/http Emscripten JS 封装层
-// 浏览器/Worker 同步 XMLHttpRequest 支持 HTTP 客户端；服务端明确不支持。
+// 浏览器/Worker 使用 fetch + Asyncify 挂起 HTTP 客户端；无 Asyncify 时保留同步 XHR fallback。服务端明确不支持。
 (function () {
   var HTTP_SERVER_UNSUPPORTED_HANDLE = 0n;
+
+  function hasAsyncifyAsync() {
+    return typeof Asyncify !== 'undefined' && Asyncify && typeof Asyncify.handleAsync === 'function';
+  }
 
   function ptrSize() {
     return typeof POINTER_SIZE !== 'undefined' ? POINTER_SIZE : 4;
@@ -194,15 +198,43 @@
     }
   }
 
+  function requestAsync(req) {
+    if (!hasAsyncifyAsync() || typeof fetch !== 'function') return requestSync(req);
+    return Asyncify.handleAsync(async function () {
+      try {
+        var headers = {};
+        req.headers.forEach(function (entry) { headers[entry[0]] = entry[1]; });
+        var response = await fetch(req.url, {
+          method: req.method || 'GET',
+          headers: headers,
+          body: req.body && req.body.length > 0 ? req.body : undefined,
+        });
+        var responseHeaders = [];
+        if (response.headers && typeof response.headers.forEach === 'function') {
+          response.headers.forEach(function (value, key) { responseHeaders.push([key, value]); });
+        }
+        return {
+          status: response.status | 0,
+          headers: responseHeaders,
+          body: arrayBufferBytes(await response.arrayBuffer()),
+        };
+      } catch (e) {
+        return null;
+      }
+    });
+  }
+
   mergeInto(LibraryManager.library, {
+    fetch__async: 'auto',
     fetch: function (ret, url) {
       var req = { method: 'GET', url: readStr(url), headers: [], body: new Uint8Array(0) };
-      var response = req.url ? requestSync(req) : null;
+      var response = req.url ? requestAsync(req) : null;
       writeOptResponse(ret, !!response, response);
     },
+    fetchEx__async: 'auto',
     fetchEx: function (ret, req) {
       var request = readRequest(req);
-      var response = request ? requestSync(request) : null;
+      var response = request ? requestAsync(request) : null;
       writeOptResponse(ret, !!response, response);
     },
     createServer: function (host, port) {

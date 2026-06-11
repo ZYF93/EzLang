@@ -1340,7 +1340,7 @@ class TestCodegen:
         assert 'call void @"sleep"' not in ir_text
 
     def test_emcc_flow_sleep_auto_links_time_js(self):
-        """emcc 下 flow sleep 的同步 fallback 需要自动携带 time.js helper。"""
+        """emcc 下 flow sleep 需要自动携带 Asyncify time.js helper。"""
         source = '''
         declare const sleep: (ms: I64) => Void;
 
@@ -1359,9 +1359,13 @@ class TestCodegen:
         assert 'call void @"__ezrt_sleep"' in ir_text
         assert 'declare void @"__ezrt_emcc_sleep"' in ir_text
         assert libs == [str(STD_ROOT / 'emcc' / 'time.js')]
+        time_js = (STD_ROOT / 'emcc' / 'time.js').read_text(encoding='utf-8')
+        assert "sleep__async: 'auto'" in time_js
+        assert "__ezrt_emcc_sleep__async: 'auto'" in time_js
+        assert 'return sleepMs(ms);' in time_js
 
-    def test_emcc_flow_without_sleep_does_not_link_time_js(self):
-        """普通 flow/parallel 不应生成未使用的 emcc sleep helper。"""
+    def test_emcc_flow_without_sleep_links_parallel_runtime_only(self):
+        """emcc 下 flow 内 parallel 应自动携带协程 runtime，但不引入 sleep helper。"""
         source = '''
         const run = (): I32 => {
             const result = flow {
@@ -1378,7 +1382,42 @@ class TestCodegen:
         binding.parse_assembly(ir_text).verify()
         assert '__ezrt_emcc_sleep' not in ir_text
         assert '__ezrt_sleep' not in ir_text
-        assert libs == []
+        assert libs == [str(STD_ROOT / 'emcc' / 'runtime.js')]
+
+    def test_emcc_flow_std_suspend_sources_link_asyncify_runtime(self):
+        """emcc 下 flow 内标准库 suspend source 应触发 Asyncify runtime 链接准备。"""
+        source = '''
+        from "./std/io.ez" import { readLine };
+        from "./std/net/http.ez" import { fetch };
+        from "./std/fs.ez" import { readFile };
+        from "./std/process.ez" import { Command, processExec };
+        from "./std/stream.ez" import { streamFromBlob, streamRead, streamWrite };
+
+        const run = (): I32 => {
+            flow {
+                const line = readLine();
+                const resp = fetch(url = "https://example.com");
+                const file = readFile(path = "missing.txt");
+                const cmd = Command(program = "echo", args = ["ok"], cwd = "", env = ["EZ=1"], stdin = Blob(data = "", size = 0));
+                const proc = processExec(command = cmd);
+                const stream = streamFromBlob(data = Blob(data = "ok", size = 2));
+                const chunk = streamRead(stream = stream.value, maxBytes = 1);
+                const written = streamWrite(stream = stream.value, data = Blob(data = "!", size = 1));
+            };
+            return 0;
+        };
+        '''
+        module, errors, libs = compile_source(source, compile_target='emcc')
+        assert module is not None
+        assert len(errors) == 0, f'编译错误: {errors}'
+        binding.parse_assembly(str(module)).verify()
+        lib_names = {str(lib) for lib in libs}
+        assert str(STD_ROOT / 'emcc' / 'runtime.js') in lib_names
+        assert str(STD_ROOT / 'emcc' / 'io.js') in lib_names
+        assert str(STD_ROOT / 'emcc' / 'net' / 'http.js') in lib_names
+        assert str(STD_ROOT / 'emcc' / 'fs.js') in lib_names
+        assert str(STD_ROOT / 'emcc' / 'process.js') in lib_names
+        assert str(STD_ROOT / 'emcc' / 'stream.js') in lib_names
 
     def test_flow_race_lowers_to_runtime_stub(self):
         """flow 内 race 应 lowering 到运行时 race stub"""
@@ -1419,8 +1458,8 @@ class TestCodegen:
         assert 'call i32 @"__ezrt_race"(i32 2, i32 10)' not in ir_text
         assert 'call i32 @"race"' not in ir_text
 
-    def test_emcc_flow_race_pl_uses_synchronous_fallback(self):
-        """emcc 目标没有 native 线程运行时时，race(pl) 保持同步可运行语义。"""
+    def test_emcc_flow_race_pl_uses_asyncify_runtime(self):
+        """emcc 目标下 race(pl) 应接入 JS 协程运行时，不再退回同步首分支。"""
         source = '''
         const run = (): I32 => {
             const result = flow {
@@ -1434,10 +1473,14 @@ class TestCodegen:
         assert len(errors) == 0, f'编译错误: {errors}'
         ir_text = str(module)
         binding.parse_assembly(ir_text).verify()
-        assert 'call i32 @"__ezrt_race_i32"' not in ir_text
+        assert 'call i32 @"__ezrt_race_i32"' in ir_text
         assert 'call i32 @"__ezrt_race"' not in ir_text
         assert 'call i32 @"race"' not in ir_text
-        assert 'define i32 @"__ez_race_branch_' not in ir_text
+        assert 'define i32 @"__ez_race_branch_' in ir_text
+        assert str(STD_ROOT / 'emcc' / 'runtime.js') in {str(lib) for lib in libs}
+        runtime_js = (STD_ROOT / 'emcc' / 'runtime.js').read_text(encoding='utf-8')
+        assert "__ezrt_task_join_i32__async: 'auto'" in runtime_js
+        assert "__ezrt_race_i32__async: 'auto'" in runtime_js
         assert not any(str(lib).endswith('packages/std/native/runtime.c') for lib in libs)
         assert 'pthread' not in {str(lib) for lib in libs}
 
@@ -1537,8 +1580,8 @@ class TestCodegen:
         binding.parse_assembly(ir_text).verify()
         assert '@"same" = global i1 0' in ir_text
 
-    def test_emcc_flow_parallel_i32_uses_synchronous_fallback(self):
-        """emcc 目标下 flow 内 parallel I32 不链接 native task runtime。"""
+    def test_emcc_flow_parallel_i32_uses_asyncify_runtime(self):
+        """emcc 目标下 flow 内 parallel I32 应接入 JS 协程任务 runtime。"""
         source = '''
         const run = (): I32 => {
             const result = flow {
@@ -1553,10 +1596,11 @@ class TestCodegen:
         assert len(errors) == 0, f'编译错误: {errors}'
         ir_text = str(module)
         binding.parse_assembly(ir_text).verify()
-        assert 'call i8* @"__ezrt_task_start_i32"' not in ir_text
-        assert 'call i32 @"__ezrt_task_join_i32"' not in ir_text
-        assert 'define i32 @"__ez_race_branch_' not in ir_text
-        assert 'call void @"__ezrt_parallel_enter"()' in ir_text
+        assert 'call i8* @"__ezrt_task_start_i32"' in ir_text
+        assert 'call i32 @"__ezrt_task_join_i32"' in ir_text
+        assert 'define i32 @"__ez_race_branch_' in ir_text
+        assert 'call void @"__ezrt_parallel_enter"()' not in ir_text
+        assert str(STD_ROOT / 'emcc' / 'runtime.js') in {str(lib) for lib in libs}
         assert not any(str(lib).endswith('packages/std/native/runtime.c') for lib in libs)
         assert 'pthread' not in {str(lib) for lib in libs}
 
@@ -1627,8 +1671,8 @@ class TestCodegen:
         assert 'call void @"__ezrt_parallel_enter"()' in ir_text
         assert not any(str(lib).endswith('packages/std/native/runtime.c') for lib in libs)
 
-    def test_emcc_flow_parallel_typed_i32_uses_synchronous_fallback(self):
-        """emcc 下显式 I32 parallel 同样保持同步协作 fallback。"""
+    def test_emcc_flow_parallel_typed_i32_uses_asyncify_runtime(self):
+        """emcc 下显式 I32 parallel 同样接入 JS 协程任务 runtime。"""
         source = '''
         const run = (): I32 => {
             const result = flow {
@@ -1643,10 +1687,11 @@ class TestCodegen:
         assert len(errors) == 0, f'编译错误: {errors}'
         ir_text = str(module)
         binding.parse_assembly(ir_text).verify()
-        assert 'call i8* @"__ezrt_task_start_i32"' not in ir_text
-        assert 'call i32 @"__ezrt_task_join_i32"' not in ir_text
-        assert 'define i32 @"__ez_race_branch_' not in ir_text
-        assert 'call void @"__ezrt_parallel_enter"()' in ir_text
+        assert 'call i8* @"__ezrt_task_start_i32"' in ir_text
+        assert 'call i32 @"__ezrt_task_join_i32"' in ir_text
+        assert 'define i32 @"__ez_race_branch_' in ir_text
+        assert 'call void @"__ezrt_parallel_enter"()' not in ir_text
+        assert str(STD_ROOT / 'emcc' / 'runtime.js') in {str(lib) for lib in libs}
         assert not any(str(lib).endswith('packages/std/native/runtime.c') for lib in libs)
         assert 'pthread' not in {str(lib) for lib in libs}
 
@@ -1670,10 +1715,11 @@ class TestCodegen:
             lib_names = {str(lib) for lib in libs}
             uses_native_runtime = any(str(lib).endswith('packages/std/native/runtime.c') for lib in libs)
             if target == 'emcc':
-                assert 'call i8* @"__ezrt_task_start_i32"' not in ir_text
-                assert 'call i32 @"__ezrt_race_i32"' not in ir_text
+                assert 'call i8* @"__ezrt_task_start_i32"' in ir_text
+                assert 'call i32 @"__ezrt_race_i32"' in ir_text
                 assert not uses_native_runtime
                 assert 'pthread' not in lib_names
+                assert str(STD_ROOT / 'emcc' / 'runtime.js') in lib_names
             else:
                 assert 'call i8* @"__ezrt_task_start_i32"' in ir_text
                 assert 'call i32 @"__ezrt_race_i32"' in ir_text

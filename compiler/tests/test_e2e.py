@@ -306,7 +306,8 @@ def test_e2e_std_fs_imports_and_builds(tmp_path):
     assert ez.main(["build", "--project", str(project_toml)]) == 0
     ir_file = tmp_path / "dist" / "native" / "e2e.ll"
     ir_text = ir_file.read_text(encoding="utf-8")
-    assert 'declare %"Blob" @"readFile"' in ir_text
+    blob_abi = "[2 x i64]" if ez._native_arch() == "aarch64" else "{i8*, i64}"
+    assert_native_small_struct_return(ir_text, "readFile", "Blob", blob_abi)
     assert 'declare i1 @"writeFile"' in ir_text
     assert 'declare i1 @"exists"' in ir_text
     assert 'declare void @"stat"({i1, %"FileStat"}* sret({i1, %"FileStat"})' in ir_text
@@ -376,7 +377,8 @@ def test_e2e_std_str_imports_and_builds(tmp_path):
     assert 'declare i64 @"strByteLen"' in ir_text
     assert 'declare i8* @"strSliceChars"' in ir_text
     assert_native_optional_return(ir_text, "strCharAt", "i8*")
-    assert 'declare %"Blob" @"strToBytes"' in ir_text
+    blob_abi = "[2 x i64]" if ez._native_arch() == "aarch64" else "{i8*, i64}"
+    assert_native_small_struct_return(ir_text, "strToBytes", "Blob", blob_abi)
     assert 'declare void @"strSplit"({i8***, i64, i64, i64}* sret({i8***, i64, i64, i64})' in ir_text
 
 
@@ -957,7 +959,7 @@ def test_e2e_platform_wrappers_probe_native_and_emcc_capabilities():
     assert "INT64_MAX / (uint64_t)page_size" in native
     assert "TARGET_OS_IPHONE" in native
     assert "return false;" in native[native.index("bool platformHasSubprocess"):]
-    for marker in ["stringToNewUTF8('emcc')", "stringToNewUTF8('wasm32')", "return 65536n", "requireNodeModule('os')", "Math.min(cpus.length, 2147483647)", "Math.floor(concurrency)", "SharedArrayBuffer", "typeof FS", "typeof fetch", "getRandomValues", "requireNodeModule('crypto')", "typeof document", "spawnSync"]:
+    for marker in ["stringToNewUTF8('emcc')", "stringToNewUTF8('wasm32')", "return 65536n", "requireNodeModule('os')", "Math.min(cpus.length, 2147483647)", "Math.floor(concurrency)", "SharedArrayBuffer", "typeof FS", "typeof fetch", "getRandomValues", "requireNodeModule('crypto')", "typeof document", "childProcess.spawn"]:
         assert marker in emcc
     assert "navigator.hardwareConcurrency) return navigator.hardwareConcurrency | 0" not in emcc
 
@@ -1056,14 +1058,14 @@ def test_e2e_process_wrappers_cover_windows_and_unsupported_targets():
     assert "#elif EZ_PROCESS_POSIX_SUPPORTED" in native
     assert "return (OptProcessResult){false, {0}};" in native
     assert "return (OptProcess){false, {0}};" in native
-    for marker in ["child_process", "spawnSync", "completed[handle]", "process.execPath", "浏览器缺少同步子进程能力时显式失败"]:
+    for marker in ["child_process", "childProcess.spawn(", "spawnSync", "completed[handle]", "process.execPath", "浏览器显式失败"]:
         assert marker in emcc
     for marker in ["processStdin", "processStdout", "processStderr", "__ez_stream_bridge", "takeCompletedStream"]:
         assert marker in emcc
     assert "保留 `stdin`/`stdout`/`stderr` 管道" not in stdlib_doc
     assert "processWait` 捕获" in stdlib_doc
     assert "进程管道流" in stdlib_doc
-    assert "processWait` 写入 `Command.stdin` 并返回捕获的 `stdout`/`stderr`" in stdlib_api_doc
+    assert "processWait` 返回捕获的 `stdout`/`stderr`" in stdlib_api_doc
 
 
 def test_e2e_emcc_process_terminate_does_not_drop_completed_spawn_result():
@@ -1935,7 +1937,8 @@ def test_e2e_std_log_imports_and_builds(tmp_path):
     ir_file = tmp_path / "dist" / "native" / "e2e.ll"
     ir_text = ir_file.read_text(encoding="utf-8")
     assert '%"LogConfig" = type' in ir_text
-    assert 'declare %"LogConfig" @"logDefaultConfig"' in ir_text
+    log_config_abi = "[2 x i64]" if ez._native_arch() == "aarch64" else "{i64, i32}"
+    assert_native_small_struct_return(ir_text, "logDefaultConfig", "LogConfig", log_config_abi)
     assert 'declare void @"logWrite"' in ir_text
     assert 'declare void @"logWriteAt"' in ir_text
     assert 'declare i1 @"logSetFile"' in ir_text
@@ -2178,7 +2181,8 @@ def test_e2e_std_regex_imports_and_builds(tmp_path):
     ir_text = ir_file.read_text(encoding="utf-8")
     assert '%"Regex" = type' in ir_text
     assert '%"RegexMatch" = type' in ir_text
-    assert 'declare %"Regex" @"regexCompile"' in ir_text
+    regex_abi = "[2 x i64]" if ez._native_arch() == "aarch64" else "{i8*, i64}"
+    assert_native_small_struct_return(ir_text, "regexCompile", "Regex", regex_abi)
     assert 'declare void @"regexFind"({i1, %"RegexMatch"}* sret({i1, %"RegexMatch"})' in ir_text
     assert 'declare i8* @"regexReplace"' in ir_text
 
@@ -2605,7 +2609,7 @@ def test_e2e_std_net_http_server_imports_and_builds(tmp_path):
     ir_file = tmp_path / "dist" / "native" / "e2e.ll"
     ir_text = ir_file.read_text(encoding="utf-8")
     assert '%"HttpServer" = type' in ir_text
-    assert 'declare %"HttpServer" @"createServer"' in ir_text
+    assert_native_small_struct_return(ir_text, "createServer", "HttpServer", "i64")
     assert 'on' in ir_text
     assert 'start' in ir_text
     assert 'stop' in ir_text
@@ -2639,7 +2643,8 @@ def test_e2e_std_net_http_native_server_and_client_support_are_explicit():
     assert 'extern "ws2_32" for windows;' in interface
     assert "chunked 响应体" in docs
     assert "后续接入真实网络实现" not in docs
-    assert "后续接入 TLS、超时配置和完整异步 flow 挂起" in docs
+    assert "`fetch` + Asyncify 挂起客户端请求" in docs
+    assert "后续接入 TLS、超时配置和 native 事件源式 flow 挂起" in docs
     create_server_body = native[native.index("HttpServer createServer"):native.index("void HttpServer_on")]
     assert "calloc" in create_server_body
     assert "return (HttpServer){(int64_t)(uintptr_t)server};" in create_server_body
@@ -2734,11 +2739,11 @@ def test_e2e_std_net_tcp_udp_ws_support_boundaries_are_explicit():
     assert "客户端掩码、分片重组和 ping/pong" in ws_interface
     assert "emcc 当前明确不支持 TCP/UDP" in api_docs
     assert "udpRecvFrom(socket: UdpSocket, maxBytes: I64) -> UdpPacket?" in api_docs
-    assert "当前接口不提供超时、TLS 或异步 flow 挂起" in api_docs
+    assert "当前接口不提供超时、TLS 或 native 事件源式 flow 挂起" in api_docs
     assert "当前接口不返回远端地址" not in api_docs
     assert "接收数据及来源地址" in stdlib_docs
     assert "当前接收接口不返回远端地址" not in stdlib_docs
-    assert "`wss://` 与 emcc 同步 WebSocket 明确不支持" in api_docs
+    assert "`wss://` 与 emcc WebSocket 桥接当前明确不支持" in api_docs
 
 
 def test_e2e_cli_build_links_externs_and_records_emcc_js_libraries():
@@ -5221,14 +5226,36 @@ assert.strictEqual(runtime.UTF8ToString(runtime.library.cwd()), '/');
 
 
 def test_e2e_emcc_io_readline_supports_node_stdin_and_browser_fallback():
-    """Node 风格 emcc 运行时同步读取 stdin；浏览器无同步 stdin 时显式返回空可选值。"""
+    """Node 风格 emcc 运行时可通过 Asyncify 挂起读取 stdin；浏览器无 stdin 时显式返回空可选值。"""
     io_js = (ROOT / "packages" / "std" / "emcc" / "io.js").read_text(encoding="utf-8")
     body = emcc_js_function_body(io_js, "readLine")
     for marker in ["writeStdout", "process.stdout.write", "stdoutPending"]:
         assert marker in io_js
-    for marker in ["loadStdinLines", "fs.readFileSync(0, 'utf8')", "stdinIndex++", "writeOptStr(ret, true"]:
-        assert marker in io_js if marker == "loadStdinLines" or marker == "fs.readFileSync(0, 'utf8')" else marker in body
+    for marker in ["readLine__async: 'auto'", "Asyncify.handleSleep", "fs.readFile(0, 'utf8'", "fs.readFileSync(0, 'utf8')"]:
+        assert marker in io_js
+    for marker in ["stdinIndex++", "writeOptStr(ret, true"]:
+        assert marker in body
     assert "writeOptStr(ret, false" in body
+
+
+def test_e2e_emcc_suspend_source_wrappers_are_asyncify_aware():
+    """emcc 阻塞标准库入口应带 Asyncify 元数据，避免浏览器主线程同步等待。"""
+    http_js = (ROOT / "packages" / "std" / "emcc" / "net" / "http.js").read_text(encoding="utf-8")
+    fs_js = (ROOT / "packages" / "std" / "emcc" / "fs.js").read_text(encoding="utf-8")
+    process_js = (ROOT / "packages" / "std" / "emcc" / "process.js").read_text(encoding="utf-8")
+    stream_js = (ROOT / "packages" / "std" / "emcc" / "stream.js").read_text(encoding="utf-8")
+    for marker in ["fetch__async: 'auto'", "fetchEx__async: 'auto'", "Asyncify.handleAsync", "await fetch"]:
+        assert marker in http_js
+    assert "xhr.open(req.method || 'GET', req.url, false)" in http_js
+    for marker in ["readFile__async: 'auto'", "writeFile__async: 'auto'", "appendFile__async: 'auto'", "Asyncify.handleSleep"]:
+        assert marker in fs_js
+    for marker in ["processExec__async: 'auto'", "processSpawn__async: 'auto'", "childProcess.spawn(", "Asyncify.handleSleep"]:
+        assert marker in process_js
+    for marker in [
+        "streamOpenFileRead__async: 'auto'", "streamRead__async: 'auto'", "streamWrite__async: 'auto'",
+        "streamCopy__async: 'auto'", "bridge.read = streamReadImpl", "Asyncify.handleSleep",
+    ]:
+        assert marker in stream_js
 
 
 def test_e2e_emcc_io_print_preserves_no_newline_when_stdout_write_exists():

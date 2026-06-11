@@ -66,7 +66,7 @@ API：
 - `streamFlush(stream: Stream) -> Bool`
 - `streamClose(stream: Stream) -> Bool`
 
-当前提供内存/Blob 流、文件读写流、TCP 连接流与进程管道流；`std/compress` 的 `*Stream` 压缩/解压 API 复用该结构。进程管道流由 `std/process` 的 `processStdin`、`processStdout` 和 `processStderr` 创建；stdin 流可写，stdout/stderr 流可读。`streamWrite` 对非法 `Blob` 输入返回 `-1`，合法空 `Blob` 写入返回 `0`；`streamCopy` 从源流当前游标开始复制到目标流，返回复制字节数，失败返回 `-1`。
+当前提供内存/Blob 流、文件读写流与 TCP 连接流，以及进程管道流；`std/compress` 的 `*Stream` 压缩/解压 API 复用该结构。进程管道流由 `std/process` 的 `processStdin`、`processStdout` 和 `processStderr` 创建；stdin 流可写，stdout/stderr 流可读。`streamWrite` 对非法 `Blob` 输入返回 `-1`，合法空 `Blob` 写入返回 `0`；`streamCopy` 从源流当前游标开始复制到目标流，返回复制字节数，失败返回 `-1`。
 
 ## std/io
 
@@ -75,7 +75,7 @@ API：
 - `error(msg: Str) -> Void`
 - `readLine() -> Str?`
 
-原生桌面目标从 stdin 同步读取一行；Android/iOS 返回空可选值。emcc 在 Node 风格同步运行时读取 fd 0，浏览器/Worker 无同步 stdin 时返回空可选值。
+原生桌面目标从 stdin 同步读取一行；Android/iOS 返回空可选值。emcc 在 Node 风格运行时通过 Asyncify 异步读取 fd 0，缺少 Asyncify 时回退同步读取；浏览器/Worker 无 stdin 时返回空可选值。
 
 `print` 不追加换行，`println` 追加换行；emcc Node 风格运行时优先写入 `process.stdout.write`，无 stdout 时会暂存连续 `print` 内容并在下一次 `println` 统一输出。
 
@@ -288,10 +288,10 @@ API：
 
 - `std/process` 只用于外部程序调用，不暴露线程、线程池、互斥锁、条件变量等底层并发接口。
 - `Command.stdin` 必须是合法 `Blob`；非法 `Blob` 输入会让 `processExec` / `processSpawn` 返回空可选值。
-- Linux/macOS/Windows native 目标实现子进程调用；emcc 的 Node 风格同步运行时使用 `child_process.spawnSync`；Android、iOS 与浏览器 WebAssembly 当前返回空可选值或 `false`。
-- `processExec` 会同步写入 `stdin` 并捕获 `stdout`/`stderr`；`processSpawn` 默认保留旧语义，由后续 `processWait` 写入 `Command.stdin` 并返回捕获的 `stdout`/`stderr`。调用 `processStdin`、`processStdout` 或 `processStderr` 会把对应管道转交给 `Stream`，转交后 `processWait` 不再自动写该 stdin 或捕获该 stdout/stderr；对应结果 Blob 为空。`Process.handle` 是标准库内部不透明句柄。emcc 的 `processSpawn` 在同步 ABI 下保存已完成的 `spawnSync` 结果，`processStdout`/`processStderr` 可把已完成输出转成可读流，`processStdin` 返回空可选值。
+- Linux/macOS/Windows native 目标实现子进程调用；emcc 的 Node 风格运行时在 Asyncify 可用时使用 `child_process.spawn` 挂起等待，缺少 Asyncify 时回退 `child_process.spawnSync`；Android、iOS 与浏览器 WebAssembly 当前返回空可选值或 `false`。
+- `processExec` 会写入 `stdin` 并捕获 `stdout`/`stderr`；`processSpawn` 默认保留旧语义，由后续 `processWait` 返回捕获的 `stdout`/`stderr`。调用 `processStdin`、`processStdout` 或 `processStderr` 会把对应管道转交给 `Stream`，转交后 `processWait` 不再自动写该 stdin 或捕获该 stdout/stderr；对应结果 Blob 为空。`Process.handle` 是标准库内部不透明句柄。emcc 的 `processSpawn` 保存已完成结果，`processStdout`/`processStderr` 可把已完成输出转成可读流，`processStdin` 返回空可选值。
 - `Command.env` 使用 `KEY=VALUE` 字符串数组表示环境覆盖；`ProcessResult.ok` 表示退出码是否为 `0`。
-- `flow` 调度状态机完成前，进程等待仍是同步阻塞调用。
+- `flow` 内的 emcc 进程入口会通过 Asyncify 挂起后恢复；native 当前仍使用阻塞进程等待 syscall。
 
 ## std/uri
 
@@ -473,6 +473,8 @@ API：
 
 `add` / `sub` 原地修改传入的 `Date`，不会返回新 `Date`。
 
+`sleep` 在 `flow {}` 内是 suspend point；emcc 目标通过 Asyncify 挂起并恢复 wasm 执行栈，flow 外仍保持同步 ABI。
+
 `format` 支持 `YYYY`、`MM`、`DD`、`HH`、`mm`、`SS` 命名占位符，以及 `%Y`、`%m`、`%d`、`%H`、`%M`、`%S`。分钟使用 `mm` 或 `%M`，月份使用 `MM` 或 `%m`。
 
 ## std/net/http
@@ -489,7 +491,7 @@ API：
 - `RouteHandler`
 - `HttpServer`
 
-原生桌面平台支持明文 `http://` 客户端请求、合法端口、userinfo 剥离、IPv6 字面量、基础请求/响应头和 `Transfer-Encoding: chunked` 响应体解码，也支持基础阻塞式 HTTP 服务端：`createServer` 创建句柄，`HttpServer.on` 注册精确路径路由，`start` 监听并处理连接，`stop` 关闭服务端。emcc 在浏览器/Worker 环境使用同步 `XMLHttpRequest` 支持客户端请求，服务端仍返回空句柄；`HttpResponse.text()` 仅在响应体是不含空字节的合法 UTF-8 时返回文本，否则返回空字符串。HTTPS、Android/iOS、Node emcc 无同步 XHR 时返回空可选值。
+原生桌面平台支持明文 `http://` 客户端请求、合法端口、userinfo 剥离、IPv6 字面量、基础请求/响应头和 `Transfer-Encoding: chunked` 响应体解码，也支持基础阻塞式 HTTP 服务端：`createServer` 创建句柄，`HttpServer.on` 注册精确路径路由，`start` 监听并处理连接，`stop` 关闭服务端。emcc 在浏览器/Worker 环境优先使用 `fetch` + Asyncify 挂起客户端请求，无 Asyncify 时保留同步 `XMLHttpRequest` fallback；服务端仍返回空句柄。`HttpResponse.text()` 仅在响应体是不含空字节的合法 UTF-8 时返回文本，否则返回空字符串。HTTPS、Android/iOS、无 `fetch` 且无同步 XHR 的 emcc 环境返回空可选值。
 
 ## std/net/tcp
 
@@ -506,7 +508,7 @@ API：
 - `udpRecv(socket: UdpSocket, maxBytes: I64) -> Blob?`
 - `udpClose(socket: UdpSocket) -> Bool`
 
-`UdpPacket` 包含 `data: Blob`、`host: Str` 和 `port: I32`；`udpRecv` 保留为只返回数据的兼容接口。原生目标提供阻塞式 TCP/UDP socket 基础能力；TCP 连接句柄可通过 `std/stream.streamFromTcpHandle` 交给通用读写和拷贝函数。端口必须在 `0..65535` 范围内，非法连接、监听或绑定端口返回空可选值，非法发送端口返回 `-1`。emcc 当前明确不支持 TCP/UDP，返回空可选值、`-1` 或 `false`。当前接口不提供超时、TLS 或异步 flow 挂起。
+`UdpPacket` 包含 `data: Blob`、`host: Str` 和 `port: I32`；`udpRecv` 保留为只返回数据的兼容接口。原生目标提供阻塞式 TCP/UDP socket 基础能力；TCP 连接句柄可通过 `std/stream.streamFromTcpHandle` 交给通用读写和拷贝函数。端口必须在 `0..65535` 范围内，非法连接、监听或绑定端口返回空可选值，非法发送端口返回 `-1`。emcc 当前明确不支持 TCP/UDP，返回空可选值、`-1` 或 `false`，不会同步等待网络。当前接口不提供超时、TLS 或 native 事件源式 flow 挂起。
 
 ## std/net/ws
 
@@ -515,7 +517,7 @@ API：
 - `wsRecv(conn: WsConn, maxBytes: I64) -> Blob?`
 - `wsClose(conn: WsConn) -> Bool`
 
-原生目标支持 `ws://` 握手校验、合法端口、userinfo 剥离、IPv6 字面量、客户端掩码、文本/二进制消息、分片帧重组和 ping/pong 自动处理；`wss://` 与 emcc 同步 WebSocket 明确不支持，失败时返回空可选值或 `-1`。
+原生目标支持 `ws://` 握手校验、合法端口、userinfo 剥离、IPv6 字面量、客户端掩码、文本/二进制消息、分片帧重组和 ping/pong 自动处理；`wss://` 与 emcc WebSocket 桥接当前明确不支持，失败时返回空可选值或 `-1`。
 
 ## std/fmt
 
@@ -566,4 +568,4 @@ JSON 与 MessagePack 当前覆盖 `I8`、`I32`、`I64`、`U8`、`U32`、`U64`、
 
 ## std/net
 
-`std/net/http`、`std/net/tcp`、`std/net/ws` 的接口声明和 ABI 已可编译链接。原生目标当前支持明文 `http://` 客户端请求、基础字符串请求/响应头、chunked 响应体解码、基础阻塞式 HTTP 服务端、阻塞式 TCP/UDP 基础收发，以及 `ws://` WebSocket 握手、合法端口、userinfo 剥离、IPv6 字面量、客户端掩码、分片重组和 ping/pong 自动处理。HTTPS、HTTP 服务端并发 worker、WebSocket `wss://`、超时配置和异步 flow 挂起仍待后续运行时接入；不支持的入口返回空可选值、失败值或零句柄。
+`std/net/http`、`std/net/tcp`、`std/net/ws` 的接口声明和 ABI 已可编译链接。原生目标当前支持明文 `http://` 客户端请求、基础字符串请求/响应头、chunked 响应体解码、基础阻塞式 HTTP 服务端、阻塞式 TCP/UDP 基础收发，以及 `ws://` WebSocket 握手、合法端口、userinfo 剥离、IPv6 字面量、客户端掩码、分片重组和 ping/pong 自动处理。emcc HTTP 客户端在 Asyncify 可用时通过 `fetch` 挂起后恢复，TCP/UDP/WS 当前明确不支持且不会同步等待网络。HTTPS、HTTP 服务端并发 worker、WebSocket `wss://`、超时配置和 native 事件源式 flow 挂起仍待后续运行时接入；不支持的入口返回空可选值、失败值或零句柄。

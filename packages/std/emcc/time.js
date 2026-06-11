@@ -3,6 +3,9 @@
   function sleepMs(ms) {
     var delay = Number(ms);
     if (!Number.isFinite(delay) || delay <= 0) return;
+    if (typeof Asyncify !== 'undefined' && Asyncify && typeof Asyncify.handleSleep === 'function') {
+      return Asyncify.handleSleep(function (wakeUp) { setTimeout(wakeUp, delay); });
+    }
     if (typeof SharedArrayBuffer !== 'undefined' && typeof Atomics !== 'undefined') {
       var flag = new Int32Array(new SharedArrayBuffer(4));
       Atomics.wait(flag, 0, 0, delay);
@@ -23,11 +26,13 @@
   timestamp: function () {
     return BigInt(Date.now());
   },
+  sleep__async: 'auto',
   sleep: function (ms) {
-    sleepMs(ms);
+    return sleepMs(ms);
   },
+  __ezrt_emcc_sleep__async: 'auto',
   __ezrt_emcc_sleep: function (ms) {
-    sleepMs(ms);
+    return sleepMs(ms);
   },
   getYear: function (datePtr) {
     return new Date(Number(HEAP64[datePtr >> 3])).getUTCFullYear();

@@ -60,4 +60,4 @@ EzLang 编译器采用小型分层结构，目标是把 `.ez` 源码转换为 LL
 - `declare` 默认绑定到最近的 active extern。
 - `std/mem` 的 `copy` / `set` / `allocRaw` 是 compiler builtin，不需要 extern。
 - `std/collections` 的 `List`/`Dict` 泛型扩展是 compiler builtin，不需要 extern。
-- `std/stream` 当前使用固定 `Stream { handle, kind }` ABI 暴露内存/Blob 流、文件流、TCP 连接流和进程管道流；`std/compress` 的流式压缩/解压复用同一结构。
+- `std/stream` 当前使用固定 `Stream { handle, kind }` ABI 暴露内存/Blob 流、文件流和 TCP 连接流，以及进程管道流；`std/compress` 的流式压缩/解压复用同一结构。

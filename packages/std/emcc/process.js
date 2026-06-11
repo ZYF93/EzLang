@@ -1,5 +1,5 @@
 // EzLang std/process Emscripten JS 封装层
-// Node 风格运行时使用 child_process.spawnSync；浏览器缺少同步子进程能力时显式失败。
+// Node 风格运行时使用 child_process.spawn + Asyncify 挂起；无 Asyncify 时回退 spawnSync。浏览器显式失败。
 (function () {
   var STREAM_KIND_PROCESS_STDIN = 5;
   var STREAM_KIND_PROCESS_STDOUT = 6;
@@ -7,6 +7,10 @@
   var nextHandle = 1;
   var completed = Object.create(null);
   var root = typeof Module !== 'undefined' && Module ? Module : (typeof globalThis !== 'undefined' ? globalThis : this);
+
+  function hasAsyncify() {
+    return typeof Asyncify !== 'undefined' && Asyncify && typeof Asyncify.handleSleep === 'function';
+  }
 
   function ptrSize() {
     return typeof POINTER_SIZE !== 'undefined' ? POINTER_SIZE : 4;
@@ -164,6 +168,47 @@
     }
   }
 
+  function spawnAsyncResult(command) {
+    var childProcess = nodeRequire('child_process');
+    if (!childProcess || typeof childProcess.spawn !== 'function') return null;
+    return Asyncify.handleSleep(function (wakeUp) {
+      var settled = false;
+      function done(result) {
+        if (settled) return;
+        settled = true;
+        wakeUp(result);
+      }
+      try {
+        var options = { env: applyEnv(command.env) };
+        if (command.cwd) options.cwd = command.cwd;
+        var child = childProcess.spawn(command.program, command.args, options);
+        var stdout = [];
+        var stderr = [];
+        if (child.stdout) child.stdout.on('data', function (chunk) { stdout.push(chunk); });
+        if (child.stderr) child.stderr.on('data', function (chunk) { stderr.push(chunk); });
+        child.on('error', function () { done(null); });
+        child.on('close', function (code, signal) {
+          done({
+            exitCode: typeof code === 'number' ? code | 0 : (signal ? 128 : 0),
+            stdout: typeof Buffer !== 'undefined' ? Buffer.concat(stdout) : new Uint8Array(0),
+            stderr: typeof Buffer !== 'undefined' ? Buffer.concat(stderr) : new Uint8Array(0),
+          });
+        });
+        if (child.stdin) {
+          if (command.stdin && command.stdin.length > 0) child.stdin.write(typeof Buffer !== 'undefined' ? Buffer.from(command.stdin) : command.stdin);
+          child.stdin.end();
+        }
+      } catch (e) {
+        done(null);
+      }
+    });
+  }
+
+  function spawnResult(command) {
+    if (hasAsyncify()) return spawnAsyncResult(command);
+    return spawnSyncResult(command);
+  }
+
   function readProcess(processPtr) {
     if (!processPtr) return null;
     return {
@@ -189,14 +234,16 @@
   }
 
   mergeInto(LibraryManager.library, {
+    processExec__async: 'auto',
     processExec: function (ret, commandPtr) {
       var command = readCommand(commandPtr);
-      var result = command ? spawnSyncResult(command) : null;
+      var result = command ? spawnResult(command) : null;
       writeOptProcessResult(ret, !!result, result);
     },
+    processSpawn__async: 'auto',
     processSpawn: function (ret, commandPtr) {
       var command = readCommand(commandPtr);
-      var result = command ? spawnSyncResult(command) : null;
+      var result = command ? spawnResult(command) : null;
       if (!result) return writeOptProcess(ret, false, null);
       var handle = nextHandle++;
       completed[handle] = result;

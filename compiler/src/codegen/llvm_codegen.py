@@ -129,6 +129,14 @@ class LLVMCodeGenerator(EzLangVisitor):
         self._flow_race = self._define_runtime_race_hook('__ezrt_race', ir.FunctionType(i32, [i32, i32]))
         self._parallel_enter = self._define_runtime_void_hook('__ezrt_parallel_enter', flow_hook_type)
         self._parallel_exit = self._define_runtime_void_hook('__ezrt_parallel_exit', flow_hook_type)
+        self._flow_suspend_names = {
+            'fetch', 'fetchEx', 'readFile', 'writeFile', 'appendFile', 'removeFile', 'mkdir', 'removeDir',
+            'listDir', 'exists', 'isDir', 'stat', 'readLine', 'processExec', 'processSpawn', 'processWait',
+            'streamOpenFileRead', 'streamOpenFileWrite', 'streamRead', 'streamWrite', 'streamCopy',
+            'streamFlush', 'streamClose', 'start', 'tcpConnect', 'tcpListen', 'udpBind',
+            'udpRecvFrom', 'udpRecv', 'tcpRead', 'wsConnect', 'wsRecv', 'accept', 'read', 'write',
+            'recv', 'send',
+        }
         self._lock_register = self._get_or_declare_function('__ezrt_lock_register', ir.FunctionType(void, [i8_ptr, i32]))
         self._lock_read_acquire = self._get_or_declare_function('__ezrt_lock_read_acquire', ir.FunctionType(void, [i8_ptr]))
         self._lock_read_release = self._get_or_declare_function('__ezrt_lock_read_release', ir.FunctionType(void, [i8_ptr]))
@@ -184,7 +192,7 @@ class LLVMCodeGenerator(EzLangVisitor):
         return func
 
     def _define_runtime_race_hook(self, name: str, func_type: ir.FunctionType) -> ir.Function:
-        """当前同步 lowering 下的 race hook：返回任务参数作为占位结果。"""
+        """旧 task 形态的 race hook：保留 ABI，返回任务参数作为兼容占位结果。"""
         func = ir.Function(self.module, func_type, name)
         entry = func.append_basic_block('entry')
         builder = ir.IRBuilder(entry)
@@ -213,14 +221,22 @@ class LLVMCodeGenerator(EzLangVisitor):
         root = Path(__file__).resolve().parents[3]
         return str((root / 'packages' / 'std' / 'native' / 'runtime.c').resolve())
 
+    def _emcc_runtime_lib_path(self) -> str:
+        root = Path(__file__).resolve().parents[3]
+        return str((root / 'packages' / 'std' / 'emcc' / 'runtime.js').resolve())
+
     def _add_active_extern_lib(self, lib_path: str) -> None:
         """按声明顺序收集当前目标需要链接的库，并避免重复传参。"""
         if lib_path not in self.active_extern_libs:
             self.active_extern_libs.append(lib_path)
 
     def _require_runtime(self) -> None:
-        """标记需要链接语言运行时 C helper。"""
+        """标记需要链接当前目标的语言运行时 helper。"""
         if self.compile_target == 'emcc':
+            path = self._emcc_runtime_lib_path()
+            self._add_active_extern_lib(path)
+            if (path, 'emcc') not in self.extern_libs:
+                self.extern_libs.append((path, 'emcc'))
             return
         self._runtime_required = True
         path = self._runtime_lib_path()
@@ -233,13 +249,19 @@ class LLVMCodeGenerator(EzLangVisitor):
             self.extern_libs.append(('pthread', None))
 
     def _require_flow_sleep(self) -> ir.Function:
-        """按需生成 flow sleep hook；emcc 同步 fallback 需要 time.js 提供 JS helper。"""
+        """按需生成 flow sleep hook；emcc 由 time.js 提供 Asyncify 兼容 helper。"""
         if self._flow_sleep is None:
             self._flow_sleep = self._define_sleep_hook('__ezrt_sleep', ir.FunctionType(ir.VoidType(), [ir.IntType(64)]))
         if self.compile_target == 'emcc':
             root = Path(__file__).resolve().parents[3]
             self._add_active_extern_lib(str((root / 'packages' / 'std' / 'emcc' / 'time.js').resolve()))
         return self._flow_sleep
+
+    def _require_flow_suspend_source(self, func_name: str) -> None:
+        """flow 内阻塞标准库调用在 emcc 下必须触发 Asyncify 链接准备。"""
+        if self.compile_target != 'emcc' or func_name not in self._flow_suspend_names:
+            return
+        self._require_runtime()
 
     def _get_or_declare_function(self, name: str, func_type: ir.FunctionType) -> ir.Function:
         existing = self.module.globals.get(name)
@@ -1832,6 +1854,25 @@ class LLVMCodeGenerator(EzLangVisitor):
                 return self._coerce_union_value(val, target_type, self._union_variant_tag_for_type(target_type, val.type))
         return val
 
+    def _truthy_value(self, val: ir.Value | None) -> ir.Value:
+        """把条件表达式结果规范成 LLVM 分支需要的 i1。"""
+        i1 = ir.IntType(1)
+        if val is None:
+            return ir.Constant(i1, 0)
+        if self._is_aggregate_ptr(val):
+            val = self.builder.load(val)
+        if val.type == i1:
+            return val
+        if isinstance(val.type, ir.IntType):
+            return self.builder.icmp_unsigned('!=', val, ir.Constant(val.type, 0))
+        if self._is_float(val.type):
+            return self.builder.fcmp_ordered('!=', val, ir.Constant(val.type, 0.0))
+        if isinstance(val.type, ir.PointerType):
+            return self.builder.icmp_unsigned('!=', val, ir.Constant(val.type, None))
+        if self._is_optional_type(val.type):
+            return self.builder.extract_value(val, 0)
+        return ir.Constant(i1, 1)
+
     def _coerce_struct_duck_value(self, val: ir.Value, target_type: ir.Type) -> ir.Value | None:
         """按字段名把兼容结构体值重组为目标结构体布局。"""
         if not isinstance(target_type, ir.IdentifiedStructType):
@@ -2720,7 +2761,7 @@ class LLVMCodeGenerator(EzLangVisitor):
         return None
 
     def _infer_race_result_type(self, ctx) -> ir.Type:
-        """从 race(pl = [() => T, ...]) 分支推断同步 fallback 的结果类型。"""
+        """从 race(pl = [() => T, ...]) 分支推断表达式结果类型。"""
         array_lit = self._find_array_literal_ctx(ctx)
         first_branch = self._first_function_literal_in_array(array_lit)
         if first_branch is None:
@@ -7688,7 +7729,7 @@ class LLVMCodeGenerator(EzLangVisitor):
         if pl_array is None:
             return legacy_race_hook()
 
-        async_result = None if self.compile_target == 'emcc' else self._gen_race_i32_runtime_call(pl_array, timeout_arg)
+        async_result = self._gen_race_i32_runtime_call(pl_array, timeout_arg)
         if async_result is not None:
             return async_result
 
@@ -7877,8 +7918,6 @@ class LLVMCodeGenerator(EzLangVisitor):
 
     def _start_flow_parallel_i32_future(self, name: str, parallel_block) -> ir.Value | None:
         """flow 内 parallel I32 块启动为后台任务，读取变量时 join。"""
-        if self.compile_target == 'emcc':
-            return None
         if self._flow_depth <= 0 or not self._flow_future_stack or parallel_block is None:
             return None
         if self._ctx_references_local_capture(parallel_block):
@@ -8245,6 +8284,8 @@ class LLVMCodeGenerator(EzLangVisitor):
             return self._zero_constant(self._call_return_type(ctx))
 
         func_type = func.type.pointee if isinstance(func.type, ir.PointerType) else None
+        if self._flow_depth > 0:
+            self._require_flow_suspend_source(func_name)
         if self._flow_depth > 0 and func_name == 'sleep' and call_args:
             sleep_arg = self._coerce_value(call_args[0], ir.IntType(64))
             return self.builder.call(self._require_flow_sleep(), [sleep_arg])
@@ -9841,6 +9882,7 @@ class LLVMCodeGenerator(EzLangVisitor):
 
         b_false = ir.Constant(ir.IntType(1), 0)
         b_true = ir.Constant(ir.IntType(1), 1)
+        left = self._truthy_value(left)
 
         for i, rhs_ctx in enumerate(ctx_rhs_list):
             rhs_bb = self.builder.append_basic_block(name=f"{op}_rhs")
@@ -9858,6 +9900,7 @@ class LLVMCodeGenerator(EzLangVisitor):
             from_block = self.builder.block
             self.builder.position_at_start(rhs_bb)
             right = self._eval(rhs_ctx)
+            right = self._truthy_value(right)
             rhs_block = self.builder.block
             self.builder.branch(merge_bb)
 
@@ -9869,6 +9912,7 @@ class LLVMCodeGenerator(EzLangVisitor):
                 left = phi
             else:
                 left = right or skip_val
+            left = self._truthy_value(left)
 
         return left
 
@@ -9947,6 +9991,7 @@ class LLVMCodeGenerator(EzLangVisitor):
         cond = self._eval(ctx.rangeExpression())
         if cond is None:
             return None
+        cond = self._truthy_value(cond)
 
         then_bb = self.builder.append_basic_block(name="then")
         else_bb = self.builder.append_basic_block(name="else")
@@ -10232,6 +10277,7 @@ class LLVMCodeGenerator(EzLangVisitor):
         for i, clause in enumerate(ctx.matchClause()):
             is_last = (i == len(clauses) - 1)
             cond = self._eval(clause.expression())
+            cond = self._truthy_value(cond)
 
             if is_last:
                 # 最后一个子句：如果条件为真则进 body，否则到 merge
@@ -10337,6 +10383,7 @@ class LLVMCodeGenerator(EzLangVisitor):
         cond = self._eval(ctx.expression(0))
         if cond is None:
             return None
+        cond = self._truthy_value(cond)
 
         then_bb = self.builder.append_basic_block(name="if_then")
         else_bb = self.builder.append_basic_block(name="if_else")

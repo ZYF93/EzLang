@@ -64,6 +64,6 @@ mergeInto(LibraryManager.library, {
   },
   platformHasSubprocess: function () {
     var childProcess = requireNodeModule('child_process');
-    return childProcess && typeof childProcess.spawnSync === 'function' ? 1 : 0;
+    return childProcess && (typeof childProcess.spawn === 'function' || typeof childProcess.spawnSync === 'function') ? 1 : 0;
   },
 });

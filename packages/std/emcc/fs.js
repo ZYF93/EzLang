@@ -4,6 +4,17 @@
   var EZFS_IDBFS_ROOT = '/ezdata';
   var EZFS_IDBFS_READY = false;
 
+  function hasAsyncify() {
+    return typeof Asyncify !== 'undefined' && Asyncify && typeof Asyncify.handleSleep === 'function';
+  }
+
+  function suspendFs(fn) {
+    if (!hasAsyncify() || typeof setTimeout !== 'function') return fn();
+    return Asyncify.handleSleep(function (wakeUp) {
+      setTimeout(function () { wakeUp(fn()); }, 0);
+    });
+  }
+
   function pathText(path) {
     return UTF8ToString(path || 0);
   }
@@ -145,7 +156,9 @@
   }
 
   mergeInto(LibraryManager.library, {
+    readFile__async: 'auto',
     readFile: function (ret, path) {
+      return suspendFs(function () {
       try {
         ensureIdbfs();
         var target = pathValue(path);
@@ -157,24 +170,35 @@
       } catch (e) {
         writeBlob(ret, new Uint8Array(0));
       }
+      });
     },
+    writeFile__async: 'auto',
     writeFile: function (path, content) {
-      return writeFileImpl(path, content, false);
+      return suspendFs(function () { return writeFileImpl(path, content, false); });
     },
+    appendFile__async: 'auto',
     appendFile: function (path, content) {
-      return writeFileImpl(path, content, true);
+      return suspendFs(function () { return writeFileImpl(path, content, true); });
     },
+    removeFile__async: 'auto',
     removeFile: function (path) {
+      return suspendFs(function () {
       var target = pathValue(path);
       if (target === null) return 0;
       return ok(function () { ensureIdbfs(); FS.unlink(target); syncFs(); });
+      });
     },
+    mkdir__async: 'auto',
     mkdir: function (path) {
+      return suspendFs(function () {
       var target = pathValue(path);
       if (target === null) return 0;
       return ok(function () { ensureIdbfs(); FS.mkdirTree(target); syncFs(); });
+      });
     },
+    removeDir__async: 'auto',
     removeDir: function (path, recursive) {
+      return suspendFs(function () {
       var target = pathValue(path);
       if (target === null) return 0;
       return ok(function () {
@@ -183,8 +207,11 @@
         else FS.rmdir(target);
         syncFs();
       });
+      });
     },
+    listDir__async: 'auto',
     listDir: function (ret, path) {
+      return suspendFs(function () {
       try {
         ensureIdbfs();
         var target = pathValue(path);
@@ -196,25 +223,35 @@
       } catch (e) {
         writeStrList(ret, []);
       }
+      });
     },
+    exists__async: 'auto',
     exists: function (path) {
+      return suspendFs(function () {
       var target = pathValue(path);
       if (target === null) return 0;
       return ok(function () { ensureIdbfs(); FS.stat(target); });
+      });
     },
+    isDir__async: 'auto',
     isDir: function (path) {
+      return suspendFs(function () {
       try {
         ensureIdbfs();
         var target = pathValue(path);
         return target !== null && FS.isDir(FS.stat(target).mode) ? 1 : 0;
       } catch (e) { return 0; }
+      });
     },
+    stat__async: 'auto',
     stat: function (ret, path) {
+      return suspendFs(function () {
       try {
         ensureIdbfs();
         var target = pathValue(path);
         writeStat(ret, target === null ? null : FS.stat(target));
       } catch (e) { writeStat(ret, null); }
+      });
     },
     absPath: function (path) {
       var raw = pathValue(path);

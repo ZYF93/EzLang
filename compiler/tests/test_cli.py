@@ -2928,14 +2928,13 @@ def test_run_std_net_native_wrappers_report_unsupported_without_success(tmp_path
         'from "std/net/tcp" import { tcpConnect, tcpListen, udpBind };\n'
         'from "std/net/ws" import { wsConnect };\n'
         'const main = (): I32 => {\n'
-        '    const resp = fetch(url = "http://127.0.0.1/");\n'
-        '    const server = createServer(host = "127.0.0.1", port = 0);\n'
-        '    const tcp = tcpConnect(host = "127.0.0.1", port = 1);\n'
-        '    const listener = tcpListen(host = "127.0.0.1", port = 0);\n'
-        '    const udp = udpBind(host = "127.0.0.1", port = 0);\n'
-        '    const ws = wsConnect(url = "ws://127.0.0.1/");\n'
-        '    const stopped = server.handle != 0 ? { server.stop(); true } : false;\n'
-        '    return (!resp.ok && stopped && !tcp.ok && listener.ok && udp.ok && !ws.ok) ? 0 : 1;\n'
+        '    const resp = fetch(url = "http://127.0.0.1:65536/");\n'
+        '    const server = createServer(host = "127.0.0.1", port = 65536);\n'
+        '    const tcp = tcpConnect(host = "127.0.0.1", port = 65536);\n'
+        '    const listener = tcpListen(host = "127.0.0.1", port = 65536);\n'
+        '    const udp = udpBind(host = "127.0.0.1", port = 65536);\n'
+        '    const ws = wsConnect(url = "ws://127.0.0.1:65536/");\n'
+        '    return (!resp.ok && server.handle == 0 && !tcp.ok && !listener.ok && !udp.ok && !ws.ok) ? 0 : 1;\n'
         '};\n',
         encoding="utf-8",
     )
@@ -5585,7 +5584,7 @@ def test_build_emcc_uses_sdk_and_js_libraries(tmp_path, capsys):
     assert str(js_lib) in calls
 
 
-def test_build_emcc_flow_parallel_uses_synchronous_fallback(tmp_path, capsys):
+def test_build_emcc_flow_parallel_uses_asyncify_runtime(tmp_path, capsys):
     project_toml = write_project(tmp_path, os_name="emcc", arch="wasm32")
     sdk_dir = tmp_path / "emsdk"
     emcc = sdk_dir / "emcc"
@@ -5612,8 +5611,21 @@ def test_build_emcc_flow_parallel_uses_synchronous_fallback(tmp_path, capsys):
     assert artifact.exists()
     assert "sdk artifact:" in out
     calls = (emcc.parent / "calls.txt").read_text(encoding="utf-8")
+    assert "-sASYNCIFY" in calls
+    assert "runtime.js" in calls
     assert "runtime.c" not in calls
     assert "pthread" not in calls
+
+
+def test_emcc_asyncify_detection_accepts_relative_std_paths():
+    assert ez._emcc_needs_asyncify(["packages/std/emcc/runtime.js"])
+    assert ez._emcc_needs_asyncify(["packages/std/emcc/time.js"])
+    assert ez._emcc_needs_asyncify(["packages/std/emcc/net/http.js"])
+    assert ez._emcc_needs_asyncify(["packages/std/emcc/io.js"])
+    assert ez._emcc_needs_asyncify(["packages/std/emcc/fs.js"])
+    assert ez._emcc_needs_asyncify(["packages/std/emcc/stream.js"])
+    assert ez._emcc_needs_asyncify(["packages/std/emcc/process.js"])
+    assert not ez._emcc_needs_asyncify(["packages/std/emcc/platform.js"])
 
 
 def test_build_android_sdk_compiles_c_extern_and_links_artifact(tmp_path, capsys):
@@ -5645,6 +5657,34 @@ def test_build_android_sdk_compiles_c_extern_and_links_artifact(tmp_path, capsys
     calls = (clang.parent / "calls.txt").read_text(encoding="utf-8")
     assert "-DEZ_TARGET_ANDROID=1" in calls
     assert "-shared" in calls
+
+
+def test_build_android_flow_runtime_links_native_helpers(tmp_path, capsys):
+    project_toml = write_project(tmp_path, os_name="android", arch="aarch64")
+    sdk_dir = tmp_path / "android-ndk"
+    clang = sdk_dir / "toolchains" / "llvm" / "prebuilt" / ez._ndk_host_tag() / "bin" / "aarch64-linux-android21-clang"
+    _write_fake_sdk_tool(clang)
+    project_toml.write_text(
+        project_toml.read_text(encoding="utf-8").replace('dir = "dist/android"', f'dir = "dist/android"\nsdk = "{sdk_dir}"'),
+        encoding="utf-8",
+    )
+    (tmp_path / "src" / "index.ez").write_text(
+        'const main = (): I32 => {\n'
+        '    const value = flow {\n'
+        '        const p = parallel { return 7; };\n'
+        '        return p + race(pl = [() => { return 1; }, () => { return 2; }], timeout = 10);\n'
+        '    };\n'
+        '    return value;\n'
+        '};\n',
+        encoding="utf-8",
+    )
+
+    assert ez.main(["build", "--project", str(project_toml)]) == 0
+
+    capsys.readouterr()
+    calls = (clang.parent / "calls.txt").read_text(encoding="utf-8")
+    assert "runtime.c" in calls
+    assert "-lpthread" in calls
 
 
 def test_build_android_ui_sdk_emits_host_bridge(tmp_path, capsys):
@@ -5709,6 +5749,34 @@ def test_build_ios_sdk_compiles_c_extern_and_links_artifact(tmp_path, capsys):
     calls = (clang.parent / "calls.txt").read_text(encoding="utf-8")
     assert "-DEZ_TARGET_IOS=1" in calls
     assert "-dynamiclib" in calls
+
+
+def test_build_ios_flow_runtime_links_native_helpers(tmp_path, capsys):
+    project_toml = write_project(tmp_path, os_name="ios", arch="aarch64")
+    sdk_dir = tmp_path / "xcode-sdk"
+    clang = sdk_dir / "usr" / "bin" / "clang"
+    _write_fake_sdk_tool(clang)
+    project_toml.write_text(
+        project_toml.read_text(encoding="utf-8").replace('dir = "dist/ios"', f'dir = "dist/ios"\nsdk = "{sdk_dir}"'),
+        encoding="utf-8",
+    )
+    (tmp_path / "src" / "index.ez").write_text(
+        'const main = (): I32 => {\n'
+        '    const value = flow {\n'
+        '        const p = parallel { return 7; };\n'
+        '        return p + race(pl = [() => { return 1; }, () => { return 2; }], timeout = 10);\n'
+        '    };\n'
+        '    return value;\n'
+        '};\n',
+        encoding="utf-8",
+    )
+
+    assert ez.main(["build", "--project", str(project_toml)]) == 0
+
+    capsys.readouterr()
+    calls = (clang.parent / "calls.txt").read_text(encoding="utf-8")
+    assert "runtime.c" in calls
+    assert "-lpthread" in calls
 
 
 def test_build_ios_ui_sdk_emits_host_bridge(tmp_path, capsys):
@@ -5863,9 +5931,12 @@ def test_root_install_script_supports_git_bootstrap_and_path_registration():
     for marker in [
         "https://github.com/ZYF93/EzLang.git",
         "--local",
-        "EZLANG_REPO_URL",
+        "EZLANG_INSTALL_DEPS",
         "require_python",
+        "require_git",
         "require_native_linker",
+        "dependency_hint",
+        "install_dependency",
         "git clone",
         "remote set-url origin",
         "remote add origin",
@@ -5875,14 +5946,26 @@ def test_root_install_script_supports_git_bootstrap_and_path_registration():
         "import llvmlite.binding",
         "无需单独安装系统 LLVM",
         "只有构建 os=\\\"emcc\\\" / wasm32 目标时才需要 Emscripten SDK",
+        "Android 目标需要 Android NDK",
+        "iOS 目标需要 macOS + Xcode Command Line Tools",
         "ez\" --version",
         "ez\" install --project",
         "ez\" build --project",
         "<<'EOF'\nlet $code",
         "EZLANG_REGISTER_PATH",
+        "EZLANG_HOME",
+        "PROFILE_SNIPPET",
+        ".zshrc",
+        ".zprofile",
+        ".bashrc",
+        ".bash_profile",
+        ".profile",
         "export PATH=",
     ]:
         assert marker in script
+    assert "REPO_URL=$DEFAULT_REPO_URL" in script
+    assert "不支持自定义仓库参数" in script
+    assert "EZLANG_REPO_URL" not in script
 
     ordered_markers = [
         "git clone",
@@ -5891,10 +5974,21 @@ def test_root_install_script_supports_git_bootstrap_and_path_registration():
         "ez\" --version",
         "ez\" install --project",
         "ez\" build --project",
-        "PATH_LINE=",
+        "    register_shell_profiles",
     ]
     positions = [script.index(marker) for marker in ordered_markers]
     assert positions == sorted(positions)
+
+
+def test_root_install_script_rejects_custom_repo_argument():
+    completed = subprocess.run(
+        ["sh", str(ROOT / "install.sh"), "https://example.com/mirror.git"],
+        text=True,
+        capture_output=True,
+    )
+    assert completed.returncode != 0
+    assert "不支持自定义仓库参数" in completed.stderr
+    assert "https://github.com/ZYF93/EzLang.git" in completed.stderr
 
 
 

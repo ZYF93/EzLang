@@ -1013,6 +1013,8 @@ def _link_sdk_artifact(obj_file: Path, output: OutputConfig, libs: list[str], bu
     if output.os == "emcc":
         artifact = build_dir / f"{name}.js"
         cmd = [str(_sdk_tool(output.sdk, ["emcc", "upstream/emscripten/emcc"])), str(obj_file), "-o", str(artifact)]
+        if _emcc_needs_asyncify(libs):
+            cmd.append("-sASYNCIFY")
         for lib in libs:
             path = Path(lib)
             if path.suffix == ".js":
@@ -1047,6 +1049,24 @@ def _link_sdk_artifact(obj_file: Path, output: OutputConfig, libs: list[str], bu
         return artifact
 
     raise CliError(f"{output.os} 目标暂不支持 SDK 链接")
+
+
+def _emcc_needs_asyncify(libs: list[str]) -> bool:
+    """emcc suspend source 与 flow runtime 依赖 Asyncify 恢复执行栈。"""
+    async_libs = {
+        "packages/std/emcc/runtime.js",
+        "packages/std/emcc/time.js",
+        "packages/std/emcc/io.js",
+        "packages/std/emcc/fs.js",
+        "packages/std/emcc/stream.js",
+        "packages/std/emcc/process.js",
+        "packages/std/emcc/net/http.js",
+    }
+    for lib in libs:
+        path = Path(lib).as_posix()
+        if any(path.endswith(item) for item in async_libs):
+            return True
+    return False
 
 
 def _emit_mobile_ui_bridge(output: OutputConfig, libs: list[str], build_dir: Path, name: str, artifact: Path) -> Path | None:

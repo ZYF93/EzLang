@@ -1855,13 +1855,6 @@ static bool ez_msgpack_skip_value(const uint8_t *bytes, size_t size, size_t *ind
     return ez_msgpack_skip_value_depth(bytes, size, index, 0);
 }
 
-static bool ez_msgpack_single_value(const Blob *data) {
-    if (!data || data->size <= 0 || !data->data) return false;
-    size_t index = 0;
-    size_t size = (size_t)data->size;
-    return ez_msgpack_skip_value(data->data, size, &index) && index == size;
-}
-
 static bool ez_msgpack_map_header(const Blob *data, size_t *index, uint32_t *count) {
     if (!data || data->size <= 0 || !data->data || !index || !count) return false;
     const uint8_t *bytes = data->data;

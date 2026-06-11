@@ -1,6 +1,8 @@
 // EzLang std/compress Emscripten JS 封装层
 // 同步 ABI 下使用 Node zlib；浏览器端暂无同步压缩 API，返回空可选值。
 (function () {
+  var root = typeof Module !== 'undefined' && Module ? Module : (typeof globalThis !== 'undefined' ? globalThis : this);
+
   function blobBytes(blobPtr) {
     if (!blobPtr) return null;
     var dataPtr = getValue(blobPtr, '*');
@@ -54,16 +56,23 @@
     return Math.floor(size);
   }
 
-  function readAllStream(srcPtr, bufferSize) {
+  function streamBridge() {
+    var bridge = root && root.__ez_stream_bridge;
+    if (bridge && typeof bridge.read === 'function' && typeof bridge.write === 'function') return bridge;
     var api = LibraryManager.library || {};
-    if (typeof api.streamRead !== 'function') return null;
+    return { read: api.streamRead, write: api.streamWrite, flush: api.streamFlush };
+  }
+
+  function readAllStream(srcPtr, bufferSize) {
+    var bridge = streamBridge();
+    if (typeof bridge.read !== 'function') return null;
     var chunk = streamChunkSize(bufferSize);
     var tmpOpt = _malloc(24);
     var chunks = [];
     var total = 0;
     try {
       while (true) {
-        api.streamRead(tmpOpt, srcPtr, chunk);
+        bridge.read(tmpOpt, srcPtr, chunk);
         if (!HEAPU8[tmpOpt]) return null;
         var dataPtr = getValue(tmpOpt + 8, '*');
         var size = Number(getValue(tmpOpt + 16, 'i64'));
@@ -90,8 +99,8 @@
   }
 
   function writeAllStream(dstPtr, bytes) {
-    var api = LibraryManager.library || {};
-    if (typeof api.streamWrite !== 'function') return -1;
+    var bridge = streamBridge();
+    if (typeof bridge.write !== 'function') return -1;
     var tmpBlob = _malloc(16);
     var dataPtr = 0;
     try {
@@ -101,9 +110,9 @@
       }
       setValue(tmpBlob, dataPtr, '*');
       setValue(tmpBlob + 8, bytes.length, 'i64');
-      var written = Number(api.streamWrite(dstPtr, tmpBlob));
+      var written = Number(bridge.write(dstPtr, tmpBlob));
       if (written !== bytes.length) return -1;
-      if (typeof api.streamFlush === 'function' && !api.streamFlush(dstPtr)) return -1;
+      if (typeof bridge.flush === 'function' && !bridge.flush(dstPtr)) return -1;
       return written;
     } finally {
       freePtr(dataPtr);

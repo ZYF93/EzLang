@@ -967,6 +967,7 @@ OptHttpResponse fetchEx(const HttpRequest *req) {
 }
 
 HttpServer createServer(const char *host, int32_t port) {
+    if (port < 0 || port > 65535) return (HttpServer){0};
     EzHttpServer *server = (EzHttpServer *)calloc(1, sizeof(EzHttpServer));
     if (!server) return (HttpServer){0};
     const char *bind_host = host && host[0] ? host : "127.0.0.1";

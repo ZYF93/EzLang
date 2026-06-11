@@ -6,8 +6,8 @@ set -eu
 # 用法：
 #   sh install.sh                         # 从官方远程仓库 clone/update 后安装
 #   sh install.sh --local                 # 从当前源码目录安装（开发用）
-#   EZLANG_REPO_URL=<git-url> sh install.sh  # 使用镜像仓库安装
-#   EZLANG_REGISTER_PATH=0 sh install.sh     # 不修改 shell 配置文件
+#   EZLANG_INSTALL_DEPS=1 sh install.sh    # 尝试用系统包管理器安装缺失的基础依赖
+#   EZLANG_REGISTER_PATH=0 sh install.sh   # 不修改 shell 配置文件
 
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname "$0")" && pwd)
 DEFAULT_REPO_URL="https://github.com/ZYF93/EzLang.git"
@@ -16,15 +16,22 @@ PYTHON_BIN=${PYTHON:-python3}
 VENV_DIR="$PREFIX/venv"
 BIN_DIR="$PREFIX/bin"
 SRC_DIR="$PREFIX/src"
+PROFILE_SNIPPET="$PREFIX/env"
 INSTALL_ARG=${1:-}
 USE_LOCAL=0
+arg_error() {
+    echo "error: $*" >&2
+    exit 1
+}
+
 if [ "$INSTALL_ARG" = "--local" ]; then
     USE_LOCAL=1
 elif [ -n "$INSTALL_ARG" ]; then
-    EZLANG_REPO_URL=$INSTALL_ARG
+    arg_error "不支持自定义仓库参数：${INSTALL_ARG}。安装脚本固定使用 ${DEFAULT_REPO_URL}；开发安装请使用 --local。"
 fi
-REPO_URL=${EZLANG_REPO_URL:-$DEFAULT_REPO_URL}
+REPO_URL=$DEFAULT_REPO_URL
 REGISTER_PATH=${EZLANG_REGISTER_PATH:-1}
+INSTALL_DEPS=${EZLANG_INSTALL_DEPS:-0}
 
 die() {
     echo "error: $*" >&2
@@ -35,53 +42,172 @@ warn() {
     echo "warning: $*" >&2
 }
 
+command_exists() {
+    command -v "$1" >/dev/null 2>&1
+}
+
+package_manager() {
+    if command_exists brew; then echo brew; return; fi
+    if command_exists apt-get; then echo apt; return; fi
+    if command_exists dnf; then echo dnf; return; fi
+    if command_exists yum; then echo yum; return; fi
+    if command_exists pacman; then echo pacman; return; fi
+    echo ""
+}
+
+install_packages() {
+    pm=$(package_manager)
+    case "$pm" in
+        brew) brew install "$@" ;;
+        apt) sudo apt-get update && sudo apt-get install -y "$@" ;;
+        dnf) sudo dnf install -y "$@" ;;
+        yum) sudo yum install -y "$@" ;;
+        pacman) sudo pacman -Sy --needed --noconfirm "$@" ;;
+        *) return 1 ;;
+    esac
+}
+
+install_dependency() {
+    tool=$1
+    pm=$(package_manager)
+    case "$pm:$tool" in
+        brew:python) install_packages python ;;
+        brew:git) install_packages git ;;
+        brew:cc) xcode-select --install ;;
+        apt:python) install_packages python3 python3-venv python3-pip ;;
+        apt:git) install_packages git ;;
+        apt:cc) install_packages build-essential ;;
+        dnf:python) install_packages python3 python3-pip ;;
+        dnf:git) install_packages git ;;
+        dnf:cc) install_packages gcc make ;;
+        yum:python) install_packages python3 python3-pip ;;
+        yum:git) install_packages git ;;
+        yum:cc) install_packages gcc make ;;
+        pacman:python) install_packages python python-pip ;;
+        pacman:git) install_packages git ;;
+        pacman:cc) install_packages base-devel ;;
+        *) return 1 ;;
+    esac
+}
+
+dependency_hint() {
+    tool=$1
+    case "$tool" in
+        python)
+            echo "macOS: brew install python；Ubuntu/Debian: sudo apt install python3 python3-venv python3-pip；Fedora: sudo dnf install python3 python3-pip；Arch: sudo pacman -S python python-pip" ;;
+        git)
+            echo "macOS: xcode-select --install 或 brew install git；Ubuntu/Debian: sudo apt install git；Fedora: sudo dnf install git；Arch: sudo pacman -S git" ;;
+        cc)
+            echo "macOS: xcode-select --install；Ubuntu/Debian: sudo apt install build-essential；Fedora: sudo dnf install gcc make；Arch: sudo pacman -S base-devel" ;;
+        emcc)
+            echo "Emscripten 只在构建 os=\"emcc\" / wasm32 时需要：git clone https://github.com/emscripten-core/emsdk.git && cd emsdk && ./emsdk install latest && ./emsdk activate latest && . ./emsdk_env.sh" ;;
+        android)
+            echo "Android 目标需要 Android NDK，并在 project.toml 的 output.sdk 指向 NDK 根目录。" ;;
+        ios)
+            echo "iOS 目标需要 macOS + Xcode Command Line Tools，并在 project.toml 的 output.sdk 指向 Xcode/SDK 根目录。" ;;
+    esac
+}
+
+try_install_dependency() {
+    tool=$1
+    if [ "$INSTALL_DEPS" != "1" ]; then
+        return 1
+    fi
+    pm=$(package_manager)
+    if [ -z "$pm" ]; then
+        return 1
+    fi
+    echo "正在尝试安装 $tool 依赖（包管理器：$pm）..."
+    install_dependency "$tool"
+}
+
 require_python() {
-    if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
-        die "未找到 Python 3.9+。请先安装 Python：macOS 可执行 \`brew install python\`，Ubuntu/Debian 可执行 \`sudo apt install python3 python3-venv python3-pip\`，然后重试。"
+    if ! command_exists "$PYTHON_BIN"; then
+        try_install_dependency python || die "未找到 Python 3.9+。请先安装 Python：$(dependency_hint python)"
     fi
     if ! PYTHON_VERSION=$("$PYTHON_BIN" -c 'import sys; print(".".join(map(str, sys.version_info[:3]))); raise SystemExit(0 if sys.version_info >= (3, 9) else 1)' 2>/dev/null); then
         die "检测到的 Python 版本不满足要求：$PYTHON_VERSION。EzLang 编译器需要 Python 3.9+。"
     fi
+    if ! "$PYTHON_BIN" -c 'import venv' >/dev/null 2>&1; then
+        try_install_dependency python || die "当前 Python 缺少 venv 模块。请安装 Python venv 支持：$(dependency_hint python)"
+    fi
+}
+
+require_git() {
+    if command_exists git; then
+        return
+    fi
+    try_install_dependency git || die "安装远程 EzLang 需要 git。请先安装 git：$(dependency_hint git)"
 }
 
 require_native_linker() {
-    if ! command -v cc >/dev/null 2>&1; then
-        die "未找到 C 编译器 \`cc\`。EzLang 本机目标链接和 C extern 编译需要它：macOS 可执行 \`xcode-select --install\`，Ubuntu/Debian 可执行 \`sudo apt install build-essential\`。"
+    if ! command_exists cc; then
+        try_install_dependency cc || die "未找到 C 编译器 \`cc\`。EzLang 本机目标链接和 C extern 编译需要它：$(dependency_hint cc)"
     fi
 }
 
 emcc_status() {
-    if command -v emcc >/dev/null 2>&1; then
+    if command_exists emcc; then
         echo "已检测到 emcc"
     else
-        echo "未检测到 emcc；只有构建 os=\"emcc\" / wasm32 目标时才需要 Emscripten SDK"
+        echo "未检测到 emcc；只有构建 os=\"emcc\" / wasm32 目标时才需要 Emscripten SDK。$(dependency_hint emcc)"
     fi
+}
+
+mobile_status() {
+    echo "Android: $(dependency_hint android)"
+    echo "iOS: $(dependency_hint ios)"
+}
+
+register_profile_file() {
+    profile_file=$1
+    mkdir -p "$(dirname "$profile_file")"
+    touch "$profile_file"
+    if ! grep -F "$PROFILE_SNIPPET" "$profile_file" >/dev/null 2>&1; then
+        {
+            echo ""
+            echo "# EzLang"
+            echo "[ -f \"$PROFILE_SNIPPET\" ] && . \"$PROFILE_SNIPPET\""
+        } >> "$profile_file"
+    fi
+    if [ -z "${PROFILE_STATUS:-}" ]; then
+        PROFILE_STATUS="$profile_file"
+    else
+        PROFILE_STATUS="$PROFILE_STATUS, $profile_file"
+    fi
+}
+
+register_shell_profiles() {
+    mkdir -p "$PREFIX"
+    cat > "$PROFILE_SNIPPET" <<EOF
+# EzLang
+export EZLANG_HOME="$PREFIX"
+case ":\$PATH:" in
+  *":\$EZLANG_HOME/bin:"*) ;;
+  *) export PATH="\$EZLANG_HOME/bin:\$PATH" ;;
+esac
+EOF
+
+    PROFILE_STATUS=""
+    if [ -n "${EZLANG_PROFILE:-}" ]; then
+        register_profile_file "$EZLANG_PROFILE"
+    else
+        register_profile_file "$HOME/.zshrc"
+        register_profile_file "$HOME/.zprofile"
+        register_profile_file "$HOME/.bashrc"
+        register_profile_file "$HOME/.bash_profile"
+        register_profile_file "$HOME/.profile"
+    fi
+    PATH_STATUS="已写入 $PROFILE_SNIPPET，并注册到 $PROFILE_STATUS"
 }
 
 require_python
 require_native_linker
-if [ -n "${EZLANG_PROFILE:-}" ]; then
-    PROFILE_FILE=$EZLANG_PROFILE
-else
-    case "${SHELL:-}" in
-        */zsh) PROFILE_FILE="$HOME/.zprofile" ;;
-        */bash)
-            if [ -f "$HOME/.bash_profile" ]; then
-                PROFILE_FILE="$HOME/.bash_profile"
-            else
-                PROFILE_FILE="$HOME/.bashrc"
-            fi
-            ;;
-        *) PROFILE_FILE="$HOME/.profile" ;;
-    esac
-fi
 
 if [ "$USE_LOCAL" = "1" ]; then
     SRC_DIR="$SCRIPT_DIR"
 else
-    if ! command -v git >/dev/null 2>&1; then
-        die "安装远程 EzLang 需要 git。请先安装 git 后重试。"
-    fi
+    require_git
     if [ -d "$SRC_DIR/.git" ]; then
         if git -C "$SRC_DIR" remote get-url origin >/dev/null 2>&1; then
             git -C "$SRC_DIR" remote set-url origin "$REPO_URL"
@@ -141,19 +267,7 @@ EOF
 "$BIN_DIR/ez" build --project "$VERIFY_DIR/project.toml" >/dev/null
 
 if [ "$REGISTER_PATH" != "0" ]; then
-    mkdir -p "$(dirname "$PROFILE_FILE")"
-    touch "$PROFILE_FILE"
-    PATH_LINE="export PATH=\"$BIN_DIR:\$PATH\""
-    if ! grep -F "$BIN_DIR" "$PROFILE_FILE" >/dev/null 2>&1; then
-        {
-            echo ""
-            echo "# EzLang CLI"
-            echo "$PATH_LINE"
-        } >> "$PROFILE_FILE"
-        PATH_STATUS="已写入 $PROFILE_FILE"
-    else
-        PATH_STATUS="$PROFILE_FILE 已包含 $BIN_DIR"
-    fi
+    register_shell_profiles
 else
     PATH_STATUS="已跳过 PATH 注册"
 fi
@@ -162,7 +276,9 @@ echo "EzLang 已安装到 $PREFIX"
 echo "源码目录: $SRC_DIR"
 echo "安装校验: ez --version、ez install 与 ez build 通过"
 echo "PATH 注册: $PATH_STATUS"
+echo "EZLANG_HOME: $PREFIX"
 echo "Python: $PYTHON_VERSION"
 echo "LLVM: 使用 Python 包 llvmlite 提供的 LLVM binding，无需单独安装系统 LLVM"
 echo "Emscripten: $(emcc_status)"
-echo "例如: export PATH=\"$BIN_DIR:\$PATH\""
+mobile_status
+echo "当前 shell 临时启用: export EZLANG_HOME=\"$PREFIX\"; export PATH=\"$BIN_DIR:\$PATH\""
