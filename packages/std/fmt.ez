@@ -15,7 +15,8 @@ export declare const parseI64: (s: Str) => I64?;
 export declare const parseF64: (s: Str) => F64?;
 
 // === 字符串格式化 ===
-export declare const format: (template: Str, args: Str[]) => Str;
+declare const fmtFormat: (template: Str, args: Str[]) => Str;
+export const format = (template: Str, args: Str[]): Str => fmtFormat(template = template, args = args);
 
 // === Base64 编码 ===
 export declare const b64Encode: (data: Blob) => Str;

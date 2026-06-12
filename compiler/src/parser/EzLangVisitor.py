@@ -1,4 +1,4 @@
-# Generated from grammar/EzLang.g4 by ANTLR 4.13.2
+# Generated from EzLang.g4 by ANTLR 4.13.2
 from antlr4 import *
 if "." in __name__:
     from .EzLangParser import EzLangParser
@@ -314,8 +314,18 @@ class EzLangVisitor(ParseTreeVisitor):
         return self.visitChildren(ctx)
 
 
-    # Visit a parse tree produced by EzLangParser#unaryExpression.
-    def visitUnaryExpression(self, ctx:EzLangParser.UnaryExpressionContext):
+    # Visit a parse tree produced by EzLangParser#prefixTypeAssertion.
+    def visitPrefixTypeAssertion(self, ctx:EzLangParser.PrefixTypeAssertionContext):
+        return self.visitChildren(ctx)
+
+
+    # Visit a parse tree produced by EzLangParser#prefixUnaryExpression.
+    def visitPrefixUnaryExpression(self, ctx:EzLangParser.PrefixUnaryExpressionContext):
+        return self.visitChildren(ctx)
+
+
+    # Visit a parse tree produced by EzLangParser#postfixUnaryExpression.
+    def visitPostfixUnaryExpression(self, ctx:EzLangParser.PostfixUnaryExpressionContext):
         return self.visitChildren(ctx)
 
 
@@ -459,6 +469,11 @@ class EzLangVisitor(ParseTreeVisitor):
         return self.visitChildren(ctx)
 
 
+    # Visit a parse tree produced by EzLangParser#callArg.
+    def visitCallArg(self, ctx:EzLangParser.CallArgContext):
+        return self.visitChildren(ctx)
+
+
     # Visit a parse tree produced by EzLangParser#namedArg.
     def visitNamedArg(self, ctx:EzLangParser.NamedArgContext):
         return self.visitChildren(ctx)
@@ -491,6 +506,11 @@ class EzLangVisitor(ParseTreeVisitor):
 
     # Visit a parse tree produced by EzLangParser#dictLiteral.
     def visitDictLiteral(self, ctx:EzLangParser.DictLiteralContext):
+        return self.visitChildren(ctx)
+
+
+    # Visit a parse tree produced by EzLangParser#dictFieldSep.
+    def visitDictFieldSep(self, ctx:EzLangParser.DictFieldSepContext):
         return self.visitChildren(ctx)
 
 

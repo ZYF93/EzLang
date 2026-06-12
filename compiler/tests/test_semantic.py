@@ -24,20 +24,13 @@ def markdown_ez_blocks(filepath: Path):
 
 
 DOC_SEMANTIC_SKIP = {
-    ('docs/doc.md', 2): '泛型、符号和局部推导的语义展示，依赖后续完整泛型推导能力',
-    ('docs/doc.md', 3): '结构体/内置类型声明展示，包含无函数上下文的示例方法体',
     ('docs/doc.md', 6): 'flow/race 调度展示，依赖示例外部 fetch 函数',
     ('docs/doc.md', 7): '控制流展示，依赖示例外部 print 函数',
     ('docs/doc.md', 9): 'extern 路径和跨平台库声明展示，依赖示例外部库文件',
     ('docs/doc.md', 10): '装饰器和标记语法展示，依赖示例外部 print 与 UI 工厂函数',
-    ('docs/ez-android-ui.md', 12): 'Android UI 包架构示例，依赖未接入的 ez-android-ui 包实现',
-    ('docs/ez-ios-ui.md', 13): 'iOS UI 包架构示例，依赖未接入的 ez-ios-ui 包实现',
-    ('docs/ez-web-ui.md', 12): 'Web UI 框架骨架示例，依赖未接入的 ez-web-ui 包实现',
     ('docs/stdlib.md', 1): 'extern 搜索路径展示，依赖示例外部库文件',
     ('docs/stdlib.md', 24): 'HTTP flow 使用示例，依赖示例外部网络接口上下文',
     ('docs/stdlib.md', 26): 'HTTP 服务端使用示例，依赖前置 HTTP 类型和服务端上下文',
-    ('docs/tutorial.md', 6): '教程片段依赖 std/io 导入解析，由 CLI 集成测试覆盖',
-    ('docs/tutorial.md', 7): '教程片段依赖 std/time 导入解析，由 CLI 集成测试覆盖',
 }
 
 
@@ -88,15 +81,58 @@ class TestSemantic:
         symbol = anal.symbols.resolve('$count')
         assert symbol is not None and symbol.type.name == 'I32'
 
+    def test_import_semantics_respects_alias_and_requested_exports(self, tmp_path):
+        """语义分析 import 应按需引入导出符号，并支持 as 别名。"""
+        (tmp_path / 'lib.ez').write_text(
+            'export const add = (a: I32, b: I32): I32 => { return a + b; };\n'
+            'export const hidden = (): I32 => { return 0; };\n',
+            encoding='utf-8',
+        )
+        anal = analyze(
+            'from "./lib.ez" import { add as sum };\n'
+            'let value = sum(a = 1, b = 2);\n',
+            base_dir=tmp_path,
+        )
+        assert not anal.symbols.has_errors(), f'语义错误: {anal.symbols.errors}'
+        assert anal.symbols.resolve('sum') is not None
+        assert anal.symbols.resolve('add') is None
+        assert anal.symbols.resolve('hidden') is None
+
     def test_placeholder_expression_requires_call_argument_context(self):
         """独立 ? 不能静默编译为 0，只能用于调用参数占位。"""
         anal = analyze('const x = ?;')
         assert anal.symbols.has_errors()
         assert any('柯里化占位参数' in error for error in anal.symbols.errors)
 
+    def test_placeholder_expression_can_initialize_optional_none(self):
+        """Optional<T> 期望上下文中的 ? 表示空可选值。"""
+        anal = analyze('let value: I32? = ?;')
+        assert not anal.symbols.has_errors(), f'语义错误: {anal.symbols.errors}'
+        symbol = anal.symbols.resolve('value')
+        assert symbol is not None and symbol.type is not None
+        assert symbol.type.kind.name == 'OPTIONAL'
+
+    def test_struct_optional_field_accepts_placeholder_none(self):
+        """结构体字段期望 Optional<T> 时，field = ? 表示空可选值。"""
+        anal = analyze('struct Node { value: I32; next: Node?; }; const node = Node(value = 1, next = ?);')
+        assert not anal.symbols.has_errors(), f'语义错误: {anal.symbols.errors}'
+        assert not anal.symbols.warnings, f'语义警告: {anal.symbols.warnings}'
+
     def test_placeholder_call_argument_is_valid(self):
         """调用参数中的 ? 保留为合法柯里化占位符。"""
         anal = analyze('const add = (a: I32, b: I32): I32 => { return a + b; }; const add2 = add(a = 2, b = ?);')
+        assert not anal.symbols.has_errors(), f'语义错误: {anal.symbols.errors}'
+
+    def test_break_continue_require_loop_or_match_context(self):
+        """break/continue 不能在 loop 或 match 外静默 no-op。"""
+        anal = analyze('break; continue;')
+        assert anal.symbols.has_errors()
+        assert any('break 只能用于 loop 或 match 内' in error for error in anal.symbols.errors)
+        assert any('continue 只能用于 loop 或 match 内' in error for error in anal.symbols.errors)
+
+    def test_break_continue_allowed_in_loop_and_match(self):
+        """loop 与 match 内的 break/continue 符合文档控制流语义。"""
+        anal = analyze('loop { continue; break; } match { (true) ? { continue; break; } };')
         assert not anal.symbols.has_errors(), f'语义错误: {anal.symbols.errors}'
 
     def test_basics(self):
@@ -206,6 +242,13 @@ class TestSemantic:
         anal = analyze('let x: I32 = 42; let y: Bool = true;')
         assert not anal.symbols.has_errors()
 
+    def test_prefix_type_assertion_returns_target_type(self):
+        """Type! expr 的语义类型应采用显式目标类型。"""
+        anal = analyze('let x: I64 = I64! 42; let y: I32 = I32! x;')
+        assert not anal.symbols.has_errors(), f'错误: {anal.symbols.errors}'
+        assert anal.symbols.resolve('x').type.name == 'I64'
+        assert anal.symbols.resolve('y').type.name == 'I32'
+
     def test_type_mismatch_detection(self):
         """检测类型不匹配（标注 I32 但初始化 Str）"""
         anal = analyze('let x: I32 = "hello";')
@@ -261,6 +304,21 @@ class TestSemantic:
         anal = analyze('let x = 1 == 2;')
         sym = anal.symbols.resolve('x')
         assert sym.type.name == 'Bool'
+
+    def test_loop_in_list_binds_element_type(self):
+        """loop item in list 应把 item 绑定为集合元素类型。"""
+        anal = analyze('''
+        struct VNode { children: VNode[]; };
+        const visit = (vnode: VNode): I32 => {
+            let total: I32 = 0;
+            loop child in vnode.children {
+                total = total + visit(vnode = child);
+            };
+            return total;
+        };
+        ''')
+        assert not anal.symbols.has_errors(), f'语义错误: {anal.symbols.errors}'
+        assert not anal.symbols.warnings, f'语义警告: {anal.symbols.warnings}'
 
     def test_simd_vector_scalar_binary_ops(self):
         """SIMD 向量支持同类标量广播运算。"""
@@ -626,6 +684,47 @@ class TestSemantic:
         assert not any('变量初始化类型不匹配' in e for e in anal.symbols.errors), anal.symbols.errors
         assert any('字典键类型不匹配' in e for e in anal.symbols.errors), anal.symbols.errors
 
+    def test_shape_dict_literal_uses_expected_fields(self):
+        """文档中的 Shape 注解对象字面量应按字段名校验，而不是退化成普通 Dict。"""
+        anal = analyze('type Shape = { name: Str; side: Str; }; let s: Shape = { name = "Square"; side = "10" };')
+        assert not anal.symbols.has_errors(), f'语义错误: {anal.symbols.errors}'
+        s = anal.symbols.resolve('s')
+        assert s is not None
+        assert s.type.name == 'Shape'
+        assert s.type.fields['name'].name == 'Str'
+        assert s.type.fields['side'].name == 'Str'
+
+    def test_mixed_dynamic_shape_literal_is_dict_with_fixed_field_checks(self):
+        """含动态键的 Shape 按 Dict 建模，同时保留固定字段校验。"""
+        anal = analyze('type Shape = { name: Str; [dynamic: Str]: Str; }; let s: Shape = { name = "Square"; side = "10" };')
+        assert not anal.symbols.has_errors(), f'语义错误: {anal.symbols.errors}'
+        s = anal.symbols.resolve('s')
+        assert s is not None
+        assert s.type.name == 'Shape'
+        assert s.type.key_type.name == 'Str'
+        assert s.type.value_type.name == 'Str'
+        assert 'name' in s.type.fields
+
+    def test_shape_dict_literal_reports_missing_required_field(self):
+        """固定 Shape 对象字面量缺字段应报错。"""
+        anal = analyze('type Shape = { name: Str; side: Str; }; let s: Shape = { name = "Square"; };')
+        assert any("缺少字段 'side'" in e for e in anal.symbols.errors), anal.symbols.errors
+
+    def test_type_shape_spread_flattens_fields(self):
+        """文档中的 type Shape 扩展 `...Base` 应展开基础形状字段。"""
+        anal = analyze('type Named = { name: Str }; type UserShape = { ...Named; age: I32; }; let u: UserShape = { name = "s"; age = 1 };')
+        assert not anal.symbols.has_errors(), f'语义错误: {anal.symbols.errors}'
+        u = anal.symbols.resolve('u')
+        assert u is not None
+        assert list(u.type.fields) == ['name', 'age']
+        assert u.type.fields['name'].name == 'Str'
+        assert u.type.fields['age'].name == 'I32'
+
+    def test_type_shape_spread_missing_base_field_reports_error(self):
+        """展开得到的字段也必须参与对象字面量缺字段检查。"""
+        anal = analyze('type Named = { name: Str }; type UserShape = { ...Named; age: I32; }; let u: UserShape = { age = 1 };')
+        assert any("缺少字段 'name'" in e for e in anal.symbols.errors), anal.symbols.errors
+
     def test_return_outside_function(self):
         """return 在函数外应报错"""
         anal = analyze('return 42;')
@@ -697,6 +796,19 @@ class TestSemantic:
         ''')
         errors = [e for e in anal.symbols.errors if '期望' in e]
         assert len(errors) > 0, f'应检测到泛型参数数量不匹配: {anal.symbols.errors}'
+
+    def test_generic_expression_function_infers_return_type_from_arguments(self):
+        """表达式体泛型函数应从实参推导返回类型。"""
+        anal = analyze('''
+        const identity = <T>(value: T) => value;
+        const inferred = identity(42);
+        const explicit = identity<I32>(7);
+        ''')
+        assert not anal.symbols.errors, f'不应产生语义错误: {anal.symbols.errors}'
+        inferred = anal.symbols.resolve('inferred')
+        explicit = anal.symbols.resolve('explicit')
+        assert inferred is not None and inferred.type is not None and inferred.type.name == 'I32'
+        assert explicit is not None and explicit.type is not None and explicit.type.name == 'I32'
 
     def test_generic_struct_explicit_args_instantiate_fields(self):
         """显式泛型结构体实参应替换字段类型。"""
@@ -868,6 +980,21 @@ class TestSemantic:
         warnings = [w for w in anal.symbols.warnings if 'this' in w]
         assert len(warnings) > 0, f'应有 this 类型警告: {warnings}'
 
+    def test_meta_decorator_fields_are_typed(self):
+        """Meta<T> 字段与 getter/setter 函数指针应参与语义检查"""
+        anal = analyze('''
+        const get_watched = (meta: Meta<I32>): I32 => { return meta.value + 10; };
+        const set_watched = (meta: Meta<I32>, v: I32): Void => { meta.value = v + 1; };
+        const log = (this: Meta<I32>): Void => {
+            this.getter = get_watched;
+            this.setter = set_watched;
+        };
+        @log let watched = 1;
+        const main = (): I32 => { watched = 2; return watched; };
+        ''')
+        assert not anal.symbols.has_errors(), f'不应有语义错误: {anal.symbols.errors}'
+        assert not anal.symbols.warnings, f'不应有语义警告: {anal.symbols.warnings}'
+
     def test_type_checks_example(self):
         """type_checks.ez 示例文件应无类型错误"""
         anal = analyze_file(
@@ -1032,19 +1159,33 @@ class TestSemantic:
         anal = analyze('''
         const result = flow {
             const conn = tcpConnect(host = "127.0.0.1", port = 80);
+            const conn_timeout = tcpConnectTimeout(host = "127.0.0.1", port = 80, timeoutMs = 100);
+            const tls = tcpTlsConnect(host = "example.com", port = 443);
+            tls.ok ? {
+                const tls_data = tcpTlsRead(conn = tls.value, maxBytes = 1024);
+                tls_data.ok ? { const tls_sent = tcpTlsWrite(conn = tls.value, data = tls_data.value); };
+            };
             const listener = tcpListen(host = "127.0.0.1", port = 8080);
             const udp = udpBind(host = "127.0.0.1", port = 5353);
             const accepted = accept(this = listener);
+            const accepted_timeout = tcpAcceptTimeout(listener = listener, timeoutMs = 100);
             const data = read(this = conn, size = 1024);
+            const data_timeout = tcpReadTimeout(conn = conn, maxBytes = 1024, timeoutMs = 100);
             const sent = write(this = conn, data = data);
+            const sent_timeout = tcpWriteTimeout(conn = conn, data = data, timeoutMs = 100);
             const packet_with_addr = udpRecvFrom(socket = udp, maxBytes = 1024);
+            const packet_with_addr_timeout = udpRecvFromTimeout(socket = udp, maxBytes = 1024, timeoutMs = 100);
             const packet = recv(this = udp, size = 1024);
+            const packet_timeout = udpRecvTimeout(socket = udp, maxBytes = 1024, timeoutMs = 100);
             send(this = udp, data = packet, host = "127.0.0.1", port = 5353);
+            const sent_udp_timeout = udpSendTimeout(socket = udp, host = "127.0.0.1", port = 5353, data = packet, timeoutMs = 100);
             return sent;
         };
         ''')
         assert {p['name'] for p in anal.suspend_points} >= {
-            'tcpConnect', 'tcpListen', 'udpBind', 'udpRecvFrom', 'accept', 'read', 'write', 'recv', 'send'
+            'tcpConnect', 'tcpConnectTimeout', 'tcpTlsConnect', 'tcpTlsRead', 'tcpTlsWrite', 'tcpListen', 'udpBind', 'accept', 'tcpAcceptTimeout',
+            'read', 'tcpReadTimeout', 'write', 'tcpWriteTimeout', 'udpRecvFrom', 'udpRecvFromTimeout',
+            'recv', 'udpRecvTimeout', 'send', 'udpSendTimeout'
         }
 
     def test_ws_calls_mark_suspend_points_in_flow(self):

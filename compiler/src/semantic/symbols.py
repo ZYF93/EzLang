@@ -137,6 +137,16 @@ class Type:
             if other.key_type is None or other.value_type is None:
                 return True
             return self.key_type.compatible_with(other.key_type) and self.value_type.compatible_with(other.value_type)
+        if self.kind == TypeKind.FUNCTION and other.kind == TypeKind.FUNCTION:
+            if len(self.param_types) != len(other.param_types):
+                return False
+            for expected_param, actual_param in zip(self.param_types, other.param_types):
+                if expected_param is not None and actual_param is not None \
+                        and not expected_param.compatible_with(actual_param):
+                    return False
+            if self.return_type is None or other.return_type is None:
+                return True
+            return self.return_type.compatible_with(other.return_type)
         # 结构体按字段信息兼容，不能只比较名字
         if self.kind == TypeKind.STRUCT and other.kind == TypeKind.STRUCT:
             if self.name == other.name:
@@ -287,6 +297,20 @@ def _make_struct(name: str, fields: dict[str, Type]) -> Type:
     return t
 
 
+def _make_function(params: list[tuple[str, Type]], ret: Type) -> Type:
+    t = Type(name="function", kind=TypeKind.FUNCTION)
+    t.param_names = [name for name, _ in params]
+    t.param_types = [type_ for _, type_ in params]
+    t.return_type = ret
+    return t
+
+
+def _make_optional(inner: Type) -> Type:
+    t = Type(name=f"{inner.name}?", kind=TypeKind.OPTIONAL)
+    t.element_type = inner
+    return t
+
+
 BUILTIN_TYPES = {
     "I8": _make_basic("I8"),
     "I32": _make_basic("I32"),
@@ -303,8 +327,56 @@ BUILTIN_TYPES = {
     "List": Type(name="List", kind=TypeKind.BASIC),
     "Dict": Type(name="Dict", kind=TypeKind.DICT),
     "Date": _make_struct("Date", {"timestamp": _make_basic("I64")}),
-    "Error": _make_struct("Error", {"code": _make_basic("I32"), "message": _make_basic("Str")}),
+    "Error": _make_struct("Error", {
+        "code": _make_basic("I32"),
+        "message": _make_basic("Str"),
+        "file": _make_basic("Str"),
+        "line": _make_basic("I32"),
+        "column": _make_basic("I32"),
+        "trace": _make_basic("Str"),
+    }),
     "Blob": _make_struct("Blob", {"data": _make_basic("Str"), "size": _make_basic("I64")}),
+}
+
+BUILTIN_TYPES["Error"].methods = {
+    "toString": _make_function([("this", BUILTIN_TYPES["Error"])], BUILTIN_TYPES["Str"]),
+}
+BUILTIN_TYPES["Date"].methods = {
+    "getYear": _make_function([("this", BUILTIN_TYPES["Date"])], BUILTIN_TYPES["I32"]),
+    "getMonth": _make_function([("this", BUILTIN_TYPES["Date"])], BUILTIN_TYPES["I32"]),
+    "getDay": _make_function([("this", BUILTIN_TYPES["Date"])], BUILTIN_TYPES["I32"]),
+    "getHour": _make_function([("this", BUILTIN_TYPES["Date"])], BUILTIN_TYPES["I32"]),
+    "getMinute": _make_function([("this", BUILTIN_TYPES["Date"])], BUILTIN_TYPES["I32"]),
+    "getSecond": _make_function([("this", BUILTIN_TYPES["Date"])], BUILTIN_TYPES["I32"]),
+    "add": _make_function([
+        ("this", BUILTIN_TYPES["Date"]),
+        ("year", _make_optional(BUILTIN_TYPES["I32"])),
+        ("month", _make_optional(BUILTIN_TYPES["I32"])),
+        ("day", _make_optional(BUILTIN_TYPES["I32"])),
+        ("hour", _make_optional(BUILTIN_TYPES["I32"])),
+        ("minute", _make_optional(BUILTIN_TYPES["I32"])),
+        ("second", _make_optional(BUILTIN_TYPES["I32"])),
+    ], BUILTIN_TYPES["Void"]),
+    "sub": _make_function([
+        ("this", BUILTIN_TYPES["Date"]),
+        ("year", _make_optional(BUILTIN_TYPES["I32"])),
+        ("month", _make_optional(BUILTIN_TYPES["I32"])),
+        ("day", _make_optional(BUILTIN_TYPES["I32"])),
+        ("hour", _make_optional(BUILTIN_TYPES["I32"])),
+        ("minute", _make_optional(BUILTIN_TYPES["I32"])),
+        ("second", _make_optional(BUILTIN_TYPES["I32"])),
+    ], BUILTIN_TYPES["Void"]),
+    "format": _make_function([("this", BUILTIN_TYPES["Date"]), ("fmt", BUILTIN_TYPES["Str"])], BUILTIN_TYPES["Str"]),
+}
+BUILTIN_TYPES["Blob"].methods = {
+    "get": _make_function(
+        [("this", BUILTIN_TYPES["Blob"]), ("index", BUILTIN_TYPES["I64"])],
+        BUILTIN_TYPES["I8"],
+    ),
+    "slice": _make_function(
+        [("this", BUILTIN_TYPES["Blob"]), ("start", BUILTIN_TYPES["I64"]), ("len", BUILTIN_TYPES["I64"])],
+        BUILTIN_TYPES["Blob"],
+    ),
 }
 
 

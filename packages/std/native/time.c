@@ -82,32 +82,32 @@ static struct tm ez_time_tm(const Date *value) {
     return tm_value;
 }
 
-int32_t getYear(const Date *value) {
+int32_t dateGetYear(const Date *value) {
     struct tm tm_value = ez_time_tm(value);
     return tm_value.tm_year + 1900;
 }
 
-int32_t getMonth(const Date *value) {
+int32_t dateGetMonth(const Date *value) {
     struct tm tm_value = ez_time_tm(value);
     return tm_value.tm_mon + 1;
 }
 
-int32_t getDay(const Date *value) {
+int32_t dateGetDay(const Date *value) {
     struct tm tm_value = ez_time_tm(value);
     return tm_value.tm_mday;
 }
 
-int32_t getHour(const Date *value) {
+int32_t dateGetHour(const Date *value) {
     struct tm tm_value = ez_time_tm(value);
     return tm_value.tm_hour;
 }
 
-int32_t getMinute(const Date *value) {
+int32_t dateGetMinute(const Date *value) {
     struct tm tm_value = ez_time_tm(value);
     return tm_value.tm_min;
 }
 
-int32_t getSecond(const Date *value) {
+int32_t dateGetSecond(const Date *value) {
     struct tm tm_value = ez_time_tm(value);
     return tm_value.tm_sec;
 }
@@ -140,13 +140,13 @@ static void ez_time_shift(Date *value, const OptI32 *year, const OptI32 *month, 
     value->timestamp = (int64_t)shifted * 1000 + ms;
 }
 
-void add(Date *value, const OptI32 *year, const OptI32 *month, const OptI32 *day,
-         const OptI32 *hour, const OptI32 *minute, const OptI32 *second) {
+void dateAdd(Date *value, const OptI32 *year, const OptI32 *month, const OptI32 *day,
+             const OptI32 *hour, const OptI32 *minute, const OptI32 *second) {
     ez_time_shift(value, year, month, day, hour, minute, second, 1);
 }
 
-void sub(Date *value, const OptI32 *year, const OptI32 *month, const OptI32 *day,
-         const OptI32 *hour, const OptI32 *minute, const OptI32 *second) {
+void dateSub(Date *value, const OptI32 *year, const OptI32 *month, const OptI32 *day,
+             const OptI32 *hour, const OptI32 *minute, const OptI32 *second) {
     ez_time_shift(value, year, month, day, hour, minute, second, -1);
 }
 
@@ -263,7 +263,7 @@ const char *__durationToString(int64_t ms) {
     return out;
 }
 
-const char *format(const Date *value, const char *fmt) {
+const char *dateFormat(const Date *value, const char *fmt) {
     struct tm tm_value = ez_time_tm(value);
     const char *pattern = fmt ? fmt : "%Y-%m-%dT%H:%M:%SZ";
     size_t cap = strlen(pattern) + 32;

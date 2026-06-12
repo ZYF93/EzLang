@@ -936,7 +936,7 @@
       var value = ok ? Number(text) : 0;
       writeOptF64(ret, ok && Number.isFinite(value), value);
     },
-    format: function (templatePtr, argsPtr) {
+    fmtFormat: function (templatePtr, argsPtr) {
       var text = UTF8ToString(templatePtr || 0);
       var index = 0;
       var out = '';

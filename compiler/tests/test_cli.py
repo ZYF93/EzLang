@@ -403,6 +403,156 @@ def test_run_allows_top_level_return_without_user_main(tmp_path):
     assert ez.main(["run", "--project", str(project_toml)]) == 7
 
 
+def test_run_aggregate_equality_compares_fields_recursively(tmp_path):
+    project_toml = write_project(
+        tmp_path,
+        os_name=ez._native_os(),
+        arch=ez._native_arch(),
+    )
+    (tmp_path / "src" / "index.ez").write_text(
+        'struct Point { x: I32; y: I32; };\n'
+        'struct Box { p: Point; ok: Bool; };\n'
+        'const main = (): I32 => {\n'
+        '    const a = Point(x = 1, y = 2);\n'
+        '    const b = Point(x = 1, y = 2);\n'
+        '    const c = Point(x = 1, y = 3);\n'
+        '    const ba = Box(p = a, ok = true);\n'
+        '    const bb = Box(p = b, ok = true);\n'
+        '    const bc = Box(p = c, ok = true);\n'
+        '    const oa: Point? = a;\n'
+        '    const ob: Point? = b;\n'
+        '    let oc: Point?;\n'
+        '    const ua: I32 | Bool = 1;\n'
+        '    const ub: I32 | Bool = 1;\n'
+        '    const uc: I32 | Bool = false;\n'
+        '    return (a == b && a != c && ba == bb && ba != bc && oa == ob && oa != oc && ua == ub && ua != uc) ? 0 : 1;\n'
+        '};\n',
+        encoding="utf-8",
+    )
+
+    assert ez.main(["run", "--project", str(project_toml)]) == 0
+
+
+def test_run_named_arguments_bind_by_name_for_functions_and_structs(tmp_path):
+    project_toml = write_project(
+        tmp_path,
+        os_name=ez._native_os(),
+        arch=ez._native_arch(),
+    )
+    (tmp_path / "src" / "index.ez").write_text(
+        'struct Pair { left: I32; right: I32; };\n'
+        'const pack = (first: I32, second: I32): I32 => {\n'
+        '    return first * 10 + second;\n'
+        '};\n'
+        'const main = (): I32 => {\n'
+        '    const value = pack(second = 2, first = 7);\n'
+        '    const pair = Pair(right = 4, left = 3);\n'
+        '    return (value == 72 && pair.left == 3 && pair.right == 4) ? 0 : 1;\n'
+        '};\n',
+        encoding="utf-8",
+    )
+
+    assert ez.main(["run", "--project", str(project_toml)]) == 0
+
+
+def test_run_prefix_type_assertion_unwraps_and_reinterprets(tmp_path):
+    project_toml = write_project(
+        tmp_path,
+        os_name=ez._native_os(),
+        arch=ez._native_arch(),
+    )
+    (tmp_path / "src" / "index.ez").write_text(
+        'const main = (): I32 => {\n'
+        '    const maybe: I32? = 42;\n'
+        '    const widened: I64 = I64! maybe;\n'
+        '    const scalar: F32 = 1.0;\n'
+        '    const bits: I32 = I32! scalar;\n'
+        '    return (widened == 42 && bits == 1065353216) ? 0 : 1;\n'
+        '};\n',
+        encoding="utf-8",
+    )
+
+    assert ez.main(["run", "--project", str(project_toml)]) == 0
+
+
+def test_run_decorator_meta_getter_setter_intercepts_global_access(tmp_path):
+    project_toml = write_project(
+        tmp_path,
+        os_name=ez._native_os(),
+        arch=ez._native_arch(),
+    )
+    (tmp_path / "src" / "index.ez").write_text(
+        'const get_watched = (meta: Meta<I32>): I32 => {\n'
+        '    return meta.value + 10;\n'
+        '};\n'
+        'const set_watched = (meta: Meta<I32>, v: I32): Void => {\n'
+        '    meta.value = v + 1;\n'
+        '};\n'
+        'const log = (this: Meta<I32>): Void => {\n'
+        '    this.getter = get_watched;\n'
+        '    this.setter = set_watched;\n'
+        '};\n'
+        '@log let watched = 1;\n'
+        'const main = (): I32 => {\n'
+        '    watched = 2;\n'
+        '    return watched == 13 ? 0 : 1;\n'
+        '};\n',
+        encoding="utf-8",
+    )
+
+    assert ez.main(["run", "--project", str(project_toml)]) == 0
+
+def test_run_str_compound_add_assign_generates_valid_ir(tmp_path):
+    project_toml = write_project(
+        tmp_path,
+        os_name=ez._native_os(),
+        arch=ez._native_arch(),
+    )
+    (tmp_path / "src" / "index.ez").write_text(
+        'const append = (s: Str): Str => { let a: Str = "hello"; a += s; return a; };\n'
+        'const main = (): I32 => { return 0; };\n',
+        encoding="utf-8",
+    )
+    assert ez.main(["run", "--project", str(project_toml)]) == 0
+
+
+
+def test_run_positional_args_mapped_to_params(tmp_path):
+    project_toml = write_project(
+        tmp_path,
+        os_name=ez._native_os(),
+        arch=ez._native_arch(),
+    )
+    (tmp_path / "src" / "index.ez").write_text(
+        'const add = (a: I32, b: I32): I32 => { return a + b; };\n'
+        'const sum = (a: I32, b: I32, c: I32 = 0): I32 => { return a + b + c; };\n'
+        'const main = (): I32 => {\n'
+        '    const x = add(1, 2);\n'
+        '    const y = add(1, b = 2);\n'
+        '    const z = sum(5, c = 3, b = 2);\n'
+        '    return (x == 3 && y == 3 && z == 10) ? 0 : 1;\n'
+        '};\n',
+        encoding="utf-8",
+    )
+
+    assert ez.main(["run", "--project", str(project_toml)]) == 0
+
+
+def test_run_str_concat_generates_valid_ir(tmp_path):
+    project_toml = write_project(
+        tmp_path,
+        os_name=ez._native_os(),
+        arch=ez._native_arch(),
+    )
+    (tmp_path / "src" / "index.ez").write_text(
+        'const concat = (a: Str, b: Str): Str => { return a + b; };\n'
+        'const main = (): I32 => { return 0; };\n',
+        encoding="utf-8",
+    )
+
+    assert ez.main(["run", "--project", str(project_toml)]) == 0
+
+
 def test_run_executes_top_level_flow_parallel_without_user_main(tmp_path):
     project_toml = write_project(
         tmp_path,
@@ -621,6 +771,25 @@ def test_build_reports_missing_import(tmp_path, capsys):
     assert "import 路径不存在" in err
 
 
+def test_run_import_alias_in_project_source_plan(tmp_path):
+    project_toml = write_project(
+        tmp_path,
+        os_name=ez._native_os(),
+        arch=ez._native_arch(),
+    )
+    (tmp_path / "src" / "math.ez").write_text(
+        'export const add = (a: I32, b: I32): I32 => { return a + b; };\n',
+        encoding="utf-8",
+    )
+    (tmp_path / "src" / "index.ez").write_text(
+        'from "./math.ez" import { add as sum };\n'
+        'const main = (): I32 => { return sum(a = 1, b = 2) == 3 ? 0 : 1; };\n',
+        encoding="utf-8",
+    )
+
+    assert ez.main(["run", "--project", str(project_toml)]) == 0
+
+
 def test_build_uses_extern_search_paths(tmp_path, capsys):
     project_toml = write_project(tmp_path, os_name="linux")
     libs_dir = tmp_path / "libs" / "linux"
@@ -822,6 +991,7 @@ def test_run_links_std_time_date_methods_native_abi(tmp_path):
         '    testReset();\n'
         '    const current = now();\n'
         '    const year = getYear(this = current);\n'
+        '    const method_year = current.getYear();\n'
         '    const month = getMonth(this = current);\n'
         '    const day = getDay(this = current);\n'
         '    const hour = getHour(this = current);\n'
@@ -832,12 +1002,18 @@ def test_run_links_std_time_date_methods_native_abi(tmp_path):
         '    let epoch = Date(timestamp = 0);\n'
         '    const before_epoch = Date(timestamp = -1);\n'
         '    testEqualStr(actual = format(this = epoch, fmt = "YYYY-MM-DD HH:%M:SS"), expected = "1970-01-01 00:00:00", msg = "mixed time format");\n'
+        '    testEqualStr(actual = epoch.format(fmt = "YYYY-MM-DD"), expected = "1970-01-01", msg = "date method format");\n'
         '    testEqualStr(actual = format(this = epoch, fmt = "YYYY-MM-DD HH:mm:SS"), expected = "1970-01-01 00:00:00", msg = "named minute time format");\n'
         '    testEqualStr(actual = format(this = epoch, fmt = "%Y-%m-%d %H:%M:%S"), expected = "1970-01-01 00:00:00", msg = "strftime time format");\n'
         '    add(this = epoch, year = 1, month = 0, day = 0, hour = 0, minute = 0, second = 0);\n'
         '    testEqualStr(actual = format(this = epoch, fmt = "%Y-%m-%d"), expected = "1971-01-01", msg = "date add mutates this");\n'
         '    sub(this = epoch, year = 1, month = 0, day = 0, hour = 0, minute = 0, second = 0);\n'
         '    testEqualStr(actual = format(this = epoch, fmt = "%Y-%m-%d"), expected = "1970-01-01", msg = "date sub mutates this");\n'
+        '    epoch.add(year = 1, month = 0, day = 0, hour = 0, minute = 0, second = 0);\n'
+        '    testEqualStr(actual = epoch.format(fmt = "%Y-%m-%d"), expected = "1971-01-01", msg = "date method add mutates this");\n'
+        '    epoch.sub(year = 1, month = 0, day = 0, hour = 0, minute = 0, second = 0);\n'
+        '    testEqualStr(actual = epoch.format(fmt = "%Y-%m-%d"), expected = "1970-01-01", msg = "date method sub mutates this");\n'
+        '    testEqualI64(actual = method_year, expected = year, msg = "date method getYear");\n'
         '    testEqualI64(actual = getYear(this = before_epoch), expected = 1969, msg = "negative timestamp year");\n'
         '    testEqualStr(actual = format(this = before_epoch, fmt = "%Y-%m-%d %H:%M:%S"), expected = "1969-12-31 23:59:59", msg = "negative timestamp floor seconds");\n'
         '    return testFailed();\n'
@@ -934,6 +1110,49 @@ def test_run_links_std_fmt_basic_native_functions(tmp_path):
     assert ez.main(["run", "--project", str(project_toml)]) == 0
 
 
+def test_run_date_format_method_does_not_conflict_with_std_fmt(tmp_path):
+    project_toml = write_project(
+        tmp_path,
+        os_name=ez._native_os(),
+        arch=ez._native_arch(),
+    )
+    (tmp_path / "src" / "index.ez").write_text(
+        'from "std/fmt" import { format };\n'
+        'from "std/str" import { strEqual };\n'
+        'const main = (): I32 => {\n'
+        '    const d = Date(timestamp = 0);\n'
+        '    const date_text = d.format(fmt = "YYYY");\n'
+        '    const fmt_text = format(template = "hello {}", args = ["ez"]);\n'
+        '    return (strEqual(a = date_text, b = "1970") && strEqual(a = fmt_text, b = "hello ez")) ? 0 : 1;\n'
+        '};\n',
+        encoding="utf-8",
+    )
+
+    assert ez.main(["run", "--project", str(project_toml)]) == 0
+
+
+def test_run_std_time_and_std_fmt_format_can_coexist(tmp_path):
+    project_toml = write_project(
+        tmp_path,
+        os_name=ez._native_os(),
+        arch=ez._native_arch(),
+    )
+    (tmp_path / "src" / "index.ez").write_text(
+        'from "std/time" import { now };\n'
+        'from "std/fmt" import { format };\n'
+        'from "std/str" import { strEqual };\n'
+        'const main = (): I32 => {\n'
+        '    const d = now();\n'
+        '    const date_text = d.format(fmt = "YYYY");\n'
+        '    const fmt_text = format(template = "{}/{}", args = ["a", "b"]);\n'
+        '    return (strEqual(a = date_text, b = "1970") || strEqual(a = fmt_text, b = "a/b")) ? 0 : 1;\n'
+        '};\n',
+        encoding="utf-8",
+    )
+
+    assert ez.main(["run", "--project", str(project_toml)]) == 0
+
+
 def test_run_std_fmt_rejects_invalid_base64(tmp_path):
     project_toml = write_project(
         tmp_path,
@@ -949,6 +1168,31 @@ def test_run_std_fmt_rejects_invalid_base64(tmp_path):
         '    const middle_padding = b64Decode(s = "AA=A");\n'
         '    const invalid_char = b64Decode(s = "!!!!");\n'
         '    return (decoded.ok && decoded.value.size == 5 && !extra_padding.ok && !middle_padding.ok && !invalid_char.ok) ? 0 : 1;\n'
+        '};\n',
+        encoding="utf-8",
+    )
+
+    assert ez.main(["run", "--project", str(project_toml)]) == 0
+
+
+def test_run_builtin_blob_get_and_slice_methods(tmp_path):
+    project_toml = write_project(
+        tmp_path,
+        os_name=ez._native_os(),
+        arch=ez._native_arch(),
+    )
+    (tmp_path / "src" / "index.ez").write_text(
+        'from "std/str" import { strFromBytes, strEqual };\n'
+        'const main = (): I32 => {\n'
+        '    const data = Blob(data = "hello", size = 5);\n'
+        '    const item = data.get(index = 1);\n'
+        '    const missing = data.get(index = 99);\n'
+        '    const part = data.slice(start = 1, len = 3);\n'
+        '    const clipped = data.slice(start = 3, len = 99);\n'
+        '    const empty = data.slice(start = -1, len = 2);\n'
+        '    const part_text = strFromBytes(data = part);\n'
+        '    const clipped_text = strFromBytes(data = clipped);\n'
+        '    return (item == 101 && missing == 0 && part_text.ok && strEqual(a = part_text.value, b = "ell") && clipped_text.ok && strEqual(a = clipped_text.value, b = "lo") && empty.size == 0) ? 0 : 1;\n'
         '};\n',
         encoding="utf-8",
     )
@@ -1989,6 +2233,8 @@ def test_run_links_std_math_basic_native_functions(tmp_path):
         '    const diff = mathSubI64Checked(a = 1, b = 2);\n'
         '    const product = mathMulI64Checked(a = 2, b = 3);\n'
         '    const quotient = mathDivI64Checked(a = 6, b = 3);\n'
+        '    const floor_quotient = mathDivI64Checked(a = -3, b = 2);\n'
+        '    const floor_quotient_neg_rhs = mathDivI64Checked(a = 3, b = -2);\n'
         '    const add_overflow = mathAddI64Checked(a = 9223372036854775807, b = 1);\n'
         '    const mul_overflow = mathMulI64Checked(a = 3037000500, b = 3037000500);\n'
         '    const div_zero = mathDivI64Checked(a = 1, b = 0);\n'
@@ -2025,11 +2271,13 @@ def test_run_links_std_math_basic_native_functions(tmp_path):
         '    testAssert(condition = round_neg == -2.0, msg = "negative round half away from zero");\n'
         '    testAssert(condition = mathIsNaN(value = nanv), msg = "nan");\n'
         '    testAssert(condition = mathIsInf(value = infv), msg = "inf");\n'
-        '    testAssert(condition = sum.ok && diff.ok && product.ok && quotient.ok, msg = "checked ok");\n'
+        '    testAssert(condition = sum.ok && diff.ok && product.ok && quotient.ok && floor_quotient.ok && floor_quotient_neg_rhs.ok, msg = "checked ok");\n'
         '    testEqualI64(actual = sum.value, expected = 3, msg = "checked add");\n'
         '    testEqualI64(actual = diff.value, expected = -1, msg = "checked sub");\n'
         '    testEqualI64(actual = product.value, expected = 6, msg = "checked mul");\n'
         '    testEqualI64(actual = quotient.value, expected = 2, msg = "checked div");\n'
+        '    testEqualI64(actual = floor_quotient.value, expected = -2, msg = "checked floor div");\n'
+        '    testEqualI64(actual = floor_quotient_neg_rhs.value, expected = -2, msg = "checked floor div negative rhs");\n'
         '    testAssert(condition = !add_overflow.ok && !mul_overflow.ok && !div_zero.ok, msg = "checked rejects invalid");\n'
         '    testAssert(condition = narrowed.ok && narrowed_i64.ok && max_i32.ok && min_i32.ok && trunc_i32_hi.ok && trunc_i32_lo.ok && min_i64.ok, msg = "float convert ok flags");\n'
         '    testAssert(condition = !too_wide.ok && !too_low.ok && !too_wide_i64.ok, msg = "float convert rejects out of range");\n'
@@ -4442,6 +4690,25 @@ def test_run_optional_ok_value_and_unwraps(tmp_path):
     assert ez.main(["run", "--project", str(project_toml)]) == 0
 
 
+def test_run_placeholder_none_initializes_optional_values(tmp_path):
+    project_toml = write_project(
+        tmp_path,
+        os_name=ez._native_os(),
+        arch=ez._native_arch(),
+    )
+    (tmp_path / "src" / "index.ez").write_text(
+        'struct Node { value: I32; next: Node?; };\n'
+        'const main = (): I32 => {\n'
+        '    let empty: I32? = ?;\n'
+        '    let node = Node(value = 1, next = ?);\n'
+        '    return (!empty.ok && !node.next.ok) ? 0 : 1;\n'
+        '};\n',
+        encoding="utf-8",
+    )
+
+    assert ez.main(["run", "--project", str(project_toml)]) == 0
+
+
 def test_run_optional_member_access_short_circuits(tmp_path):
     project_toml = write_project(
         tmp_path,
@@ -4550,6 +4817,48 @@ def test_run_union_match_branches_on_tag(tmp_path):
     assert ez.main(["run", "--project", str(project_toml)]) == 0
 
 
+def test_run_match_continues_by_default_and_supports_continue_break(tmp_path):
+    project_toml = write_project(
+        tmp_path,
+        os_name=ez._native_os(),
+        arch=ez._native_arch(),
+    )
+    (tmp_path / "src" / "index.ez").write_text(
+        'const main = (): I32 => {\n'
+        '    let value: I32 = 0;\n'
+        '    match {\n'
+        '        (true) ? { value += 1; },\n'
+        '        (true) ? { value += 10; continue; value += 100; },\n'
+        '        (true) ? { value += 1000; break; },\n'
+        '        (true) ? { value += 10000; }\n'
+        '    };\n'
+        '    return value == 1011 ? 0 : value;\n'
+        '};\n',
+        encoding="utf-8",
+    )
+
+    assert ez.main(["run", "--project", str(project_toml)]) == 0
+
+
+def test_run_if_like_expression_statement_executes_conditionally(tmp_path):
+    project_toml = write_project(
+        tmp_path,
+        os_name=ez._native_os(),
+        arch=ez._native_arch(),
+    )
+    (tmp_path / "src" / "index.ez").write_text(
+        'const main = (): I32 => {\n'
+        '    let value: I32 = 1;\n'
+        '    (false) ? value = 10;\n'
+        '    (true) ? value = value + 2;\n'
+        '    return value == 3 ? 0 : value;\n'
+        '};\n',
+        encoding="utf-8",
+    )
+
+    assert ez.main(["run", "--project", str(project_toml)]) == 0
+
+
 def test_run_generic_function_infers_type_arguments(tmp_path):
     project_toml = write_project(
         tmp_path,
@@ -4563,6 +4872,25 @@ def test_run_generic_function_infers_type_arguments(tmp_path):
         '    const n = identity(value = 42);\n'
         '    const s = identity(value = "ez");\n'
         '    return (n == 42 && strEqual(a = s, b = "ez")) ? 0 : 1;\n'
+        '};\n',
+        encoding="utf-8",
+    )
+
+    assert ez.main(["run", "--project", str(project_toml)]) == 0
+
+
+def test_run_expression_generic_function_infers_type_arguments(tmp_path):
+    project_toml = write_project(
+        tmp_path,
+        os_name=ez._native_os(),
+        arch=ez._native_arch(),
+    )
+    (tmp_path / "src" / "index.ez").write_text(
+        'const identity = <T>(value: T) => value;\n'
+        'const main = (): I32 => {\n'
+        '    const explicit = identity<I32>(42);\n'
+        '    const inferred = identity(7);\n'
+        '    return (explicit == 42 && inferred == 7) ? 0 : 1;\n'
         '};\n',
         encoding="utf-8",
     )
@@ -4694,6 +5022,27 @@ def test_run_index_assignment_and_compound_assignment(tmp_path):
     assert ez.main(["run", "--project", str(project_toml)]) == 0
 
 
+def test_run_loop_in_array_iterates_element_values(tmp_path):
+    project_toml = write_project(
+        tmp_path,
+        os_name=ez._native_os(),
+        arch=ez._native_arch(),
+    )
+    (tmp_path / "src" / "index.ez").write_text(
+        'const main = (): I32 => {\n'
+        '    let total: I32 = 0;\n'
+        '    let nums: I32[] = [1, 2, 3];\n'
+        '    loop item in nums {\n'
+        '        total += item;\n'
+        '    };\n'
+        '    return total == 6 ? 0 : 1;\n'
+        '};\n',
+        encoding="utf-8",
+    )
+
+    assert ez.main(["run", "--project", str(project_toml)]) == 0
+
+
 def test_run_array_length_member_reads_paged_layout(tmp_path):
     project_toml = write_project(
         tmp_path,
@@ -4749,6 +5098,32 @@ def test_run_unsigned_integer_ops(tmp_path):
         '    r %= b;\n'
         '    s >>= shift;\n'
         '    return q == 536870912 && r == 0 && s == 536870912 ? 0 : 1;\n'
+        '};\n',
+        encoding="utf-8",
+    )
+
+    assert ez.main(["run", "--project", str(project_toml)]) == 0
+
+
+def test_run_signed_integer_division_uses_floor_semantics(tmp_path):
+    project_toml = write_project(
+        tmp_path,
+        os_name=ez._native_os(),
+        arch=ez._native_arch(),
+    )
+    (tmp_path / "src" / "index.ez").write_text(
+        'const main = (): I32 => {\n'
+        '    let a: I32 = -3;\n'
+        '    let b: I32 = 2;\n'
+        '    let c: I32 = 3;\n'
+        '    let d: I32 = -2;\n'
+        '    let q1 = a / b;\n'
+        '    let r1 = a % b;\n'
+        '    let q2 = c / d;\n'
+        '    let r2 = c % d;\n'
+        '    a /= b;\n'
+        '    c %= d;\n'
+        '    return (q1 == -2 && r1 == 1 && q2 == -2 && r2 == -1 && a == -2 && c == -1) ? 0 : 1;\n'
         '};\n',
         encoding="utf-8",
     )
@@ -4849,11 +5224,33 @@ def test_run_catch_expression_returns_thrown_error(tmp_path):
         arch=ez._native_arch(),
     )
     (tmp_path / "src" / "index.ez").write_text(
+        'from "std/str" import { strContains, strEqual };\n'
         'const main = (): I32 => {\n'
         '    const err = catch {\n'
         '        throw Error(code = 9, message = "boom");\n'
         '    };\n'
-        '    return err.code == 9 ? 0 : 1;\n'
+        '    const ok = err.code == 9 && strEqual(a = err.message, b = "boom") && err.file != "" && err.line > 0 && err.column > 0 && strContains(s = err.trace, needle = "main@");\n'
+        '    return ok ? 0 : 1;\n'
+        '};\n',
+        encoding="utf-8",
+    )
+
+    assert ez.main(["run", "--project", str(project_toml)]) == 0
+
+
+def test_run_builtin_error_to_string_method(tmp_path):
+    project_toml = write_project(
+        tmp_path,
+        os_name=ez._native_os(),
+        arch=ez._native_arch(),
+    )
+    (tmp_path / "src" / "index.ez").write_text(
+        'from "std/str" import { strContains };\n'
+        'const main = (): I32 => {\n'
+        '    const err = Error(code = 7, message = "boom");\n'
+        '    const text = err.toString();\n'
+        '    const ok = strContains(s = text, needle = "code=7") && strContains(s = text, needle = "message=boom") && strContains(s = text, needle = "trace=main@");\n'
+        '    return ok ? 0 : 1;\n'
         '};\n',
         encoding="utf-8",
     )
@@ -4882,7 +5279,7 @@ def test_run_catch_captures_error_from_called_function(tmp_path):
     assert ez.main(["run", "--project", str(project_toml)]) == 0
 
 
-def test_run_uncaught_throw_exits_nonzero(tmp_path):
+def test_run_uncaught_throw_exits_nonzero(tmp_path, capfd):
     project_toml = write_project(
         tmp_path,
         os_name=ez._native_os(),
@@ -4897,6 +5294,12 @@ def test_run_uncaught_throw_exits_nonzero(tmp_path):
     )
 
     assert ez.main(["run", "--project", str(project_toml)]) == 1
+    captured = capfd.readouterr()
+    output = captured.out + captured.err
+    assert "uncaught EzLang throw" in output
+    assert "code=9" in output
+    assert "message=boom" in output
+    assert "trace=main@" in output
 
 
 def test_run_uncaught_throw_from_called_function_exits_nonzero(tmp_path):
@@ -5014,29 +5417,112 @@ def test_run_ui_native_minimal_handles_work(tmp_path):
         (
             "android",
             'from "std/str" import { strEqual };\n'
-            'from "ez-android-ui" import { createTextView, createButton, setText, getText, addView, getRootView, getChildCount, isMainThread, requestPermission };\n'
+            'from "ez-android-ui" import { Color, createTextView, createButton, createRecyclerView, createHScrollView, createImageButton, createCheckBox, createRadioButton, createSwitch, createProgressBar, createSeekBar, setText, getText, addView, getRootView, getChildCount, setLayoutWidth, setLayoutHeight, getWidth, getHeight, getMeasuredWidth, getMeasuredHeight, setTag, getTag, setHint, setWeight, setAlpha, setBackgroundDrawable, setElevation, setCornerRadius, setContentDesc, setStatusBarColor, showKeyboard, hideKeyboard, isMainThread, requestPermission, requestPermissions };\n'
             'const main = (): I32 => {\n'
             '    const root = getRootView();\n'
             '    const label = createTextView();\n'
             '    const button = createButton();\n'
+            '    const list = createRecyclerView();\n'
             '    setText(node = label, text = "hello");\n'
+            '    setLayoutWidth(node = label, value = 123);\n'
+            '    setLayoutHeight(node = label, value = 45);\n'
+            '    setTag(node = label, key = "role", value = "title");\n'
+            '    setHint(node = label, hint = "hint");\n'
+            '    setWeight(node = label, weight = 1.0);\n'
+            '    setAlpha(node = label, alpha = 0.5);\n'
+            '    setBackgroundDrawable(node = label, resId = 7);\n'
+            '    setElevation(node = label, dp = 2.0);\n'
+            '    setCornerRadius(node = label, dp = 3.0);\n'
+            '    setContentDesc(node = label, desc = "desc");\n'
+            '    setStatusBarColor(color = Color(value = 0));\n'
+            '    showKeyboard(node = label);\n'
+            '    hideKeyboard();\n'
+            '    const perms = requestPermissions(perms = ["android.permission.CAMERA"]);\n'
+            '    addView(parent = root, child = list);\n'
             '    addView(parent = root, child = label);\n'
             '    addView(parent = root, child = button);\n'
-            '    return (root.id != 0 && label.id != 0 && button.id != 0 && getChildCount(parent = root) == 2 && strEqual(a = getText(node = label), b = "hello") && isMainThread() && !requestPermission(perm = "android.permission.CAMERA")) ? 0 : 1;\n'
+            '    addView(parent = root, child = createHScrollView());\n'
+            '    addView(parent = root, child = createImageButton());\n'
+            '    addView(parent = root, child = createCheckBox());\n'
+            '    addView(parent = root, child = createRadioButton());\n'
+            '    addView(parent = root, child = createSwitch());\n'
+            '    addView(parent = root, child = createProgressBar());\n'
+            '    addView(parent = root, child = createSeekBar());\n'
+            '    return (root.id != 0 && label.id != 0 && button.id != 0 && getChildCount(parent = root) == 10 && getWidth(node = label) == 123 && getHeight(node = label) == 45 && getMeasuredWidth(node = label) == 123 && getMeasuredHeight(node = label) == 45 && strEqual(a = getText(node = label), b = "hello") && strEqual(a = getTag(node = label, key = "role")!, b = "title") && perms["android.permission.CAMERA"] == false && isMainThread() && !requestPermission(perm = "android.permission.CAMERA")) ? 0 : 1;\n'
             '};\n',
         ),
         (
             "ios",
             'from "std/str" import { strEqual };\n'
-            'from "ez-ios-ui" import { createLabel, createButton, setText, getText, addSubview, getRootView, getSubviewCount, isMainThread, requestPermission };\n'
+            'from "ez-ios-ui" import { Color, Rect, Insets, createLabel, createButton, createSegmentControl, createStepper, createActivityIndicator, createTableView, createCollectionView, createImageView, setFrame, getFrame, setBounds, getBounds, setText, getText, addSubview, insertSubviewAbove, insertSubviewBelow, bringToFront, sendToBack, getSubviewAt, getRootView, getSubviewCount, setTag_, getTag_, setSwitchOn, getSwitchOn, setSliderValue, getSliderValue, setSliderRange, pinToEdges, centerInParent, setWidth, setHeight, sizeToFit, setSpacing, setAlignment, setDistribution, setAttributedText, setFont, setSystemFont, setTextColor, setTextAlign, setNumberOfLines, setLineBreakMode, setPlaceholder, setKeyboardType, setSecureEntry, setReturnKeyType, setBackgroundColor, setAlpha, setHidden, setUserInteraction, setClipsToBounds, setCornerRadius, setBorderWidth, setBorderColor, setShadow, setAccessLabel, setNeedsLayout, layoutIfNeeded, setImageUrl, setImageName, setSystemImage, setContentMode, setTintColor, setButtonTitle, setButtonImage, setButtonEnabled, setSwitchTintColor, startAnimating, stopAnimating, becomeFirstResponder, resignFirstResponder, isMainThread, requestPermission };\n'
             'const main = (): I32 => {\n'
             '    const root = getRootView();\n'
             '    const label = createLabel();\n'
             '    const button = createButton();\n'
+            '    const table = createTableView();\n'
             '    setText(node = label, text = "hello");\n'
+            '    setFrame(node = label, rect = Rect(x = 1.0, y = 2.0, width = 30.0, height = 40.0));\n'
+            '    setBounds(node = label, rect = Rect(x = 0.0, y = 0.0, width = 10.0, height = 20.0));\n'
+            '    setTag_(node = label, tag = 7);\n'
+            '    setSwitchOn(node = button, on = true, animated = false);\n'
+            '    setSliderValue(node = table, value = 0.75, animated = false);\n'
+            '    setSliderRange(node = table, min = 0.0, max = 1.0);\n'
+            '    pinToEdges(node = label, insets = Insets(top = 1.0, left = 2.0, bottom = 3.0, right = 4.0));\n'
+            '    centerInParent(node = label);\n'
+            '    setWidth(node = label, width = 50.0);\n'
+            '    setHeight(node = label, height = 60.0);\n'
+            '    sizeToFit(node = createLabel());\n'
+            '    setSpacing(node = root, spacing = 2.0);\n'
+            '    setAlignment(node = root, align = 1);\n'
+            '    setDistribution(node = root, dist = 2);\n'
+            '    setAttributedText(node = label, html = "<b>hello</b>");\n'
+            '    setFont(node = label, name = "A", size = 12.0);\n'
+            '    setSystemFont(node = label, size = 13.0, weight = 1.0);\n'
+            '    setTextColor(node = label, color = Color(r = 1.0, g = 1.0, b = 1.0, a = 1.0));\n'
+            '    setTextAlign(node = label, align = 1);\n'
+            '    setNumberOfLines(node = label, n = 2);\n'
+            '    setLineBreakMode(node = label, mode = 1);\n'
+            '    setPlaceholder(node = label, text = "hint");\n'
+            '    setKeyboardType(node = label, type_ = 1);\n'
+            '    setSecureEntry(node = label, secure = true);\n'
+            '    setReturnKeyType(node = label, type_ = 1);\n'
+            '    setBackgroundColor(node = label, color = Color(r = 0.0, g = 0.0, b = 0.0, a = 1.0));\n'
+            '    setAlpha(node = label, alpha = 0.5);\n'
+            '    setHidden(node = label, hidden = false);\n'
+            '    setUserInteraction(node = label, enabled = true);\n'
+            '    setClipsToBounds(node = label, clips = true);\n'
+            '    setCornerRadius(node = label, radius = 3.0);\n'
+            '    setBorderWidth(node = label, width = 1.0);\n'
+            '    setBorderColor(node = label, color = Color(r = 1.0, g = 0.0, b = 0.0, a = 1.0));\n'
+            '    setShadow(node = label, color = Color(r = 0.0, g = 0.0, b = 0.0, a = 1.0), offset = Rect(x = 1.0, y = 1.0, width = 0.0, height = 0.0), radius = 2.0, opacity = 0.3);\n'
+            '    setAccessLabel(node = label, label = "access");\n'
+            '    setNeedsLayout(node = label);\n'
+            '    layoutIfNeeded(node = label);\n'
+            '    setImageUrl(node = label, url = "https://x");\n'
+            '    setImageName(node = label, name = "asset");\n'
+            '    setSystemImage(node = label, sfName = "star");\n'
+            '    setContentMode(node = label, mode = 1);\n'
+            '    setTintColor(node = label, color = Color(r = 0.0, g = 1.0, b = 0.0, a = 1.0));\n'
+            '    setButtonTitle(node = button, title = "ok", state = 0);\n'
+            '    setButtonImage(node = button, name = "ok", state = 0);\n'
+            '    setButtonEnabled(node = button, enabled = true);\n'
+            '    setSwitchTintColor(node = button, color = Color(r = 0.0, g = 1.0, b = 0.0, a = 1.0));\n'
+            '    startAnimating(node = createActivityIndicator());\n'
+            '    stopAnimating(node = createActivityIndicator());\n'
+            '    becomeFirstResponder(node = label);\n'
+            '    resignFirstResponder(node = label);\n'
             '    addSubview(parent = root, child = label);\n'
             '    addSubview(parent = root, child = button);\n'
-            '    return (root.id != 0 && label.id != 0 && button.id != 0 && getSubviewCount(parent = root) == 2 && strEqual(a = getText(node = label), b = "hello") && isMainThread() && !requestPermission(perm = "camera")) ? 0 : 1;\n'
+            '    insertSubviewBelow(parent = root, child = createSegmentControl(segments = ["a", "b"]), ref = label);\n'
+            '    insertSubviewAbove(parent = root, child = createStepper(), ref = button);\n'
+            '    addSubview(parent = root, child = table);\n'
+            '    addSubview(parent = root, child = createCollectionView());\n'
+            '    addSubview(parent = root, child = createImageView());\n'
+            '    bringToFront(node = label);\n'
+            '    sendToBack(node = button);\n'
+            '    const frame = getFrame(node = label);\n'
+            '    const bounds = getBounds(node = label);\n'
+            '    return (root.id != 0 && label.id != 0 && button.id != 0 && getSubviewCount(parent = root) == 7 && getSubviewAt(parent = root, index = 0)!.id == button.id && strEqual(a = getText(node = label), b = "hello") && getTag_(node = label) == 7 && getSwitchOn(node = button) && getSliderValue(node = table) > 0.7 && frame.width >= 5.0 && bounds.width == 10.0 && isMainThread() && !requestPermission(perm = "camera")) ? 0 : 1;\n'
             '};\n',
         ),
     ]
@@ -5473,6 +5959,47 @@ def test_run_dict_index_assignment_updates_and_inserts(tmp_path):
     assert ez.main(["run", "--project", str(project_toml)]) == 0
 
 
+def test_run_shape_and_dynamic_shape_dict_literals(tmp_path):
+    project_toml = write_project(
+        tmp_path,
+        os_name=ez._native_os(),
+        arch=ez._native_arch(),
+    )
+    (tmp_path / "src" / "index.ez").write_text(
+        'from "std/str" import { strEqual };\n'
+        'type FixedShape = { name: Str; side: Str; };\n'
+        'type DynamicShape = { name: Str; [dynamic: Str]: Str; };\n'
+        'const main = (): I32 => {\n'
+        '    let fixed: FixedShape = { side = "10"; name = "Square" };\n'
+        '    let dynamic: DynamicShape = { name = "Square"; side = "10" };\n'
+        '    return (strEqual(a = fixed.name, b = "Square") && strEqual(a = fixed.side, b = "10") && strEqual(a = dynamic["side"], b = "10")) ? 0 : 1;\n'
+        '};\n',
+        encoding="utf-8",
+    )
+
+    assert ez.main(["run", "--project", str(project_toml)]) == 0
+
+
+def test_run_type_shape_spread_flattens_fields(tmp_path):
+    project_toml = write_project(
+        tmp_path,
+        os_name=ez._native_os(),
+        arch=ez._native_arch(),
+    )
+    (tmp_path / "src" / "index.ez").write_text(
+        'from "std/str" import { strEqual };\n'
+        'type Named = { name: Str; };\n'
+        'type UserShape = { ...Named; age: I32; };\n'
+        'const main = (): I32 => {\n'
+        '    let u: UserShape = { age = 42; name = "s" };\n'
+        '    return (strEqual(a = u.name, b = "s") && u.age == 42) ? 0 : 1;\n'
+        '};\n',
+        encoding="utf-8",
+    )
+
+    assert ez.main(["run", "--project", str(project_toml)]) == 0
+
+
 def test_run_dynamic_dict_expression_key_return_keeps_key_value_types(tmp_path):
     project_toml = write_project(
         tmp_path,
@@ -5504,6 +6031,29 @@ def test_run_dict_index_compound_assignment(tmp_path):
         '    let counts = { hits = 2 };\n'
         '    counts["hits"] += 3;\n'
         '    return counts["hits"] == 5 ? 0 : 1;\n'
+        '};\n',
+        encoding="utf-8",
+    )
+
+    assert ez.main(["run", "--project", str(project_toml)]) == 0
+
+
+def test_run_dict_hash_index_handles_delete_and_reinsert(tmp_path):
+    project_toml = write_project(
+        tmp_path,
+        os_name=ez._native_os(),
+        arch=ez._native_arch(),
+    )
+    (tmp_path / "src" / "index.ez").write_text(
+        'from "std/collections" import { dictDelete, dictHas, dictLen };\n'
+        'const main = (): I32 => {\n'
+        '    let values: { [key: I32]: I32 } = { [1] = 10, [2] = 20, [3] = 30, [4] = 40, [5] = 50, [6] = 60, [7] = 70, [8] = 80, [9] = 90 };\n'
+        '    const before = values[9] == 90 && dictHas<I32, I32>(dict = values, key = 2);\n'
+        '    const removed = dictDelete<I32, I32>(dict = values, key = 2);\n'
+        '    values[10] = 100;\n'
+        '    values[9] += 1;\n'
+        '    const after = !dictHas<I32, I32>(dict = values, key = 2) && values[9] == 91 && values[10] == 100;\n'
+        '    return (before && removed && after && dictLen<I32, I32>(dict = values) == 9) ? 0 : 1;\n'
         '};\n',
         encoding="utf-8",
     )
@@ -5625,6 +6175,9 @@ def test_emcc_asyncify_detection_accepts_relative_std_paths():
     assert ez._emcc_needs_asyncify(["packages/std/emcc/fs.js"])
     assert ez._emcc_needs_asyncify(["packages/std/emcc/stream.js"])
     assert ez._emcc_needs_asyncify(["packages/std/emcc/process.js"])
+    assert ez._emcc_needs_asyncify(["packages/std/emcc/compress.js"])
+    assert ez._emcc_needs_asyncify(["packages/std/emcc/net/tcp.js"])
+    assert ez._emcc_needs_asyncify(["packages/std/emcc/net/ws.js"])
     assert not ez._emcc_needs_asyncify(["packages/std/emcc/platform.js"])
 
 
@@ -5715,9 +6268,13 @@ def test_build_android_ui_sdk_emits_host_bridge(tmp_path, capsys):
     assert (bridge / "app" / "src" / "main" / "AndroidManifest.xml").exists()
     assert (bridge / "app" / "src" / "main" / "jniLibs" / "arm64-v8a" / "libdemo.so").exists()
     activity = bridge / "app" / "src" / "main" / "java" / "dev" / "ezlang" / "EzLangActivity.kt"
-    assert 'System.loadLibrary("demo")' in activity.read_text(encoding="utf-8")
+    activity_text = activity.read_text(encoding="utf-8")
+    assert 'System.loadLibrary("demo")' in activity_text
+    assert "ezAndroidSetScreenMetrics(metrics.widthPixels, metrics.heightPixels, metrics.density)" in activity_text
     calls = (clang.parent / "calls.txt").read_text(encoding="utf-8")
     assert "android_jni_entry.c" in calls
+    jni_entry = tmp_path / "dist" / "android" / ".ez" / "android_jni_entry.c"
+    assert "Java_dev_ezlang_EzLangActivity_ezAndroidSetScreenMetrics" in jni_entry.read_text(encoding="utf-8")
 
 
 def test_build_ios_sdk_compiles_c_extern_and_links_artifact(tmp_path, capsys):
@@ -5807,7 +6364,10 @@ def test_build_ios_ui_sdk_emits_host_bridge(tmp_path, capsys):
     assert (bridge / "Package.swift").exists()
     assert (bridge / "Libraries" / "libdemo.dylib").exists()
     view_controller = bridge / "Sources" / "EzLangBridge" / "EzLangViewController.swift"
-    assert "ezlangMain" in view_controller.read_text(encoding="utf-8")
+    view_controller_text = view_controller.read_text(encoding="utf-8")
+    assert "ezlangMain" in view_controller_text
+    assert "ezIosSetScreenMetrics" in view_controller_text
+    assert "Float(bounds.width)" in view_controller_text
 
 
 def test_build_sdk_reports_missing_tool(tmp_path, capsys):

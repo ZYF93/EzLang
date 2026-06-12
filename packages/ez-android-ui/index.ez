@@ -1,5 +1,5 @@
 // ez-android-ui - Android View 绑定包
-// 当前提供可编译链接的 ABI 占位；真实 JNI/View 桥接后续接入。
+// 当前提供可编译链接的原生句柄状态层；真实 JNI/View 桥接由宿主模板接入。
 
 extern "@pkg/ez-android-ui/native/android_ui.c" for linux;
 extern "@pkg/ez-android-ui/native/android_ui.c" for macos;
@@ -27,6 +27,12 @@ export type ClickHandler = () => Void;
 export type TouchHandler = (e: TouchEvent) => Void;
 export type TextChangeHandler = (e: TextChangedEvent) => Void;
 export type CheckChangeHandler = (checked: Bool) => Void;
+export type ScrollHandler = (dx: I32, dy: I32) => Void;
+export type FocusHandler = (focused: Bool) => Void;
+export type AdapterItemCount = () => I32;
+export type AdapterCreateItem = (viewType: I32) => Node;
+export type AdapterBindItem = (item: Node, index: I32) => Void;
+export type AdapterGetItemType = (index: I32) => I32;
 
 export const dp: Str = "dp";
 export const sp: Str = "sp";
@@ -61,10 +67,18 @@ export declare const createView: () => Node;
 export declare const createLinearLayout: (orientation: Str) => Node;
 export declare const createFrameLayout: () => Node;
 export declare const createScrollView: () => Node;
+export declare const createHScrollView: () => Node;
+export declare const createRecyclerView: () => Node;
 export declare const createTextView: () => Node;
 export declare const createEditText: () => Node;
 export declare const createButton: () => Node;
+export declare const createImageButton: () => Node;
+export declare const createCheckBox: () => Node;
+export declare const createRadioButton: () => Node;
+export declare const createSwitch: () => Node;
 export declare const createImageView: () => Node;
+export declare const createProgressBar: () => Node;
+export declare const createSeekBar: () => Node;
 export declare const destroyNode: (node: Node) => Void;
 
 export declare const addView: (parent: Node, child: Node) => Void;
@@ -74,11 +88,13 @@ export declare const removeAllViews: (parent: Node) => Void;
 export declare const getChildAt: (parent: Node, index: I32) => Node?;
 export declare const getChildCount: (parent: Node) => I32;
 export declare const getParent: (node: Node) => Node?;
+export declare const setAdapter: (recycler: Node, itemCount: AdapterItemCount, createItem: AdapterCreateItem, bindItem: AdapterBindItem, getItemType: AdapterGetItemType) => Void;
 
 export declare const setLayoutWidth: (node: Node, value: I32) => Void;
 export declare const setLayoutHeight: (node: Node, value: I32) => Void;
 export declare const setMargin: (node: Node, left: I32, top: I32, right: I32, bottom: I32) => Void;
 export declare const setPadding: (node: Node, left: I32, top: I32, right: I32, bottom: I32) => Void;
+export declare const setWeight: (node: Node, weight: F32) => Void;
 export declare const setGravity: (node: Node, gravity: I32) => Void;
 
 export declare const setText: (node: Node, text: Str) => Void;
@@ -86,13 +102,41 @@ export declare const getText: (node: Node) => Str;
 export declare const setTextSize: (node: Node, sp: F32) => Void;
 export declare const setTextColor: (node: Node, color: Color) => Void;
 export declare const setBackgroundColor: (node: Node, color: Color) => Void;
+export declare const setBackgroundDrawable: (node: Node, resId: I32) => Void;
+export declare const setAlpha: (node: Node, alpha: F32) => Void;
 export declare const setVisibility: (node: Node, v: I32) => Void;
 export declare const setEnabled: (node: Node, enabled: Bool) => Void;
+export declare const setElevation: (node: Node, dp: F32) => Void;
+export declare const setCornerRadius: (node: Node, dp: F32) => Void;
+export declare const setTag: (node: Node, key: Str, value: Str) => Void;
+export declare const getTag: (node: Node, key: Str) => Str?;
+export declare const setContentDesc: (node: Node, desc: Str) => Void;
+export declare const getWidth: (node: Node) => I32;
+export declare const getHeight: (node: Node) => I32;
+export declare const getMeasuredWidth: (node: Node) => I32;
+export declare const getMeasuredHeight: (node: Node) => I32;
+
+export declare const setHint: (node: Node, hint: Str) => Void;
+export declare const setHintColor: (node: Node, color: Color) => Void;
+export declare const setTextStyle: (node: Node, style: I32) => Void;
+export declare const setMaxLines: (node: Node, max: I32) => Void;
+export declare const setInputType: (node: Node, type_: I32) => Void;
+
+export declare const setImageUrl: (node: Node, url: Str) => Void;
+export declare const setImageRes: (node: Node, resId: I32) => Void;
+export declare const setImageBlob: (node: Node, data: Blob) => Void;
+export declare const setScaleType: (node: Node, type_: Str) => Void;
 
 export declare const setOnClick: (node: Node, handler: ClickHandler) => Void;
+export declare const setOnLongClick: (node: Node, handler: ClickHandler) => Void;
 export declare const setOnTouch: (node: Node, handler: TouchHandler) => Void;
 export declare const setOnTextChanged: (node: Node, handler: TextChangeHandler) => Void;
+export declare const setOnCheckedChange: (node: Node, handler: CheckChangeHandler) => Void;
+export declare const setOnScroll: (node: Node, handler: ScrollHandler) => Void;
+export declare const setOnFocus: (node: Node, handler: FocusHandler) => Void;
 export declare const clearOnClick: (node: Node) => Void;
+export declare const clearOnTouch: (node: Node) => Void;
+export declare const clearOnTextChanged: (node: Node) => Void;
 
 export declare const runOnMainThread: (work: () => Void) => Void;
 export declare const postFrame: (work: () => Void) => I64;
@@ -102,9 +146,13 @@ export declare const cancelDelayed: (token: I64) => Void;
 export declare const isMainThread: () => Bool;
 
 export declare const getRootView: () => Node;
+export declare const setStatusBarColor: (color: Color) => Void;
+export declare const showKeyboard: (node: Node) => Void;
+export declare const hideKeyboard: () => Void;
 export declare const getScreenDensity: () => F32;
 export declare const getScreenWidth: () => I32;
 export declare const getScreenHeight: () => I32;
 
 export declare const requestPermission: (perm: Str) => Bool;
+export declare const requestPermissions: (perms: Str[]) => Dict<Str, Bool>;
 export declare const queryPermission: (perm: Str) => Str;

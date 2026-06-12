@@ -1,12 +1,17 @@
 // EzLang std/net/ws 原生封装层
-// 当前实现 ws:// 握手、客户端掩码、分片重组和 ping/pong 控制帧；TLS 与异步挂起后续接入。
+// 当前实现 ws:// / wss:// 握手、客户端掩码、分片重组和 ping/pong 控制帧；TLS 后端不可用时 wss 显式失败。
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+
+#ifndef __has_include
+#define __has_include(x) 0
+#endif
 
 #if defined(_WIN32)
 #include <winsock2.h>
@@ -26,6 +31,13 @@ typedef int ez_socket_t;
 #define ez_close_socket close
 #endif
 
+#if !defined(_WIN32) && !defined(EZ_TARGET_ANDROID) && !defined(EZ_TARGET_IOS) && __has_include(<dlfcn.h>)
+#define EZ_WS_HAS_OPENSSL_TLS 1
+#include <dlfcn.h>
+#else
+#define EZ_WS_HAS_OPENSSL_TLS 0
+#endif
+
 typedef struct { int64_t handle; } WsConn;
 typedef struct { uint8_t *data; int64_t size; } Blob;
 typedef struct { bool ok; WsConn value; } OptWsConn;
@@ -38,7 +50,27 @@ typedef struct {
     char *host_header;
     char *path;
     char port[8];
+    bool tls;
 } EzWsUrl;
+
+#if EZ_WS_HAS_OPENSSL_TLS
+typedef struct ssl_st SSL;
+typedef struct ssl_ctx_st SSL_CTX;
+typedef struct ssl_method_st SSL_METHOD;
+typedef struct X509_VERIFY_PARAM_st X509_VERIFY_PARAM;
+#endif
+
+typedef struct EzWsConnection {
+    ez_socket_t sock;
+#if EZ_WS_HAS_OPENSSL_TLS
+    SSL_CTX *tls_ctx;
+    SSL *tls_ssl;
+#endif
+    bool tls;
+    struct EzWsConnection *next;
+} EzWsConnection;
+
+static EzWsConnection *ez_ws_connections = NULL;
 
 typedef struct {
     bool fin;
@@ -72,9 +104,44 @@ static bool ez_blob_valid(const Blob *data) {
     return data && data->size >= 0 && (data->size == 0 || data->data);
 }
 
-static ez_socket_t ez_socket_from_handle(int64_t handle) {
-    if (handle == 0) return EZ_INVALID_SOCKET;
-    return (ez_socket_t)handle;
+static void ez_ws_register_conn(EzWsConnection *conn) {
+    if (!conn) return;
+    conn->next = ez_ws_connections;
+    ez_ws_connections = conn;
+}
+
+static bool ez_ws_conn_is_registered(EzWsConnection *conn) {
+    for (EzWsConnection *it = ez_ws_connections; it; it = it->next) {
+        if (it == conn) return true;
+    }
+    return false;
+}
+
+static void ez_ws_unregister_conn(EzWsConnection *conn) {
+    EzWsConnection **slot = &ez_ws_connections;
+    while (*slot) {
+        if (*slot == conn) {
+            *slot = conn->next;
+            conn->next = NULL;
+            return;
+        }
+        slot = &(*slot)->next;
+    }
+}
+
+static EzWsConnection *ez_ws_conn_from_handle(int64_t handle, EzWsConnection *fallback) {
+    if (handle == 0) return NULL;
+    EzWsConnection *conn = (EzWsConnection *)(uintptr_t)handle;
+    if (ez_ws_conn_is_registered(conn)) return conn;
+    if (!fallback) return NULL;
+    fallback->sock = (ez_socket_t)handle;
+    fallback->tls = false;
+    fallback->next = NULL;
+#if EZ_WS_HAS_OPENSSL_TLS
+    fallback->tls_ctx = NULL;
+    fallback->tls_ssl = NULL;
+#endif
+    return fallback;
 }
 
 static void ez_ws_url_free(EzWsUrl *url) {
@@ -91,13 +158,22 @@ static char ez_ascii_lower(char ch) {
     return (ch >= 'A' && ch <= 'Z') ? (char)(ch - 'A' + 'a') : ch;
 }
 
-static bool ez_ws_has_scheme(const char *url) {
-    const char *prefix = "ws://";
-    if (!url) return false;
+static bool ez_ascii_starts_with_ci(const char *text, const char *prefix) {
+    if (!text || !prefix) return false;
     for (size_t i = 0; prefix[i] != '\0'; ++i) {
-        if (url[i] == '\0' || ez_ascii_lower(url[i]) != prefix[i]) return false;
+        if (text[i] == '\0' || ez_ascii_lower(text[i]) != prefix[i]) return false;
     }
     return true;
+}
+
+static size_t ez_ws_scheme_len(const char *url, bool *tls) {
+    if (tls) *tls = false;
+    if (ez_ascii_starts_with_ci(url, "ws://")) return strlen("ws://");
+    if (ez_ascii_starts_with_ci(url, "wss://")) {
+        if (tls) *tls = true;
+        return strlen("wss://");
+    }
+    return 0;
 }
 
 static bool ez_ws_url_bytes_valid(const char *start, const char *end) {
@@ -138,10 +214,12 @@ static char *ez_make_ws_host_header(const char *host, const char *port, bool has
 }
 
 static bool ez_parse_ws_url(const char *url, EzWsUrl *out) {
-    size_t prefix_len = strlen("ws://");
     if (!out) return false;
     *out = (EzWsUrl){0};
-    if (!ez_ws_has_scheme(url)) return false;
+    bool tls = false;
+    size_t prefix_len = ez_ws_scheme_len(url, &tls);
+    if (prefix_len == 0) return false;
+    out->tls = tls;
     const char *host_start = url + prefix_len;
     const char *fragment_start = strchr(host_start, '#');
     const char *url_end = fragment_start ? fragment_start : url + strlen(url);
@@ -156,7 +234,7 @@ static bool ez_parse_ws_url(const char *url, EzWsUrl *out) {
 
     bool has_port = false;
     char *host_for_header = NULL;
-    strcpy(out->port, "80");
+    strcpy(out->port, tls ? "443" : "80");
 
     if (*host_start == '[') {
         const char *close = memchr(host_start, ']', (size_t)(authority_end - host_start));
@@ -260,18 +338,287 @@ static bool ez_send_all(ez_socket_t sock, const char *data, size_t len) {
     return true;
 }
 
-static bool ez_send_all_bytes(ez_socket_t sock, const uint8_t *data, size_t len) {
-    return ez_send_all(sock, (const char *)data, len);
+static int ez_recv_some(ez_socket_t sock, void *data, size_t len) {
+#if defined(_WIN32)
+    return recv(sock, (char *)data, (int)len, 0);
+#else
+    ssize_t n = recv(sock, data, len, 0);
+    if (n > INT_MAX) return INT_MAX;
+    return (int)n;
+#endif
 }
 
-static bool ez_recv_exact(ez_socket_t sock, uint8_t *data, size_t len) {
+#if EZ_WS_HAS_OPENSSL_TLS
+typedef int (*EzOpenSslInitSslFn)(uint64_t, const void *);
+typedef const SSL_METHOD *(*EzOpenSslMethodFn)(void);
+typedef SSL_CTX *(*EzOpenSslCtxNewFn)(const SSL_METHOD *);
+typedef void (*EzOpenSslCtxFreeFn)(SSL_CTX *);
+typedef int (*EzOpenSslCtxDefaultPathsFn)(SSL_CTX *);
+typedef void (*EzOpenSslCtxSetVerifyFn)(SSL_CTX *, int, void *);
+typedef SSL *(*EzOpenSslNewFn)(SSL_CTX *);
+typedef void (*EzOpenSslFreeFn)(SSL *);
+typedef int (*EzOpenSslSetFdFn)(SSL *, int);
+typedef long (*EzOpenSslCtrlFn)(SSL *, int, long, void *);
+typedef X509_VERIFY_PARAM *(*EzOpenSslGet0ParamFn)(SSL *);
+typedef int (*EzOpenSslParamSetHostFn)(X509_VERIFY_PARAM *, const char *, size_t);
+typedef int (*EzOpenSslParamSetIpFn)(X509_VERIFY_PARAM *, const char *);
+typedef int (*EzOpenSslConnectFn)(SSL *);
+typedef int (*EzOpenSslReadFn)(SSL *, void *, int);
+typedef int (*EzOpenSslWriteFn)(SSL *, const void *, int);
+typedef int (*EzOpenSslShutdownFn)(SSL *);
+typedef long (*EzOpenSslVerifyResultFn)(const SSL *);
+
+typedef struct {
+    void *ssl_handle;
+    void *crypto_handle;
+    EzOpenSslInitSslFn init_ssl;
+    EzOpenSslMethodFn tls_client_method;
+    EzOpenSslMethodFn sslv23_client_method;
+    EzOpenSslCtxNewFn ctx_new;
+    EzOpenSslCtxFreeFn ctx_free;
+    EzOpenSslCtxDefaultPathsFn ctx_default_paths;
+    EzOpenSslCtxSetVerifyFn ctx_set_verify;
+    EzOpenSslNewFn ssl_new;
+    EzOpenSslFreeFn ssl_free;
+    EzOpenSslSetFdFn ssl_set_fd;
+    EzOpenSslCtrlFn ssl_ctrl;
+    EzOpenSslGet0ParamFn ssl_get0_param;
+    EzOpenSslParamSetHostFn param_set_host;
+    EzOpenSslParamSetIpFn param_set_ip;
+    EzOpenSslConnectFn ssl_connect;
+    EzOpenSslReadFn ssl_read;
+    EzOpenSslWriteFn ssl_write;
+    EzOpenSslShutdownFn ssl_shutdown;
+    EzOpenSslVerifyResultFn ssl_get_verify_result;
+    bool loaded;
+    bool available;
+} EzWsTlsApi;
+
+static EzWsTlsApi ez_ws_tls_api = {0};
+
+static void *ez_ws_dlsym_required(void *handle, const char *name, bool *ok) {
+    void *symbol = dlsym(handle, name);
+    if (!symbol) *ok = false;
+    return symbol;
+}
+
+static void *ez_ws_dlopen_first(const char *const *candidates) {
+    for (size_t i = 0; candidates[i] != NULL; ++i) {
+#if defined(EZ_WS_TEST_NO_OPENSSL_DLOPEN)
+        void *handle = NULL;
+#else
+        void *handle = dlopen(candidates[i], RTLD_LAZY | RTLD_LOCAL);
+#endif
+        if (handle) return handle;
+    }
+    return NULL;
+}
+
+static void ez_ws_tls_reset_failed(EzWsTlsApi *api) {
+    void *ssl_handle = api->ssl_handle;
+    void *crypto_handle = api->crypto_handle;
+    memset(api, 0, sizeof(*api));
+    if (crypto_handle && crypto_handle != ssl_handle) dlclose(crypto_handle);
+    if (ssl_handle) dlclose(ssl_handle);
+    api->loaded = true;
+}
+
+static bool ez_ws_load_tls(EzWsTlsApi *api) {
+    if (api->loaded) return api->available;
+    api->loaded = true;
+
+#if defined(__APPLE__)
+    const char *ssl_candidates[] = {
+        "/opt/homebrew/opt/openssl@3/lib/libssl.3.dylib",
+        "/usr/local/opt/openssl@3/lib/libssl.3.dylib",
+        "/opt/homebrew/lib/libssl.3.dylib",
+        "/usr/local/lib/libssl.3.dylib",
+        "libssl.3.dylib",
+        "libssl.1.1.dylib",
+        "libssl.dylib",
+        NULL,
+    };
+    const char *crypto_candidates[] = {
+        "/opt/homebrew/opt/openssl@3/lib/libcrypto.3.dylib",
+        "/usr/local/opt/openssl@3/lib/libcrypto.3.dylib",
+        "/opt/homebrew/lib/libcrypto.3.dylib",
+        "/usr/local/lib/libcrypto.3.dylib",
+        "libcrypto.3.dylib",
+        "libcrypto.1.1.dylib",
+        "libcrypto.dylib",
+        NULL,
+    };
+#else
+    const char *ssl_candidates[] = {
+        "libssl.so.3",
+        "libssl.so.1.1",
+        "libssl.so",
+        NULL,
+    };
+    const char *crypto_candidates[] = {
+        "libcrypto.so.3",
+        "libcrypto.so.1.1",
+        "libcrypto.so",
+        NULL,
+    };
+#endif
+
+    api->ssl_handle = ez_ws_dlopen_first(ssl_candidates);
+    api->crypto_handle = ez_ws_dlopen_first(crypto_candidates);
+    if (!api->ssl_handle || !api->crypto_handle) {
+        ez_ws_tls_reset_failed(api);
+        return false;
+    }
+
+    bool ok = true;
+    api->init_ssl = (EzOpenSslInitSslFn)dlsym(api->ssl_handle, "OPENSSL_init_ssl");
+    api->tls_client_method = (EzOpenSslMethodFn)dlsym(api->ssl_handle, "TLS_client_method");
+    api->sslv23_client_method = (EzOpenSslMethodFn)dlsym(api->ssl_handle, "SSLv23_client_method");
+    api->ctx_new = (EzOpenSslCtxNewFn)ez_ws_dlsym_required(api->ssl_handle, "SSL_CTX_new", &ok);
+    api->ctx_free = (EzOpenSslCtxFreeFn)ez_ws_dlsym_required(api->ssl_handle, "SSL_CTX_free", &ok);
+    api->ctx_default_paths = (EzOpenSslCtxDefaultPathsFn)ez_ws_dlsym_required(api->ssl_handle, "SSL_CTX_set_default_verify_paths", &ok);
+    api->ctx_set_verify = (EzOpenSslCtxSetVerifyFn)ez_ws_dlsym_required(api->ssl_handle, "SSL_CTX_set_verify", &ok);
+    api->ssl_new = (EzOpenSslNewFn)ez_ws_dlsym_required(api->ssl_handle, "SSL_new", &ok);
+    api->ssl_free = (EzOpenSslFreeFn)ez_ws_dlsym_required(api->ssl_handle, "SSL_free", &ok);
+    api->ssl_set_fd = (EzOpenSslSetFdFn)ez_ws_dlsym_required(api->ssl_handle, "SSL_set_fd", &ok);
+    api->ssl_ctrl = (EzOpenSslCtrlFn)ez_ws_dlsym_required(api->ssl_handle, "SSL_ctrl", &ok);
+    api->ssl_get0_param = (EzOpenSslGet0ParamFn)ez_ws_dlsym_required(api->ssl_handle, "SSL_get0_param", &ok);
+    api->ssl_connect = (EzOpenSslConnectFn)ez_ws_dlsym_required(api->ssl_handle, "SSL_connect", &ok);
+    api->ssl_read = (EzOpenSslReadFn)ez_ws_dlsym_required(api->ssl_handle, "SSL_read", &ok);
+    api->ssl_write = (EzOpenSslWriteFn)ez_ws_dlsym_required(api->ssl_handle, "SSL_write", &ok);
+    api->ssl_shutdown = (EzOpenSslShutdownFn)ez_ws_dlsym_required(api->ssl_handle, "SSL_shutdown", &ok);
+    api->ssl_get_verify_result = (EzOpenSslVerifyResultFn)ez_ws_dlsym_required(api->ssl_handle, "SSL_get_verify_result", &ok);
+    api->param_set_host = (EzOpenSslParamSetHostFn)ez_ws_dlsym_required(api->crypto_handle, "X509_VERIFY_PARAM_set1_host", &ok);
+    api->param_set_ip = (EzOpenSslParamSetIpFn)ez_ws_dlsym_required(api->crypto_handle, "X509_VERIFY_PARAM_set1_ip_asc", &ok);
+    if ((!api->tls_client_method && !api->sslv23_client_method) || !ok) {
+        ez_ws_tls_reset_failed(api);
+        return false;
+    }
+    api->available = true;
+    return true;
+}
+
+static bool ez_ws_tls_host_is_ip_literal(const char *host) {
+    if (!host || !host[0]) return false;
+    if (strchr(host, ':')) return true;
+    bool saw_dot = false;
+    for (const char *p = host; *p; ++p) {
+        if (*p == '.') {
+            saw_dot = true;
+            continue;
+        }
+        if (*p < '0' || *p > '9') return false;
+    }
+    return saw_dot;
+}
+
+static bool ez_ws_tls_configure_verify(EzWsTlsApi *api, SSL *ssl, const char *host) {
+    if (!api || !ssl || !host || !host[0]) return false;
+    X509_VERIFY_PARAM *param = api->ssl_get0_param(ssl);
+    if (!param) return false;
+    if (ez_ws_tls_host_is_ip_literal(host)) return api->param_set_ip(param, host) == 1;
+    return api->param_set_host(param, host, 0) == 1;
+}
+
+static bool ez_ws_tls_start(EzWsConnection *conn, const char *host) {
+    EzWsTlsApi *api = &ez_ws_tls_api;
+    if (!conn || conn->sock == EZ_INVALID_SOCKET || !ez_ws_load_tls(api)) return false;
+    if (api->init_ssl) api->init_ssl(0, NULL);
+    const SSL_METHOD *method = api->tls_client_method ? api->tls_client_method() : api->sslv23_client_method();
+    if (!method) return false;
+    SSL_CTX *ctx = api->ctx_new(method);
+    if (!ctx) return false;
+
+    const int ssl_verify_peer = 1;
+    const int ssl_ctrl_set_tlsext_hostname = 55;
+    const long tlsext_nametype_host_name = 0;
+    SSL *ssl = NULL;
+    bool ok = api->ctx_default_paths(ctx) == 1;
+    if (ok) api->ctx_set_verify(ctx, ssl_verify_peer, NULL);
+    if (ok) {
+        ssl = api->ssl_new(ctx);
+        ok = ssl != NULL;
+    }
+    if (ok && !ez_ws_tls_configure_verify(api, ssl, host)) ok = false;
+    if (ok && !ez_ws_tls_host_is_ip_literal(host)) {
+        ok = api->ssl_ctrl(ssl, ssl_ctrl_set_tlsext_hostname, tlsext_nametype_host_name, (void *)host) > 0;
+    }
+    if (ok) ok = api->ssl_set_fd(ssl, (int)conn->sock) == 1;
+    if (ok) ok = api->ssl_connect(ssl) == 1;
+    if (ok) ok = api->ssl_get_verify_result(ssl) == 0;
+    if (!ok) {
+        if (ssl) api->ssl_free(ssl);
+        api->ctx_free(ctx);
+        return false;
+    }
+    conn->tls_ctx = ctx;
+    conn->tls_ssl = ssl;
+    conn->tls = true;
+    return true;
+}
+#endif
+
+static void ez_ws_conn_close(EzWsConnection *conn) {
+    if (!conn) return;
+#if EZ_WS_HAS_OPENSSL_TLS
+    if (conn->tls_ssl) {
+        EzWsTlsApi *api = &ez_ws_tls_api;
+        if (api->ssl_shutdown) api->ssl_shutdown(conn->tls_ssl);
+        if (api->ssl_free) api->ssl_free(conn->tls_ssl);
+        conn->tls_ssl = NULL;
+    }
+    if (conn->tls_ctx) {
+        EzWsTlsApi *api = &ez_ws_tls_api;
+        if (api->ctx_free) api->ctx_free(conn->tls_ctx);
+        conn->tls_ctx = NULL;
+    }
+#endif
+    if (conn->sock != EZ_INVALID_SOCKET) {
+        ez_close_socket(conn->sock);
+        conn->sock = EZ_INVALID_SOCKET;
+    }
+    conn->tls = false;
+}
+
+static bool ez_ws_conn_send_all(EzWsConnection *conn, const char *data, size_t len) {
+    if (!conn || conn->sock == EZ_INVALID_SOCKET) return false;
+#if EZ_WS_HAS_OPENSSL_TLS
+    if (conn->tls) {
+        EzWsTlsApi *api = &ez_ws_tls_api;
+        size_t sent = 0;
+        while (sent < len) {
+            size_t remaining = len - sent;
+            int chunk = remaining > (size_t)INT_MAX ? INT_MAX : (int)remaining;
+            int n = api->ssl_write(conn->tls_ssl, data + sent, chunk);
+            if (n <= 0) return false;
+            sent += (size_t)n;
+        }
+        return true;
+    }
+#endif
+    return ez_send_all(conn->sock, data, len);
+}
+
+static int ez_ws_conn_recv(EzWsConnection *conn, void *data, size_t len) {
+    if (!conn || conn->sock == EZ_INVALID_SOCKET || !data || len == 0) return -1;
+#if EZ_WS_HAS_OPENSSL_TLS
+    if (conn->tls) {
+        EzWsTlsApi *api = &ez_ws_tls_api;
+        int chunk = len > (size_t)INT_MAX ? INT_MAX : (int)len;
+        return api->ssl_read(conn->tls_ssl, data, chunk);
+    }
+#endif
+    return ez_recv_some(conn->sock, data, len);
+}
+
+static bool ez_send_all_bytes(EzWsConnection *conn, const uint8_t *data, size_t len) {
+    return ez_ws_conn_send_all(conn, (const char *)data, len);
+}
+
+static bool ez_recv_exact(EzWsConnection *conn, uint8_t *data, size_t len) {
     size_t got = 0;
     while (got < len) {
-#if defined(_WIN32)
-        int n = recv(sock, (char *)data + got, (int)(len - got), 0);
-#else
-        ssize_t n = recv(sock, data + got, len - got, 0);
-#endif
+        int n = ez_ws_conn_recv(conn, data + got, len - got);
         if (n <= 0) return false;
         got += (size_t)n;
     }
@@ -495,17 +842,13 @@ static bool ez_ws_find_header_end(const char *data, size_t size) {
     return false;
 }
 
-static char *ez_ws_read_handshake_response(ez_socket_t sock) {
+static char *ez_ws_read_handshake_response(EzWsConnection *conn) {
     size_t len = 0;
     size_t cap = 0;
     char *buffer = NULL;
     char chunk[1024];
     while (len <= 64 * 1024) {
-#if defined(_WIN32)
-        int n = recv(sock, chunk, (int)sizeof(chunk), 0);
-#else
-        ssize_t n = recv(sock, chunk, sizeof(chunk), 0);
-#endif
+        int n = ez_ws_conn_recv(conn, chunk, sizeof(chunk));
         if (n <= 0) {
             free(buffer);
             return NULL;
@@ -591,10 +934,10 @@ static bool ez_ws_status_is_101(const char *response) {
     return space[1] == '1' && space[2] == '0' && space[3] == '1' && (space + 4 == line_end || space[4] == ' ' || space[4] == '\t');
 }
 
-static bool ez_ws_handshake_response_valid(ez_socket_t sock, const char *key) {
+static bool ez_ws_handshake_response_valid(EzWsConnection *conn, const char *key) {
     char expected_accept[29];
     if (!ez_ws_expected_accept(key, expected_accept)) return false;
-    char *response = ez_ws_read_handshake_response(sock);
+    char *response = ez_ws_read_handshake_response(conn);
     if (!response) return false;
     bool ok = ez_ws_status_is_101(response) &&
               ez_ws_header_matches(response, "Upgrade", "websocket", true) &&
@@ -604,7 +947,7 @@ static bool ez_ws_handshake_response_valid(ez_socket_t sock, const char *key) {
     return ok;
 }
 
-static bool ez_ws_send_frame(ez_socket_t sock, uint8_t opcode, const uint8_t *payload, uint64_t size, bool mask_payload) {
+static bool ez_ws_send_frame(EzWsConnection *conn, uint8_t opcode, const uint8_t *payload, uint64_t size, bool mask_payload) {
     uint8_t header[14];
     size_t header_len = 0;
     header[header_len++] = (uint8_t)(0x80 | (opcode & 0x0F));
@@ -628,23 +971,23 @@ static bool ez_ws_send_frame(ez_socket_t sock, uint8_t opcode, const uint8_t *pa
         memcpy(header + header_len, mask, sizeof(mask));
         header_len += sizeof(mask);
     }
-    if (!ez_send_all_bytes(sock, header, header_len)) return false;
+    if (!ez_send_all_bytes(conn, header, header_len)) return false;
     if (size == 0) return true;
     if (!payload) return false;
-    if (!mask_payload) return ez_send_all_bytes(sock, payload, (size_t)size);
+    if (!mask_payload) return ez_send_all_bytes(conn, payload, (size_t)size);
 
     uint8_t stack_buf[4096];
     uint8_t *buf = size <= sizeof(stack_buf) ? stack_buf : (uint8_t *)malloc((size_t)size);
     if (!buf) return false;
     for (uint64_t i = 0; i < size; ++i) buf[i] = payload[i] ^ mask[i % 4];
-    bool ok = ez_send_all_bytes(sock, buf, (size_t)size);
+    bool ok = ez_send_all_bytes(conn, buf, (size_t)size);
     if (buf != stack_buf) free(buf);
     return ok;
 }
 
-static bool ez_ws_read_frame_header(ez_socket_t sock, EzWsFrameHeader *out) {
+static bool ez_ws_read_frame_header(EzWsConnection *conn, EzWsFrameHeader *out) {
     uint8_t header[2];
-    if (!out || !ez_recv_exact(sock, header, sizeof(header))) return false;
+    if (!out || !ez_recv_exact(conn, header, sizeof(header))) return false;
     memset(out, 0, sizeof(*out));
     out->fin = (header[0] & 0x80) != 0;
     out->opcode = header[0] & 0x0F;
@@ -652,36 +995,36 @@ static bool ez_ws_read_frame_header(ez_socket_t sock, EzWsFrameHeader *out) {
     out->length = header[1] & 0x7F;
     if (out->length == 126) {
         uint8_t ext[2];
-        if (!ez_recv_exact(sock, ext, sizeof(ext))) return false;
+        if (!ez_recv_exact(conn, ext, sizeof(ext))) return false;
         out->length = ((uint64_t)ext[0] << 8) | ext[1];
     } else if (out->length == 127) {
         uint8_t ext[8];
-        if (!ez_recv_exact(sock, ext, sizeof(ext))) return false;
+        if (!ez_recv_exact(conn, ext, sizeof(ext))) return false;
         out->length = 0;
         for (int i = 0; i < 8; ++i) out->length = (out->length << 8) | ext[i];
     }
-    if (out->masked && !ez_recv_exact(sock, out->mask, sizeof(out->mask))) return false;
+    if (out->masked && !ez_recv_exact(conn, out->mask, sizeof(out->mask))) return false;
     return true;
 }
 
-static bool ez_ws_read_payload(ez_socket_t sock, const EzWsFrameHeader *header, uint8_t *data) {
+static bool ez_ws_read_payload(EzWsConnection *conn, const EzWsFrameHeader *header, uint8_t *data) {
     if (!header) return false;
     if (header->length == 0) return true;
-    if (!data || !ez_recv_exact(sock, data, (size_t)header->length)) return false;
+    if (!data || !ez_recv_exact(conn, data, (size_t)header->length)) return false;
     if (header->masked) {
         for (uint64_t i = 0; i < header->length; ++i) data[i] ^= header->mask[i % 4];
     }
     return true;
 }
 
-static bool ez_ws_discard_payload(ez_socket_t sock, const EzWsFrameHeader *header) {
+static bool ez_ws_discard_payload(EzWsConnection *conn, const EzWsFrameHeader *header) {
     if (!header || header->length > EZ_WS_MAX_MESSAGE) return false;
     uint8_t stack_buf[512];
     uint64_t remaining = header->length;
     uint64_t offset = 0;
     while (remaining > 0) {
         size_t chunk = remaining > sizeof(stack_buf) ? sizeof(stack_buf) : (size_t)remaining;
-        if (!ez_recv_exact(sock, stack_buf, chunk)) return false;
+        if (!ez_recv_exact(conn, stack_buf, chunk)) return false;
         if (header->masked) {
             for (size_t i = 0; i < chunk; ++i) stack_buf[i] ^= header->mask[(offset + i) % 4];
         }
@@ -703,12 +1046,12 @@ static bool ez_ws_append_message(uint8_t **data, uint64_t *size, const uint8_t *
     return true;
 }
 
-static bool ez_ws_handle_control_frame(ez_socket_t sock, const EzWsFrameHeader *header) {
+static bool ez_ws_handle_control_frame(EzWsConnection *conn, const EzWsFrameHeader *header) {
     if (!header || !header->fin || header->length > 125) return false;
     uint8_t payload[125];
-    if (!ez_ws_read_payload(sock, header, payload)) return false;
+    if (!ez_ws_read_payload(conn, header, payload)) return false;
     if (header->opcode == 0x9) {
-        return ez_ws_send_frame(sock, 0xA, payload, header->length, true);
+        return ez_ws_send_frame(conn, 0xA, payload, header->length, true);
     }
     if (header->opcode == 0xA) return true;
     return false;
@@ -717,15 +1060,38 @@ static bool ez_ws_handle_control_frame(ez_socket_t sock, const EzWsFrameHeader *
 OptWsConn wsConnect(const char *url) {
     EzWsUrl parts = {0};
     if (!ez_parse_ws_url(url, &parts)) return ez_ws_none();
-    ez_socket_t sock = ez_connect_socket(parts.host, parts.port);
-    if (sock == EZ_INVALID_SOCKET) {
+    EzWsConnection *conn = (EzWsConnection *)calloc(1, sizeof(EzWsConnection));
+    if (!conn) {
+        ez_ws_url_free(&parts);
+        return ez_ws_none();
+    }
+    conn->sock = ez_connect_socket(parts.host, parts.port);
+    if (conn->sock == EZ_INVALID_SOCKET) {
+        free(conn);
         ez_ws_url_free(&parts);
         return ez_ws_none();
     }
 
+    if (parts.tls) {
+#if EZ_WS_HAS_OPENSSL_TLS
+        if (!ez_ws_tls_start(conn, parts.host)) {
+            ez_ws_conn_close(conn);
+            free(conn);
+            ez_ws_url_free(&parts);
+            return ez_ws_none();
+        }
+#else
+        ez_ws_conn_close(conn);
+        free(conn);
+        ez_ws_url_free(&parts);
+        return ez_ws_none();
+#endif
+    }
+
     char key[25];
     if (!ez_ws_generate_key(key)) {
-        ez_close_socket(sock);
+        ez_ws_conn_close(conn);
+        free(conn);
         ez_ws_url_free(&parts);
         return ez_ws_none();
     }
@@ -739,13 +1105,15 @@ OptWsConn wsConnect(const char *url) {
         "Sec-WebSocket-Version: 13\r\n\r\n",
         parts.path, parts.host_header, key);
     if (req_len < 0) {
-        ez_close_socket(sock);
+        ez_ws_conn_close(conn);
+        free(conn);
         ez_ws_url_free(&parts);
         return ez_ws_none();
     }
     char *request = (char *)malloc((size_t)req_len + 1);
     if (!request) {
-        ez_close_socket(sock);
+        ez_ws_conn_close(conn);
+        free(conn);
         ez_ws_url_free(&parts);
         return ez_ws_none();
     }
@@ -759,28 +1127,32 @@ OptWsConn wsConnect(const char *url) {
         parts.path, parts.host_header, key);
     ez_ws_url_free(&parts);
 
-    bool ok = ez_send_all(sock, request, (size_t)req_len) && ez_ws_handshake_response_valid(sock, key);
+    bool ok = ez_ws_conn_send_all(conn, request, (size_t)req_len) && ez_ws_handshake_response_valid(conn, key);
     free(request);
     if (!ok) {
-        ez_close_socket(sock);
+        ez_ws_conn_close(conn);
+        free(conn);
         return ez_ws_none();
     }
-    return (OptWsConn){true, {(int64_t)sock}};
+    ez_ws_register_conn(conn);
+    return (OptWsConn){true, {(int64_t)(uintptr_t)conn}};
 }
 
 int64_t wsSend(const WsConn *conn, const Blob *data) {
     if (!conn || !ez_blob_valid(data) || !ez_net_init()) return -1;
-    ez_socket_t sock = ez_socket_from_handle(conn->handle);
-    if (sock == EZ_INVALID_SOCKET) return -1;
+    EzWsConnection fallback = {0};
+    EzWsConnection *ws = ez_ws_conn_from_handle(conn->handle, &fallback);
+    if (!ws || ws->sock == EZ_INVALID_SOCKET) return -1;
     uint64_t size = (uint64_t)data->size;
     if (size > EZ_WS_MAX_MESSAGE) return -1;
-    return ez_ws_send_frame(sock, 0x2, data->data, size, true) ? (int64_t)size : -1;
+    return ez_ws_send_frame(ws, 0x2, data->data, size, true) ? (int64_t)size : -1;
 }
 
 OptBlob wsRecv(const WsConn *conn, int64_t maxBytes) {
     if (!conn || maxBytes < 0 || !ez_net_init()) return ez_ws_none_blob();
-    ez_socket_t sock = ez_socket_from_handle(conn->handle);
-    if (sock == EZ_INVALID_SOCKET) return ez_ws_none_blob();
+    EzWsConnection fallback = {0};
+    EzWsConnection *ws = ez_ws_conn_from_handle(conn->handle, &fallback);
+    if (!ws || ws->sock == EZ_INVALID_SOCKET) return ez_ws_none_blob();
     if ((uint64_t)maxBytes > EZ_WS_MAX_MESSAGE) maxBytes = EZ_WS_MAX_MESSAGE;
 
     uint8_t *message = NULL;
@@ -788,42 +1160,42 @@ OptBlob wsRecv(const WsConn *conn, int64_t maxBytes) {
     bool receiving_message = false;
     for (;;) {
         EzWsFrameHeader header;
-        if (!ez_ws_read_frame_header(sock, &header)) {
+        if (!ez_ws_read_frame_header(ws, &header)) {
             free(message);
             return ez_ws_none_blob();
         }
 
         if (header.opcode == 0x8) {
-            ez_ws_discard_payload(sock, &header);
+            ez_ws_discard_payload(ws, &header);
             free(message);
             return ez_ws_empty_blob();
         }
         if (header.opcode == 0x9 || header.opcode == 0xA) {
-            if (!ez_ws_handle_control_frame(sock, &header)) {
+            if (!ez_ws_handle_control_frame(ws, &header)) {
                 free(message);
                 return ez_ws_none_blob();
             }
             continue;
         }
         if (header.opcode != 0x0 && header.opcode != 0x1 && header.opcode != 0x2) {
-            if (!ez_ws_discard_payload(sock, &header)) {
+            if (!ez_ws_discard_payload(ws, &header)) {
                 free(message);
                 return ez_ws_none_blob();
             }
             continue;
         }
         if (header.opcode == 0x0 && !receiving_message) {
-            if (!ez_ws_discard_payload(sock, &header)) return ez_ws_none_blob();
+            if (!ez_ws_discard_payload(ws, &header)) return ez_ws_none_blob();
             continue;
         }
         if ((header.opcode == 0x1 || header.opcode == 0x2) && receiving_message) {
             free(message);
-            if (!ez_ws_discard_payload(sock, &header)) return ez_ws_none_blob();
+            if (!ez_ws_discard_payload(ws, &header)) return ez_ws_none_blob();
             return ez_ws_none_blob();
         }
         if (header.length > EZ_WS_MAX_MESSAGE || message_size > EZ_WS_MAX_MESSAGE - header.length || message_size + header.length > (uint64_t)maxBytes) {
             free(message);
-            if (!ez_ws_discard_payload(sock, &header)) return ez_ws_none_blob();
+            if (!ez_ws_discard_payload(ws, &header)) return ez_ws_none_blob();
             return ez_ws_none_blob();
         }
 
@@ -835,7 +1207,7 @@ OptBlob wsRecv(const WsConn *conn, int64_t maxBytes) {
                 return ez_ws_none_blob();
             }
         }
-        if (!ez_ws_read_payload(sock, &header, chunk)) {
+        if (!ez_ws_read_payload(ws, &header, chunk)) {
             free(chunk);
             free(message);
             return ez_ws_none_blob();
@@ -860,8 +1232,13 @@ OptBlob wsRecv(const WsConn *conn, int64_t maxBytes) {
 
 bool wsClose(const WsConn *conn) {
     if (!conn) return false;
-    ez_socket_t sock = ez_socket_from_handle(conn->handle);
-    if (sock == EZ_INVALID_SOCKET) return false;
-    ez_ws_send_frame(sock, 0x8, NULL, 0, true);
-    return ez_close_socket(sock) == 0;
+    EzWsConnection fallback = {0};
+    EzWsConnection *ws = ez_ws_conn_from_handle(conn->handle, &fallback);
+    if (!ws || ws->sock == EZ_INVALID_SOCKET) return false;
+    ez_ws_send_frame(ws, 0x8, NULL, 0, true);
+    if (ws == &fallback) return ez_close_socket(ws->sock) == 0;
+    ez_ws_unregister_conn(ws);
+    ez_ws_conn_close(ws);
+    free(ws);
+    return true;
 }

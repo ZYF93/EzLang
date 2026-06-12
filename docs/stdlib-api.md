@@ -75,7 +75,7 @@ API：
 - `error(msg: Str) -> Void`
 - `readLine() -> Str?`
 
-原生桌面目标从 stdin 同步读取一行；Android/iOS 返回空可选值。emcc 在 Node 风格运行时通过 Asyncify 异步读取 fd 0，缺少 Asyncify 时回退同步读取；浏览器/Worker 无 stdin 时返回空可选值。
+原生目标从 stdin 同步读取一行；Android/iOS 若宿主未提供 stdin 或已到 EOF 则返回空可选值。emcc 在 Node 风格运行时通过 Asyncify 异步读取 fd 0，缺少 Asyncify 时回退同步读取；浏览器/Worker 无 stdin 时返回空可选值。
 
 `print` 不追加换行，`println` 追加换行；emcc Node 风格运行时优先写入 `process.stdout.write`，无 stdout 时会暂存连续 `print` 内容并在下一次 `println` 统一输出。
 
@@ -200,7 +200,7 @@ API：
 - Linux 原生目标会额外链接系统数学库 `libm`。
 - WebAssembly 目标使用 JavaScript `Math` 与 `BigInt` 封装。
 - `mathRound` 的 `.5` 按远离 0 方向取整，匹配 C `round` 语义。
-- checked 运算在溢出、除零或非法转换时返回空可选值。
+- checked 运算在溢出、除零或非法转换时返回空可选值；`mathDivI64Checked` 与语言整数 `/` 一样向下取整。
 - `mathF64ToI32` / `mathF64ToI64` 只接受有限数，且按 C/JS 规则截断后的整数必须位于目标整数范围内。
 
 ## std/random
@@ -288,8 +288,8 @@ API：
 
 - `std/process` 只用于外部程序调用，不暴露线程、线程池、互斥锁、条件变量等底层并发接口。
 - `Command.stdin` 必须是合法 `Blob`；非法 `Blob` 输入会让 `processExec` / `processSpawn` 返回空可选值。
-- Linux/macOS/Windows native 目标实现子进程调用；emcc 的 Node 风格运行时在 Asyncify 可用时使用 `child_process.spawn` 挂起等待，缺少 Asyncify 时回退 `child_process.spawnSync`；Android、iOS 与浏览器 WebAssembly 当前返回空可选值或 `false`。
-- `processExec` 会写入 `stdin` 并捕获 `stdout`/`stderr`；`processSpawn` 默认保留旧语义，由后续 `processWait` 返回捕获的 `stdout`/`stderr`。调用 `processStdin`、`processStdout` 或 `processStderr` 会把对应管道转交给 `Stream`，转交后 `processWait` 不再自动写该 stdin 或捕获该 stdout/stderr；对应结果 Blob 为空。`Process.handle` 是标准库内部不透明句柄。emcc 的 `processSpawn` 保存已完成结果，`processStdout`/`processStderr` 可把已完成输出转成可读流，`processStdin` 返回空可选值。
+- Linux/macOS/Windows/Android native 目标实现子进程调用；emcc 的 Node 风格运行时在 Asyncify 可用时使用 `child_process.spawn` 保留活子进程和管道，缺少 Asyncify 时回退 `child_process.spawnSync` 并保存已完成结果；iOS 与浏览器 WebAssembly 当前返回空可选值或 `false`。
+- `processExec` 会写入 `stdin` 并捕获 `stdout`/`stderr`；`processSpawn` 默认保留旧语义，由后续 `processWait` 返回捕获的 `stdout`/`stderr`。调用 `processStdin`、`processStdout` 或 `processStderr` 会把对应管道转交给 `Stream`，转交后 `processWait` 不再自动写该 stdin 或捕获该 stdout/stderr；对应结果 Blob 为空。`Process.handle` 是标准库内部不透明句柄。emcc 缺少 Asyncify 时的同步 fallback 仍只能把已完成 stdout/stderr 转成可读流，stdin 返回空可选值。
 - `Command.env` 使用 `KEY=VALUE` 字符串数组表示环境覆盖；`ProcessResult.ok` 表示退出码是否为 `0`。
 - `flow` 内的 emcc 进程入口会通过 Asyncify 挂起后恢复；native 当前仍使用阻塞进程等待 syscall。
 
@@ -337,7 +337,7 @@ API：
 
 平台说明：
 
-- `debugStack` 为尽力捕获，不支持的平台返回空可选值。
+- `debugStack` 为尽力捕获；桌面平台优先返回符号信息，Android/iOS 使用 `_Unwind_Backtrace` 返回地址帧，不支持的平台返回空可选值。
 - `debugCrash` 和失败的 `debugAssert` 会终止当前程序或 WebAssembly 模块执行。
 
 ## std/log
@@ -412,6 +412,7 @@ API：
 - `RegexMatch.start/end` 使用 UTF-8 字节偏移；`regexReplace` 的 replacement 按字面字符串处理。
 - `regexMultiline` 让 `^`/`$` 匹配每行的开始/结束；未设置时只匹配整个输入的开始/结束。`.` 默认不匹配换行符。
 - Windows 内置 fallback 支持字面量、`.`、`^`/`$`、分组、`|`、字符类/范围、常用 POSIX 字符类、`?`/`*`/`+` 量词、捕获组、全局查找/替换和分割。
+- 为避免高危正则造成灾难性回溯，`regexCompile` 会拒绝超过 4096 字节的模式、超过 64 个捕获组、上界超过 1024 的区间重复、嵌套可变重复以及对包含分支的分组再次做可变重复。
 - 当前不是完整 PCRE 实现，复杂语法是否可用取决于底层引擎。
 
 ## std/crypto
@@ -445,7 +446,7 @@ API：
 平台说明：
 
 - native 目标使用系统 zlib；对应工具链需要提供 zlib 开发库。
-- emcc 同步 ABI 下优先使用 Node `zlib`；浏览器同步环境当前没有同步压缩 API，一次性 API 返回空可选值，流式 API 返回 `-1`。
+- emcc 目标优先使用 Node `zlib`；浏览器/Worker 环境在 Asyncify 可用时通过 `CompressionStream` / `DecompressionStream` 支持 gzip、zlib 和 raw deflate，一次性 API 与流式 API 都会挂起后恢复；缺少对应 Web API 或 Asyncify 时返回空可选值或 `-1`。
 - 一次性 API 处理完整 `Blob`；`*Stream` API 从 `src` 当前游标读到 EOF，压缩或解压后写入 `dst`，返回写入字节数，失败返回 `-1`。
 
 ## std/time
@@ -491,24 +492,35 @@ API：
 - `RouteHandler`
 - `HttpServer`
 
-原生桌面平台支持明文 `http://` 客户端请求、合法端口、userinfo 剥离、IPv6 字面量、基础请求/响应头和 `Transfer-Encoding: chunked` 响应体解码，也支持基础阻塞式 HTTP 服务端：`createServer` 创建句柄，`HttpServer.on` 注册精确路径路由，`start` 监听并处理连接，`stop` 关闭服务端。emcc 在浏览器/Worker 环境优先使用 `fetch` + Asyncify 挂起客户端请求，无 Asyncify 时保留同步 `XMLHttpRequest` fallback；服务端仍返回空句柄。`HttpResponse.text()` 仅在响应体是不含空字节的合法 UTF-8 时返回文本，否则返回空字符串。HTTPS、Android/iOS、无 `fetch` 且无同步 XHR 的 emcc 环境返回空可选值。
+原生平台支持 `http://` 客户端请求、合法端口、userinfo 剥离、IPv6 字面量、基础请求/响应头和 `Transfer-Encoding: chunked` 响应体解码；Linux/macOS 在可动态加载 OpenSSL TLS 后端、系统 CA 可用且证书链与主机名校验通过时支持 `https://`，否则返回空可选值。原生平台也支持基础 HTTP 服务端：`createServer` 创建句柄，`HttpServer.on` 注册精确路径路由，`start` 监听并将已接受连接交给 worker 处理，`stop` 关闭服务端。emcc 在浏览器/Worker 环境优先使用 `fetch` + Asyncify 挂起客户端请求，无 Asyncify 时保留同步 `XMLHttpRequest` fallback；Node 风格运行时通过 `http.createServer` + Asyncify 支持基础 HTTP 服务端，浏览器/Worker 服务端仍返回空句柄。`HttpResponse.text()` 仅在响应体是不含空字节的合法 UTF-8 时返回文本，否则返回空字符串。无 `fetch` 且无同步 XHR 的 emcc 环境返回空可选值。
 
 ## std/net/tcp
 
 - `tcpConnect(host: Str, port: I32) -> TcpConn?`
+- `tcpConnectTimeout(host: Str, port: I32, timeoutMs: I32) -> TcpConn?`
+- `tcpTlsConnect(host: Str, port: I32) -> TcpTlsConn?`
+- `tcpTlsRead(conn: TcpTlsConn, maxBytes: I64) -> Blob?`
+- `tcpTlsWrite(conn: TcpTlsConn, data: Blob) -> I64`
+- `tcpTlsClose(conn: TcpTlsConn) -> Bool`
 - `tcpListen(host: Str, port: I32) -> TcpListener?`
 - `tcpAccept(listener: TcpListener) -> TcpConn?`
+- `tcpAcceptTimeout(listener: TcpListener, timeoutMs: I32) -> TcpConn?`
 - `tcpRead(conn: TcpConn, maxBytes: I64) -> Blob?`
+- `tcpReadTimeout(conn: TcpConn, maxBytes: I64, timeoutMs: I32) -> Blob?`
 - `tcpWrite(conn: TcpConn, data: Blob) -> I64`
+- `tcpWriteTimeout(conn: TcpConn, data: Blob, timeoutMs: I32) -> I64`
 - `tcpClose(conn: TcpConn) -> Bool`
 - `tcpListenerClose(listener: TcpListener) -> Bool`
 - `udpBind(host: Str, port: I32) -> UdpSocket?`
 - `udpSend(socket: UdpSocket, host: Str, port: I32, data: Blob) -> I64`
+- `udpSendTimeout(socket: UdpSocket, host: Str, port: I32, data: Blob, timeoutMs: I32) -> I64`
 - `udpRecvFrom(socket: UdpSocket, maxBytes: I64) -> UdpPacket?`
+- `udpRecvFromTimeout(socket: UdpSocket, maxBytes: I64, timeoutMs: I32) -> UdpPacket?`
 - `udpRecv(socket: UdpSocket, maxBytes: I64) -> Blob?`
+- `udpRecvTimeout(socket: UdpSocket, maxBytes: I64, timeoutMs: I32) -> Blob?`
 - `udpClose(socket: UdpSocket) -> Bool`
 
-`UdpPacket` 包含 `data: Blob`、`host: Str` 和 `port: I32`；`udpRecv` 保留为只返回数据的兼容接口。原生目标提供阻塞式 TCP/UDP socket 基础能力；TCP 连接句柄可通过 `std/stream.streamFromTcpHandle` 交给通用读写和拷贝函数。端口必须在 `0..65535` 范围内，非法连接、监听或绑定端口返回空可选值，非法发送端口返回 `-1`。emcc 当前明确不支持 TCP/UDP，返回空可选值、`-1` 或 `false`，不会同步等待网络。当前接口不提供超时、TLS 或 native 事件源式 flow 挂起。
+`UdpPacket` 包含 `data: Blob`、`host: Str` 和 `port: I32`；`udpRecv` 保留为只返回数据的兼容接口。原生目标提供阻塞式 TCP/UDP socket 基础能力，并为 connect/accept/read/write/send/recv 提供一次性 `timeoutMs` 超时变体；Linux/macOS 在可动态加载 OpenSSL TLS 后端、系统 CA 可用且证书链与主机名校验通过时支持 TCP TLS 客户端，TLS 连接使用独立 `TcpTlsConn`，不会伪装成裸 `TcpConn`。emcc 的 Node 风格运行时通过 `net` / `tls` / `dgram` + Asyncify 提供基础 TCP/TLS/UDP 连接、监听、读写、UDP 收发和关闭，浏览器/Worker 环境仍显式失败。裸 TCP 连接句柄可通过 `std/stream.streamFromTcpHandle` 交给通用读写和拷贝函数。端口必须在 `0..65535` 范围内，非法连接、监听或绑定端口返回空可选值，非法发送端口返回 `-1`；`timeoutMs < 0` 视为非法参数，`timeoutMs == 0` 表示只轮询一次且不等待。当前接口不提供 native 事件源式 flow 挂起。
 
 ## std/net/ws
 
@@ -517,7 +529,7 @@ API：
 - `wsRecv(conn: WsConn, maxBytes: I64) -> Blob?`
 - `wsClose(conn: WsConn) -> Bool`
 
-原生目标支持 `ws://` 握手校验、合法端口、userinfo 剥离、IPv6 字面量、客户端掩码、文本/二进制消息、分片帧重组和 ping/pong 自动处理；`wss://` 与 emcc WebSocket 桥接当前明确不支持，失败时返回空可选值或 `-1`。
+原生目标支持 `ws://` 握手校验、合法端口、userinfo 剥离、IPv6 字面量、客户端掩码、文本/二进制消息、分片帧重组和 ping/pong 自动处理；Linux/macOS 在可动态加载 OpenSSL TLS 后端、系统 CA 可用且证书链与主机名校验通过时支持 `wss://`，否则返回空可选值。emcc 目标在浏览器/Worker 环境通过 WebSocket + Asyncify 支持 `ws://` / `wss://` 客户端连接、二进制发送、消息接收和关闭。缺少 WebSocket 或 Asyncify 时返回空可选值或 `-1`。
 
 ## std/fmt
 
@@ -564,8 +576,8 @@ JSON 与 MessagePack 当前覆盖 `I8`、`I32`、`I64`、`U8`、`U32`、`U64`、
 
 `List<T>` 支持 `listLen`、`listPush`、`listPop`、`listShift`、`listUnshift`、`listSlice`、`listSort`、`listFilter`、`listMap`、`listFind`。当前数组/List ABI 使用分页布局 `{ pages, length, capacity, page_count }`，`push/unshift/filter` 会按需扩页。
 
-`Dict<K, V>` 支持 `dictKeys`、`dictValues`、`dictHas`、`dictDelete`、`dictLen`。当前字典实现基于现有分页键值存储做线性扫描；`Str` 键按 C 字符串内容比较，标量键按值比较。后续哈希表布局落地后可替换为更高效实现。
+`Dict<K, V>` 支持 `dictKeys`、`dictValues`、`dictHas`、`dictDelete`、`dictLen`。字典保持分页键值存储 ABI 以兼容原生/JS 标准库边界；编译器自建字典会为 `Str` 与基础标量键维护开放寻址哈希索引，查找、更新和删除按哈希索引定位，`dictKeys` / `dictValues` 仍按插入顺序返回。外部标准库返回的兼容 `Dict` 没有内部哈希标记时会自动走分页顺序扫描。
 
 ## std/net
 
-`std/net/http`、`std/net/tcp`、`std/net/ws` 的接口声明和 ABI 已可编译链接。原生目标当前支持明文 `http://` 客户端请求、基础字符串请求/响应头、chunked 响应体解码、基础阻塞式 HTTP 服务端、阻塞式 TCP/UDP 基础收发，以及 `ws://` WebSocket 握手、合法端口、userinfo 剥离、IPv6 字面量、客户端掩码、分片重组和 ping/pong 自动处理。emcc HTTP 客户端在 Asyncify 可用时通过 `fetch` 挂起后恢复，TCP/UDP/WS 当前明确不支持且不会同步等待网络。HTTPS、HTTP 服务端并发 worker、WebSocket `wss://`、超时配置和 native 事件源式 flow 挂起仍待后续运行时接入；不支持的入口返回空可选值、失败值或零句柄。
+`std/net/http`、`std/net/tcp`、`std/net/ws` 的接口声明和 ABI 已可编译链接。原生目标当前支持 `http://` 客户端请求、基础字符串请求/响应头、chunked 响应体解码、每连接 worker HTTP 服务端、阻塞式 TCP/UDP 基础收发、TCP/UDP 一次性超时变体、TCP TLS 客户端，以及 `ws://` WebSocket 握手、合法端口、userinfo 剥离、IPv6 字面量、客户端掩码、分片重组和 ping/pong 自动处理；Linux/macOS 在可动态加载 OpenSSL TLS 后端、系统 CA 可用且证书链与主机名校验通过时支持 `https://` HTTP 客户端、TCP TLS 客户端和 `wss://` WebSocket 客户端。emcc HTTP 客户端在 Asyncify 可用时通过 `fetch` 挂起后恢复，Node 风格运行时通过 `http.createServer` + Asyncify 支持基础 HTTP 服务端，TCP/TLS/UDP 在 Node 风格运行时通过 `net` / `tls` / `dgram` + Asyncify 挂起等待，WebSocket 客户端在浏览器/Worker 环境通过 WebSocket + Asyncify 挂起连接和接收。浏览器原生 TCP/UDP 和 native 事件源式 flow 挂起仍待后续运行时接入；不支持的入口返回空可选值、失败值或零句柄。

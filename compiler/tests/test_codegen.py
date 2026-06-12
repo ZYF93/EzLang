@@ -150,6 +150,26 @@ class TestCodegen:
         assert 'store i32 0, i32* %"count"' in ir_text
         assert 'store {i1, {i32**, i64, i64, i64}} {i1 0' in ir_text
 
+    def test_prefix_type_assertion_codegen(self):
+        """Type! expr 应生成目标类型值，并支持从可选值拆包。"""
+        source = '''
+        const widen = (): I64 => {
+            return I64! 42;
+        };
+        const unwrap = (value: I32?): I32 => {
+            return I32! value;
+        };
+        '''
+
+        module, errors, _ = compile_source(source)
+        assert module is not None
+        assert len(errors) == 0, f'编译错误: {errors}'
+        ir_text = str(module)
+        binding.parse_assembly(ir_text).verify()
+        assert 'define i64 @"widen"' in ir_text
+        assert 'sext i32 42 to i64' in function_ir(ir_text, 'widen')
+        assert '_type_assert_load' in function_ir(ir_text, 'unwrap')
+
     def test_simple_function(self):
         """简单函数代码生成"""
         source = '''
@@ -187,7 +207,31 @@ class TestCodegen:
         ir_text = str(module)
         assert '%"Meta_i32"' in ir_text
         assert '@"watched" = global %"Meta_i32"' in ir_text
-        assert 'call void @"log"(%"Meta_i32"' in ir_text
+        assert 'call void @"log"(%"Meta_i32"*' in ir_text
+
+    def test_decorator_meta_getter_setter_ir(self):
+        """装饰器变量读写应通过 Meta getter/setter 函数指针拦截"""
+        source = '''
+        const get_watched = (meta: Meta<I32>): I32 => { return meta.value + 10; };
+        const set_watched = (meta: Meta<I32>, v: I32): Void => { meta.value = v + 1; };
+        const log = (this: Meta<I32>): Void => {
+            this.getter = get_watched;
+            this.setter = set_watched;
+        };
+        @log let watched = 1;
+        const main = (): I32 => {
+            watched = 2;
+            return watched;
+        };
+        '''
+        module, errors, _ = compile_source(source)
+        assert module is not None
+        assert len(errors) == 0, f'编译错误: {errors}'
+        ir_text = str(module)
+        assert 'store i32 (%"Meta_i32"*)* @"get_watched"' in ir_text
+        assert 'store void (%"Meta_i32"*, i32)* @"set_watched"' in ir_text
+        assert 'call void %"_watched_setter"(%"Meta_i32"* @"watched", i32 2)' in ir_text
+        assert 'call i32 %"_watched_getter"(%"Meta_i32"* @"watched")' in ir_text
 
     def test_functions_example_codegen(self):
         """functions.ez 应可生成函数相关 IR"""
@@ -326,6 +370,25 @@ class TestCodegen:
         assert module is not None
         func = module.get_global('test_range_loop')
         assert func is not None
+
+    def test_list_loop_binds_element_value(self):
+        """集合循环 loop item in list 应按元素值生成循环变量。"""
+        source = '''
+        const sum_list = (): I32 => {
+            let total: I32 = 0;
+            let nums: I32[] = [1, 2, 3];
+            loop item in nums {
+                total = total + item;
+            };
+            return total;
+        };
+        '''
+        module, errors, _ = compile_source(source)
+        assert module is not None
+        assert len(errors) == 0, f'编译错误: {errors}'
+        ir_text = str(module)
+        binding.parse_assembly(ir_text).verify()
+        assert '_list_len' in ir_text
 
     def test_ir_correctness(self):
         """验证 IR 输出包含正确的运算指令"""
@@ -1176,6 +1239,24 @@ class TestCodegen:
         assert module.get_global('id_I32') is not None
         assert module.get_global('id_Str') is not None
 
+    def test_generic_expression_function_infers_type_args_from_positional_arguments(self):
+        """表达式体泛型函数可从位置实参推导类型参数。"""
+        source = '''
+        const identity = <T>(value: T) => value;
+
+        const run = (): I32 => {
+            let inferred = identity(7);
+            return inferred;
+        };
+        '''
+        module, errors, _ = compile_source(source)
+        assert module is not None
+        assert len(errors) == 0, f'编译错误: {errors}'
+        assert module.get_global('identity_I32') is not None
+        ir_text = str(module)
+        assert 'call i32 @"identity_I32"(i32 7)' in ir_text
+        assert 'store i32 0, i32* %"inferred"' not in ir_text
+
     def test_generic_struct_explicit_args_monomorphize_layout(self):
         """显式泛型结构体实参应生成具体字段布局。"""
         source = '''
@@ -1794,6 +1875,58 @@ class TestCodegen:
         assert 'icmp' in run_ir
         assert 'ret i1 %' in run_ir
 
+    def test_builtin_error_to_string_method_codegen(self):
+        """文档声明的 Error.toString() 应作为内置方法生成可链接 IR。"""
+        source = '''
+        const run = (): Str => {
+            const err = Error(code = 7, message = "boom");
+            return err.toString();
+        };
+        '''
+        module, errors, _ = compile_source(source)
+        assert module is not None
+        assert len(errors) == 0, f'编译错误: {errors}'
+        ir_text = str(module)
+        assert 'define i8* @"Error_toString"(%"Error"* %"this")' in ir_text
+        assert 'call i8* @"Error_toString"' in function_ir(ir_text, 'run')
+
+    def test_builtin_blob_methods_codegen(self):
+        """文档声明的 Blob.get/slice 应作为内置方法生成可链接 IR。"""
+        source = '''
+        const read = (): I8 => {
+            const data = Blob(data = "hello", size = 5);
+            return data.get(index = 1);
+        };
+        const part = (): Blob => {
+            const data = Blob(data = "hello", size = 5);
+            return data.slice(start = 1, len = 3);
+        };
+        '''
+        module, errors, _ = compile_source(source)
+        assert module is not None
+        assert len(errors) == 0, f'编译错误: {errors}'
+        ir_text = str(module)
+        assert 'define i8 @"Blob_get"(%"Blob"* %"this", i64 %"index")' in ir_text
+        assert 'define %"Blob" @"Blob_slice"(%"Blob"* %"this", i64 %"start", i64 %"len")' in ir_text
+        assert 'call i8 @"Blob_get"' in function_ir(ir_text, 'read')
+        assert 'call %"Blob" @"Blob_slice"' in function_ir(ir_text, 'part')
+
+    def test_builtin_date_methods_use_namespaced_abi(self):
+        """Date 方法应调用专用 ABI 符号，避免和 std/fmt.format 等自由函数冲突。"""
+        source = '''
+        const run = (): Str => {
+            const d = Date(timestamp = 0);
+            return d.format(fmt = "YYYY");
+        };
+        '''
+        module, errors, libs = compile_source(source, compile_target='macos')
+        assert module is not None
+        assert len(errors) == 0, f'编译错误: {errors}'
+        ir_text = str(module)
+        assert 'declare i8* @"dateFormat"(%"Date"*' in ir_text
+        assert 'call i8* @"dateFormat"' in function_ir(ir_text, 'run')
+        assert any(str(lib).endswith('packages/std/native/time.c') for lib in libs)
+
     def test_comprehensive_module(self):
         """综合测试：结构体、方法、可选类型、泛型、管道、字典"""
         source = '''
@@ -1870,6 +2003,30 @@ class TestCodegen:
         module, errors, _ = compile_source('const x = ?;')
         assert module is not None
         assert any('柯里化占位参数' in error for error in errors)
+
+    def test_placeholder_expression_can_initialize_optional_none(self):
+        """Optional<T> 期望上下文中的 ? 应生成空可选值。"""
+        source = 'let x: I32? = ?;'
+        module, errors, _ = compile_source(source)
+        assert module is not None
+        assert len(errors) == 0, f'编译错误: {errors}'
+        ir_text = str(module)
+        assert 'insertvalue {i1, i32} undef, i1 0, 0' in ir_text
+
+    def test_struct_optional_field_accepts_placeholder_none(self):
+        """结构体 Optional 字段的 field = ? 应生成空可选值。"""
+        source = '''
+        struct Node { value: I32; next: Node?; };
+        const make = (): Node => {
+            return Node(value = 1, next = ?);
+        };
+        '''
+        module, errors, _ = compile_source(source)
+        assert module is not None
+        assert len(errors) == 0, f'编译错误: {errors}'
+        ir_text = str(module)
+        assert '%"Node" = type {i32, {i1, %"Node"*}}' in ir_text
+        assert 'insertvalue {i1, %"Node"*} undef, i1 0, 0' in ir_text
 
     # ==================== 标准库测试 ====================
 
@@ -1995,6 +2152,28 @@ class TestCodegen:
         assert 'srem i32' not in ir_text
         assert 'ashr i32' not in ir_text
         assert 'store i32 %"_assign_value"' in ir_text
+
+    def test_signed_integer_division_uses_floor_semantics(self):
+        """有符号整数除法应按文档使用向下取整语义。"""
+        source = '''
+        const calc = (a: I32, b: I32): I32 => {
+            let q = a / b;
+            let r = a % b;
+            q /= b;
+            r %= b;
+            return q + r;
+        };
+        '''
+        module, errors, _ = compile_source(source)
+        assert module is not None
+        assert len(errors) == 0, f'编译错误: {errors}'
+        ir_text = str(module)
+        binding.parse_assembly(ir_text).verify()
+        assert 'sdiv i32' in ir_text
+        assert 'srem i32' in ir_text
+        assert '_floor_div_adjust' in ir_text
+        assert '_floor_rem_adjust' in ir_text
+        assert '_assign_floor_adjust' in ir_text
 
     def test_unsigned_bitwise_results_keep_logical_shift(self):
         """U* 位运算表达式结果继续按无符号值生成逻辑右移。"""
@@ -3063,6 +3242,7 @@ class TestCodegen:
             const ts = timestamp();
             sleep(ms = 1);
             const y = getYear(this = d);
+            const y2 = d.getYear();
             const m = getMonth(this = d);
             const day = getDay(this = d);
             const hour = getHour(this = d);
@@ -3070,7 +3250,10 @@ class TestCodegen:
             const second = getSecond(this = d);
             add(this = d, year = 1, month = 1, day = 1, hour = 1, minute = 1, second = 1);
             sub(this = d, year = 1, month = 1, day = 1, hour = 1, minute = 1, second = 1);
+            d.add(year = 1, month = 0, day = 0, hour = 0, minute = 0, second = 0);
+            d.sub(year = 1, month = 0, day = 0, hour = 0, minute = 0, second = 0);
             const s = format(this = d, fmt = "yyyy-MM-dd");
+            const s2 = d.format(fmt = "yyyy-MM-dd");
             return y;
         };
         '''
@@ -3086,6 +3269,11 @@ class TestCodegen:
         assert 'call %"Duration" @"Duration_fromMin"' in ir_text
         assert 'call i8* @"Duration_toString"' in ir_text
         assert 'call i8* @"durationToString"' in ir_text
+        check_ir = function_ir(ir_text, 'check_time')
+        assert check_ir.count('call i32 @"getYear"') >= 2
+        assert check_ir.count('call void @"add"') >= 2
+        assert check_ir.count('call void @"sub"') >= 2
+        assert check_ir.count('call i8* @"format"') >= 2
         assert 'declare i8* @"__durationToString"' in ir_text
 
     def test_stdlib_time_target_filter(self):
@@ -3736,7 +3924,7 @@ class TestCodegen:
         module, errors, libs = compile_source(source, compile_target='linux')
         assert module is not None
         assert len(errors) == 0, f'编译错误: {errors}'
-        assert libs == [str(STD_ROOT / 'native' / 'net' / 'http.c')]
+        assert libs == [str(STD_ROOT / 'native' / 'net' / 'http.c'), 'pthread', 'dl']
         assert module.get_global('fetch') is not None
         assert module.get_global('fetchEx') is not None
         assert module.get_global('HttpResponse_text') is not None
@@ -3753,9 +3941,9 @@ class TestCodegen:
         _, _, windows_libs = compile_source(source, compile_target='windows')
         _, _, android_libs = compile_source(source, compile_target='android')
         _, _, emcc_libs = compile_source(source, compile_target='emcc')
-        assert linux_libs == [str(STD_ROOT / 'native' / 'net' / 'http.c')]
+        assert linux_libs == [str(STD_ROOT / 'native' / 'net' / 'http.c'), 'pthread', 'dl']
         assert windows_libs == [str(STD_ROOT / 'native' / 'net' / 'http.c'), 'ws2_32']
-        assert android_libs == [str(STD_ROOT / 'native' / 'net' / 'http.c')]
+        assert android_libs == [str(STD_ROOT / 'native' / 'net' / 'http.c'), 'pthread']
         assert emcc_libs == [str(STD_ROOT / 'emcc' / 'net' / 'http.js')]
 
     def test_stdlib_net_http_server_import(self):
@@ -3771,7 +3959,7 @@ class TestCodegen:
         module, errors, libs = compile_source(source, compile_target='linux')
         assert module is not None
         assert len(errors) == 0, f'编译错误: {errors}'
-        assert libs == [str(STD_ROOT / 'native' / 'net' / 'http.c')]
+        assert libs == [str(STD_ROOT / 'native' / 'net' / 'http.c'), 'pthread', 'dl']
         assert module.get_global('createServer') is not None
         assert 'HttpServer' in str(module)
 
@@ -3820,7 +4008,7 @@ class TestCodegen:
         module, errors, libs = compile_source(source, compile_target='linux')
         assert module is not None
         assert len(errors) == 0, f'编译错误: {errors}'
-        assert libs == [str(STD_ROOT / 'native' / 'net' / 'tcp.c')]
+        assert libs == [str(STD_ROOT / 'native' / 'net' / 'tcp.c'), 'dl']
         for name in [
             'tcpConnect', 'tcpListen', 'tcpAccept', 'tcpRead', 'tcpWrite', 'tcpClose',
             'tcpListenerClose', 'udpBind', 'udpSend', 'udpRecvFrom', 'udpRecv', 'udpClose'
@@ -3852,7 +4040,7 @@ class TestCodegen:
         module, errors, libs = compile_source(source, compile_target='linux')
         assert module is not None
         assert len(errors) == 0, f'编译错误: {errors}'
-        assert libs == [str(STD_ROOT / 'native' / 'stream.c'), str(STD_ROOT / 'native' / 'net' / 'tcp.c')]
+        assert libs == [str(STD_ROOT / 'native' / 'stream.c'), str(STD_ROOT / 'native' / 'net' / 'tcp.c'), 'dl']
         ir_text = str(module)
         binding.parse_assembly(ir_text).verify()
         assert '%"Stream" = type {i64, i32}' in ir_text
@@ -3869,7 +4057,7 @@ class TestCodegen:
         _, _, linux_libs = compile_source(source, compile_target='linux')
         _, _, windows_libs = compile_source(source, compile_target='windows')
         _, _, emcc_libs = compile_source(source, compile_target='emcc')
-        assert linux_libs == [str(STD_ROOT / 'native' / 'net' / 'tcp.c')]
+        assert linux_libs == [str(STD_ROOT / 'native' / 'net' / 'tcp.c'), 'dl']
         assert windows_libs == [str(STD_ROOT / 'native' / 'net' / 'tcp.c'), 'ws2_32']
         assert emcc_libs == [str(STD_ROOT / 'emcc' / 'net' / 'tcp.js')]
 
@@ -3892,7 +4080,7 @@ class TestCodegen:
         module, errors, libs = compile_source(source, compile_target='linux')
         assert module is not None
         assert len(errors) == 0, f'编译错误: {errors}'
-        assert libs == [str(STD_ROOT / 'native' / 'net' / 'ws.c')]
+        assert libs == [str(STD_ROOT / 'native' / 'net' / 'ws.c'), 'dl']
         for name in ['wsConnect', 'wsSend', 'wsRecv', 'wsClose']:
             assert module.get_global(name) is not None
         ir_text = str(module)
@@ -3906,7 +4094,7 @@ class TestCodegen:
         _, _, linux_libs = compile_source(source, compile_target='linux')
         _, _, windows_libs = compile_source(source, compile_target='windows')
         _, _, emcc_libs = compile_source(source, compile_target='emcc')
-        assert linux_libs == [str(STD_ROOT / 'native' / 'net' / 'ws.c')]
+        assert linux_libs == [str(STD_ROOT / 'native' / 'net' / 'ws.c'), 'dl']
         assert windows_libs == [str(STD_ROOT / 'native' / 'net' / 'ws.c'), 'ws2_32', 'bcrypt']
         assert emcc_libs == [str(STD_ROOT / 'emcc' / 'net' / 'ws.js')]
 
@@ -4379,6 +4567,58 @@ class TestCodegen:
         binding.parse_assembly(ir_text).verify()
         assert 'dict_find_cond' in ir_text
         assert 'dict_upsert_insert' in ir_text
+
+    def test_shape_dict_literal_codegen_uses_named_fields(self):
+        """Shape 注解的对象字面量应按字段名写入结构体字段。"""
+        source = '''
+        type Shape = { name: Str; side: Str; };
+        const test = (): Str => {
+            let s: Shape = { side = "10"; name = "Square" };
+            return s.name;
+        };
+        '''
+        module, errors, _ = compile_source(source)
+        assert module is not None
+        assert len(errors) == 0, f'编译错误: {errors}'
+        ir_text = str(module)
+        binding.parse_assembly(ir_text).verify()
+        assert '%"Shape" = type {i8*, i8*}' in ir_text
+        assert '_tmp_shape' in ir_text
+
+    def test_mixed_dynamic_shape_literal_codegen_keeps_dict_types(self):
+        """混合固定字段和动态键的 Shape 应按 Dict 键值类型生成。"""
+        source = '''
+        type Shape = { name: Str; [dynamic: Str]: Str; };
+        const test = (): Str => {
+            let s: Shape = { name = "Square"; side = "10" };
+            return s["side"];
+        };
+        '''
+        module, errors, _ = compile_source(source)
+        assert module is not None
+        assert len(errors) == 0, f'编译错误: {errors}'
+        ir_text = str(module)
+        binding.parse_assembly(ir_text).verify()
+        assert 'dict_find_cond' in ir_text
+        assert 'dict_lookup_value_val' in ir_text
+
+    def test_type_shape_spread_codegen_flattens_layout(self):
+        """type Shape 的 `...Base` 扩展应展平成目标结构体布局。"""
+        source = '''
+        type Named = { name: Str; };
+        type UserShape = { ...Named; age: I32; };
+        const test = (): I32 => {
+            let u: UserShape = { name = "s"; age = 42 };
+            return u.age;
+        };
+        '''
+        module, errors, _ = compile_source(source)
+        assert module is not None
+        assert len(errors) == 0, f'编译错误: {errors}'
+        ir_text = str(module)
+        binding.parse_assembly(ir_text).verify()
+        assert '%"UserShape" = type {i8*, i32}' in ir_text
+        assert '_tmp_shape' in ir_text
 
     def test_p0_documented_syntax_codegen(self):
         """P0 文档语法应能生成 IR 或明确占位 ABI"""

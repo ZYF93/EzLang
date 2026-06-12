@@ -2,6 +2,7 @@
 // 依赖: EzLang 标准库封装层（C/JS）
 
 extern "@std/native/net/ws.c" for linux;
+extern "dl" for linux;
 extern "@std/native/net/ws.c" for macos;
 extern "@std/native/net/ws.c" for windows;
 extern "ws2_32" for windows;
@@ -14,7 +15,7 @@ export struct WsConn {
     handle: I64;
 };
 
-// 原生目标支持 ws:// 握手、客户端掩码、分片重组和 ping/pong；wss:// 与 emcc WebSocket 桥接当前明确不支持。
+// 原生目标支持 ws:// 握手和 Linux/macOS 可校验 TLS 的 wss://，以及客户端掩码、分片重组和 ping/pong；emcc 通过浏览器/Worker WebSocket + Asyncify 支持客户端连接、收发和关闭。
 export declare const wsConnect: (url: Str) => WsConn?;
 export declare const wsSend: (conn: WsConn, data: Blob) => I64;
 export declare const wsRecv: (conn: WsConn, maxBytes: I64) => Blob?;

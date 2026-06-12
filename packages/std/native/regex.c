@@ -38,6 +38,10 @@ typedef struct {
 
 typedef struct { bool ok; RegexMatch value; } OptRegexMatch;
 
+#define EZ_REGEX_MAX_PATTERN_BYTES 4096
+#define EZ_REGEX_MAX_GROUPS 64
+#define EZ_REGEX_MAX_BOUNDED_REPEAT 1024
+
 static char *ez_strdup_range(const char *src, size_t len) {
     char *out = (char *)malloc(len + 1);
     if (!out) return NULL;
@@ -174,6 +178,160 @@ static bool ez_regex_has_end_anchor(const char *pattern) {
         if (*p == '$' && !in_class) return true;
     }
     return false;
+}
+
+typedef struct {
+    bool has_variable_repeat;
+    bool has_alternation;
+} EzRegexRiskFrame;
+
+typedef struct {
+    bool exists;
+    bool has_variable_repeat;
+    bool has_alternation;
+} EzRegexPendingAtom;
+
+static void ez_regex_clear_pending(EzRegexPendingAtom *pending) {
+    pending->exists = false;
+    pending->has_variable_repeat = false;
+    pending->has_alternation = false;
+}
+
+static void ez_regex_commit_pending(EzRegexRiskFrame *stack, size_t depth, EzRegexPendingAtom *pending) {
+    if (!pending->exists || depth == 0) return;
+    stack[depth - 1].has_variable_repeat = stack[depth - 1].has_variable_repeat || pending->has_variable_repeat;
+    stack[depth - 1].has_alternation = stack[depth - 1].has_alternation || pending->has_alternation;
+    ez_regex_clear_pending(pending);
+}
+
+static int ez_regex_parse_interval_limit(const char *pattern, size_t len, size_t start, size_t *end, bool *variable) {
+    size_t i = start + 1;
+    if (i >= len || !isdigit((unsigned char)pattern[i])) return 0;
+    size_t min_value = 0;
+    while (i < len && isdigit((unsigned char)pattern[i])) {
+        size_t digit = (size_t)(pattern[i] - '0');
+        if (min_value > (EZ_REGEX_MAX_BOUNDED_REPEAT - digit) / 10) return -1;
+        min_value = min_value * 10 + digit;
+        i++;
+    }
+    size_t max_value = min_value;
+    bool has_max = true;
+    if (i < len && pattern[i] == ',') {
+        i++;
+        if (i < len && pattern[i] == '}') {
+            has_max = false;
+        } else {
+            if (i >= len || !isdigit((unsigned char)pattern[i])) return 0;
+            max_value = 0;
+            while (i < len && isdigit((unsigned char)pattern[i])) {
+                size_t digit = (size_t)(pattern[i] - '0');
+                if (max_value > (EZ_REGEX_MAX_BOUNDED_REPEAT - digit) / 10) return -1;
+                max_value = max_value * 10 + digit;
+                i++;
+            }
+        }
+    }
+    if (i >= len || pattern[i] != '}') return 0;
+    if (has_max && max_value < min_value) return 0;
+    *end = i + 1;
+    *variable = !has_max || max_value != min_value;
+    return 1;
+}
+
+static size_t ez_regex_skip_class(const char *pattern, size_t len, size_t start) {
+    size_t i = start + 1;
+    if (i < len && pattern[i] == '^') i++;
+    if (i < len && pattern[i] == ']') i++;
+    while (i < len) {
+        if (pattern[i] == '\\' && i + 1 < len) {
+            i += 2;
+            continue;
+        }
+        if (pattern[i] == ']') return i + 1;
+        i++;
+    }
+    return len;
+}
+
+static bool ez_regex_complexity_ok(const char *pattern) {
+    if (!pattern) pattern = "";
+    size_t len = strlen(pattern);
+    if (len > EZ_REGEX_MAX_PATTERN_BYTES) return false;
+
+    EzRegexRiskFrame stack[EZ_REGEX_MAX_GROUPS + 1];
+    memset(stack, 0, sizeof(stack));
+    size_t depth = 1;
+    EzRegexPendingAtom pending = {0};
+
+    for (size_t i = 0; i < len;) {
+        char ch = pattern[i];
+        if (ch == '\\') {
+            ez_regex_commit_pending(stack, depth, &pending);
+            pending = (EzRegexPendingAtom){true, false, false};
+            i += (i + 1 < len) ? 2 : 1;
+            continue;
+        }
+        if (ch == '[') {
+            ez_regex_commit_pending(stack, depth, &pending);
+            pending = (EzRegexPendingAtom){true, false, false};
+            i = ez_regex_skip_class(pattern, len, i);
+            continue;
+        }
+        if (ch == '(') {
+            ez_regex_commit_pending(stack, depth, &pending);
+            if (depth >= EZ_REGEX_MAX_GROUPS + 1) return false;
+            memset(&stack[depth], 0, sizeof(stack[depth]));
+            depth++;
+            i++;
+            continue;
+        }
+        if (ch == ')') {
+            ez_regex_commit_pending(stack, depth, &pending);
+            if (depth <= 1) {
+                i++;
+                continue;
+            }
+            EzRegexRiskFrame group = stack[--depth];
+            pending = (EzRegexPendingAtom){true, group.has_variable_repeat, group.has_alternation};
+            i++;
+            continue;
+        }
+        if (ch == '|') {
+            ez_regex_commit_pending(stack, depth, &pending);
+            stack[depth - 1].has_alternation = true;
+            i++;
+            continue;
+        }
+        if (ch == '?' || ch == '*' || ch == '+') {
+            if (!pending.exists) {
+                i++;
+                continue;
+            }
+            if (pending.has_variable_repeat || pending.has_alternation) return false;
+            pending.has_variable_repeat = true;
+            ez_regex_commit_pending(stack, depth, &pending);
+            i++;
+            continue;
+        }
+        if (ch == '{' && pending.exists) {
+            size_t end = i;
+            bool variable = false;
+            int parsed = ez_regex_parse_interval_limit(pattern, len, i, &end, &variable);
+            if (parsed < 0) return false;
+            if (parsed > 0) {
+                if (variable && (pending.has_variable_repeat || pending.has_alternation)) return false;
+                if (variable) pending.has_variable_repeat = true;
+                ez_regex_commit_pending(stack, depth, &pending);
+                i = end;
+                continue;
+            }
+        }
+        ez_regex_commit_pending(stack, depth, &pending);
+        pending = (EzRegexPendingAtom){true, false, false};
+        i++;
+    }
+    ez_regex_commit_pending(stack, depth, &pending);
+    return true;
 }
 
 static size_t ez_utf8_advance_one(const char *text) {
@@ -902,7 +1060,7 @@ static OptRegexMatch ez_rx_find_portable(const Regex *regex, const char *input) 
 
 #if !EZ_REGEX_USE_PORTABLE
 static bool ez_compile(const Regex *regex, regex_t *compiled) {
-    if (!regex || !regex->pattern || !regex->ok) return false;
+    if (!regex || !regex->pattern || !regex->ok || !ez_regex_complexity_ok(regex->pattern)) return false;
     char *pattern = ez_regex_posix_pattern(regex->pattern);
     if (!pattern) return false;
     bool ok = regcomp(compiled, pattern, ez_regex_cflags(regex->flags)) == 0;
@@ -913,12 +1071,13 @@ static bool ez_compile(const Regex *regex, regex_t *compiled) {
 
 Regex regexCompile(const char *pattern, int32_t flags) {
     if (!pattern) pattern = "";
+    bool safe = ez_regex_complexity_ok(pattern);
 #if EZ_REGEX_USE_PORTABLE
-    return (Regex){ez_strdup_safe(pattern), flags, ez_rx_pattern_valid(pattern, NULL)};
+    return (Regex){ez_strdup_safe(pattern), flags, safe && ez_rx_pattern_valid(pattern, NULL)};
 #else
     regex_t compiled;
     char *native_pattern = ez_regex_posix_pattern(pattern);
-    bool ok = native_pattern && regcomp(&compiled, native_pattern, ez_regex_cflags(flags)) == 0;
+    bool ok = safe && native_pattern && regcomp(&compiled, native_pattern, ez_regex_cflags(flags)) == 0;
     if (ok) regfree(&compiled);
     free(native_pattern);
     return (Regex){ez_strdup_safe(pattern), flags, ok};
@@ -927,7 +1086,7 @@ Regex regexCompile(const char *pattern, int32_t flags) {
 
 bool regexIsValid(const Regex *regex) {
 #if EZ_REGEX_USE_PORTABLE
-    return regex && regex->ok && ez_rx_pattern_valid(regex->pattern, NULL);
+    return regex && regex->ok && ez_regex_complexity_ok(regex->pattern) && ez_rx_pattern_valid(regex->pattern, NULL);
 #else
     regex_t compiled;
     if (!ez_compile(regex, &compiled)) return false;

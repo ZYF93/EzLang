@@ -76,6 +76,13 @@ int main(void) {
     Regex invalid_repeat = regexCompile("ab{4,2}c", 0);
     if (regexIsValid(&invalid_repeat)) return 31;
 
+    Regex nested_repeat = regexCompile("(a+)+$", 0);
+    if (regexIsValid(&nested_repeat) || regexTest(&nested_repeat, "aaaaaaaaaaaaaaaa!")) return 32;
+    Regex repeated_alt = regexCompile("(a|aa)+$", 0);
+    if (regexIsValid(&repeated_alt)) return 33;
+    Regex huge_repeat = regexCompile("a{0,2048}", 0);
+    if (regexIsValid(&huge_repeat)) return 34;
+
     Regex comma = regexCompile(",", 4);
     StrList parts = regexSplit(&comma, "a,b,c");
     if (parts.length != 3 || !expect_str(list_get(parts, 1), "b")) return 10;

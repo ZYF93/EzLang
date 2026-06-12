@@ -2,6 +2,7 @@
 // 依赖: EzLang 标准库封装层（C/JS）
 
 extern "@std/native/net/tcp.c" for linux;
+extern "dl" for linux;
 extern "@std/native/net/tcp.c" for macos;
 extern "@std/native/net/tcp.c" for windows;
 extern "ws2_32" for windows;
@@ -10,6 +11,10 @@ extern "@std/native/net/tcp.c" for ios;
 extern "@std/emcc/net/tcp.js" for emcc;
 
 export struct TcpConn {
+    handle: I64;
+};
+
+export struct TcpTlsConn {
     handle: I64;
 };
 
@@ -27,16 +32,27 @@ export struct UdpPacket {
     port: I32;
 };
 
-// 原生目标提供阻塞式 TCP/UDP socket；emcc 明确不支持并返回空可选值或失败值。
+// 原生目标提供阻塞式 TCP/UDP socket、一次性超时变体和 Linux/macOS TLS 客户端；emcc Node 风格运行时通过 net/tls/dgram + Asyncify 支持基础 TCP/UDP/TLS，浏览器显式失败。
 export declare const tcpConnect: (host: Str, port: I32) => TcpConn?;
+export declare const tcpConnectTimeout: (host: Str, port: I32, timeoutMs: I32) => TcpConn?;
+export declare const tcpTlsConnect: (host: Str, port: I32) => TcpTlsConn?;
+export declare const tcpTlsRead: (conn: TcpTlsConn, maxBytes: I64) => Blob?;
+export declare const tcpTlsWrite: (conn: TcpTlsConn, data: Blob) => I64;
+export declare const tcpTlsClose: (conn: TcpTlsConn) => Bool;
 export declare const tcpListen: (host: Str, port: I32) => TcpListener?;
 export declare const tcpAccept: (listener: TcpListener) => TcpConn?;
+export declare const tcpAcceptTimeout: (listener: TcpListener, timeoutMs: I32) => TcpConn?;
 export declare const tcpRead: (conn: TcpConn, maxBytes: I64) => Blob?;
+export declare const tcpReadTimeout: (conn: TcpConn, maxBytes: I64, timeoutMs: I32) => Blob?;
 export declare const tcpWrite: (conn: TcpConn, data: Blob) => I64;
+export declare const tcpWriteTimeout: (conn: TcpConn, data: Blob, timeoutMs: I32) => I64;
 export declare const tcpClose: (conn: TcpConn) => Bool;
 export declare const tcpListenerClose: (listener: TcpListener) => Bool;
 export declare const udpBind: (host: Str, port: I32) => UdpSocket?;
 export declare const udpSend: (socket: UdpSocket, host: Str, port: I32, data: Blob) => I64;
+export declare const udpSendTimeout: (socket: UdpSocket, host: Str, port: I32, data: Blob, timeoutMs: I32) => I64;
 export declare const udpRecvFrom: (socket: UdpSocket, maxBytes: I64) => UdpPacket?;
+export declare const udpRecvFromTimeout: (socket: UdpSocket, maxBytes: I64, timeoutMs: I32) => UdpPacket?;
 export declare const udpRecv: (socket: UdpSocket, maxBytes: I64) => Blob?;
+export declare const udpRecvTimeout: (socket: UdpSocket, maxBytes: I64, timeoutMs: I32) => Blob?;
 export declare const udpClose: (socket: UdpSocket) => Bool;

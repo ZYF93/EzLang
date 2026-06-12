@@ -17,11 +17,15 @@
 #include <windows.h>
 #include <dbghelp.h>
 #define EZ_DEBUG_HAS_WINDOWS_STACK 1
+#define EZ_DEBUG_HAS_UNWIND 0
 #elif defined(__ANDROID__) || (defined(__APPLE__) && TARGET_OS_IPHONE)
+#include <unwind.h>
 #define EZ_DEBUG_HAS_EXECINFO 0
+#define EZ_DEBUG_HAS_UNWIND 1
 #else
 #include <execinfo.h>
 #define EZ_DEBUG_HAS_EXECINFO 1
+#define EZ_DEBUG_HAS_UNWIND 0
 #endif
 
 typedef struct {
@@ -39,6 +43,41 @@ static char *ez_strdup_safe(const char *src) {
     memcpy(out, src, len + 1);
     return out;
 }
+
+#if EZ_DEBUG_HAS_UNWIND
+static bool ez_append_text(char **out, size_t *len, size_t *cap, const char *text) {
+    if (!out || !len || !cap || !text) return false;
+    size_t text_len = strlen(text);
+    if (*len + text_len + 1 < *len) return false;
+    if (*len + text_len + 1 > *cap) {
+        size_t next = *cap ? *cap : 256;
+        while (*len + text_len + 1 > next) {
+            if (next > ((size_t)-1) / 2) return false;
+            next *= 2;
+        }
+        char *grown = (char *)realloc(*out, next);
+        if (!grown) return false;
+        *out = grown;
+        *cap = next;
+    }
+    memcpy(*out + *len, text, text_len + 1);
+    *len += text_len;
+    return true;
+}
+
+typedef struct {
+    uintptr_t frames[32];
+    int count;
+} EzUnwindStack;
+
+static _Unwind_Reason_Code ez_debug_unwind_frame(struct _Unwind_Context *context, void *arg) {
+    EzUnwindStack *stack = (EzUnwindStack *)arg;
+    if (!stack || stack->count >= 32) return _URC_END_OF_STACK;
+    uintptr_t ip = (uintptr_t)_Unwind_GetIP(context);
+    if (ip != 0) stack->frames[stack->count++] = ip;
+    return _URC_NO_REASON;
+}
+#endif
 
 void debugPrint(const char *msg) {
     fputs(msg ? msg : "", stderr);
@@ -169,6 +208,22 @@ OptStr debugStack(void) {
         strcat(out, "\n");
     }
     free(symbols);
+    return (OptStr){true, out};
+#elif EZ_DEBUG_HAS_UNWIND
+    EzUnwindStack stack = {0};
+    _Unwind_Backtrace(ez_debug_unwind_frame, &stack);
+    if (stack.count <= 0) return (OptStr){false, NULL};
+    char *out = NULL;
+    size_t len = 0;
+    size_t cap = 0;
+    for (int i = 0; i < stack.count; ++i) {
+        char line[64];
+        snprintf(line, sizeof(line), "%d: 0x%llx\n", i, (unsigned long long)stack.frames[i]);
+        if (!ez_append_text(&out, &len, &cap, line)) {
+            free(out);
+            return (OptStr){false, NULL};
+        }
+    }
     return (OptStr){true, out};
 #else
     return (OptStr){false, NULL};

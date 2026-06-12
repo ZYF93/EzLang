@@ -1,4 +1,4 @@
-# Generated from grammar/EzLang.g4 by ANTLR 4.13.2
+# Generated from EzLang.g4 by ANTLR 4.13.2
 from antlr4 import *
 if "." in __name__:
     from .EzLangParser import EzLangParser
@@ -557,12 +557,30 @@ class EzLangListener(ParseTreeListener):
         pass
 
 
-    # Enter a parse tree produced by EzLangParser#unaryExpression.
-    def enterUnaryExpression(self, ctx:EzLangParser.UnaryExpressionContext):
+    # Enter a parse tree produced by EzLangParser#prefixTypeAssertion.
+    def enterPrefixTypeAssertion(self, ctx:EzLangParser.PrefixTypeAssertionContext):
         pass
 
-    # Exit a parse tree produced by EzLangParser#unaryExpression.
-    def exitUnaryExpression(self, ctx:EzLangParser.UnaryExpressionContext):
+    # Exit a parse tree produced by EzLangParser#prefixTypeAssertion.
+    def exitPrefixTypeAssertion(self, ctx:EzLangParser.PrefixTypeAssertionContext):
+        pass
+
+
+    # Enter a parse tree produced by EzLangParser#prefixUnaryExpression.
+    def enterPrefixUnaryExpression(self, ctx:EzLangParser.PrefixUnaryExpressionContext):
+        pass
+
+    # Exit a parse tree produced by EzLangParser#prefixUnaryExpression.
+    def exitPrefixUnaryExpression(self, ctx:EzLangParser.PrefixUnaryExpressionContext):
+        pass
+
+
+    # Enter a parse tree produced by EzLangParser#postfixUnaryExpression.
+    def enterPostfixUnaryExpression(self, ctx:EzLangParser.PostfixUnaryExpressionContext):
+        pass
+
+    # Exit a parse tree produced by EzLangParser#postfixUnaryExpression.
+    def exitPostfixUnaryExpression(self, ctx:EzLangParser.PostfixUnaryExpressionContext):
         pass
 
 
@@ -818,6 +836,15 @@ class EzLangListener(ParseTreeListener):
         pass
 
 
+    # Enter a parse tree produced by EzLangParser#callArg.
+    def enterCallArg(self, ctx:EzLangParser.CallArgContext):
+        pass
+
+    # Exit a parse tree produced by EzLangParser#callArg.
+    def exitCallArg(self, ctx:EzLangParser.CallArgContext):
+        pass
+
+
     # Enter a parse tree produced by EzLangParser#namedArg.
     def enterNamedArg(self, ctx:EzLangParser.NamedArgContext):
         pass
@@ -878,6 +905,15 @@ class EzLangListener(ParseTreeListener):
 
     # Exit a parse tree produced by EzLangParser#dictLiteral.
     def exitDictLiteral(self, ctx:EzLangParser.DictLiteralContext):
+        pass
+
+
+    # Enter a parse tree produced by EzLangParser#dictFieldSep.
+    def enterDictFieldSep(self, ctx:EzLangParser.DictFieldSepContext):
+        pass
+
+    # Exit a parse tree produced by EzLangParser#dictFieldSep.
+    def exitDictFieldSep(self, ctx:EzLangParser.DictFieldSepContext):
         pass
 
 

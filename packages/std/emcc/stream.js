@@ -65,6 +65,21 @@
     return streams[handle];
   }
 
+  function localStream(ptr) {
+    if (!ptr) return null;
+    var handle = Number(getValue(ptr, 'i64'));
+    return streams[handle] || null;
+  }
+
+  function isTcpStream(ptr) {
+    return !!ptr && (getValue(ptr + 8, 'i32') | 0) === STREAM_KIND_TCP;
+  }
+
+  function isProcessPipeStream(ptr) {
+    var stream = localStream(ptr);
+    return !!(stream && stream.processPipe);
+  }
+
   function appendBytes(stream, bytes) {
     if (!bytes || bytes.length === 0) return 0;
     var next = new Uint8Array(stream.data.length + bytes.length);
@@ -87,6 +102,14 @@
     return createByteStream(bytes, kind);
   };
 
+  bridge.fromProcessPipe = function (pipe, kind) {
+    kind = kind | 0;
+    if (!pipe || (kind !== STREAM_KIND_PROCESS_STDIN && kind !== STREAM_KIND_PROCESS_STDOUT && kind !== STREAM_KIND_PROCESS_STDERR)) return null;
+    var handle = nextHandle++;
+    streams[handle] = { kind: kind, processPipe: pipe, closed: false };
+    return { handle: handle, kind: kind };
+  };
+
   function flushFileStream(stream) {
     if (!stream || stream.closed || !stream.file || typeof FS === 'undefined') return 0;
     try {
@@ -105,10 +128,16 @@
     if (!stream) stream = readStream(streamPtr, STREAM_KIND_PROCESS_STDOUT);
     if (!stream) stream = readStream(streamPtr, STREAM_KIND_PROCESS_STDERR);
     if (!stream && streamPtr && (getValue(streamPtr + 8, 'i32') | 0) === STREAM_KIND_TCP) {
+      if (typeof bridge.readTcp === 'function') return bridge.readTcp(ret, streamPtr, maxBytes);
       return writeOptBlob(ret, false, new Uint8Array(0));
     }
     if (!stream || stream.closed || max < 0) return writeOptBlob(ret, false, new Uint8Array(0));
     if (max === 0) return writeOptBlob(ret, true, new Uint8Array(0));
+    if (stream.processPipe) {
+      if (typeof stream.processPipe.read !== 'function') return writeOptBlob(ret, false, new Uint8Array(0));
+      var pipeBytes = stream.processPipe.read(max);
+      return writeOptBlob(ret, pipeBytes !== null, pipeBytes || new Uint8Array(0));
+    }
     if (stream.kind === STREAM_KIND_MEMORY || stream.kind === STREAM_KIND_PROCESS_STDOUT || stream.kind === STREAM_KIND_PROCESS_STDERR) {
       var remaining = stream.data.length - stream.cursor;
       var count = Math.min(remaining, max);
@@ -129,11 +158,17 @@
   function streamWriteImpl(streamPtr, dataPtr) {
     var stream = readStream(streamPtr, STREAM_KIND_MEMORY);
     if (!stream) stream = readStream(streamPtr, STREAM_KIND_FILE_WRITE);
-    if (!stream && streamPtr && (getValue(streamPtr + 8, 'i32') | 0) === STREAM_KIND_TCP) return -1;
+    if (!stream) stream = readStream(streamPtr, STREAM_KIND_PROCESS_STDIN);
+    if (!stream && streamPtr && (getValue(streamPtr + 8, 'i32') | 0) === STREAM_KIND_TCP) {
+      return typeof bridge.writeTcp === 'function' ? bridge.writeTcp(streamPtr, dataPtr) : -1;
+    }
     if (!stream || stream.closed) return -1;
     var bytes = readBlob(dataPtr);
     if (bytes === null) return -1;
     if (bytes.length === 0) return 0;
+    if (stream.processPipe) {
+      return typeof stream.processPipe.write === 'function' ? stream.processPipe.write(bytes) : -1;
+    }
     if (stream.kind === STREAM_KIND_MEMORY) return appendBytes(stream, bytes);
     try {
       var written = FS.write(stream.file, bytes, 0, bytes.length, null);
@@ -180,8 +215,11 @@
     if (!stream) stream = readStream(streamPtr, STREAM_KIND_PROCESS_STDIN);
     if (!stream) stream = readStream(streamPtr, STREAM_KIND_PROCESS_STDOUT);
     if (!stream) stream = readStream(streamPtr, STREAM_KIND_PROCESS_STDERR);
+    if (stream && stream.processPipe) return typeof stream.processPipe.flush === 'function' ? stream.processPipe.flush() : 1;
     if (stream && (stream.kind === STREAM_KIND_PROCESS_STDIN || stream.kind === STREAM_KIND_PROCESS_STDOUT || stream.kind === STREAM_KIND_PROCESS_STDERR)) return stream.closed ? 0 : 1;
-    if (!stream && streamPtr && (getValue(streamPtr + 8, 'i32') | 0) === STREAM_KIND_TCP) return 0;
+    if (!stream && streamPtr && (getValue(streamPtr + 8, 'i32') | 0) === STREAM_KIND_TCP) {
+      return typeof bridge.flushTcp === 'function' ? bridge.flushTcp(streamPtr) : 0;
+    }
     return flushFileStream(stream);
   };
 
@@ -246,10 +284,14 @@
     },
     streamRead__async: 'auto',
     streamRead: function (ret, streamPtr, maxBytes) {
+      if (isTcpStream(streamPtr) && typeof bridge.readTcp === 'function') return bridge.readTcp(ret, streamPtr, maxBytes);
+      if (isProcessPipeStream(streamPtr)) return streamReadImpl(ret, streamPtr, maxBytes);
       return suspendStream(function () { return streamReadImpl(ret, streamPtr, maxBytes); });
     },
     streamWrite__async: 'auto',
     streamWrite: function (streamPtr, dataPtr) {
+      if (isTcpStream(streamPtr) && typeof bridge.writeTcp === 'function') return bridge.writeTcp(streamPtr, dataPtr);
+      if (isProcessPipeStream(streamPtr)) return streamWriteImpl(streamPtr, dataPtr);
       return suspendStream(function () { return streamWriteImpl(streamPtr, dataPtr); });
     },
     streamToBlob: function (ret, streamPtr) {
@@ -259,18 +301,31 @@
     },
     streamCopy__async: 'auto',
     streamCopy: function (dstPtr, srcPtr, bufferSize) {
+      if (isTcpStream(dstPtr) || isTcpStream(srcPtr) || isProcessPipeStream(dstPtr) || isProcessPipeStream(srcPtr)) return streamCopyImpl(dstPtr, srcPtr, bufferSize);
       return suspendStream(function () { return streamCopyImpl(dstPtr, srcPtr, bufferSize); });
     },
     streamFlush__async: 'auto',
     streamFlush: function (streamPtr) {
+      if (isTcpStream(streamPtr) && typeof bridge.flushTcp === 'function') return bridge.flushTcp(streamPtr);
+      if (isProcessPipeStream(streamPtr)) return bridge.flush(streamPtr);
       return suspendStream(function () { return bridge.flush(streamPtr); });
     },
     streamClose__async: 'auto',
     streamClose: function (streamPtr) {
+      if (isTcpStream(streamPtr) && typeof bridge.closeTcp === 'function') return bridge.closeTcp(streamPtr);
+      if (isProcessPipeStream(streamPtr)) {
+        var pipeStream = localStream(streamPtr);
+        if (!pipeStream || pipeStream.closed) return 0;
+        pipeStream.closed = true;
+        delete streams[Number(getValue(streamPtr, 'i64'))];
+        return typeof pipeStream.processPipe.close === 'function' ? pipeStream.processPipe.close() : 1;
+      }
       return suspendStream(function () {
         var handle = streamPtr ? Number(getValue(streamPtr, 'i64')) : 0;
         var stream = streams[handle];
-        if (!stream && streamPtr && (getValue(streamPtr + 8, 'i32') | 0) === STREAM_KIND_TCP) return 0;
+        if (!stream && streamPtr && (getValue(streamPtr + 8, 'i32') | 0) === STREAM_KIND_TCP) {
+          return typeof bridge.closeTcp === 'function' ? bridge.closeTcp(streamPtr) : 0;
+        }
         if (!stream || stream.closed) return 0;
         if (stream.file) {
           try { FS.close(stream.file); } catch (e) { return 0; }

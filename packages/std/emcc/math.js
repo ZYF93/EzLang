@@ -110,7 +110,10 @@
       if (b === 0n || (a === I64_MIN && b === -1n)) {
         writeOptI64(ret, false, 0n);
       } else {
-        writeOptI64(ret, true, a / b);
+        var q = a / b;
+        var r = a % b;
+        if (r !== 0n && ((a < 0n) !== (b < 0n))) q -= 1n;
+        writeOptI64(ret, true, q);
       }
     },
     mathF64ToI32: function (ret, value) {

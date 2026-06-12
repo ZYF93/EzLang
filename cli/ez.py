@@ -57,6 +57,7 @@ TARGET_TRIPLES = {
 }
 SEMVER_RE = re.compile(r"^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$")
 IMPORT_RE = re.compile(r'\bfrom\s+"([^"]+)"\s+import\s*\{')
+IMPORT_DECL_RE = re.compile(r'\bfrom\s+"([^"]+)"\s+import\s*\{([^}]*)\}\s*;?')
 DEFAULT_ENTRY_CANDIDATES = (
     "src/main.ez",
     "src/index.ez",
@@ -505,7 +506,7 @@ def cmd_fmt(args) -> int:
     changed: list[Path] = []
     for file in files:
         source = file.read_text(encoding="utf-8")
-        _, errors, _ = compile_source(source, module_name=file.stem, base_dir=file.parent)
+        _, errors, _ = compile_source(source, module_name=file.stem, base_dir=file.parent, source_name=file)
         if errors:
             raise CliError(f"{file}: {'; '.join(errors)}")
         formatted = _format_ez_source(source)
@@ -748,7 +749,7 @@ def _discover_sources_from(config: ProjectConfig, entry: Path) -> list[Path]:
 def _compile_source_plan(config: ProjectConfig, compile_target: str, source_plan: list[Path], base_dir: Path,
                          target_arch: str | None = None, ensure_entrypoint: bool = False):
     analyze, compile_source = _load_compiler_modules()
-    source = "\n".join(_strip_imports(path.read_text(encoding="utf-8")) for path in source_plan)
+    source = _merge_source_plan(config, source_plan)
     analyzer = analyze(
         source,
         base_dir=base_dir,
@@ -767,6 +768,7 @@ def _compile_source_plan(config: ProjectConfig, compile_target: str, source_plan
         log_compile_min_level=config.log_compile_min_level,
         ensure_entrypoint=ensure_entrypoint,
         base_dir=base_dir,
+        source_name=source_plan[-1] if source_plan else None,
     )
     errors = _resolve_extern_errors(errors, config, compile_target, base_dir)
     if errors:
@@ -1060,7 +1062,10 @@ def _emcc_needs_asyncify(libs: list[str]) -> bool:
         "packages/std/emcc/fs.js",
         "packages/std/emcc/stream.js",
         "packages/std/emcc/process.js",
+        "packages/std/emcc/compress.js",
         "packages/std/emcc/net/http.js",
+        "packages/std/emcc/net/tcp.js",
+        "packages/std/emcc/net/ws.js",
     }
     for lib in libs:
         path = Path(lib).as_posix()
@@ -1090,10 +1095,16 @@ def _write_android_jni_entry(build_dir: Path) -> Path:
         '// EzLang Android 宿主入口：把 Kotlin Activity 的 native main 转发到 EzLang main。\n'
         '#include <jni.h>\n\n'
         'extern int main(void);\n\n'
+        'extern void ezAndroidSetScreenMetrics(int width, int height, float density);\n\n'
         'JNIEXPORT jint JNICALL Java_dev_ezlang_EzLangActivity_main(JNIEnv *env, jclass cls) {\n'
         '    (void)env;\n'
         '    (void)cls;\n'
         '    return (jint)main();\n'
+        '}\n'
+        'JNIEXPORT void JNICALL Java_dev_ezlang_EzLangActivity_ezAndroidSetScreenMetrics(JNIEnv *env, jclass cls, jint width, jint height, jfloat density) {\n'
+        '    (void)env;\n'
+        '    (void)cls;\n'
+        '    ezAndroidSetScreenMetrics((int)width, (int)height, (float)density);\n'
         '}\n',
         encoding="utf-8",
     )
@@ -1132,10 +1143,14 @@ def _emit_android_ui_bridge(build_dir: Path, name: str, artifact: Path) -> Path:
         '    companion object {\n'
         f'        init {{ System.loadLibrary("{artifact.stem.removeprefix("lib")}") }}\n'
         '        @JvmStatic external fun main(): Int\n'
+        '        @JvmStatic external fun ezAndroidSetScreenMetrics(width: Int, height: Int, density: Float)\n'
         '    }\n\n'
         '    override fun onCreate(savedInstanceState: Bundle?) {\n'
         '        super.onCreate(savedInstanceState)\n'
-        '        setContentView(FrameLayout(this))\n'
+        '        val root = FrameLayout(this)\n'
+        '        setContentView(root)\n'
+        '        val metrics = resources.displayMetrics\n'
+        '        ezAndroidSetScreenMetrics(metrics.widthPixels, metrics.heightPixels, metrics.density)\n'
         '        main()\n'
         '    }\n'
         '}\n',
@@ -1166,10 +1181,14 @@ def _emit_ios_ui_bridge(build_dir: Path, name: str, artifact: Path) -> Path:
     (sources / "EzLangViewController.swift").write_text(
         'import UIKit\n\n'
         '@_silgen_name("main") private func ezlangMain() -> Int32\n\n'
+        '@_silgen_name("ezIosSetScreenMetrics") private func ezIosSetScreenMetrics(_ width: Float, _ height: Float, _ scale: Float, _ safeTop: Float, _ safeLeft: Float, _ safeBottom: Float, _ safeRight: Float, _ statusBarHeight: Float)\n\n'
         'public final class EzLangViewController: UIViewController {\n'
         '    public override func viewDidLoad() {\n'
         '        super.viewDidLoad()\n'
         '        view.backgroundColor = .systemBackground\n'
+        '        let bounds = UIScreen.main.bounds\n'
+        '        let insets = view.safeAreaInsets\n'
+        '        ezIosSetScreenMetrics(Float(bounds.width), Float(bounds.height), Float(UIScreen.main.scale), Float(insets.top), Float(insets.left), Float(insets.bottom), Float(insets.right), Float(view.window?.windowScene?.statusBarManager?.statusBarFrame.height ?? 0))\n'
         '        _ = ezlangMain()\n'
         '    }\n'
         '}\n',
@@ -1380,6 +1399,223 @@ def _package_entry(root: Path, package_name: str, rest: str) -> Path | None:
 
 def _strip_imports(source: str) -> str:
     return "\n".join(line for line in source.splitlines() if IMPORT_RE.search(line) is None) + "\n"
+
+
+def _merge_source_plan(config: ProjectConfig, source_plan: list[Path]) -> str:
+    if not source_plan:
+        return ""
+    requested: dict[Path, dict[str, str] | None] = {path.resolve(): {} for path in source_plan[:-1]}
+    for importer in source_plan:
+        for import_path, specs in _parse_import_decls(importer.read_text(encoding="utf-8")):
+            module_path = _resolve_import(importer.parent, import_path, config).resolve()
+            module_specs = requested.setdefault(module_path, {})
+            if module_specs is not None:
+                module_specs.update(specs)
+
+    chunks: list[str] = []
+    entry = source_plan[-1].resolve()
+    for path in source_plan:
+        resolved = path.resolve()
+        source = path.read_text(encoding="utf-8")
+        if resolved == entry:
+            chunks.append(_strip_imports(source))
+        else:
+            chunks.append(_filter_imported_source(source, requested.get(resolved)))
+    return "\n".join(chunks)
+
+
+def _parse_import_decls(source: str) -> list[tuple[str, dict[str, str]]]:
+    imports: list[tuple[str, dict[str, str]]] = []
+    for match in IMPORT_DECL_RE.finditer(source):
+        specs: dict[str, str] = {}
+        for raw_spec in match.group(2).split(','):
+            spec = raw_spec.strip()
+            if not spec:
+                continue
+            parts = re.split(r'\s+as\s+', spec, maxsplit=1)
+            name = parts[0].strip()
+            alias = parts[1].strip() if len(parts) == 2 else name
+            if name:
+                specs[name] = alias
+        imports.append((match.group(1), specs))
+    return imports
+
+
+def _filter_imported_source(source: str, requested: dict[str, str] | None) -> str:
+    if requested is None:
+        return _strip_imports(source)
+    private_chunks: list[str] = []
+    exports: dict[str, str] = {}
+    for stmt in _top_level_statements(source):
+        stripped = stmt.lstrip()
+        if not stripped or IMPORT_RE.search(stripped):
+            continue
+        export_name = _exported_decl_name(stripped)
+        if export_name is not None:
+            exports[export_name] = stmt
+            continue
+        private_chunks.append(stmt)
+
+    selected = {name for name in requested if name in exports}
+    changed = True
+    while changed:
+        changed = False
+        selected_text = "\n".join(exports[name] for name in selected)
+        for name in exports:
+            if name in selected:
+                continue
+            if re.search(rf'\b{re.escape(name)}\b', selected_text):
+                selected.add(name)
+                changed = True
+
+    chunks = private_chunks + [
+        _rename_exported_decl(exports[name], name, requested.get(name, name)) if name in requested else exports[name]
+        for name in exports
+        if name in selected
+    ]
+    return "\n".join(chunks) + "\n"
+
+
+def _top_level_statements(source: str) -> list[str]:
+    statements: list[str] = []
+    start = 0
+    brace_depth = 0
+    paren_depth = 0
+    bracket_depth = 0
+    in_line_comment = False
+    in_block_comment = False
+    in_string = False
+    escape = False
+    index = 0
+    length = len(source)
+
+    while index < length:
+        char = source[index]
+        nxt = source[index + 1] if index + 1 < length else ""
+        if in_line_comment:
+            if char == "\n":
+                in_line_comment = False
+            index += 1
+            continue
+        if in_block_comment:
+            if char == "*" and nxt == "/":
+                in_block_comment = False
+                index += 2
+            else:
+                index += 1
+            continue
+        if in_string:
+            if escape:
+                escape = False
+            elif char == "\\":
+                escape = True
+            elif char == '"':
+                in_string = False
+            index += 1
+            continue
+        if char == "/" and nxt == "/":
+            in_line_comment = True
+            index += 2
+            continue
+        if char == "/" and nxt == "*":
+            in_block_comment = True
+            index += 2
+            continue
+        if char == '"':
+            in_string = True
+        elif char == "{":
+            brace_depth += 1
+        elif char == "}":
+            brace_depth = max(0, brace_depth - 1)
+            if brace_depth == 0 and paren_depth == 0 and bracket_depth == 0:
+                end = index + 1
+                while end < length and source[end] in " \t\r\n;":
+                    end += 1
+                statements.append(source[start:end].strip())
+                start = end
+                index = end
+                continue
+        elif char == "(":
+            paren_depth += 1
+        elif char == ")":
+            paren_depth = max(0, paren_depth - 1)
+        elif char == "[":
+            bracket_depth += 1
+        elif char == "]":
+            bracket_depth = max(0, bracket_depth - 1)
+        elif char == ";" and brace_depth == 0 and paren_depth == 0 and bracket_depth == 0:
+            end = index + 1
+            statements.append(source[start:end].strip())
+            start = end
+        index += 1
+    tail = source[start:].strip()
+    if tail:
+        statements.append(tail)
+    return statements
+
+
+def _exported_decl_name(stmt: str) -> str | None:
+    text = _strip_leading_comments(stmt).strip()
+    if not text.startswith("export"):
+        return None
+    rest = text[len("export"):].lstrip()
+    match = re.match(r'(?:declare\s+)?(?:const|let|static)\s+([A-Za-z_][A-Za-z0-9_]*)\b', rest)
+    if match:
+        return match.group(1)
+    match = re.match(r'struct\s+([A-Z][A-Za-z0-9_]*)\b', rest)
+    if match:
+        return match.group(1)
+    match = re.match(r'type\s+([A-Z][A-Za-z0-9_]*)\b', rest)
+    if match:
+        return match.group(1)
+    return None
+
+
+def _rename_exported_decl(stmt: str, name: str, alias: str) -> str:
+    if not alias or alias == name:
+        return stmt
+    offset = stmt.find("export")
+    if offset < 0:
+        return stmt
+    head = stmt[:offset]
+    body = stmt[offset:]
+    body = re.sub(
+        rf'\b((?:export\s+)?(?:declare\s+)?(?:const|let|static)\s+){re.escape(name)}\b',
+        rf'\1{alias}',
+        body,
+        count=1,
+    )
+    body = re.sub(
+        rf'\b((?:export\s+)?struct\s+){re.escape(name)}\b',
+        rf'\1{alias}',
+        body,
+        count=1,
+    )
+    body = re.sub(
+        rf'\b((?:export\s+)?type\s+){re.escape(name)}\b',
+        rf'\1{alias}',
+        body,
+        count=1,
+    )
+    return head + body
+
+
+def _strip_leading_comments(text: str) -> str:
+    while True:
+        stripped = text.lstrip()
+        if stripped.startswith("//"):
+            newline = stripped.find("\n")
+            if newline < 0:
+                return ""
+            text = stripped[newline + 1:]
+            continue
+        if stripped.startswith("/*"):
+            end = stripped.find("*/", 2)
+            if end < 0:
+                return ""
+            text = stripped[end + 2:]
+            continue
+        return stripped
 
 
 def _format_sources(config: ProjectConfig, sources: list[Path]) -> str:

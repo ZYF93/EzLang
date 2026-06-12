@@ -2,8 +2,10 @@
 
 import re
 import shutil
+import socket
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 import pytest
@@ -224,7 +226,7 @@ def test_e2e_std_io_imports_and_builds(tmp_path):
     assert_native_optional_return(ir_text, "readLine", "i8*")
 
 
-def test_e2e_native_io_wrapper_uses_mobile_logs_and_empty_mobile_stdin():
+def test_e2e_native_io_wrapper_uses_mobile_logs_and_shared_stdin():
     io_c = (ROOT / "packages" / "std" / "native" / "io.c").read_text(encoding="utf-8")
     assert "__android_log_write" in io_c
     assert "ANDROID_LOG_INFO" in io_c
@@ -232,9 +234,35 @@ def test_e2e_native_io_wrapper_uses_mobile_logs_and_empty_mobile_stdin():
     assert "os_log_with_type" in io_c
     assert "OS_LOG_TYPE_INFO" in io_c
     assert "OS_LOG_TYPE_ERROR" in io_c
-    assert "#if defined(__ANDROID__) || (defined(__APPLE__) && TARGET_OS_IPHONE)" in io_c
-    assert "return (OptStr){false, NULL};" in io_c
+    readline_body = io_c[io_c.index("OptStr readLine"):]
+    assert "fgetc(stdin)" in readline_body
+    assert "defined(__ANDROID__) || (defined(__APPLE__) && TARGET_OS_IPHONE)" not in readline_body
+    assert "return (OptStr){false, NULL};" in readline_body
     assert "static char buffer[4096]" not in io_c
+
+
+def test_e2e_mobile_io_readline_compiles_shared_stdin_branch(tmp_path):
+    """Android/iOS readLine 应复用 native stdin 读取逻辑，而不是预处理失败。"""
+    cc = shutil.which("cc")
+    if cc is None:
+        pytest.skip("需要 C 编译器验证移动端 std/io wrapper")
+
+    android_obj = tmp_path / "io_android.o"
+    subprocess.run(
+        [
+            cc,
+            "-std=c11",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-D__ANDROID__=1",
+            "-c",
+            str(ROOT / "packages" / "std" / "native" / "io.c"),
+            "-o",
+            str(android_obj),
+        ],
+        check=True,
+    )
 
 
 def test_e2e_native_io_readline_reads_long_crlf_lines(tmp_path):
@@ -1046,6 +1074,7 @@ def test_e2e_std_process_imports_and_builds(tmp_path):
 
 def test_e2e_process_wrappers_cover_windows_and_unsupported_targets():
     native = (ROOT / "packages" / "std" / "native" / "process.c").read_text(encoding="utf-8")
+    platform_native = (ROOT / "packages" / "std" / "native" / "platform.c").read_text(encoding="utf-8")
     emcc = (ROOT / "packages" / "std" / "emcc" / "process.js").read_text(encoding="utf-8")
     stdlib_doc = (ROOT / "docs" / "stdlib.md").read_text(encoding="utf-8")
     stdlib_api_doc = (ROOT / "docs" / "stdlib-api.md").read_text(encoding="utf-8")
@@ -1056,20 +1085,66 @@ def test_e2e_process_wrappers_cover_windows_and_unsupported_targets():
     assert "EZ_PROCESS_POSIX_SUPPORTED" in native
     assert "#if defined(_WIN32)" in native
     assert "#elif EZ_PROCESS_POSIX_SUPPORTED" in native
+    assert "!defined(__ANDROID__)" not in native[native.index("#if !defined(_WIN32)"):native.index("#if EZ_PROCESS_POSIX_SUPPORTED")]
     assert "return (OptProcessResult){false, {0}};" in native
     assert "return (OptProcess){false, {0}};" in native
-    for marker in ["child_process", "childProcess.spawn(", "spawnSync", "completed[handle]", "process.execPath", "浏览器显式失败"]:
+    assert "defined(__APPLE__) && TARGET_OS_IPHONE" in platform_native[platform_native.index("bool platformHasSubprocess"):]
+    assert "defined(__ANDROID__)" not in platform_native[platform_native.index("bool platformHasSubprocess"):]
+    for marker in ["child_process", "childProcess.spawn(", "spawnSync", "running[handle]", "completed[handle]", "process.execPath", "浏览器显式失败"]:
         assert marker in emcc
-    for marker in ["processStdin", "processStdout", "processStderr", "__ez_stream_bridge", "takeCompletedStream"]:
+    for marker in ["processStdin", "processStdout", "processStderr", "__ez_stream_bridge", "takeCompletedStream", "fromProcessPipe"]:
         assert marker in emcc
     assert "保留 `stdin`/`stdout`/`stderr` 管道" not in stdlib_doc
-    assert "processWait` 捕获" in stdlib_doc
+    assert "processWait` 挂起等待退出" in stdlib_doc
     assert "进程管道流" in stdlib_doc
+    assert "Linux/macOS/Windows/Android native 目标实现子进程调用" in stdlib_doc
+    assert "iOS 目标当前仍显式失败" in stdlib_doc
     assert "processWait` 返回捕获的 `stdout`/`stderr`" in stdlib_api_doc
+    assert "Linux/macOS/Windows/Android native 目标实现子进程调用" in stdlib_api_doc
 
 
-def test_e2e_emcc_process_terminate_does_not_drop_completed_spawn_result():
-    """emcc processSpawn 是同步结果句柄，terminate 不能伪装成功或删除结果。"""
+def test_e2e_android_process_uses_posix_subprocess_branch(tmp_path):
+    """Android native process wrapper 应复用 POSIX fork/exec 分支。"""
+    cc = shutil.which("cc")
+    if cc is None:
+        pytest.skip("需要 C 编译器验证 Android process 预处理分支")
+
+    process_obj = tmp_path / "process_android.o"
+    platform_obj = tmp_path / "platform_android.o"
+    subprocess.run(
+        [
+            cc,
+            "-std=c11",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-D__ANDROID__=1",
+            "-c",
+            str(ROOT / "packages" / "std" / "native" / "process.c"),
+            "-o",
+            str(process_obj),
+        ],
+        check=True,
+    )
+    subprocess.run(
+        [
+            cc,
+            "-std=c11",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-D__ANDROID__=1",
+            "-c",
+            str(ROOT / "packages" / "std" / "native" / "platform.c"),
+            "-o",
+            str(platform_obj),
+        ],
+        check=True,
+    )
+
+
+def test_e2e_emcc_process_spawn_falls_back_when_async_spawn_unavailable():
+    """emcc processSpawn 在 Asyncify spawn 不可用时回退同步结果句柄。"""
     node = shutil.which("node")
     if node is None:
         pytest.skip("需要 Node 验证 std/process emcc wrapper")
@@ -1139,10 +1214,13 @@ function writeList(ptr, values) {
 
 let spawnCalls = 0;
 const fakeChildProcess = {
-  spawnSync(program, args, options) {
+  spawn(program, args) {
     spawnCalls += 1;
     assert.strictEqual(program, 'tool');
     assert.deepStrictEqual(Array.from(args), ['arg']);
+    return null;
+  },
+  spawnSync(program, args, options) {
     assert.strictEqual(Buffer.from(options.input).toString('utf8'), 'in');
     return { status: 0, stdout: Buffer.from('out'), stderr: Buffer.from(''), error: null };
   },
@@ -1160,6 +1238,7 @@ vm.runInNewContext(code, {
   stringToUTF8,
   UTF8ToString,
   stringToNewUTF8,
+  Asyncify: { handleSleep(fn) { let value; fn((result) => { value = result; }); return value; } },
   require(name) { return name === 'child_process' ? fakeChildProcess : null; },
   LibraryManager: { library },
   mergeInto(target, source) { Object.assign(target, source); },
@@ -1300,8 +1379,8 @@ assert.strictEqual(spawnCalls, 0);
     subprocess.run([node, "-e", script, str(ROOT / "packages" / "std" / "emcc" / "process.js")], check=True)
 
 
-def test_e2e_emcc_process_stdout_can_transfer_to_stream():
-    """emcc processStdout 可把同步 spawn 结果转交给 std/stream。"""
+def test_e2e_emcc_process_completed_stdout_can_transfer_to_stream():
+    """emcc processStdout 可把已完成 spawn 结果转交给 std/stream。"""
     node = shutil.which("node")
     if node is None:
         pytest.skip("需要 Node 验证 std/process emcc wrapper")
@@ -1420,6 +1499,208 @@ library.processWait(waited, spawned + 8);
 assert.strictEqual(HEAPU8[waited], 1);
 assert.strictEqual(getValue(waited + 24, 'i64'), 0);
 assert.strictEqual(getValue(waited + 40, 'i64'), 3);
+'''
+    subprocess.run(
+        [node, "-e", script, str(ROOT / "packages" / "std" / "emcc" / "stream.js"), str(ROOT / "packages" / "std" / "emcc" / "process.js")],
+        check=True,
+    )
+
+
+def test_e2e_emcc_process_live_pipe_streams_roundtrip():
+    """emcc Asyncify processSpawn 应暴露活 stdin/stdout 管道流。"""
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("需要 Node 验证 std/process emcc wrapper")
+    script = r'''
+const assert = require('assert');
+const fs = require('fs');
+const { EventEmitter } = require('events');
+const vm = require('vm');
+
+const streamCode = fs.readFileSync(process.argv[1], 'utf8');
+const processCode = fs.readFileSync(process.argv[2], 'utf8');
+const memory = new ArrayBuffer(131072);
+const HEAPU8 = new Uint8Array(memory);
+const view = new DataView(memory);
+let heap = 1024;
+
+function align(value) { return (value + 7) & ~7; }
+function _malloc(size) {
+  const ptr = heap;
+  heap = align(heap + Math.max(1, size));
+  if (heap > HEAPU8.length) throw new Error('oom');
+  return ptr;
+}
+function _free() {}
+function getValue(ptr, type) {
+  if (type === '*') return view.getUint32(ptr, true);
+  if (type === 'i32') return view.getInt32(ptr, true);
+  if (type === 'i64') return Number(view.getBigInt64(ptr, true));
+  throw new Error('unsupported getValue type ' + type);
+}
+function setValue(ptr, value, type) {
+  if (type === '*') { view.setUint32(ptr, Number(value), true); return; }
+  if (type === 'i32') { view.setInt32(ptr, Number(value), true); return; }
+  if (type === 'i64') { view.setBigInt64(ptr, BigInt(value), true); return; }
+  throw new Error('unsupported setValue type ' + type);
+}
+function stringToNewUTF8(text) {
+  const bytes = Buffer.from(text, 'utf8');
+  const ptr = _malloc(bytes.length + 1);
+  HEAPU8.set(bytes, ptr);
+  HEAPU8[ptr + bytes.length] = 0;
+  return ptr;
+}
+function UTF8ToString(ptr) {
+  if (!ptr) return '';
+  let end = ptr;
+  while (HEAPU8[end] !== 0) end++;
+  return Buffer.from(HEAPU8.slice(ptr, end)).toString('utf8');
+}
+function writeList(ptr, values) {
+  const pages = values.length === 0 ? 0 : _malloc(4);
+  if (values.length > 0) {
+    const page = _malloc(32);
+    setValue(pages, page, '*');
+    values.forEach((value, index) => setValue(page + index * 4, stringToNewUTF8(value), '*'));
+  }
+  setValue(ptr, pages, '*');
+  setValue(ptr + 8, values.length, 'i64');
+  setValue(ptr + 16, values.length === 0 ? 0 : 8, 'i64');
+  setValue(ptr + 24, values.length === 0 ? 0 : 1, 'i64');
+}
+function makeBlob(text) {
+  const bytes = Buffer.from(text, 'utf8');
+  const data = _malloc(bytes.length || 1);
+  HEAPU8.set(bytes, data);
+  const blob = _malloc(16);
+  setValue(blob, data, '*');
+  setValue(blob + 8, bytes.length, 'i64');
+  return blob;
+}
+function blobText(ptr) {
+  const dataPtr = getValue(ptr, '*');
+  const size = getValue(ptr + 8, 'i64');
+  return Buffer.from(HEAPU8.slice(dataPtr, dataPtr + size)).toString('utf8');
+}
+
+class FakeReadable extends EventEmitter {
+  constructor() {
+    super();
+    this.queue = [];
+    this.readableEnded = false;
+    this.destroyed = false;
+  }
+  pushData(text) {
+    this.queue.push(Buffer.from(text));
+    this.emit('data', Buffer.from(text));
+  }
+  read(max) {
+    if (this.queue.length === 0) return null;
+    const chunk = this.queue.shift();
+    if (chunk.length > max) {
+      this.queue.unshift(chunk.slice(max));
+      return chunk.slice(0, max);
+    }
+    return chunk;
+  }
+  end() {
+    this.readableEnded = true;
+    this.emit('end');
+    this.emit('close');
+  }
+  destroy() { this.destroyed = true; this.emit('close'); }
+}
+
+class FakeWritable extends EventEmitter {
+  constructor(child) {
+    super();
+    this.child = child;
+    this.destroyed = false;
+  }
+  write(data) {
+    this.child.stdout.pushData('echo:' + Buffer.from(data).toString('utf8'));
+    return true;
+  }
+  end() { this.child.stdout.end(); }
+  destroy() { this.destroyed = true; }
+}
+
+class FakeChild extends EventEmitter {
+  constructor() {
+    super();
+    this.pid = 42;
+    this.stdout = new FakeReadable();
+    this.stderr = new FakeReadable();
+    this.stdin = new FakeWritable(this);
+  }
+  kill() {
+    this.emit('close', 143, null);
+    return true;
+  }
+}
+
+const child = new FakeChild();
+const fakeChildProcess = { spawn() { return child; } };
+
+const library = {};
+const context = {
+  require(name) { return name === 'child_process' ? fakeChildProcess : null; },
+  BigInt,
+  Buffer,
+  ArrayBuffer,
+  DataView,
+  Uint8Array,
+  HEAPU8,
+  FS: {},
+  _malloc,
+  _free,
+  getValue,
+  setValue,
+  UTF8ToString,
+  stringToNewUTF8,
+  Asyncify: { handleSleep(fn) { let value; fn((result) => { value = result; }); return value; } },
+  LibraryManager: { library },
+  mergeInto(target, source) { Object.assign(target, source); },
+};
+vm.runInNewContext(streamCode, context, { filename: process.argv[1] });
+vm.runInNewContext(processCode, context, { filename: process.argv[2] });
+
+const command = _malloc(96);
+setValue(command, stringToNewUTF8('tool'), '*');
+writeList(command + 8, []);
+setValue(command + 40, 0, '*');
+writeList(command + 48, []);
+setValue(command + 80, 0, '*');
+setValue(command + 88, 0, 'i64');
+
+const spawned = _malloc(32);
+library.processSpawn(spawned, command);
+assert.strictEqual(HEAPU8[spawned], 1);
+assert.strictEqual(getValue(spawned + 16, 'i64'), 42);
+
+const stdinOpt = _malloc(24);
+library.processStdin(stdinOpt, spawned + 8);
+assert.strictEqual(HEAPU8[stdinOpt], 1);
+const stdoutOpt = _malloc(24);
+library.processStdout(stdoutOpt, spawned + 8);
+assert.strictEqual(HEAPU8[stdoutOpt], 1);
+
+assert.strictEqual(library.streamWrite(stdinOpt + 8, makeBlob('pipe')), 4);
+const chunk = _malloc(24);
+library.streamRead(chunk, stdoutOpt + 8, 16);
+assert.strictEqual(HEAPU8[chunk], 1);
+assert.strictEqual(blobText(chunk + 8), 'echo:pipe');
+assert.strictEqual(library.streamClose(stdinOpt + 8), 1);
+assert.strictEqual(library.streamClose(stdoutOpt + 8), 1);
+
+child.emit('close', 0, null);
+const waited = _malloc(80);
+library.processWait(waited, spawned + 8);
+assert.strictEqual(HEAPU8[waited], 1);
+assert.strictEqual(getValue(waited + 16, 'i64'), 0);
+assert.strictEqual(getValue(waited + 40, 'i64'), 0);
+assert.strictEqual(HEAPU8[waited + 48], 1);
 '''
     subprocess.run(
         [node, "-e", script, str(ROOT / "packages" / "std" / "emcc" / "stream.js"), str(ROOT / "packages" / "std" / "emcc" / "process.js")],
@@ -1791,13 +2072,38 @@ def test_e2e_debug_wrappers_cover_crash_hex_and_stack_paths():
     ez = (ROOT / "packages" / "std" / "debug.ez").read_text(encoding="utf-8")
     for marker in ["abort();", "backtrace(frames", "backtrace_symbols", "CaptureStackBackTrace", "SymFromAddr", "ezlang native/windows", "ezlang native/linux"]:
         assert marker in native
-    for marker in ["EZ_DEBUG_HAS_EXECINFO 0", "ezlang native/ios", "return (OptStr){false, NULL};"]:
+    for marker in ["EZ_DEBUG_HAS_EXECINFO 0", "EZ_DEBUG_HAS_UNWIND 1", "_Unwind_Backtrace", "ez_debug_unwind_frame", "ezlang native/ios"]:
         assert marker in native
+    assert "移动端堆栈显式失败" not in (ROOT / "docs" / "stdlib.md").read_text(encoding="utf-8")
     assert 'extern "dbghelp" for windows;' in ez
     assert 'static const char hex[] = "0123456789abcdef"' in native
     for marker in ["console.error", "throw new Error", "new Error().stack", "padStart(2, '0')", "ezlang emcc/wasm32", "HEAPU8.length - dataPtr"]:
         assert marker in emcc
     assert "stack.length > 0" in emcc
+
+
+def test_e2e_mobile_debug_stack_uses_unwind_branch(tmp_path):
+    """Android/iOS debugStack 应编译到 _Unwind_Backtrace 地址栈 fallback。"""
+    cc = shutil.which("cc")
+    if cc is None:
+        pytest.skip("需要 C 编译器验证移动端 debugStack 预处理分支")
+
+    android_obj = tmp_path / "debug_android.o"
+    subprocess.run(
+        [
+            cc,
+            "-std=c11",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-D__ANDROID__=1",
+            "-c",
+            str(ROOT / "packages" / "std" / "native" / "debug.c"),
+            "-o",
+            str(android_obj),
+        ],
+        check=True,
+    )
 
 
 def test_e2e_emcc_debug_stack_returns_none_without_stack_text():
@@ -2332,7 +2638,11 @@ def test_e2e_compress_wrappers_use_zlib_and_reject_invalid_blobs():
 
     for marker in ["defined(_WIN32)", "#include <zlib.h>", "deflateInit2", "inflateInit2", "!ez_blob_bytes", "ez_zlib_stream_run", "streamRead", "streamWrite"]:
         assert marker in native
-    for marker in ["require('zlib')", "gzipSync", "inflateRawSync", "input === null", "writeOptBlob", "HEAPU8.length - dataPtr", "runStream", "streamRead", "streamWrite"]:
+    for marker in [
+        "require('zlib')", "gzipSync", "inflateRawSync", "CompressionStream", "DecompressionStream",
+        "Asyncify.handleAsync", "compressGzip__async: 'auto'", "decompressGzipStream__async: 'auto'",
+        "input === null", "writeOptBlob", "HEAPU8.length - dataPtr", "runStream", "streamRead", "streamWrite",
+    ]:
         assert marker in emcc
     assert "Windows native 当前返回空可选值" not in api_docs
     assert "Windows native 当前返回空可选值" not in docs
@@ -2347,6 +2657,7 @@ def test_e2e_compress_wrappers_use_zlib_and_reject_invalid_blobs():
     assert "std/compress" in api_docs
     assert "| `std/stream` | 运行时 ABI 封装 | 内存/Blob、文件流、TCP 流" in docs
     assert "native 目标使用系统 zlib" in api_docs
+    assert "CompressionStream` / `DecompressionStream`" in api_docs
 
 
 def test_e2e_native_compress_zlib_vectors(tmp_path):
@@ -2526,6 +2837,131 @@ assert.strictEqual(library.decompressGzipStream(allocStream([]).ptr, allocStream
     subprocess.run([node, "-e", script, str(ROOT / "packages" / "std" / "emcc" / "compress.js")], check=True)
 
 
+def test_e2e_emcc_compress_web_streams_bridge():
+    """emcc compress 在浏览器/Worker 能通过 CompressionStream + Asyncify 桥接。"""
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("需要 Node 验证 std/compress emcc wrapper")
+    script = r'''
+const assert = require('assert');
+const fs = require('fs');
+const vm = require('vm');
+
+const code = fs.readFileSync(process.argv[1], 'utf8');
+const memory = new ArrayBuffer(65536);
+const HEAPU8 = new Uint8Array(memory);
+const view = new DataView(memory);
+let heap = 1024;
+const calls = [];
+
+function align(value) { return (value + 7) & ~7; }
+function _malloc(size) {
+  const ptr = heap;
+  heap = align(heap + Math.max(0, size));
+  if (heap > HEAPU8.length) throw new Error('oom');
+  return ptr;
+}
+function _free() {}
+function getValue(ptr, type) {
+  if (type === '*') return view.getUint32(ptr, true);
+  if (type === 'i64') return Number(view.getBigInt64(ptr, true));
+  if (type === 'i32') return view.getInt32(ptr, true);
+  throw new Error('unsupported getValue type ' + type);
+}
+function setValue(ptr, value, type) {
+  if (type === '*') { view.setUint32(ptr, Number(value), true); return; }
+  if (type === 'i64') { view.setBigInt64(ptr, BigInt(value), true); return; }
+  if (type === 'i32') { view.setInt32(ptr, Number(value), true); return; }
+  throw new Error('unsupported setValue type ' + type);
+}
+class SyncPromise {
+  constructor(executor) {
+    this.value = undefined;
+    this.error = undefined;
+    executor(
+      (value) => { this.value = value instanceof SyncPromise ? value.value : value; },
+      (error) => { this.error = error; }
+    );
+  }
+  then(onFulfilled, onRejected) {
+    return new SyncPromise((resolve, reject) => {
+      try {
+        if (this.error !== undefined) resolve(onRejected ? onRejected(this.error) : undefined);
+        else resolve(onFulfilled ? onFulfilled(this.value) : this.value);
+      } catch (error) {
+        reject(error);
+      }
+    });
+  }
+}
+class FakeBlob {
+  constructor(parts) { this.bytes = Buffer.concat(parts.map((part) => Buffer.from(part))); }
+  stream() { return { bytes: this.bytes, pipeThrough(transform) { return { bytes: transform.apply(this.bytes) }; } }; }
+}
+class FakeCompressionStream {
+  constructor(format) { this.format = format; calls.push(['c', format]); }
+  apply(bytes) { return Buffer.concat([Buffer.from('C:' + this.format + ':'), Buffer.from(bytes)]); }
+}
+class FakeDecompressionStream {
+  constructor(format) { this.format = format; calls.push(['d', format]); }
+  apply(bytes) { return Buffer.concat([Buffer.from('D:' + this.format + ':'), Buffer.from(bytes)]); }
+}
+class FakeResponse {
+  constructor(stream) { this.stream = stream; }
+  arrayBuffer() { return new SyncPromise((resolve) => resolve(this.stream.bytes.buffer.slice(this.stream.bytes.byteOffset, this.stream.bytes.byteOffset + this.stream.bytes.byteLength))); }
+}
+
+const library = {};
+const context = {
+  Buffer,
+  Uint8Array,
+  HEAPU8,
+  _malloc,
+  _free,
+  getValue,
+  setValue,
+  Promise: SyncPromise,
+  Blob: FakeBlob,
+  Response: FakeResponse,
+  CompressionStream: FakeCompressionStream,
+  DecompressionStream: FakeDecompressionStream,
+  Asyncify: { handleAsync(fn) { const value = fn(); return value instanceof SyncPromise ? value.value : value; } },
+  LibraryManager: { library },
+  mergeInto(target, source) { Object.assign(target, source); },
+};
+vm.runInNewContext(code, context, { filename: process.argv[1] });
+
+function allocBlob(text) {
+  const bytes = Buffer.from(text, 'utf8');
+  const blob = _malloc(16);
+  const data = _malloc(bytes.length);
+  HEAPU8.set(bytes, data);
+  setValue(blob, data, '*');
+  setValue(blob + 8, bytes.length, 'i64');
+  return blob;
+}
+function call(name, blob) {
+  const ret = _malloc(32);
+  library[name](ret, blob);
+  const ok = HEAPU8[ret] !== 0;
+  const dataPtr = getValue(ret + 8, '*');
+  const size = getValue(ret + 16, 'i64');
+  return { ok, text: Buffer.from(HEAPU8.slice(dataPtr, dataPtr + size)).toString('utf8') };
+}
+assert.deepStrictEqual(call('compressGzip', allocBlob('x')), { ok: true, text: 'C:gzip:x' });
+assert.deepStrictEqual(call('decompressZlib', allocBlob('y')), { ok: true, text: 'D:deflate:y' });
+assert.deepStrictEqual(call('compressDeflate', allocBlob('z')), { ok: true, text: 'C:deflate-raw:z' });
+assert.deepStrictEqual(calls, [['c', 'gzip'], ['d', 'deflate'], ['c', 'deflate-raw']]);
+
+const noAsync = {};
+vm.runInNewContext(code, Object.assign({}, context, { Asyncify: undefined, LibraryManager: { library: noAsync } }), { filename: process.argv[1] });
+const ret = _malloc(32);
+noAsync.compressGzip(ret, allocBlob('x'));
+assert.strictEqual(HEAPU8[ret], 0);
+'''
+    subprocess.run([node, "-e", script, str(ROOT / "packages" / "std" / "emcc" / "compress.js")], check=True)
+
+
 def test_e2e_std_os_imports_and_builds(tmp_path):
     source = tmp_path / "std_os.ez"
     source.write_text(
@@ -2561,10 +2997,13 @@ def test_e2e_std_time_imports_and_builds(tmp_path):
     assert_native_small_struct_return(ir_text, "now", "Date", "i64")
     assert 'declare i64 @"timestamp"' in ir_text
     assert 'declare void @"sleep"' in ir_text
-    assert 'declare i32 @"getYear"' in ir_text
-    assert 'declare i32 @"getHour"' in ir_text
-    assert 'declare void @"add"' in ir_text
-    assert 'declare i8* @"format"' in ir_text
+    assert 'define i32 @"getYear"' in ir_text
+    assert 'declare i32 @"dateGetYear"' in ir_text
+    assert 'define i32 @"getHour"' in ir_text
+    assert 'declare i32 @"dateGetHour"' in ir_text
+    assert 'define void @"add"' in ir_text
+    assert 'declare void @"dateAdd"' in ir_text
+    assert 'declare i8* @"dateFormat"' in ir_text
     assert 'define %"Duration" @"Duration_fromSec"' in ir_text
     assert 'define i8* @"Duration_toString"' in ir_text
     assert 'declare i8* @"__durationToString"' in ir_text
@@ -2615,8 +3054,8 @@ def test_e2e_std_net_http_server_imports_and_builds(tmp_path):
     assert 'stop' in ir_text
 
 
-def test_e2e_std_net_http_native_server_and_client_support_are_explicit():
-    """HTTP 原生客户端/服务端有实现；emcc 服务端仍明确不支持。"""
+def test_e2e_std_net_http_native_and_emcc_server_support_are_explicit():
+    """HTTP 原生服务端与 emcc Node 服务端都有真实实现，浏览器环境仍失败。"""
     native = (ROOT / "packages" / "std" / "native" / "net" / "http.c").read_text(encoding="utf-8")
     emcc = (ROOT / "packages" / "std" / "emcc" / "net" / "http.js").read_text(encoding="utf-8")
     interface = (ROOT / "packages" / "std" / "net" / "http.ez").read_text(encoding="utf-8")
@@ -2627,6 +3066,15 @@ def test_e2e_std_net_http_native_server_and_client_support_are_explicit():
     assert "send(sock" in native
     assert "recv(sock" in native
     assert "ez_decode_chunked_body" in native
+    assert '"https://"' in native
+    assert 'strcpy(out->port, tls ? "443" : "80")' in native
+    assert "ez_http_load_tls" in native
+    assert "OPENSSL_init_ssl" in native
+    assert "X509_VERIFY_PARAM_set1_host" in native
+    assert "X509_VERIFY_PARAM_set1_ip_asc" in native
+    assert "SSL_get_verify_result" in native
+    assert "ez_http_conn_send_all" in native
+    assert 'extern "dl" for linux;' in interface
     assert "fragment_start" in native
     assert "*authority_end == '?'" in native
     assert "ez_parse_http_port" in native
@@ -2634,21 +3082,30 @@ def test_e2e_std_net_http_native_server_and_client_support_are_explicit():
     assert "memchr(host_start, ']'" in native
     for marker in ["XMLHttpRequest", "xhr.open(req.method || 'GET', req.url, false)", "parseResponseHeaders", "writeOptResponse"]:
         assert marker in emcc
-    assert "HTTP_SERVER_UNSUPPORTED_HANDLE" in emcc
+    for marker in ["nodeRequire('http')", "http.createServer", "HttpServer_start__async: 'auto'", "callHandler"]:
+        assert marker in emcc
     for marker in ["HttpServer_on", "HttpServer_start", "HttpServer_stop", "ez_http_handle_client", "ez_http_listen_socket"]:
         assert marker in native
+    for marker in ["ez_http_client_worker", "active_workers", "pthread_create", "CreateThread", "ez_http_wait_workers"]:
+        assert marker in native
     assert "HTTP 服务端当前明确不支持" not in interface
-    assert "原生桌面平台支持基础阻塞式 HTTP 服务端" in docs
-    assert "| `std/net/http` | 原生/JS 封装 | 明文 HTTP 客户端；基础服务端 | 明文 HTTP 客户端；基础服务端" in docs
+    assert "原生平台支持基础 HTTP 服务端" in docs
+    assert "HTTP/HTTPS 客户端；基础服务端" in docs
+    assert "可加载 OpenSSL TLS 后端且证书链与主机名校验通过时支持 `https://`" in docs
+    assert "复用原生封装，支持明文 `http://` 客户端和每连接 worker 服务端" in docs
     assert 'extern "ws2_32" for windows;' in interface
+    assert 'extern "pthread" for linux;' in interface
     assert "chunked 响应体" in docs
     assert "后续接入真实网络实现" not in docs
     assert "`fetch` + Asyncify 挂起客户端请求" in docs
-    assert "后续接入 TLS、超时配置和 native 事件源式 flow 挂起" in docs
+    assert "Node 风格运行时支持基础 HTTP 服务端" in docs
+    assert "后续接入 TLS、超时配置和 native 事件源式 flow 挂起" not in docs
+    assert "后续接入超时配置和 native 事件源式 flow 挂起" not in docs
+    assert "后续接入 native 事件源式 flow 挂起" in docs
+    assert "HTTP 服务端并发 worker" not in docs
     create_server_body = native[native.index("HttpServer createServer"):native.index("void HttpServer_on")]
     assert "calloc" in create_server_body
     assert "return (HttpServer){(int64_t)(uintptr_t)server};" in create_server_body
-    assert "return 0n;" not in emcc
 
 
 def test_e2e_native_http_fetch_ex_rejects_invalid_body_blob_before_connect(tmp_path):
@@ -2662,6 +3119,7 @@ def test_e2e_native_http_fetch_ex_rejects_invalid_body_blob_before_connect(tmp_p
         r'''
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <stddef.h>
 
 typedef struct { uint8_t *data; int64_t size; } Blob;
@@ -2683,6 +3141,7 @@ int main(void) {
         encoding="utf-8",
     )
     exe = tmp_path / "http_invalid_body_harness"
+    extra_libs = ["-ldl"] if sys.platform.startswith("linux") else []
     subprocess.run(
         [
             cc,
@@ -2692,6 +3151,240 @@ int main(void) {
             "-Werror",
             str(harness),
             str(ROOT / "packages" / "std" / "native" / "net" / "http.c"),
+            "-pthread",
+            *extra_libs,
+            "-o",
+            str(exe),
+        ],
+        check=True,
+    )
+    subprocess.run([str(exe)], check=True)
+
+
+def test_e2e_native_http_https_fails_without_tls_backend(tmp_path):
+    """HTTPS 客户端不应在 TLS 后端不可用时伪装成功或回退明文。"""
+    cc = shutil.which("cc")
+    if cc is None:
+        pytest.skip("需要 C 编译器验证原生 std/net/http wrapper")
+
+    harness = tmp_path / "http_https_no_tls_harness.c"
+    harness.write_text(
+        r'''
+#include <stdbool.h>
+#include <stdint.h>
+
+typedef struct { uint8_t *data; int64_t size; } Blob;
+typedef struct { char ***key_pages; char ***value_pages; int32_t count; int32_t capacity; int32_t page_count; } Dict;
+typedef struct { int32_t status; Dict headers; Blob body; } HttpResponse;
+typedef struct { bool ok; HttpResponse value; } OptHttpResponse;
+
+OptHttpResponse fetch(const char *url);
+
+int main(int argc, char **argv) {
+    return fetch(argc > 1 ? argv[1] : "https://127.0.0.1:1/").ok ? 2 : 0;
+}
+''',
+        encoding="utf-8",
+    )
+    exe = tmp_path / "http_https_no_tls_harness"
+    extra_libs = ["-ldl"] if sys.platform.startswith("linux") else []
+    subprocess.run(
+        [
+            cc,
+            "-std=c11",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-DEZ_HTTP_TEST_NO_OPENSSL_DLOPEN=1",
+            str(harness),
+            str(ROOT / "packages" / "std" / "native" / "net" / "http.c"),
+            "-pthread",
+            *extra_libs,
+            "-o",
+            str(exe),
+        ],
+        check=True,
+    )
+
+    ready = threading.Event()
+    captured = []
+
+    def serve_once():
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
+            server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            server.bind(("127.0.0.1", 0))
+            server.listen(1)
+            captured.append(server.getsockname()[1])
+            ready.set()
+            conn, _ = server.accept()
+            with conn:
+                conn.settimeout(2)
+                try:
+                    data = conn.recv(128)
+                except socket.timeout:
+                    data = b""
+                captured.append(data)
+
+    thread = threading.Thread(target=serve_once, daemon=True)
+    thread.start()
+    assert ready.wait(timeout=2)
+    subprocess.run([str(exe), f"https://127.0.0.1:{captured[0]}/"], check=True, timeout=5)
+    thread.join(timeout=3)
+    assert len(captured) >= 2
+    assert not captured[1].startswith(b"GET /")
+
+
+def test_e2e_native_http_server_handles_connections_concurrently(tmp_path):
+    """原生 HTTP 服务端应将已接受连接交给 worker 并发处理。"""
+    if sys.platform.startswith("win"):
+        pytest.skip("POSIX harness 用于验证 pthread HTTP worker")
+    cc = shutil.which("cc")
+    if cc is None:
+        pytest.skip("需要 C 编译器验证原生 std/net/http wrapper")
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+
+    harness = tmp_path / "http_concurrent_server_harness.c"
+    harness.write_text(
+        r'''
+#define _DEFAULT_SOURCE
+#define _DARWIN_C_SOURCE
+
+#include <arpa/inet.h>
+#include <pthread.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+typedef struct { uint8_t *data; int64_t size; } Blob;
+typedef struct { char ***key_pages; char ***value_pages; int32_t count; int32_t capacity; int32_t page_count; } Dict;
+typedef struct { int32_t status; Dict headers; Blob body; } HttpResponse;
+typedef struct { const char *method; const char *url; Dict headers; Blob body; } HttpRequest;
+typedef struct { int64_t handle; } HttpServer;
+typedef HttpResponse (*RouteHandler)(const HttpRequest *req);
+
+HttpServer createServer(const char *host, int32_t port);
+void HttpServer_on(HttpServer *value, const char *path, RouteHandler handler);
+void HttpServer_start(HttpServer *value);
+void HttpServer_stop(HttpServer *value);
+
+static HttpServer server;
+static pthread_mutex_t state_lock = PTHREAD_MUTEX_INITIALIZER;
+static int active_requests = 0;
+static int max_active_requests = 0;
+static int handled_requests = 0;
+
+static HttpResponse route(const HttpRequest *req) {
+    (void)req;
+    pthread_mutex_lock(&state_lock);
+    active_requests++;
+    handled_requests++;
+    if (active_requests > max_active_requests) max_active_requests = active_requests;
+    int seen = handled_requests;
+    pthread_mutex_unlock(&state_lock);
+
+    usleep(250000);
+
+    pthread_mutex_lock(&state_lock);
+    active_requests--;
+    pthread_mutex_unlock(&state_lock);
+    if (seen >= 2) HttpServer_stop(&server);
+    return (HttpResponse){200, {0}, {(uint8_t *)"ok", 2}};
+}
+
+static void *run_server(void *arg) {
+    (void)arg;
+    HttpServer_start(&server);
+    return NULL;
+}
+
+static int connect_with_retry(void) {
+    for (int i = 0; i < 100; ++i) {
+        int sock = socket(AF_INET, SOCK_STREAM, 0);
+        if (sock < 0) return -1;
+        struct sockaddr_in addr;
+        memset(&addr, 0, sizeof(addr));
+        addr.sin_family = AF_INET;
+        addr.sin_port = htons(EZ_TEST_PORT);
+        inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
+        if (connect(sock, (struct sockaddr *)&addr, sizeof(addr)) == 0) return sock;
+        close(sock);
+        usleep(20000);
+    }
+    return -1;
+}
+
+static void *run_client(void *arg) {
+    (void)arg;
+    int sock = connect_with_retry();
+    if (sock < 0) return (void *)(intptr_t)2;
+    const char *req = "GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 0\r\n\r\n";
+    if (send(sock, req, strlen(req), 0) < 0) {
+        close(sock);
+        return (void *)(intptr_t)3;
+    }
+    char buffer[256];
+    int saw_ok = 0;
+    for (;;) {
+        ssize_t n = recv(sock, buffer, sizeof(buffer), 0);
+        if (n < 0) {
+            close(sock);
+            return (void *)(intptr_t)4;
+        }
+        if (n == 0) break;
+        for (ssize_t i = 0; i + 1 < n; ++i) {
+            if (buffer[i] == 'o' && buffer[i + 1] == 'k') saw_ok = 1;
+        }
+    }
+    close(sock);
+    return (void *)(intptr_t)(saw_ok ? 0 : 5);
+}
+
+int main(void) {
+    server = createServer("127.0.0.1", EZ_TEST_PORT);
+    if (!server.handle) return 10;
+    HttpServer_on(&server, "/", route);
+
+    pthread_t server_thread;
+    if (pthread_create(&server_thread, NULL, run_server, NULL) != 0) return 11;
+    usleep(100000);
+
+    pthread_t first;
+    pthread_t second;
+    if (pthread_create(&first, NULL, run_client, NULL) != 0) return 12;
+    if (pthread_create(&second, NULL, run_client, NULL) != 0) return 13;
+
+    void *first_status = NULL;
+    void *second_status = NULL;
+    pthread_join(first, &first_status);
+    pthread_join(second, &second_status);
+    pthread_join(server_thread, NULL);
+
+    if ((intptr_t)first_status != 0 || (intptr_t)second_status != 0) return 20;
+    if (handled_requests != 2) return 21;
+    if (max_active_requests < 2) return 22;
+    return 0;
+}
+''',
+        encoding="utf-8",
+    )
+    exe = tmp_path / "http_concurrent_server_harness"
+    subprocess.run(
+        [
+            cc,
+            "-std=c11",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            f"-DEZ_TEST_PORT={port}",
+            str(harness),
+            str(ROOT / "packages" / "std" / "native" / "net" / "http.c"),
+            "-pthread",
             "-o",
             str(exe),
         ],
@@ -2711,13 +3404,23 @@ def test_e2e_std_net_tcp_udp_ws_support_boundaries_are_explicit():
     api_docs = (ROOT / "docs" / "stdlib-api.md").read_text(encoding="utf-8")
     stdlib_docs = (ROOT / "docs" / "stdlib.md").read_text(encoding="utf-8")
 
-    for marker in ["socket(", "connect(", "bind(", "listen(", "accept(", "recv(", "send(", "sendto(", "recvfrom("]:
+    for marker in ["socket(", "connect(", "bind(", "listen(", "accept(", "recv(", "send(", "sendto(", "recvfrom(", "select("]:
+        assert marker in tcp_native
+    for marker in ["tcpConnectTimeout", "tcpAcceptTimeout", "tcpReadTimeout", "tcpWriteTimeout", "udpSendTimeout", "udpRecvFromTimeout", "udpRecvTimeout"]:
+        assert marker in tcp_native
+        assert marker in tcp_interface
+    for marker in ["TcpTlsConn", "tcpTlsConnect", "tcpTlsRead", "tcpTlsWrite", "tcpTlsClose"]:
+        assert marker in tcp_native
+        assert marker in tcp_interface
+    for marker in ["ez_tcp_load_tls", "OPENSSL_init_ssl", "X509_VERIFY_PARAM_set1_host", "SSL_get_verify_result"]:
         assert marker in tcp_native
     for marker in ["UdpPacket", "udpRecvFrom", "sockaddr_storage", "getnameinfo", "NI_NUMERICHOST", "NI_NUMERICSERV"]:
         assert marker in tcp_native
-    for marker in ["ws://", "Sec-WebSocket-Key", "ez_ws_send_frame", "ez_ws_handle_control_frame", "opcode", "0x8"]:
+    for marker in ["ws://", "wss://", "Sec-WebSocket-Key", "ez_ws_send_frame", "ez_ws_handle_control_frame", "opcode", "0x8"]:
         assert marker in ws_native
     for marker in ["Sec-WebSocket-Accept", "ez_ws_expected_accept", "ez_ws_handshake_response_valid", "ez_ws_sha1_final"]:
+        assert marker in ws_native
+    for marker in ["ez_ws_load_tls", "OPENSSL_init_ssl", "X509_VERIFY_PARAM_set1_host", "SSL_get_verify_result", "ez_ws_conn_send_all"]:
         assert marker in ws_native
     assert "fragment_start" in ws_native
     assert "*authority_end == '?'" in ws_native
@@ -2725,25 +3428,36 @@ def test_e2e_std_net_tcp_udp_ws_support_boundaries_are_explicit():
     assert "ez_make_ws_host_header" in ws_native
     assert "memchr(host_start, ']'" in ws_native
     assert 'extern "ws2_32" for windows;' in tcp_interface
+    assert 'extern "dl" for linux;' in tcp_interface
     assert 'extern "ws2_32" for windows;' in ws_interface
     assert 'extern "bcrypt" for windows;' in ws_interface
-    assert 'const char *prefix = "ws://";' in ws_native
-    assert 'const char *prefix = "wss://";' not in ws_native
+    assert 'extern "dl" for linux;' in ws_interface
+    assert '"ws://"' in ws_native
+    assert '"wss://"' in ws_native
 
-    for marker in ["HEAPU8[ret] = 0;", "return -1;", "return 0;"]:
+    for marker in [
+        "net/tls/dgram + Asyncify", "tcpConnect__async: 'auto'", "tcpAccept__async: 'auto'",
+        "tcpWrite__async: 'auto'", "udpSend__async: 'auto'", "tcpConnectTimeout__async: 'auto'",
+        "udpRecvFromTimeout__async: 'auto'", "nodeRequire('net')", "nodeRequire('dgram')",
+        "tcpTlsConnect__async: 'auto'", "nodeRequire('tls')",
+    ]:
         assert marker in tcp_emcc
+    for marker in ["WebSocket + Asyncify", "wsConnect__async: 'auto'", "new WebSocket", "socket.send", "wsRecv__async: 'auto'"]:
         assert marker in ws_emcc
-    assert "emcc 明确不支持" in tcp_interface
+    assert "emcc Node 风格运行时" in tcp_interface
     assert "UdpPacket" in tcp_interface
     assert "udpRecvFrom" in tcp_interface
-    assert "客户端掩码、分片重组和 ping/pong" in ws_interface
-    assert "emcc 当前明确不支持 TCP/UDP" in api_docs
+    assert "WebSocket + Asyncify" in ws_interface
+    assert "Node 风格运行时通过 `net` / `tls` / `dgram` + Asyncify" in api_docs
     assert "udpRecvFrom(socket: UdpSocket, maxBytes: I64) -> UdpPacket?" in api_docs
-    assert "当前接口不提供超时、TLS 或 native 事件源式 flow 挂起" in api_docs
+    assert "tcpConnectTimeout(host: Str, port: I32, timeoutMs: I32) -> TcpConn?" in api_docs
+    assert "TCP TLS 客户端" in api_docs
+    assert "当前接口不提供 TCP TLS" not in api_docs
     assert "当前接口不返回远端地址" not in api_docs
     assert "接收数据及来源地址" in stdlib_docs
     assert "当前接收接口不返回远端地址" not in stdlib_docs
-    assert "`wss://` 与 emcc WebSocket 桥接当前明确不支持" in api_docs
+    assert "通过 WebSocket + Asyncify 支持 `ws://` / `wss://`" in api_docs
+    assert "Linux/macOS 在可动态加载 OpenSSL TLS 后端、系统 CA 可用且证书链与主机名校验通过时支持 `wss://`" in api_docs
 
 
 def test_e2e_cli_build_links_externs_and_records_emcc_js_libraries():
@@ -3053,7 +3767,7 @@ def test_e2e_std_fmt_imports_and_builds(tmp_path):
     assert '%"_parseInt_abi_ret" = alloca {i1, i32}' in ir_text
     assert_native_optional_return(ir_text, "parseI64", "i64")
     assert_native_optional_return(ir_text, "parseF64", "double")
-    assert 'declare i8* @"format"' in ir_text
+    assert 'declare i8* @"fmtFormat"' in ir_text
     assert 'declare i8* @"b64Encode"' in ir_text
     assert 'declare i8* @"jsonStringify_I32"' in ir_text
     assert 'declare i32 @"jsonParse_I32"' in ir_text
@@ -3643,6 +4357,13 @@ function compile(pattern, flags) {
   assert.strictEqual(HEAPU8[ret + 8], 1, 'regex should compile');
   return ret;
 }
+function compileInvalid(pattern, flags) {
+  const ret = _malloc(16);
+  library.regexCompile(ret, stringToNewUTF8(pattern), flags);
+  assert.strictEqual(HEAPU8[ret + 8], 0, 'regex should be rejected');
+  assert.strictEqual(library.regexIsValid(ret), 0);
+  return ret;
+}
 function replace(pattern, flags, input, replacement) {
   return UTF8ToString(library.regexReplace(compile(pattern, flags), stringToNewUTF8(input), stringToNewUTF8(replacement)));
 }
@@ -3681,6 +4402,9 @@ assert.strictEqual(find('^b', 2, 'a\nb').ok, true);
 assert.strictEqual(find('^b', 0, 'a\nb').ok, false);
 assert.strictEqual(find('a.b', 0, 'a b').ok, true);
 assert.strictEqual(find('a.b', 0, 'a\nb').ok, false);
+compileInvalid('(a+)+$', 0);
+compileInvalid('(a|aa)+$', 0);
+compileInvalid('a{0,2048}', 0);
 '''
     subprocess.run([node, "-e", script, str(ROOT / "packages" / "std" / "emcc" / "regex.js")], check=True)
 
@@ -3691,9 +4415,10 @@ def test_e2e_native_regex_portable_fallback_vectors(tmp_path):
         pytest.skip("需要 C 编译器验证 std/regex portable fallback")
     native = (ROOT / "packages" / "std" / "native" / "regex.c").read_text(encoding="utf-8")
     docs = (ROOT / "docs" / "stdlib.md").read_text(encoding="utf-8")
-    for marker in ["EZ_REGEX_USE_PORTABLE", "ez_rx_compile_pattern", "ez_rx_search", "ez_rx_find_portable"]:
+    for marker in ["EZ_REGEX_USE_PORTABLE", "ez_rx_compile_pattern", "ez_rx_search", "ez_rx_find_portable", "ez_regex_complexity_ok", "EZ_REGEX_MAX_BOUNDED_REPEAT"]:
         assert marker in native
     assert "Windows 原生目标使用内置同步轻量正则 fallback" in docs
+    assert "嵌套可变重复" in docs
     assert "Windows 原生目标当前显式返回不可用结果" not in docs
 
     source = ROOT / "compiler" / "tests" / "fixtures" / "regex_portable_check.c"
@@ -5244,18 +5969,32 @@ def test_e2e_emcc_suspend_source_wrappers_are_asyncify_aware():
     fs_js = (ROOT / "packages" / "std" / "emcc" / "fs.js").read_text(encoding="utf-8")
     process_js = (ROOT / "packages" / "std" / "emcc" / "process.js").read_text(encoding="utf-8")
     stream_js = (ROOT / "packages" / "std" / "emcc" / "stream.js").read_text(encoding="utf-8")
+    tcp_js = (ROOT / "packages" / "std" / "emcc" / "net" / "tcp.js").read_text(encoding="utf-8")
+    ws_js = (ROOT / "packages" / "std" / "emcc" / "net" / "ws.js").read_text(encoding="utf-8")
     for marker in ["fetch__async: 'auto'", "fetchEx__async: 'auto'", "Asyncify.handleAsync", "await fetch"]:
         assert marker in http_js
     assert "xhr.open(req.method || 'GET', req.url, false)" in http_js
     for marker in ["readFile__async: 'auto'", "writeFile__async: 'auto'", "appendFile__async: 'auto'", "Asyncify.handleSleep"]:
         assert marker in fs_js
-    for marker in ["processExec__async: 'auto'", "processSpawn__async: 'auto'", "childProcess.spawn(", "Asyncify.handleSleep"]:
+    for marker in ["processExec__async: 'auto'", "processSpawn__async: 'auto'", "processWait__async: 'auto'", "childProcess.spawn(", "Asyncify.handleSleep"]:
         assert marker in process_js
     for marker in [
         "streamOpenFileRead__async: 'auto'", "streamRead__async: 'auto'", "streamWrite__async: 'auto'",
         "streamCopy__async: 'auto'", "bridge.read = streamReadImpl", "Asyncify.handleSleep",
     ]:
         assert marker in stream_js
+    for marker in [
+        "tcpConnect__async: 'auto'", "tcpAccept__async: 'auto'", "tcpRead__async: 'auto'",
+        "tcpWrite__async: 'auto'", "udpBind__async: 'auto'", "udpSend__async: 'auto'",
+        "udpRecvFrom__async: 'auto'", "udpRecv__async: 'auto'", "Asyncify.handleAsync",
+        "tcpConnectTimeout__async: 'auto'", "tcpAcceptTimeout__async: 'auto'",
+        "tcpReadTimeout__async: 'auto'", "tcpWriteTimeout__async: 'auto'",
+        "udpSendTimeout__async: 'auto'", "udpRecvFromTimeout__async: 'auto'", "udpRecvTimeout__async: 'auto'",
+        "tcpTlsConnect__async: 'auto'", "tcpTlsRead__async: 'auto'", "tcpTlsWrite__async: 'auto'",
+    ]:
+        assert marker in tcp_js
+    for marker in ["wsConnect__async: 'auto'", "wsRecv__async: 'auto'", "Asyncify.handleAsync", "new WebSocket"]:
+        assert marker in ws_js
 
 
 def test_e2e_emcc_io_print_preserves_no_newline_when_stdout_write_exists():
@@ -5334,34 +6073,14 @@ assert.deepStrictEqual(lines, ['xyz']);
     subprocess.run([node, "-e", script, str(ROOT / "packages" / "std" / "emcc" / "io.js")], check=True)
 
 
-def test_e2e_emcc_stub_wrappers_are_marked_unsupported():
-    """公开 wrapper 只有失败占位时，必须写明平台不支持。"""
-    cases = {
-        "packages/std/emcc/net/http.js": ["createServer"],
-        "packages/std/emcc/net/tcp.js": [
-            "tcpConnect", "tcpListen", "tcpAccept", "tcpRead", "tcpWrite", "tcpClose",
-            "tcpListenerClose", "udpBind", "udpSend", "udpRecvFrom", "udpRecv", "udpClose",
-        ],
-        "packages/std/emcc/net/ws.js": ["wsConnect", "wsSend", "wsRecv", "wsClose"],
-    }
-    unsupported_marker = re.compile(r"不支持|不可用|unsupported|unavailable", re.I)
-    failure_markers = [
-        "HEAPU8[ret] = 0;",
-        "writeOptProcessResult(ret, false)",
-        "writeOptProcess(ret, false)",
-        "writeOptStr(ret, null)",
-        "return -1;",
-        "return 0;",
-        "return 0n;",
-        "HTTP_SERVER_UNSUPPORTED_HANDLE",
-    ]
-
-    for rel_path, names in cases.items():
-        text = (ROOT / rel_path).read_text(encoding="utf-8")
-        assert unsupported_marker.search(text), f"{rel_path} 的占位 wrapper 缺少不支持说明"
-        for name in names:
-            body = emcc_js_function_body(text, name)
-            assert any(marker in body for marker in failure_markers), f"{rel_path}:{name} 未显式失败"
+def test_e2e_emcc_http_server_wrapper_is_not_legacy_stub():
+    """emcc HTTP createServer 不应退回旧的统一失败占位。"""
+    text = (ROOT / "packages" / "std" / "emcc" / "net" / "http.js").read_text(encoding="utf-8")
+    body = emcc_js_function_body(text, "createServer")
+    assert "HTTP_SERVER_UNSUPPORTED_HANDLE" not in text
+    assert "nodeRequire('http')" in body
+    assert "http.createServer" in body
+    assert "return BigInt(handle);" in body
 
 
 def test_e2e_emcc_optional_and_struct_returns_use_sret(tmp_path):
@@ -5413,9 +6132,19 @@ def test_e2e_emcc_net_wrappers_use_optional_sret():
     assert "fetchEx: function (ret, req)" in http_js
     assert "HttpResponse_text: function" in http_js
     assert "tcpConnect: function (ret, host, port)" in tcp_js
+    assert "tcpConnectTimeout: function (ret, host, port, timeoutMs)" in tcp_js
+    assert "tcpTlsConnect: function (ret, host, port)" in tcp_js
+    assert "tcpTlsRead: function (ret, connPtr, maxBytes)" in tcp_js
+    assert "tcpTlsWrite: function (connPtr, dataPtr)" in tcp_js
     assert "tcpListen: function (ret, host, port)" in tcp_js
+    assert "tcpAcceptTimeout: function (ret, listenerPtr, timeoutMs)" in tcp_js
+    assert "tcpReadTimeout: function (ret, connPtr, maxBytes, timeoutMs)" in tcp_js
+    assert "tcpWriteTimeout: function (connPtr, dataPtr, timeoutMs)" in tcp_js
     assert "udpBind: function (ret, host, port)" in tcp_js
-    assert "udpRecvFrom: function (ret, socket, maxBytes)" in tcp_js
+    assert "udpSendTimeout: function (socketPtr, host, port, dataPtr, timeoutMs)" in tcp_js
+    assert "udpRecvFrom: function (ret, socketPtr, maxBytes)" in tcp_js
+    assert "udpRecvFromTimeout: function (ret, socketPtr, maxBytes, timeoutMs)" in tcp_js
+    assert "udpRecvTimeout: function (ret, socketPtr, maxBytes, timeoutMs)" in tcp_js
     assert "wsConnect: function (ret, url)" in ws_js
 
 
@@ -5623,6 +6352,223 @@ assert.strictEqual(text([255]), '');
     subprocess.run([node, "-e", script, str(ROOT / "packages" / "std" / "emcc" / "net" / "http.js")], check=True)
 
 
+def test_e2e_emcc_http_server_uses_node_http_bridge():
+    """emcc Node 风格运行时应创建基础 HTTP 服务端并调用 Ez 路由回调。"""
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("需要 Node 验证 std/net/http emcc wrapper")
+    script = r'''
+const assert = require('assert');
+const fs = require('fs');
+const vm = require('vm');
+
+const code = fs.readFileSync(process.argv[1], 'utf8');
+const memory = new ArrayBuffer(131072);
+const HEAPU8 = new Uint8Array(memory);
+const view = new DataView(memory);
+let heap = 1024;
+
+function align(value) { return (value + 7) & ~7; }
+function _malloc(size) {
+  const ptr = heap;
+  heap = align(heap + Math.max(1, size));
+  if (heap > HEAPU8.length) throw new Error('oom');
+  return ptr;
+}
+function getValue(ptr, type) {
+  if (type === '*') return view.getUint32(ptr, true);
+  if (type === 'i32') return view.getInt32(ptr, true);
+  if (type === 'i64') return Number(view.getBigInt64(ptr, true));
+  throw new Error('unsupported getValue type ' + type);
+}
+function setValue(ptr, value, type) {
+  if (type === '*') { view.setUint32(ptr, Number(value), true); return; }
+  if (type === 'i32') { view.setInt32(ptr, Number(value), true); return; }
+  if (type === 'i64') { view.setBigInt64(ptr, BigInt(value), true); return; }
+  throw new Error('unsupported setValue type ' + type);
+}
+function stringToNewUTF8(text) {
+  const bytes = Buffer.from(text, 'utf8');
+  const ptr = _malloc(bytes.length + 1);
+  HEAPU8.set(bytes, ptr);
+  HEAPU8[ptr + bytes.length] = 0;
+  return ptr;
+}
+function UTF8ToString(ptr) {
+  if (!ptr) return '';
+  let end = ptr;
+  while (HEAPU8[end] !== 0) end++;
+  return Buffer.from(HEAPU8.slice(ptr, end)).toString('utf8');
+}
+function blobText(ptr) {
+  const dataPtr = getValue(ptr, '*');
+  const size = getValue(ptr + 8, 'i64');
+  return Buffer.from(HEAPU8.slice(dataPtr, dataPtr + size)).toString('utf8');
+}
+function dictValue(dictPtr, key) {
+  const keyPages = getValue(dictPtr, '*');
+  const valuePages = getValue(dictPtr + 8, '*');
+  const count = getValue(dictPtr + 16, 'i32');
+  for (let i = 0; i < count; i++) {
+    const keyPage = getValue(keyPages + Math.floor(i / 8) * 4, '*');
+    const valuePage = getValue(valuePages + Math.floor(i / 8) * 4, '*');
+    const slot = i % 8;
+    if (UTF8ToString(getValue(keyPage + slot * 4, '*')) === key) {
+      return UTF8ToString(getValue(valuePage + slot * 4, '*'));
+    }
+  }
+  return '';
+}
+function writeBlob(ptr, text) {
+  const bytes = Buffer.from(text, 'utf8');
+  const data = _malloc(bytes.length || 1);
+  HEAPU8.set(bytes, data);
+  setValue(ptr, data, '*');
+  setValue(ptr + 8, bytes.length, 'i64');
+}
+function writeDict(ptr, entries) {
+  const pages = entries.length ? _malloc(4) : 0;
+  const values = entries.length ? _malloc(4) : 0;
+  const keyPage = entries.length ? _malloc(32) : 0;
+  const valuePage = entries.length ? _malloc(32) : 0;
+  if (entries.length) {
+    setValue(pages, keyPage, '*');
+    setValue(values, valuePage, '*');
+    entries.forEach((entry, index) => {
+      setValue(keyPage + index * 4, stringToNewUTF8(entry[0]), '*');
+      setValue(valuePage + index * 4, stringToNewUTF8(entry[1]), '*');
+    });
+  }
+  setValue(ptr, pages, '*');
+  setValue(ptr + 8, values, '*');
+  setValue(ptr + 16, entries.length, 'i32');
+  setValue(ptr + 20, entries.length ? 8 : 0, 'i32');
+  setValue(ptr + 24, entries.length ? 1 : 0, 'i32');
+}
+
+class SyncPromise {
+  constructor(executor) {
+    this.value = undefined;
+    this.error = undefined;
+    executor(
+      (value) => { this.value = value instanceof SyncPromise ? value.value : value; },
+      (error) => { this.error = error; }
+    );
+  }
+  then(onFulfilled, onRejected) {
+    return new SyncPromise((resolve, reject) => {
+      try {
+        if (this.error !== undefined) resolve(onRejected ? onRejected(this.error) : undefined);
+        else resolve(onFulfilled ? onFulfilled(this.value) : this.value);
+      } catch (error) {
+        reject(error);
+      }
+    });
+  }
+}
+
+class FakeRequest {
+  constructor() {
+    this.method = 'POST';
+    this.url = '/hello?name=ez';
+    this.headers = { 'x-ez': 'ping' };
+    this.events = Object.create(null);
+  }
+  on(name, fn) {
+    (this.events[name] || (this.events[name] = [])).push(fn);
+    if (name === 'data') fn(Buffer.from('data'));
+    if (name === 'end') fn();
+    return this;
+  }
+}
+class FakeResponse {
+  constructor() { this.status = 0; this.headers = {}; this.body = Buffer.alloc(0); }
+  writeHead(status, headers) { this.status = status; this.headers = headers; }
+  end(body) { this.body = Buffer.from(body || []); }
+}
+class FakeServer {
+  constructor(handler) { this.handler = handler; this.events = Object.create(null); this.closed = false; this.response = new FakeResponse(); }
+  once(name, fn) { (this.events[name] || (this.events[name] = [])).push(fn); return this; }
+  emit(name) { (this.events[name] || []).slice().forEach((fn) => fn()); }
+  listen(options) { this.options = options; this.emit('listening'); this.handler(new FakeRequest(), this.response); }
+  close() { this.closed = true; }
+}
+
+let fakeServer = null;
+const fakeHttp = { createServer(handler) { fakeServer = new FakeServer(handler); return fakeServer; } };
+const library = {};
+function handler(respPtr, reqPtr) {
+  assert.strictEqual(UTF8ToString(getValue(reqPtr, '*')), 'POST');
+  assert.strictEqual(UTF8ToString(getValue(reqPtr + 8, '*')), '/hello?name=ez');
+  assert.strictEqual(dictValue(reqPtr + 16, 'x-ez'), 'ping');
+  assert.strictEqual(blobText(reqPtr + 40), 'data');
+  setValue(respPtr, 201, 'i32');
+  writeDict(respPtr + 8, [['X-Ez', 'pong'], ['Content-Length', '999']]);
+  writeBlob(respPtr + 32, 'ok');
+}
+
+vm.runInNewContext(code, {
+  BigInt,
+  Buffer,
+  ArrayBuffer,
+  DataView,
+  TextDecoder,
+  TextEncoder,
+  Uint8Array,
+  HEAPU8,
+  _malloc,
+  getValue,
+  setValue,
+  UTF8ToString,
+  stringToNewUTF8,
+  Promise: SyncPromise,
+  wasmTable: { get(index) { assert.strictEqual(index, 7); return handler; } },
+  Asyncify: { handleAsync(fn) { const value = fn(); return value instanceof SyncPromise ? value.value : value; } },
+  require(name) { return name === 'http' ? fakeHttp : null; },
+  LibraryManager: { library },
+  mergeInto(target, source) { Object.assign(target, source); },
+}, { filename: process.argv[1] });
+
+const handle = library.createServer(stringToNewUTF8('127.0.0.1'), 8080);
+assert.strictEqual(typeof handle, 'bigint');
+assert.notStrictEqual(handle, 0n);
+const serverPtr = _malloc(8);
+setValue(serverPtr, handle, 'i64');
+library.HttpServer_on(serverPtr, stringToNewUTF8('/hello'), 7);
+library.HttpServer_start(serverPtr);
+assert.strictEqual(fakeServer.options.host, '127.0.0.1');
+assert.strictEqual(fakeServer.options.port, 8080);
+assert.strictEqual(fakeServer.response.status, 201);
+assert.strictEqual(fakeServer.response.headers['X-Ez'], 'pong');
+assert.strictEqual(fakeServer.response.headers['Content-Length'], '2');
+assert.strictEqual(fakeServer.response.body.toString('utf8'), 'ok');
+library.HttpServer_stop(serverPtr);
+assert.strictEqual(fakeServer.closed, true);
+assert.strictEqual(getValue(serverPtr, 'i64'), 0);
+
+const browserOnly = {};
+vm.runInNewContext(code, {
+  BigInt,
+  ArrayBuffer,
+  DataView,
+  TextDecoder,
+  TextEncoder,
+  Uint8Array,
+  HEAPU8,
+  _malloc,
+  getValue,
+  setValue,
+  UTF8ToString,
+  stringToNewUTF8,
+  Asyncify: { handleAsync(fn) { return fn(); } },
+  LibraryManager: { library: browserOnly },
+  mergeInto(target, source) { Object.assign(target, source); },
+}, { filename: process.argv[1] });
+assert.strictEqual(browserOnly.createServer(stringToNewUTF8('127.0.0.1'), 8080), 0n);
+'''
+    subprocess.run([node, "-e", script, str(ROOT / "packages" / "std" / "emcc" / "net" / "http.js")], check=True)
+
+
 def emcc_js_function_body(text: str, name: str) -> str:
     pattern = rf"{name}: function \([^)]*\) \{{(?P<body>.*?)\n\s*\}},"
     match = re.search(pattern, text, re.S)
@@ -5630,23 +6576,472 @@ def emcc_js_function_body(text: str, name: str) -> str:
     return match.group("body")
 
 
-def test_e2e_emcc_tcp_udp_ws_wrappers_fail_explicitly():
-    """emcc 暂不支持 TCP/UDP/WS 时应显式返回失败值，不能伪装成功。"""
+def test_e2e_emcc_tcp_udp_wrapper_uses_node_asyncify_bridge():
+    """emcc TCP/TLS/UDP wrapper 应通过 Node net/tls/dgram + Asyncify 桥接，浏览器缺能力时失败。"""
     tcp_js = (ROOT / "packages" / "std" / "emcc" / "net" / "tcp.js").read_text(encoding="utf-8")
-    ws_js = (ROOT / "packages" / "std" / "emcc" / "net" / "ws.js").read_text(encoding="utf-8")
+    for marker in [
+        "nodeRequire('net')", "nodeRequire('tls')", "nodeRequire('dgram')", "net.createConnection", "net.createServer",
+        "dgram.createSocket", "tcpConnect__async: 'auto'", "tcpAccept__async: 'auto'",
+        "tcpRead__async: 'auto'", "tcpWrite__async: 'auto'", "udpBind__async: 'auto'",
+        "udpSend__async: 'auto'", "udpRecvFrom__async: 'auto'", "udpRecv__async: 'auto'",
+        "tcpConnectTimeout__async: 'auto'", "tcpAcceptTimeout__async: 'auto'",
+        "tcpReadTimeout__async: 'auto'", "tcpWriteTimeout__async: 'auto'",
+        "tcpTlsConnect__async: 'auto'", "tcpTlsRead__async: 'auto'", "tcpTlsWrite__async: 'auto'",
+        "udpSendTimeout__async: 'auto'", "udpRecvFromTimeout__async: 'auto'", "udpRecvTimeout__async: 'auto'",
+    ]:
+        assert marker in tcp_js
 
-    for name in ["tcpConnect", "tcpListen", "tcpAccept", "tcpRead", "udpBind", "udpRecvFrom", "udpRecv"]:
-        assert "HEAPU8[ret] = 0;" in emcc_js_function_body(tcp_js, name)
-    assert "HEAPU8[ret] = 0;" in emcc_js_function_body(ws_js, "wsConnect")
-    assert "HEAPU8[ret] = 0;" in emcc_js_function_body(ws_js, "wsRecv")
+    expectations = {
+        "tcpConnect": "connectAsync",
+        "tcpConnectTimeout": "connectTimeoutAsync",
+        "tcpTlsConnect": "tlsConnectAsync",
+        "tcpTlsRead": "readTcpAsync",
+        "tcpTlsWrite": "streamBridge.writeTcp",
+        "tcpListen": "listenAsync",
+        "tcpAccept": "acceptAsync",
+        "tcpAcceptTimeout": "acceptTimeoutAsync",
+        "tcpRead": "readTcpAsync",
+        "tcpReadTimeout": "readTcpTimeoutAsync",
+        "tcpWrite": "streamBridge.writeTcp",
+        "tcpWriteTimeout": "writeTcpTimeoutAsync",
+        "udpBind": "bindUdpAsync",
+        "udpSend": "sendUdpAsync",
+        "udpSendTimeout": "sendUdpTimeoutAsync",
+        "udpRecvFrom": "recvUdpAsync",
+        "udpRecvFromTimeout": "recvUdpTimeoutAsync",
+        "udpRecv": "recvUdpAsync",
+        "udpRecvTimeout": "recvUdpTimeoutAsync",
+    }
+    for name, marker in expectations.items():
+        assert marker in emcc_js_function_body(tcp_js, name)
 
-    for name in ["tcpWrite", "udpSend"]:
-        assert "return -1;" in emcc_js_function_body(tcp_js, name)
-    assert "return -1;" in emcc_js_function_body(ws_js, "wsSend")
 
-    for name in ["tcpClose", "tcpListenerClose", "udpClose"]:
-        assert "return 0;" in emcc_js_function_body(tcp_js, name)
-    assert "return 0;" in emcc_js_function_body(ws_js, "wsClose")
+def test_e2e_emcc_tcp_udp_wrapper_node_bridge_roundtrip():
+    """emcc TCP/UDP wrapper 在 Node 风格运行时应完成基础连接、收发和关闭。"""
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("需要 Node 验证 std/net/tcp emcc wrapper")
+    script = r'''
+const assert = require('assert');
+const fs = require('fs');
+const vm = require('vm');
+
+const tcpCode = fs.readFileSync(process.argv[1], 'utf8');
+const streamCode = fs.readFileSync(process.argv[2], 'utf8');
+const memory = new ArrayBuffer(262144);
+const HEAPU8 = new Uint8Array(memory);
+const view = new DataView(memory);
+let heap = 1024;
+
+function align(value) { return (value + 7) & ~7; }
+function _malloc(size) {
+  const ptr = heap;
+  heap = align(heap + Math.max(1, size));
+  if (heap > HEAPU8.length) throw new Error('oom');
+  return ptr;
+}
+function getValue(ptr, type) {
+  if (type === '*') return view.getUint32(ptr, true);
+  if (type === 'i32') return view.getInt32(ptr, true);
+  if (type === 'i64') return Number(view.getBigInt64(ptr, true));
+  throw new Error('unsupported getValue type ' + type);
+}
+function setValue(ptr, value, type) {
+  if (type === '*') { view.setUint32(ptr, Number(value), true); return; }
+  if (type === 'i32') { view.setInt32(ptr, Number(value), true); return; }
+  if (type === 'i64') { view.setBigInt64(ptr, BigInt(value), true); return; }
+  throw new Error('unsupported setValue type ' + type);
+}
+function stringToNewUTF8(text) {
+  const bytes = Buffer.from(text, 'utf8');
+  const ptr = _malloc(bytes.length + 1);
+  HEAPU8.set(bytes, ptr);
+  HEAPU8[ptr + bytes.length] = 0;
+  return ptr;
+}
+function UTF8ToString(ptr) {
+  if (!ptr) return '';
+  let end = ptr;
+  while (HEAPU8[end] !== 0) end++;
+  return Buffer.from(HEAPU8.slice(ptr, end)).toString('utf8');
+}
+function makeBlob(bytes) {
+  const data = _malloc(bytes.length || 1);
+  HEAPU8.set(Uint8Array.from(bytes), data);
+  const blob = _malloc(16);
+  setValue(blob, data, '*');
+  setValue(blob + 8, bytes.length, 'i64');
+  return blob;
+}
+function bytesFromBlob(ptr) {
+  const dataPtr = getValue(ptr, '*');
+  const size = getValue(ptr + 8, 'i64');
+  return Array.from(HEAPU8.slice(dataPtr, dataPtr + size));
+}
+function ptrHandle(ptr) { return getValue(ptr, 'i64'); }
+
+class SyncPromise {
+  constructor(executor) {
+    this.value = undefined;
+    this.error = undefined;
+    executor(
+      (value) => { this.value = value instanceof SyncPromise ? value.value : value; },
+      (error) => { this.error = error; }
+    );
+  }
+  then(onFulfilled, onRejected) {
+    return new SyncPromise((resolve, reject) => {
+      try {
+        if (this.error !== undefined) resolve(onRejected ? onRejected(this.error) : undefined);
+        else resolve(onFulfilled ? onFulfilled(this.value) : this.value);
+      } catch (error) {
+        reject(error);
+      }
+    });
+  }
+}
+
+class FakeTcpSocket {
+  constructor() {
+    this.events = Object.create(null);
+    this.closed = false;
+  }
+  on(name, fn) {
+    (this.events[name] || (this.events[name] = [])).push(fn);
+    return this;
+  }
+  once(name, fn) {
+    if (name === 'connect' || name === 'secureConnect') fn();
+    else this.on(name, fn);
+    return this;
+  }
+  removeListener(name, fn) {
+    this.events[name] = (this.events[name] || []).filter((item) => item !== fn);
+    return this;
+  }
+  emit(name, value) {
+    (this.events[name] || []).slice().forEach((fn) => fn(value));
+  }
+  write(data, cb) {
+    const payload = Buffer.from(data);
+    this.emit('data', Buffer.concat([Buffer.from('pong:'), payload]));
+    if (cb) cb();
+    return true;
+  }
+  end() { this.closed = true; this.emit('end'); }
+  destroy() { this.closed = true; this.emit('close'); }
+}
+
+class FakeServer {
+  constructor(handler) {
+    this.handler = handler;
+    this.events = Object.create(null);
+    this.closed = false;
+  }
+  on(name, fn) { (this.events[name] || (this.events[name] = [])).push(fn); return this; }
+  once(name, fn) { return this.on(name, fn); }
+  emit(name, value) { (this.events[name] || []).slice().forEach((fn) => fn(value)); }
+  listen() {
+    this.emit('listening');
+    this.handler(new FakeTcpSocket());
+  }
+  close() { this.closed = true; this.emit('close'); }
+}
+
+class FakeUdpSocket {
+  constructor() {
+    this.events = Object.create(null);
+    this.closed = false;
+  }
+  on(name, fn) { (this.events[name] || (this.events[name] = [])).push(fn); return this; }
+  once(name, fn) { return this.on(name, fn); }
+  emit(name, ...args) { (this.events[name] || []).slice().forEach((fn) => fn(...args)); }
+  bind() { this.emit('listening'); }
+  send(data, port, host, cb) {
+    this.emit('message', Buffer.concat([Buffer.from('u:'), Buffer.from(data)]), { address: host, port });
+    if (cb) cb();
+  }
+  close() { this.closed = true; this.emit('close'); }
+}
+
+const fakeNet = {
+  createConnection() { return new FakeTcpSocket(); },
+  createServer(handler) { return new FakeServer(handler); },
+};
+const fakeTls = { connect() { return new FakeTcpSocket(); } };
+const fakeDgram = { createSocket() { return new FakeUdpSocket(); } };
+function fakeRequire(name) {
+  if (name === 'net') return fakeNet;
+  if (name === 'tls') return fakeTls;
+  if (name === 'dgram') return fakeDgram;
+  throw new Error('unexpected require ' + name);
+}
+
+const library = {};
+const context = {
+  require: fakeRequire,
+  BigInt,
+  Buffer,
+  ArrayBuffer,
+  DataView,
+  Uint8Array,
+  HEAPU8,
+  _malloc,
+  getValue,
+  setValue,
+  UTF8ToString,
+  stringToNewUTF8,
+  Promise: SyncPromise,
+  Asyncify: { handleAsync(fn) { const value = fn(); return value instanceof SyncPromise ? value.value : value; } },
+  LibraryManager: { library },
+  mergeInto(target, source) { Object.assign(target, source); },
+};
+vm.runInNewContext(streamCode, context, { filename: process.argv[2] });
+vm.runInNewContext(tcpCode, context, { filename: process.argv[1] });
+
+const ret = _malloc(24);
+library.tcpConnect(ret, stringToNewUTF8('127.0.0.1'), 9000);
+assert.strictEqual(HEAPU8[ret], 1);
+const conn = ret + 8;
+assert.strictEqual(library.tcpWrite(conn, makeBlob([112, 105, 110, 103])), 4);
+const tcpRead = _malloc(24);
+library.tcpRead(tcpRead, conn, 16);
+assert.strictEqual(HEAPU8[tcpRead], 1);
+assert.deepStrictEqual(bytesFromBlob(tcpRead + 8), Array.from(Buffer.from('pong:ping')));
+
+const timeoutRet = _malloc(24);
+library.tcpConnectTimeout(timeoutRet, stringToNewUTF8('127.0.0.1'), 9000, 1);
+assert.strictEqual(HEAPU8[timeoutRet], 1);
+const timeoutConn = timeoutRet + 8;
+assert.strictEqual(library.tcpWriteTimeout(timeoutConn, makeBlob([111, 107]), 1), 2);
+const tcpTimeoutRead = _malloc(24);
+library.tcpReadTimeout(tcpTimeoutRead, timeoutConn, 16, 1);
+assert.strictEqual(HEAPU8[tcpTimeoutRead], 1);
+assert.deepStrictEqual(bytesFromBlob(tcpTimeoutRead + 8), Array.from(Buffer.from('pong:ok')));
+assert.strictEqual(library.tcpClose(timeoutConn), 1);
+
+const tlsRet = _malloc(24);
+library.tcpTlsConnect(tlsRet, stringToNewUTF8('example.com'), 443);
+assert.strictEqual(HEAPU8[tlsRet], 1);
+const tlsConn = tlsRet + 8;
+assert.strictEqual(library.tcpTlsWrite(tlsConn, makeBlob([116, 108, 115])), 3);
+const tlsRead = _malloc(24);
+library.tcpTlsRead(tlsRead, tlsConn, 16);
+assert.strictEqual(HEAPU8[tlsRead], 1);
+assert.deepStrictEqual(bytesFromBlob(tlsRead + 8), Array.from(Buffer.from('pong:tls')));
+assert.strictEqual(library.tcpTlsClose(tlsConn), 1);
+
+const stream = _malloc(16);
+library.streamFromTcpHandle(stream, ptrHandle(conn));
+assert.strictEqual(library.streamWrite(stream, makeBlob([50])), 1);
+const streamRead = _malloc(24);
+library.streamRead(streamRead, stream, 16);
+assert.strictEqual(HEAPU8[streamRead], 1);
+assert.deepStrictEqual(bytesFromBlob(streamRead + 8), Array.from(Buffer.from('pong:2')));
+assert.strictEqual(library.streamClose(stream), 1);
+
+const listenerRet = _malloc(24);
+library.tcpListen(listenerRet, stringToNewUTF8('127.0.0.1'), 8080);
+assert.strictEqual(HEAPU8[listenerRet], 1);
+const acceptedRet = _malloc(24);
+library.tcpAccept(acceptedRet, listenerRet + 8);
+assert.strictEqual(HEAPU8[acceptedRet], 1);
+assert.strictEqual(library.tcpListenerClose(listenerRet + 8), 1);
+
+const timeoutListenerRet = _malloc(24);
+library.tcpListen(timeoutListenerRet, stringToNewUTF8('127.0.0.1'), 8081);
+assert.strictEqual(HEAPU8[timeoutListenerRet], 1);
+const acceptedTimeoutRet = _malloc(24);
+library.tcpAcceptTimeout(acceptedTimeoutRet, timeoutListenerRet + 8, 1);
+assert.strictEqual(HEAPU8[acceptedTimeoutRet], 1);
+assert.strictEqual(library.tcpListenerClose(timeoutListenerRet + 8), 1);
+
+const udpRet = _malloc(24);
+library.udpBind(udpRet, stringToNewUTF8('127.0.0.1'), 0);
+assert.strictEqual(HEAPU8[udpRet], 1);
+const udpSocket = udpRet + 8;
+assert.strictEqual(library.udpSend(udpSocket, stringToNewUTF8('127.0.0.1'), 9001, makeBlob([120])), 1);
+const packet = _malloc(40);
+library.udpRecvFrom(packet, udpSocket, 16);
+assert.strictEqual(HEAPU8[packet], 1);
+assert.deepStrictEqual(bytesFromBlob(packet + 8), Array.from(Buffer.from('u:x')));
+assert.strictEqual(UTF8ToString(getValue(packet + 24, '*')), '127.0.0.1');
+assert.strictEqual(getValue(packet + 32, 'i32'), 9001);
+assert.strictEqual(library.udpSendTimeout(udpSocket, stringToNewUTF8('127.0.0.1'), 9002, makeBlob([121]), 1), 1);
+const packetTimeout = _malloc(40);
+library.udpRecvFromTimeout(packetTimeout, udpSocket, 16, 1);
+assert.strictEqual(HEAPU8[packetTimeout], 1);
+assert.deepStrictEqual(bytesFromBlob(packetTimeout + 8), Array.from(Buffer.from('u:y')));
+assert.strictEqual(UTF8ToString(getValue(packetTimeout + 24, '*')), '127.0.0.1');
+assert.strictEqual(getValue(packetTimeout + 32, 'i32'), 9002);
+assert.strictEqual(library.udpSendTimeout(udpSocket, stringToNewUTF8('127.0.0.1'), 9003, makeBlob([122]), 1), 1);
+const udpBlobTimeout = _malloc(24);
+library.udpRecvTimeout(udpBlobTimeout, udpSocket, 16, 1);
+assert.strictEqual(HEAPU8[udpBlobTimeout], 1);
+assert.deepStrictEqual(bytesFromBlob(udpBlobTimeout + 8), Array.from(Buffer.from('u:z')));
+assert.strictEqual(library.udpClose(udpSocket), 1);
+
+const badRet = _malloc(24);
+library.tcpConnect(badRet, stringToNewUTF8('127.0.0.1'), 65536);
+assert.strictEqual(HEAPU8[badRet], 0);
+'''
+    subprocess.run([
+        node,
+        "-e",
+        script,
+        str(ROOT / "packages" / "std" / "emcc" / "net" / "tcp.js"),
+        str(ROOT / "packages" / "std" / "emcc" / "stream.js"),
+    ], check=True)
+
+
+def test_e2e_emcc_ws_wrapper_uses_websocket_bridge():
+    """emcc WebSocket wrapper 应通过 WebSocket 桥接完成连接、发送、接收和关闭。"""
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("需要 Node 验证 std/net/ws emcc wrapper")
+    script = r'''
+const assert = require('assert');
+const fs = require('fs');
+const vm = require('vm');
+
+const code = fs.readFileSync(process.argv[1], 'utf8');
+const memory = new ArrayBuffer(65536);
+const HEAPU8 = new Uint8Array(memory);
+const view = new DataView(memory);
+let heap = 1024;
+
+function align(value) { return (value + 7) & ~7; }
+function _malloc(size) {
+  const ptr = heap;
+  heap = align(heap + Math.max(1, size));
+  if (heap > HEAPU8.length) throw new Error('oom');
+  return ptr;
+}
+function getValue(ptr, type) {
+  if (type === '*') return view.getUint32(ptr, true);
+  if (type === 'i32') return view.getInt32(ptr, true);
+  if (type === 'i64') return Number(view.getBigInt64(ptr, true));
+  throw new Error('unsupported getValue type ' + type);
+}
+function setValue(ptr, value, type) {
+  if (type === '*') { view.setUint32(ptr, Number(value), true); return; }
+  if (type === 'i32') { view.setInt32(ptr, Number(value), true); return; }
+  if (type === 'i64') { view.setBigInt64(ptr, BigInt(value), true); return; }
+  throw new Error('unsupported setValue type ' + type);
+}
+function stringToNewUTF8(text) {
+  const bytes = Buffer.from(text, 'utf8');
+  const ptr = _malloc(bytes.length + 1);
+  HEAPU8.set(bytes, ptr);
+  HEAPU8[ptr + bytes.length] = 0;
+  return ptr;
+}
+function UTF8ToString(ptr) {
+  if (!ptr) return '';
+  let end = ptr;
+  while (HEAPU8[end] !== 0) end++;
+  return Buffer.from(HEAPU8.slice(ptr, end)).toString('utf8');
+}
+
+class SyncPromise {
+  constructor(executor) {
+    this.value = undefined;
+    this.error = undefined;
+    executor(
+      (value) => { this.value = value instanceof SyncPromise ? value.value : value; },
+      (error) => { this.error = error; }
+    );
+  }
+  then(onFulfilled, onRejected) {
+    return new SyncPromise((resolve, reject) => {
+      try {
+        if (this.error !== undefined) resolve(onRejected ? onRejected(this.error) : undefined);
+        else resolve(onFulfilled ? onFulfilled(this.value) : this.value);
+      } catch (error) {
+        reject(error);
+      }
+    });
+  }
+  static resolve(value) { return new SyncPromise((resolve) => resolve(value)); }
+}
+
+class FakeWebSocket {
+  constructor(url) {
+    this.url = url;
+    this.readyState = 0;
+    this.sent = [];
+    FakeWebSocket.instances.push(this);
+  }
+  set onopen(fn) {
+    this._onopen = fn;
+    if (!this._opened && fn) {
+      this._opened = true;
+      this.readyState = 1;
+      fn();
+    }
+  }
+  get onopen() { return this._onopen; }
+  send(data) { this.sent.push(Array.from(data)); }
+  close() {
+    this.readyState = 3;
+    if (this.onclose) this.onclose({});
+  }
+  emit(data) { this.onmessage({ data }); }
+}
+FakeWebSocket.instances = [];
+
+const library = {};
+vm.runInNewContext(code, {
+  BigInt,
+  ArrayBuffer,
+  DataView,
+  TextDecoder,
+  TextEncoder,
+  Uint8Array,
+  HEAPU8,
+  _malloc,
+  getValue,
+  setValue,
+  UTF8ToString,
+  stringToNewUTF8,
+  Promise: SyncPromise,
+  WebSocket: FakeWebSocket,
+  Asyncify: { handleAsync(fn) { const value = fn(); return value instanceof SyncPromise ? value.value : value; } },
+  LibraryManager: { library },
+  mergeInto(target, source) { Object.assign(target, source); },
+}, { filename: process.argv[1] });
+
+function makeBlob(bytes) {
+  const data = _malloc(bytes.length || 1);
+  HEAPU8.set(Uint8Array.from(bytes), data);
+  const blob = _malloc(16);
+  setValue(blob, data, '*');
+  setValue(blob + 8, bytes.length, 'i64');
+  return blob;
+}
+
+const ret = _malloc(24);
+library.wsConnect(ret, stringToNewUTF8('wss://example.test/socket'));
+assert.strictEqual(HEAPU8[ret], 1);
+const conn = ret + 8;
+const socket = FakeWebSocket.instances[0];
+assert.strictEqual(socket.url, 'wss://example.test/socket');
+
+assert.strictEqual(library.wsSend(conn, makeBlob([1, 2, 3])), 3);
+assert.deepStrictEqual(socket.sent, [[1, 2, 3]]);
+
+socket.emit(new Uint8Array([4, 5]).buffer);
+const recv = _malloc(24);
+library.wsRecv(recv, conn, 16);
+assert.strictEqual(HEAPU8[recv], 1);
+const dataPtr = getValue(recv + 8, '*');
+const size = getValue(recv + 16, 'i64');
+assert.strictEqual(size, 2);
+assert.deepStrictEqual(Array.from(HEAPU8.slice(dataPtr, dataPtr + size)), [4, 5]);
+
+assert.strictEqual(library.wsClose(conn), 1);
+'''
+    subprocess.run([node, "-e", script, str(ROOT / "packages" / "std" / "emcc" / "net" / "ws.js")], check=True)
 
 
 def test_e2e_native_tcp_udp_write_accepts_empty_blob_and_rejects_invalid_blob(tmp_path):
@@ -5737,6 +7132,7 @@ int main(void) {
         encoding="utf-8",
     )
     exe = tmp_path / "tcp_empty_blob_harness"
+    extra_libs = ["-ldl"] if sys.platform.startswith("linux") else []
     subprocess.run(
         [
             cc,
@@ -5746,12 +7142,228 @@ int main(void) {
             "-Werror",
             str(harness),
             str(ROOT / "packages" / "std" / "native" / "net" / "tcp.c"),
+            *extra_libs,
             "-o",
             str(exe),
         ],
         check=True,
     )
     subprocess.run([str(exe)], check=True)
+
+
+def test_e2e_native_tcp_udp_timeout_variants_poll_without_blocking(tmp_path):
+    """原生 TCP/UDP timeout 变体应支持零等待轮询和有限等待收发。"""
+    cc = shutil.which("cc")
+    if cc is None:
+        pytest.skip("需要 C 编译器验证原生 std/net/tcp timeout wrapper")
+
+    harness = tmp_path / "tcp_udp_timeout_harness.c"
+    harness.write_text(
+        r'''
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#if !defined(_WIN32)
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
+#endif
+
+typedef struct { int64_t handle; } TcpConn;
+typedef struct { int64_t handle; } TcpListener;
+typedef struct { int64_t handle; } UdpSocket;
+typedef struct { uint8_t *data; int64_t size; } Blob;
+typedef struct { Blob data; const char *host; int32_t port; } UdpPacket;
+typedef struct { bool ok; TcpConn value; } OptTcpConn;
+typedef struct { bool ok; TcpListener value; } OptTcpListener;
+typedef struct { bool ok; UdpSocket value; } OptUdpSocket;
+typedef struct { bool ok; Blob value; } OptBlob;
+typedef struct { bool ok; UdpPacket value; } OptUdpPacket;
+
+OptTcpConn tcpAcceptTimeout(const TcpListener *listener, int32_t timeoutMs);
+OptTcpListener tcpListen(const char *host, int32_t port);
+OptBlob tcpReadTimeout(const TcpConn *conn, int64_t maxBytes, int32_t timeoutMs);
+int64_t tcpWriteTimeout(const TcpConn *conn, const Blob *data, int32_t timeoutMs);
+bool tcpListenerClose(const TcpListener *listener);
+OptUdpSocket udpBind(const char *host, int32_t port);
+int64_t udpSendTimeout(const UdpSocket *socket_value, const char *host, int32_t port, const Blob *data, int32_t timeoutMs);
+OptUdpPacket udpRecvFromTimeout(const UdpSocket *socket_value, int64_t maxBytes, int32_t timeoutMs);
+OptBlob udpRecvTimeout(const UdpSocket *socket_value, int64_t maxBytes, int32_t timeoutMs);
+bool udpClose(const UdpSocket *socket_value);
+
+static int bound_port(int64_t handle) {
+    struct sockaddr_storage addr;
+    socklen_t addr_len = sizeof(addr);
+    if (getsockname((int)handle, (struct sockaddr *)&addr, &addr_len) != 0) return -1;
+    if (addr.ss_family != AF_INET) return -1;
+    return (int)ntohs(((struct sockaddr_in *)&addr)->sin_port);
+}
+
+int main(void) {
+#if defined(_WIN32)
+    return 0;
+#else
+    int pair[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, pair) != 0) return 2;
+    TcpConn conn = {(int64_t)pair[0]};
+
+    OptBlob empty_read = tcpReadTimeout(&conn, 4, 0);
+    if (empty_read.ok) return 3;
+
+    if (write(pair[1], "ab", 2) != 2) return 4;
+    OptBlob read_data = tcpReadTimeout(&conn, 4, 100);
+    if (!read_data.ok || !read_data.value.data || read_data.value.size != 2) return 5;
+    if (read_data.value.data[0] != 'a' || read_data.value.data[1] != 'b') return 6;
+    free(read_data.value.data);
+
+    Blob tcp_payload = {(uint8_t *)"cd", 2};
+    if (tcpWriteTimeout(&conn, &tcp_payload, 100) != 2) return 7;
+    char tcp_buf[2];
+    if (read(pair[1], tcp_buf, sizeof(tcp_buf)) != 2) return 8;
+    if (tcp_buf[0] != 'c' || tcp_buf[1] != 'd') return 9;
+    close(pair[0]);
+    close(pair[1]);
+
+    OptTcpListener listener = tcpListen("127.0.0.1", 0);
+    if (!listener.ok || listener.value.handle == 0) return 10;
+    OptTcpConn accepted = tcpAcceptTimeout(&listener.value, 0);
+    if (accepted.ok) return 11;
+    if (!tcpListenerClose(&listener.value)) return 12;
+
+    OptUdpSocket udp = udpBind("127.0.0.1", 0);
+    if (!udp.ok || udp.value.handle == 0) return 13;
+    OptUdpPacket missing_packet = udpRecvFromTimeout(&udp.value, 8, 0);
+    if (missing_packet.ok) return 14;
+
+    OptUdpSocket peer = udpBind("127.0.0.1", 0);
+    if (!peer.ok || peer.value.handle == 0) return 15;
+    int udp_port = bound_port(udp.value.handle);
+    int peer_port = bound_port(peer.value.handle);
+    if (udp_port <= 0 || peer_port <= 0) return 16;
+
+    Blob udp_payload = {(uint8_t *)"xy", 2};
+    if (udpSendTimeout(&peer.value, "127.0.0.1", udp_port, &udp_payload, 100) != 2) return 17;
+    OptUdpPacket packet = udpRecvFromTimeout(&udp.value, 8, 100);
+    if (!packet.ok || !packet.value.data.data || packet.value.data.size != 2) return 18;
+    if (packet.value.data.data[0] != 'x' || packet.value.data.data[1] != 'y') return 19;
+    if (!packet.value.host || packet.value.host[0] == '\0') return 20;
+    if (packet.value.port != peer_port) return 21;
+    free(packet.value.data.data);
+    free((void *)packet.value.host);
+
+    Blob udp_payload_2 = {(uint8_t *)"z", 1};
+    if (udpSendTimeout(&peer.value, "127.0.0.1", udp_port, &udp_payload_2, 100) != 1) return 22;
+    OptBlob udp_blob = udpRecvTimeout(&udp.value, 8, 100);
+    if (!udp_blob.ok || !udp_blob.value.data || udp_blob.value.size != 1) return 23;
+    if (udp_blob.value.data[0] != 'z') return 24;
+    free(udp_blob.value.data);
+
+    if (!udpClose(&peer.value)) return 25;
+    if (!udpClose(&udp.value)) return 26;
+    return 0;
+#endif
+}
+''',
+        encoding="utf-8",
+    )
+    exe = tmp_path / "tcp_udp_timeout_harness"
+    extra_libs = ["-ldl"] if sys.platform.startswith("linux") else []
+    subprocess.run(
+        [
+            cc,
+            "-std=c11",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            str(harness),
+            str(ROOT / "packages" / "std" / "native" / "net" / "tcp.c"),
+            *extra_libs,
+            "-o",
+            str(exe),
+        ],
+        check=True,
+    )
+    subprocess.run([str(exe)], check=True)
+
+
+def test_e2e_native_tcp_tls_fails_without_tls_backend(tmp_path):
+    """TCP TLS 客户端不应在 TLS 后端不可用时伪装成功或回退明文。"""
+    cc = shutil.which("cc")
+    if cc is None:
+        pytest.skip("需要 C 编译器验证原生 std/net/tcp TLS wrapper")
+
+    harness = tmp_path / "tcp_tls_no_tls_harness.c"
+    harness.write_text(
+        r'''
+	#include <stdbool.h>
+	#include <stdint.h>
+	#include <stdlib.h>
+
+	typedef struct { int64_t handle; } TcpTlsConn;
+typedef struct { bool ok; TcpTlsConn value; } OptTcpTlsConn;
+
+OptTcpTlsConn tcpTlsConnect(const char *host, int32_t port);
+
+int main(int argc, char **argv) {
+    int port = argc > 1 ? (int)strtol(argv[1], NULL, 10) : 1;
+    return tcpTlsConnect("127.0.0.1", port).ok ? 2 : 0;
+}
+''',
+        encoding="utf-8",
+    )
+    exe = tmp_path / "tcp_tls_no_tls_harness"
+    extra_libs = ["-ldl"] if sys.platform.startswith("linux") else []
+    subprocess.run(
+        [
+            cc,
+            "-std=c11",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-DEZ_TCP_TEST_NO_OPENSSL_DLOPEN=1",
+            str(harness),
+            str(ROOT / "packages" / "std" / "native" / "net" / "tcp.c"),
+            *extra_libs,
+            "-o",
+            str(exe),
+        ],
+        check=True,
+    )
+
+    ready = threading.Event()
+    captured = []
+
+    def serve_once():
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
+            server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            server.bind(("127.0.0.1", 0))
+            server.listen(1)
+            captured.append(server.getsockname()[1])
+            ready.set()
+            server.settimeout(2)
+            try:
+                conn, _ = server.accept()
+            except socket.timeout:
+                captured.append(b"")
+                return
+            with conn:
+                conn.settimeout(2)
+                try:
+                    captured.append(conn.recv(128))
+                except socket.timeout:
+                    captured.append(b"")
+
+    thread = threading.Thread(target=serve_once, daemon=True)
+    thread.start()
+    assert ready.wait(timeout=2)
+    subprocess.run([str(exe), str(captured[0])], check=True, timeout=5)
+    thread.join(timeout=3)
+    assert len(captured) >= 2
+    assert captured[1] == b""
 
 
 def test_e2e_native_ws_send_accepts_empty_blob_and_rejects_invalid_blob(tmp_path):
@@ -5829,6 +7441,76 @@ int main(void) {
         check=True,
     )
     subprocess.run([str(exe)], check=True)
+
+
+def test_e2e_native_ws_wss_fails_without_tls_backend(tmp_path):
+    """wss 客户端不应在 TLS 后端不可用时伪装成功或回退明文握手。"""
+    cc = shutil.which("cc")
+    if cc is None:
+        pytest.skip("需要 C 编译器验证原生 std/net/ws wrapper")
+
+    harness = tmp_path / "ws_wss_no_tls_harness.c"
+    harness.write_text(
+        r'''
+#include <stdbool.h>
+#include <stdint.h>
+
+typedef struct { int64_t handle; } WsConn;
+typedef struct { bool ok; WsConn value; } OptWsConn;
+
+OptWsConn wsConnect(const char *url);
+
+int main(int argc, char **argv) {
+    return wsConnect(argc > 1 ? argv[1] : "wss://127.0.0.1:1/").ok ? 2 : 0;
+}
+''',
+        encoding="utf-8",
+    )
+    exe = tmp_path / "ws_wss_no_tls_harness"
+    extra_libs = ["-ldl"] if sys.platform.startswith("linux") else []
+    subprocess.run(
+        [
+            cc,
+            "-std=c11",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-DEZ_WS_TEST_NO_OPENSSL_DLOPEN=1",
+            str(harness),
+            str(ROOT / "packages" / "std" / "native" / "net" / "ws.c"),
+            *extra_libs,
+            "-o",
+            str(exe),
+        ],
+        check=True,
+    )
+
+    ready = threading.Event()
+    captured = []
+
+    def serve_once():
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
+            server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            server.bind(("127.0.0.1", 0))
+            server.listen(1)
+            captured.append(server.getsockname()[1])
+            ready.set()
+            conn, _ = server.accept()
+            with conn:
+                conn.settimeout(2)
+                try:
+                    data = conn.recv(128)
+                except socket.timeout:
+                    data = b""
+                captured.append(data)
+
+    thread = threading.Thread(target=serve_once, daemon=True)
+    thread.start()
+    assert ready.wait(timeout=2)
+    subprocess.run([str(exe), f"wss://127.0.0.1:{captured[0]}/"], check=True, timeout=5)
+    thread.join(timeout=3)
+    assert len(captured) >= 2
+    assert not captured[1].startswith(b"GET /")
 
 
 def test_e2e_public_emcc_wrappers_do_not_use_legacy_null_stubs():
@@ -5954,6 +7636,125 @@ def test_e2e_mobile_ui_native_wrappers_keep_minimal_state():
         assert "static UiNode" in text
         for name in names:
             assert f"{name}(" in text
+
+
+def test_e2e_mobile_ui_screen_metrics_and_attributed_text_state(tmp_path):
+    """移动 UI 状态层应保存宿主注入的屏幕指标和富文本可见文本。"""
+    cc = shutil.which("cc")
+    if cc is None:
+        pytest.skip("需要 C 编译器验证移动 UI 状态层")
+
+    android_harness = tmp_path / "android_ui_metrics_harness.c"
+    android_harness.write_text(
+        r'''
+#include <math.h>
+#include <stdint.h>
+
+void ezAndroidSetScreenMetrics(int32_t width, int32_t height, float density);
+float getScreenDensity(void);
+int32_t getScreenWidth(void);
+int32_t getScreenHeight(void);
+
+int main(void) {
+    if (getScreenWidth() != 0 || getScreenHeight() != 0) return 2;
+    ezAndroidSetScreenMetrics(1080, 2400, 2.75f);
+    if (getScreenWidth() != 1080 || getScreenHeight() != 2400) return 3;
+    if (fabsf(getScreenDensity() - 2.75f) > 0.001f) return 4;
+    ezAndroidSetScreenMetrics(-1, -1, -1.0f);
+    if (getScreenWidth() != 0 || getScreenHeight() != 0) return 5;
+    if (fabsf(getScreenDensity() - 1.0f) > 0.001f) return 6;
+    return 0;
+}
+''',
+        encoding="utf-8",
+    )
+    android_exe = tmp_path / "android_ui_metrics_harness"
+    subprocess.run(
+        [
+            cc,
+            "-std=c11",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            str(android_harness),
+            str(ROOT / "packages" / "ez-android-ui" / "native" / "android_ui.c"),
+            "-o",
+            str(android_exe),
+        ],
+        check=True,
+    )
+    subprocess.run([str(android_exe)], check=True)
+
+    ios_harness = tmp_path / "ios_ui_metrics_harness.c"
+    ios_harness.write_text(
+        r'''
+#include <math.h>
+#include <stdint.h>
+#include <string.h>
+
+typedef struct { int32_t id; } Node;
+typedef struct { float top; float left; float bottom; float right; } Insets;
+
+Node createLabel(void);
+void setAttributedText(const Node *node, const char *html);
+const char *getText(const Node *node);
+void ezIosSetScreenMetrics(float width, float height, float scale, float safeTop, float safeLeft, float safeBottom, float safeRight, float statusBarHeight);
+float getScreenWidth(void);
+float getScreenHeight(void);
+float getScreenScale(void);
+Insets getSafeAreaInsets(void);
+float getStatusBarHeight(void);
+
+int main(void) {
+    Node label = createLabel();
+    setAttributedText(&label, "<b>Hello</b>&nbsp;&amp;&lt;world&gt;");
+    if (strcmp(getText(&label), "Hello &<world>") != 0) return 2;
+    ezIosSetScreenMetrics(393.0f, 852.0f, 3.0f, 59.0f, 1.0f, 34.0f, 2.0f, 47.0f);
+    if (fabsf(getScreenWidth() - 393.0f) > 0.001f) return 3;
+    if (fabsf(getScreenHeight() - 852.0f) > 0.001f) return 4;
+    if (fabsf(getScreenScale() - 3.0f) > 0.001f) return 5;
+    Insets insets = getSafeAreaInsets();
+    if (fabsf(insets.top - 59.0f) > 0.001f || fabsf(insets.bottom - 34.0f) > 0.001f) return 6;
+    if (fabsf(getStatusBarHeight() - 47.0f) > 0.001f) return 7;
+    return 0;
+}
+''',
+        encoding="utf-8",
+    )
+    ios_exe = tmp_path / "ios_ui_metrics_harness"
+    subprocess.run(
+        [
+            cc,
+            "-std=c11",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            str(ios_harness),
+            str(ROOT / "packages" / "ez-ios-ui" / "native" / "ios_ui.c"),
+            "-o",
+            str(ios_exe),
+        ],
+        check=True,
+    )
+    subprocess.run([str(ios_exe)], check=True)
+
+
+def test_e2e_mobile_ui_packages_export_documented_apis():
+    """移动 UI 包的 index.ez 与 native C 应覆盖文档中声明的公开 API。"""
+    cases = [
+        ("ez-android-ui", "android_ui.c"),
+        ("ez-ios-ui", "ios_ui.c"),
+    ]
+    declare_pattern = re.compile(r"declare const\s+([A-Za-z_][A-Za-z0-9_]*)\s*:")
+    export_pattern = re.compile(r"export declare const\s+([A-Za-z_][A-Za-z0-9_]*)\s*:")
+    c_pattern = re.compile(r"^(?:const\s+char\s*\*\s*|[A-Za-z_][A-Za-z0-9_]*|void|bool|int32_t|int64_t|float|double|Node|OptNode|OptStr|Rect|Insets|Dict)\s*([A-Za-z_][A-Za-z0-9_]*)\s*\(", re.MULTILINE)
+
+    for package, native_name in cases:
+        doc_apis = set(declare_pattern.findall((ROOT / "docs" / f"{package}.md").read_text(encoding="utf-8")))
+        index_apis = set(export_pattern.findall((ROOT / "packages" / package / "index.ez").read_text(encoding="utf-8")))
+        native_apis = set(c_pattern.findall((ROOT / "packages" / package / "native" / native_name).read_text(encoding="utf-8")))
+        assert doc_apis - index_apis == set(), package
+        assert doc_apis - native_apis == set(), package
 
 
 def test_e2e_std_platform_externs_cover_mobile_and_emcc(tmp_path, capsys):

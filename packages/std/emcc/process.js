@@ -6,6 +6,7 @@
   var STREAM_KIND_PROCESS_STDERR = 7;
   var nextHandle = 1;
   var completed = Object.create(null);
+  var running = Object.create(null);
   var root = typeof Module !== 'undefined' && Module ? Module : (typeof globalThis !== 'undefined' ? globalThis : this);
 
   function hasAsyncify() {
@@ -102,6 +103,11 @@
   function writeOptStream(ret, streamValue) {
     HEAPU8[ret] = streamValue ? 1 : 0;
     writeStream(ret + 8, streamValue);
+  }
+
+  function emptyResult(exitCode) {
+    exitCode = typeof exitCode === 'number' ? exitCode | 0 : 0;
+    return { exitCode: exitCode, stdout: new Uint8Array(0), stderr: new Uint8Array(0), ok: exitCode === 0 };
   }
 
   function nodeRequire(name) {
@@ -209,6 +215,150 @@
     return spawnSyncResult(command);
   }
 
+  function spawnProcess(command) {
+    if (!hasAsyncify()) return null;
+    var childProcess = nodeRequire('child_process');
+    if (!childProcess || typeof childProcess.spawn !== 'function') return null;
+    try {
+      var options = { env: applyEnv(command.env), stdio: ['pipe', 'pipe', 'pipe'] };
+      if (command.cwd) options.cwd = command.cwd;
+      var child = childProcess.spawn(command.program, command.args, options);
+      var handle = nextHandle++;
+      var state = {
+        handle: handle,
+        pid: typeof child.pid === 'number' ? child.pid : 0,
+        child: child,
+        stdinData: command.stdin,
+        stdinWritten: false,
+        stdout: [],
+        stderr: [],
+        stdoutTransferred: false,
+        stderrTransferred: false,
+        stdinTransferred: false,
+        exitCode: null,
+        closed: false,
+        error: false,
+        stdoutDone: false,
+        stderrDone: false,
+        stdoutWaiters: [],
+        stderrWaiters: [],
+      };
+      running[handle] = state;
+      if (child.stdout) {
+        child.stdout.on('data', function (chunk) { pushPipeChunk(state, 'stdout', chunk); });
+        child.stdout.on('end', function () { finishPipe(state, 'stdout'); });
+        child.stdout.on('close', function () { finishPipe(state, 'stdout'); });
+      } else {
+        state.stdoutDone = true;
+      }
+      if (child.stderr) {
+        child.stderr.on('data', function (chunk) { pushPipeChunk(state, 'stderr', chunk); });
+        child.stderr.on('end', function () { finishPipe(state, 'stderr'); });
+        child.stderr.on('close', function () { finishPipe(state, 'stderr'); });
+      } else {
+        state.stderrDone = true;
+      }
+      child.on('error', function () { state.error = true; });
+      child.on('close', function (code, signal) {
+        state.closed = true;
+        state.exitCode = typeof code === 'number' ? code | 0 : (signal ? 128 : 0);
+      });
+      return state;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  function stdinAutoWrite(state) {
+    if (!state || state.stdinTransferred || state.stdinWritten) return;
+    state.stdinWritten = true;
+    if (!state.child || !state.child.stdin) return;
+    try {
+      if (state.stdinData && state.stdinData.length > 0) state.child.stdin.write(typeof Buffer !== 'undefined' ? Buffer.from(state.stdinData) : state.stdinData);
+      state.child.stdin.end();
+    } catch (e) {
+      state.error = true;
+    }
+  }
+
+  function wakePipe(state, field) {
+    var waiters = state[field + 'Waiters'];
+    while (waiters && waiters.length > 0) waiters.shift()();
+  }
+
+  function pushPipeChunk(state, field, chunk) {
+    if (!state) return;
+    state[field].push(bytesValue(chunk));
+    wakePipe(state, field);
+  }
+
+  function finishPipe(state, field) {
+    if (!state || state[field + 'Done']) return;
+    state[field + 'Done'] = true;
+    wakePipe(state, field);
+  }
+
+  function queuedPipeRead(state, field, max) {
+    max = Number(max);
+    if (!state || !Number.isFinite(max) || max < 0 || Math.floor(max) !== max) return null;
+    if (max === 0) return new Uint8Array(0);
+    var queue = state[field];
+    if (queue && queue.length > 0) {
+      var out = [];
+      var total = 0;
+      while (queue.length > 0 && total < max) {
+        var chunk = bytesValue(queue.shift());
+        var take = Math.min(chunk.length, max - total);
+        if (take > 0) {
+          out.push(chunk.slice(0, take));
+          total += take;
+        }
+        if (take < chunk.length) queue.unshift(chunk.slice(take));
+      }
+      var bytes = new Uint8Array(total);
+      var offset = 0;
+      for (var i = 0; i < out.length; i++) {
+        bytes.set(out[i], offset);
+        offset += out[i].length;
+      }
+      return bytes;
+    }
+    if (state[field + 'Done'] || state.closed || state.error) return new Uint8Array(0);
+    if (!hasAsyncify()) return null;
+    return Asyncify.handleSleep(function (wakeUp) {
+      state[field + 'Waiters'].push(function () { wakeUp(queuedPipeRead(state, field, max)); });
+    });
+  }
+
+  function waitRunning(state) {
+    if (!state || !state.child || !hasAsyncify()) return null;
+    stdinAutoWrite(state);
+    return Asyncify.handleSleep(function (wakeUp) {
+      var settled = false;
+      function finish() {
+        if (settled) return;
+        settled = true;
+        if (state.error) {
+          delete running[state.handle];
+          wakeUp(null);
+          return;
+        }
+        var exitCode = typeof state.exitCode === 'number' ? state.exitCode : 0;
+        var result = {
+          exitCode: exitCode,
+          stdout: state.stdoutTransferred ? new Uint8Array(0) : bytesValue(typeof Buffer !== 'undefined' ? Buffer.concat(state.stdout) : new Uint8Array(0)),
+          stderr: state.stderrTransferred ? new Uint8Array(0) : bytesValue(typeof Buffer !== 'undefined' ? Buffer.concat(state.stderr) : new Uint8Array(0)),
+          ok: exitCode === 0,
+        };
+        delete running[state.handle];
+        wakeUp(result);
+      }
+      if (state.closed) return finish();
+      state.child.once('close', finish);
+      state.child.once('error', function () { state.error = true; finish(); });
+    });
+  }
+
   function readProcess(processPtr) {
     if (!processPtr) return null;
     return {
@@ -220,6 +370,64 @@
   function streamBridge() {
     var bridge = root && root.__ez_stream_bridge;
     return bridge && typeof bridge.fromBytes === 'function' ? bridge : null;
+  }
+
+  function pipeWrite(writable, bytes) {
+    if (!writable || !bytes || writable.destroyed) return -1;
+    if (bytes.length === 0) return 0;
+    try {
+      writable.write(typeof Buffer !== 'undefined' ? Buffer.from(bytes) : bytes);
+      return bytes.length;
+    } catch (e) {
+      return -1;
+    }
+  }
+
+  function pipeClose(stream) {
+    if (!stream) return 0;
+    try {
+      if (typeof stream.end === 'function') stream.end();
+      else if (typeof stream.destroy === 'function') stream.destroy();
+      return 1;
+    } catch (e) {
+      return 0;
+    }
+  }
+
+  function takeLivePipe(ret, processPtr, kind) {
+    var processValue = readProcess(processPtr);
+    var state = processValue ? running[processValue.handle] : null;
+    var bridge = root && root.__ez_stream_bridge;
+    if (!state || !bridge || typeof bridge.fromProcessPipe !== 'function') return writeOptStream(ret, null);
+    var pipe = null;
+    if (kind === STREAM_KIND_PROCESS_STDIN) {
+      if (state.stdinTransferred || state.stdinWritten || !state.child.stdin) return writeOptStream(ret, null);
+      state.stdinTransferred = true;
+      state.stdinData = new Uint8Array(0);
+      pipe = {
+        write: function (bytes) { return pipeWrite(state.child.stdin, bytes); },
+        flush: function () { return state.child.stdin && !state.child.stdin.destroyed ? 1 : 0; },
+        close: function () { return pipeClose(state.child.stdin); },
+      };
+    } else if (kind === STREAM_KIND_PROCESS_STDOUT) {
+      if (state.stdoutTransferred || !state.child.stdout) return writeOptStream(ret, null);
+      state.stdoutTransferred = true;
+      pipe = {
+        read: function (max) { return queuedPipeRead(state, 'stdout', max); },
+        flush: function () { return state.child.stdout && !state.child.stdout.destroyed ? 1 : 0; },
+        close: function () { return pipeClose(state.child.stdout); },
+      };
+    } else if (kind === STREAM_KIND_PROCESS_STDERR) {
+      if (state.stderrTransferred || !state.child.stderr) return writeOptStream(ret, null);
+      state.stderrTransferred = true;
+      pipe = {
+        read: function (max) { return queuedPipeRead(state, 'stderr', max); },
+        flush: function () { return state.child.stderr && !state.child.stderr.destroyed ? 1 : 0; },
+        close: function () { return pipeClose(state.child.stderr); },
+      };
+    }
+    var stream = pipe ? bridge.fromProcessPipe(pipe, kind) : null;
+    writeOptStream(ret, stream);
   }
 
   function takeCompletedStream(ret, processPtr, field, kind) {
@@ -243,31 +451,43 @@
     processSpawn__async: 'auto',
     processSpawn: function (ret, commandPtr) {
       var command = readCommand(commandPtr);
-      var result = command ? spawnResult(command) : null;
+      if (!command) return writeOptProcess(ret, false, null);
+      var state = spawnProcess(command);
+      if (state) return writeOptProcess(ret, true, { handle: state.handle, pid: state.pid });
+      var result = spawnSyncResult(command);
       if (!result) return writeOptProcess(ret, false, null);
       var handle = nextHandle++;
       completed[handle] = result;
       writeOptProcess(ret, true, { handle: handle, pid: 0 });
     },
+    processWait__async: 'auto',
     processWait: function (ret, processPtr) {
       var processValue = readProcess(processPtr);
       var result = processValue ? completed[processValue.handle] : null;
-      if (!result) return writeOptProcessResult(ret, false, null);
-      delete completed[processValue.handle];
-      writeOptProcessResult(ret, true, result);
+      if (result) {
+        delete completed[processValue.handle];
+        return writeOptProcessResult(ret, true, result);
+      }
+      result = processValue ? waitRunning(running[processValue.handle]) : null;
+      writeOptProcessResult(ret, !!result, result || emptyResult(0));
     },
     processTerminate: function (processPtr) {
-      readProcess(processPtr);
-      return 0;
+      var processValue = readProcess(processPtr);
+      var state = processValue ? running[processValue.handle] : null;
+      if (!state || !state.child || typeof state.child.kill !== 'function') return 0;
+      try { return state.child.kill() ? 1 : 0; } catch (e) { return 0; }
     },
     processStdin: function (ret, processPtr) {
-      readProcess(processPtr);
-      writeOptStream(ret, null);
+      takeLivePipe(ret, processPtr, STREAM_KIND_PROCESS_STDIN);
     },
     processStdout: function (ret, processPtr) {
+      var processValue = readProcess(processPtr);
+      if (processValue && running[processValue.handle]) return takeLivePipe(ret, processPtr, STREAM_KIND_PROCESS_STDOUT);
       takeCompletedStream(ret, processPtr, 'stdout', STREAM_KIND_PROCESS_STDOUT);
     },
     processStderr: function (ret, processPtr) {
+      var processValue = readProcess(processPtr);
+      if (processValue && running[processValue.handle]) return takeLivePipe(ret, processPtr, STREAM_KIND_PROCESS_STDERR);
       takeCompletedStream(ret, processPtr, 'stderr', STREAM_KIND_PROCESS_STDERR);
     },
     processCurrentPath: function (ret) {

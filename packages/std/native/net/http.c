@@ -1,27 +1,44 @@
 // EzLang std/net/http 原生封装层
-// 当前实现明文 HTTP 客户端和基础阻塞式服务端；HTTPS 与完整网络运行时后续补齐。
+// 当前实现 HTTP/HTTPS 客户端和每连接 worker 服务端；TLS 后端不可用时 HTTPS 显式失败。
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
+#ifndef __has_include
+#define __has_include(x) 0
+#endif
+
 #if defined(_WIN32)
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <windows.h>
 typedef SOCKET ez_socket_t;
 #define EZ_INVALID_SOCKET INVALID_SOCKET
 #define ez_close_socket closesocket
+#define EZ_SHUTDOWN_BOTH SD_BOTH
 #else
 #include <errno.h>
 #include <netinet/in.h>
 #include <netdb.h>
+#include <pthread.h>
+#include <sys/select.h>
 #include <sys/socket.h>
 #include <unistd.h>
 typedef int ez_socket_t;
 #define EZ_INVALID_SOCKET (-1)
 #define ez_close_socket close
+#define EZ_SHUTDOWN_BOTH SHUT_RDWR
+#endif
+
+#if !defined(_WIN32) && !defined(EZ_TARGET_ANDROID) && !defined(EZ_TARGET_IOS) && __has_include(<dlfcn.h>)
+#define EZ_HTTP_HAS_OPENSSL_TLS 1
+#include <dlfcn.h>
+#else
+#define EZ_HTTP_HAS_OPENSSL_TLS 0
 #endif
 
 typedef struct {
@@ -66,10 +83,25 @@ typedef struct {
     int32_t port;
     ez_socket_t sock;
     bool running;
+    bool started;
     EzHttpRoute *routes;
     size_t route_count;
     size_t route_capacity;
+#if defined(_WIN32)
+    CRITICAL_SECTION worker_lock;
+    CONDITION_VARIABLE worker_done;
+#else
+    pthread_mutex_t worker_lock;
+    pthread_cond_t worker_done;
+#endif
+    int32_t active_workers;
+    bool sync_ready;
 } EzHttpServer;
+
+typedef struct {
+    EzHttpServer *server;
+    ez_socket_t client;
+} EzHttpClientWorker;
 
 typedef struct {
     bool ok;
@@ -81,7 +113,25 @@ typedef struct {
     char *host_header;
     char *path;
     char port[8];
+    bool tls;
 } EzUrlParts;
+
+#if EZ_HTTP_HAS_OPENSSL_TLS
+typedef struct ssl_st SSL;
+typedef struct ssl_ctx_st SSL_CTX;
+typedef struct ssl_method_st SSL_METHOD;
+typedef struct x509_st X509;
+typedef struct x509_store_ctx_st X509_STORE_CTX;
+#endif
+
+typedef struct {
+    ez_socket_t sock;
+#if EZ_HTTP_HAS_OPENSSL_TLS
+    SSL_CTX *tls_ctx;
+    SSL *tls_ssl;
+#endif
+    bool tls;
+} EzHttpConnection;
 
 static char *ez_strdup_range(const char *src, size_t len) {
     char *out = (char *)malloc(len + 1);
@@ -98,6 +148,7 @@ static Dict ez_empty_headers(void) {
 static const char *ez_dict_key_at(const Dict *dict, int32_t index);
 static const char *ez_dict_value_at(const Dict *dict, int32_t index);
 static bool ez_append_bytes(uint8_t **buffer, size_t *len, size_t *cap, const uint8_t *chunk, size_t chunk_len);
+static bool ez_send_all(ez_socket_t sock, const char *data, size_t len);
 
 static void ez_free_headers(Dict *headers) {
     if (!headers || headers->count <= 0) return;
@@ -257,13 +308,22 @@ static void ez_url_parts_free(EzUrlParts *parts) {
     parts->path = NULL;
 }
 
-static bool ez_http_has_scheme(const char *url) {
-    const char *prefix = "http://";
-    if (!url) return false;
+static bool ez_ascii_starts_with_ci(const char *text, const char *prefix) {
+    if (!text || !prefix) return false;
     for (size_t i = 0; prefix[i] != '\0'; ++i) {
-        if (url[i] == '\0' || ez_ascii_lower(url[i]) != prefix[i]) return false;
+        if (text[i] == '\0' || ez_ascii_lower(text[i]) != prefix[i]) return false;
     }
     return true;
+}
+
+static size_t ez_http_scheme_len(const char *url, bool *tls) {
+    if (tls) *tls = false;
+    if (ez_ascii_starts_with_ci(url, "http://")) return strlen("http://");
+    if (ez_ascii_starts_with_ci(url, "https://")) {
+        if (tls) *tls = true;
+        return strlen("https://");
+    }
+    return 0;
 }
 
 static bool ez_http_url_bytes_valid(const char *start, const char *end) {
@@ -304,10 +364,12 @@ static char *ez_make_host_header(const char *host, const char *port, bool has_po
 }
 
 static bool ez_parse_http_url(const char *url, EzUrlParts *out) {
-    size_t prefix_len = strlen("http://");
     if (!out) return false;
     *out = (EzUrlParts){0};
-    if (!ez_http_has_scheme(url)) return false;
+    bool tls = false;
+    size_t prefix_len = ez_http_scheme_len(url, &tls);
+    if (prefix_len == 0) return false;
+    out->tls = tls;
     const char *host_start = url + prefix_len;
     const char *fragment_start = strchr(host_start, '#');
     const char *url_end = fragment_start ? fragment_start : url + strlen(url);
@@ -322,7 +384,7 @@ static bool ez_parse_http_url(const char *url, EzUrlParts *out) {
 
     bool has_port = false;
     char *host_for_header = NULL;
-    strcpy(out->port, "80");
+    strcpy(out->port, tls ? "443" : "80");
 
     if (*host_start == '[') {
         const char *close = memchr(host_start, ']', (size_t)(authority_end - host_start));
@@ -412,14 +474,426 @@ static ez_socket_t ez_http_connect(const char *host, const char *port) {
     return sock;
 }
 
+#if EZ_HTTP_HAS_OPENSSL_TLS
+typedef struct X509_VERIFY_PARAM_st X509_VERIFY_PARAM;
+typedef int (*EzOpenSslInitSslFn)(uint64_t, const void *);
+typedef const SSL_METHOD *(*EzOpenSslMethodFn)(void);
+typedef SSL_CTX *(*EzOpenSslCtxNewFn)(const SSL_METHOD *);
+typedef void (*EzOpenSslCtxFreeFn)(SSL_CTX *);
+typedef int (*EzOpenSslCtxDefaultPathsFn)(SSL_CTX *);
+typedef void (*EzOpenSslCtxSetVerifyFn)(SSL_CTX *, int, void *);
+typedef SSL *(*EzOpenSslNewFn)(SSL_CTX *);
+typedef void (*EzOpenSslFreeFn)(SSL *);
+typedef int (*EzOpenSslSetFdFn)(SSL *, int);
+typedef long (*EzOpenSslCtrlFn)(SSL *, int, long, void *);
+typedef X509_VERIFY_PARAM *(*EzOpenSslGet0ParamFn)(SSL *);
+typedef int (*EzOpenSslParamSetHostFn)(X509_VERIFY_PARAM *, const char *, size_t);
+typedef int (*EzOpenSslParamSetIpFn)(X509_VERIFY_PARAM *, const char *);
+typedef int (*EzOpenSslConnectFn)(SSL *);
+typedef int (*EzOpenSslReadFn)(SSL *, void *, int);
+typedef int (*EzOpenSslWriteFn)(SSL *, const void *, int);
+typedef int (*EzOpenSslShutdownFn)(SSL *);
+typedef long (*EzOpenSslVerifyResultFn)(const SSL *);
+
+typedef struct {
+    void *ssl_handle;
+    void *crypto_handle;
+    EzOpenSslInitSslFn init_ssl;
+    EzOpenSslMethodFn tls_client_method;
+    EzOpenSslMethodFn sslv23_client_method;
+    EzOpenSslCtxNewFn ctx_new;
+    EzOpenSslCtxFreeFn ctx_free;
+    EzOpenSslCtxDefaultPathsFn ctx_default_paths;
+    EzOpenSslCtxSetVerifyFn ctx_set_verify;
+    EzOpenSslNewFn ssl_new;
+    EzOpenSslFreeFn ssl_free;
+    EzOpenSslSetFdFn ssl_set_fd;
+    EzOpenSslCtrlFn ssl_ctrl;
+    EzOpenSslGet0ParamFn ssl_get0_param;
+    EzOpenSslParamSetHostFn param_set_host;
+    EzOpenSslParamSetIpFn param_set_ip;
+    EzOpenSslConnectFn ssl_connect;
+    EzOpenSslReadFn ssl_read;
+    EzOpenSslWriteFn ssl_write;
+    EzOpenSslShutdownFn ssl_shutdown;
+    EzOpenSslVerifyResultFn ssl_get_verify_result;
+    bool loaded;
+    bool available;
+} EzHttpTlsApi;
+
+static EzHttpTlsApi ez_http_tls_api = {0};
+
+static void *ez_http_dlsym_required(void *handle, const char *name, bool *ok) {
+    void *symbol = dlsym(handle, name);
+    if (!symbol) *ok = false;
+    return symbol;
+}
+
+static void *ez_http_dlopen_first(const char *const *candidates) {
+    for (size_t i = 0; candidates[i] != NULL; ++i) {
+#if defined(EZ_HTTP_TEST_NO_OPENSSL_DLOPEN)
+        void *handle = NULL;
+#else
+        void *handle = dlopen(candidates[i], RTLD_LAZY | RTLD_LOCAL);
+#endif
+        if (handle) return handle;
+    }
+    return NULL;
+}
+
+static void ez_http_tls_reset_failed(EzHttpTlsApi *api) {
+    void *ssl_handle = api->ssl_handle;
+    void *crypto_handle = api->crypto_handle;
+    memset(api, 0, sizeof(*api));
+    if (crypto_handle && crypto_handle != ssl_handle) dlclose(crypto_handle);
+    if (ssl_handle) dlclose(ssl_handle);
+    api->loaded = true;
+}
+
+static bool ez_http_load_tls(EzHttpTlsApi *api) {
+    if (api->loaded) return api->available;
+    api->loaded = true;
+
+#if defined(__APPLE__)
+    const char *ssl_candidates[] = {
+        "/opt/homebrew/opt/openssl@3/lib/libssl.3.dylib",
+        "/usr/local/opt/openssl@3/lib/libssl.3.dylib",
+        "/opt/homebrew/lib/libssl.3.dylib",
+        "/usr/local/lib/libssl.3.dylib",
+        "libssl.3.dylib",
+        "libssl.1.1.dylib",
+        "libssl.dylib",
+        NULL,
+    };
+    const char *crypto_candidates[] = {
+        "/opt/homebrew/opt/openssl@3/lib/libcrypto.3.dylib",
+        "/usr/local/opt/openssl@3/lib/libcrypto.3.dylib",
+        "/opt/homebrew/lib/libcrypto.3.dylib",
+        "/usr/local/lib/libcrypto.3.dylib",
+        "libcrypto.3.dylib",
+        "libcrypto.1.1.dylib",
+        "libcrypto.dylib",
+        NULL,
+    };
+#else
+    const char *ssl_candidates[] = {
+        "libssl.so.3",
+        "libssl.so.1.1",
+        "libssl.so",
+        NULL,
+    };
+    const char *crypto_candidates[] = {
+        "libcrypto.so.3",
+        "libcrypto.so.1.1",
+        "libcrypto.so",
+        NULL,
+    };
+#endif
+
+    api->ssl_handle = ez_http_dlopen_first(ssl_candidates);
+    api->crypto_handle = ez_http_dlopen_first(crypto_candidates);
+    if (!api->ssl_handle || !api->crypto_handle) {
+        ez_http_tls_reset_failed(api);
+        return false;
+    }
+
+    bool ok = true;
+    api->init_ssl = (EzOpenSslInitSslFn)dlsym(api->ssl_handle, "OPENSSL_init_ssl");
+    api->tls_client_method = (EzOpenSslMethodFn)dlsym(api->ssl_handle, "TLS_client_method");
+    api->sslv23_client_method = (EzOpenSslMethodFn)dlsym(api->ssl_handle, "SSLv23_client_method");
+    api->ctx_new = (EzOpenSslCtxNewFn)ez_http_dlsym_required(api->ssl_handle, "SSL_CTX_new", &ok);
+    api->ctx_free = (EzOpenSslCtxFreeFn)ez_http_dlsym_required(api->ssl_handle, "SSL_CTX_free", &ok);
+    api->ctx_default_paths = (EzOpenSslCtxDefaultPathsFn)ez_http_dlsym_required(api->ssl_handle, "SSL_CTX_set_default_verify_paths", &ok);
+    api->ctx_set_verify = (EzOpenSslCtxSetVerifyFn)ez_http_dlsym_required(api->ssl_handle, "SSL_CTX_set_verify", &ok);
+    api->ssl_new = (EzOpenSslNewFn)ez_http_dlsym_required(api->ssl_handle, "SSL_new", &ok);
+    api->ssl_free = (EzOpenSslFreeFn)ez_http_dlsym_required(api->ssl_handle, "SSL_free", &ok);
+    api->ssl_set_fd = (EzOpenSslSetFdFn)ez_http_dlsym_required(api->ssl_handle, "SSL_set_fd", &ok);
+    api->ssl_ctrl = (EzOpenSslCtrlFn)ez_http_dlsym_required(api->ssl_handle, "SSL_ctrl", &ok);
+    api->ssl_get0_param = (EzOpenSslGet0ParamFn)ez_http_dlsym_required(api->ssl_handle, "SSL_get0_param", &ok);
+    api->ssl_connect = (EzOpenSslConnectFn)ez_http_dlsym_required(api->ssl_handle, "SSL_connect", &ok);
+    api->ssl_read = (EzOpenSslReadFn)ez_http_dlsym_required(api->ssl_handle, "SSL_read", &ok);
+    api->ssl_write = (EzOpenSslWriteFn)ez_http_dlsym_required(api->ssl_handle, "SSL_write", &ok);
+    api->ssl_shutdown = (EzOpenSslShutdownFn)ez_http_dlsym_required(api->ssl_handle, "SSL_shutdown", &ok);
+    api->ssl_get_verify_result = (EzOpenSslVerifyResultFn)ez_http_dlsym_required(api->ssl_handle, "SSL_get_verify_result", &ok);
+    api->param_set_host = (EzOpenSslParamSetHostFn)ez_http_dlsym_required(api->crypto_handle, "X509_VERIFY_PARAM_set1_host", &ok);
+    api->param_set_ip = (EzOpenSslParamSetIpFn)ez_http_dlsym_required(api->crypto_handle, "X509_VERIFY_PARAM_set1_ip_asc", &ok);
+    if ((!api->tls_client_method && !api->sslv23_client_method) || !ok) {
+        ez_http_tls_reset_failed(api);
+        return false;
+    }
+    api->available = true;
+    return true;
+}
+
+static bool ez_http_tls_host_is_ip_literal(const char *host) {
+    if (!host || !host[0]) return false;
+    if (strchr(host, ':')) return true;
+    bool saw_dot = false;
+    for (const char *p = host; *p; ++p) {
+        if (*p == '.') {
+            saw_dot = true;
+            continue;
+        }
+        if (*p < '0' || *p > '9') return false;
+    }
+    return saw_dot;
+}
+
+static bool ez_http_tls_configure_verify(EzHttpTlsApi *api, SSL *ssl, const char *host) {
+    if (!api || !ssl || !host || !host[0]) return false;
+    X509_VERIFY_PARAM *param = api->ssl_get0_param(ssl);
+    if (!param) return false;
+    if (ez_http_tls_host_is_ip_literal(host)) return api->param_set_ip(param, host) == 1;
+    return api->param_set_host(param, host, 0) == 1;
+}
+
+static bool ez_http_tls_start(EzHttpConnection *conn, const char *host) {
+    EzHttpTlsApi *api = &ez_http_tls_api;
+    if (!conn || conn->sock == EZ_INVALID_SOCKET || !ez_http_load_tls(api)) return false;
+    if (api->init_ssl) api->init_ssl(0, NULL);
+    const SSL_METHOD *method = api->tls_client_method ? api->tls_client_method() : api->sslv23_client_method();
+    if (!method) return false;
+    SSL_CTX *ctx = api->ctx_new(method);
+    if (!ctx) return false;
+
+    const int ssl_verify_peer = 1;
+    const int ssl_ctrl_set_tlsext_hostname = 55;
+    const long tlsext_nametype_host_name = 0;
+    SSL *ssl = NULL;
+    bool ok = api->ctx_default_paths(ctx) == 1;
+    if (ok) api->ctx_set_verify(ctx, ssl_verify_peer, NULL);
+    if (ok) {
+        ssl = api->ssl_new(ctx);
+        ok = ssl != NULL;
+    }
+    if (ok && !ez_http_tls_configure_verify(api, ssl, host)) ok = false;
+    if (ok && !ez_http_tls_host_is_ip_literal(host)) {
+        ok = api->ssl_ctrl(ssl, ssl_ctrl_set_tlsext_hostname, tlsext_nametype_host_name, (void *)host) > 0;
+    }
+    if (ok) ok = api->ssl_set_fd(ssl, (int)conn->sock) == 1;
+    if (ok) ok = api->ssl_connect(ssl) == 1;
+    if (ok) ok = api->ssl_get_verify_result(ssl) == 0;
+    if (!ok) {
+        if (ssl) api->ssl_free(ssl);
+        api->ctx_free(ctx);
+        return false;
+    }
+    conn->tls_ctx = ctx;
+    conn->tls_ssl = ssl;
+    conn->tls = true;
+    return true;
+}
+#endif
+
+static void ez_http_conn_close(EzHttpConnection *conn) {
+    if (!conn) return;
+#if EZ_HTTP_HAS_OPENSSL_TLS
+    if (conn->tls_ssl) {
+        EzHttpTlsApi *api = &ez_http_tls_api;
+        if (api->ssl_shutdown) api->ssl_shutdown(conn->tls_ssl);
+        if (api->ssl_free) api->ssl_free(conn->tls_ssl);
+        conn->tls_ssl = NULL;
+    }
+    if (conn->tls_ctx) {
+        EzHttpTlsApi *api = &ez_http_tls_api;
+        if (api->ctx_free) api->ctx_free(conn->tls_ctx);
+        conn->tls_ctx = NULL;
+    }
+#endif
+    if (conn->sock != EZ_INVALID_SOCKET) {
+        ez_close_socket(conn->sock);
+        conn->sock = EZ_INVALID_SOCKET;
+    }
+    conn->tls = false;
+}
+
+static bool ez_http_conn_open(const EzUrlParts *parts, EzHttpConnection *conn) {
+    if (!parts || !conn) return false;
+    *conn = (EzHttpConnection){0};
+    conn->sock = ez_http_connect(parts->host, parts->port);
+    if (conn->sock == EZ_INVALID_SOCKET) return false;
+    if (!parts->tls) return true;
+#if EZ_HTTP_HAS_OPENSSL_TLS
+    if (ez_http_tls_start(conn, parts->host)) return true;
+#endif
+    ez_http_conn_close(conn);
+    return false;
+}
+
+static bool ez_http_conn_send_all(EzHttpConnection *conn, const char *data, size_t len) {
+    if (!conn || conn->sock == EZ_INVALID_SOCKET) return false;
+#if EZ_HTTP_HAS_OPENSSL_TLS
+    if (conn->tls) {
+        EzHttpTlsApi *api = &ez_http_tls_api;
+        size_t sent = 0;
+        while (sent < len) {
+            size_t remaining = len - sent;
+            int chunk = remaining > (size_t)INT_MAX ? INT_MAX : (int)remaining;
+            int n = api->ssl_write(conn->tls_ssl, data + sent, chunk);
+            if (n <= 0) return false;
+            sent += (size_t)n;
+        }
+        return true;
+    }
+#endif
+    return ez_send_all(conn->sock, data, len);
+}
+
+static int ez_http_conn_recv(EzHttpConnection *conn, uint8_t *buffer, size_t len) {
+    if (!conn || conn->sock == EZ_INVALID_SOCKET || !buffer || len == 0) return -1;
+#if EZ_HTTP_HAS_OPENSSL_TLS
+    if (conn->tls) {
+        EzHttpTlsApi *api = &ez_http_tls_api;
+        int chunk = len > (size_t)INT_MAX ? INT_MAX : (int)len;
+        return api->ssl_read(conn->tls_ssl, buffer, chunk);
+    }
+#endif
+#if defined(_WIN32)
+    return recv(conn->sock, (char *)buffer, (int)len, 0);
+#else
+    ssize_t n = recv(conn->sock, buffer, len, 0);
+    if (n > INT_MAX) return INT_MAX;
+    return (int)n;
+#endif
+}
+
 static EzHttpServer *ez_server_from_value(const HttpServer *server) {
     if (!server || server->handle == 0) return NULL;
     return (EzHttpServer *)(uintptr_t)server->handle;
 }
 
+static bool ez_http_server_sync_init(EzHttpServer *server) {
+    if (!server) return false;
+#if defined(_WIN32)
+    InitializeCriticalSection(&server->worker_lock);
+    InitializeConditionVariable(&server->worker_done);
+#else
+    if (pthread_mutex_init(&server->worker_lock, NULL) != 0) return false;
+    if (pthread_cond_init(&server->worker_done, NULL) != 0) {
+        pthread_mutex_destroy(&server->worker_lock);
+        return false;
+    }
+#endif
+    server->sync_ready = true;
+    return true;
+}
+
+static void ez_http_server_sync_destroy(EzHttpServer *server) {
+    if (!server || !server->sync_ready) return;
+#if defined(_WIN32)
+    DeleteCriticalSection(&server->worker_lock);
+#else
+    pthread_cond_destroy(&server->worker_done);
+    pthread_mutex_destroy(&server->worker_lock);
+#endif
+    server->sync_ready = false;
+}
+
+static void ez_http_worker_done(EzHttpServer *server) {
+    if (!server || !server->sync_ready) return;
+#if defined(_WIN32)
+    EnterCriticalSection(&server->worker_lock);
+    if (server->active_workers > 0) server->active_workers--;
+    WakeAllConditionVariable(&server->worker_done);
+    LeaveCriticalSection(&server->worker_lock);
+#else
+    pthread_mutex_lock(&server->worker_lock);
+    if (server->active_workers > 0) server->active_workers--;
+    pthread_cond_broadcast(&server->worker_done);
+    pthread_mutex_unlock(&server->worker_lock);
+#endif
+}
+
+static void ez_http_wait_workers(EzHttpServer *server) {
+    if (!server || !server->sync_ready) return;
+#if defined(_WIN32)
+    EnterCriticalSection(&server->worker_lock);
+    while (server->active_workers > 0) SleepConditionVariableCS(&server->worker_done, &server->worker_lock, INFINITE);
+    LeaveCriticalSection(&server->worker_lock);
+#else
+    pthread_mutex_lock(&server->worker_lock);
+    while (server->active_workers > 0) pthread_cond_wait(&server->worker_done, &server->worker_lock);
+    pthread_mutex_unlock(&server->worker_lock);
+#endif
+}
+
+static ez_socket_t ez_http_mark_started(EzHttpServer *server) {
+    if (!server || !server->sync_ready) return EZ_INVALID_SOCKET;
+#if defined(_WIN32)
+    EnterCriticalSection(&server->worker_lock);
+    server->started = true;
+    server->running = true;
+    ez_socket_t sock = server->sock;
+    LeaveCriticalSection(&server->worker_lock);
+#else
+    pthread_mutex_lock(&server->worker_lock);
+    server->started = true;
+    server->running = true;
+    ez_socket_t sock = server->sock;
+    pthread_mutex_unlock(&server->worker_lock);
+#endif
+    return sock;
+}
+
+static ez_socket_t ez_http_take_listener(EzHttpServer *server, bool *was_running, bool *was_started) {
+    if (was_running) *was_running = false;
+    if (was_started) *was_started = false;
+    if (!server || !server->sync_ready) return EZ_INVALID_SOCKET;
+#if defined(_WIN32)
+    EnterCriticalSection(&server->worker_lock);
+    if (was_running) *was_running = server->running;
+    if (was_started) *was_started = server->started;
+    server->running = false;
+    ez_socket_t sock = server->sock;
+    server->sock = EZ_INVALID_SOCKET;
+    LeaveCriticalSection(&server->worker_lock);
+#else
+    pthread_mutex_lock(&server->worker_lock);
+    if (was_running) *was_running = server->running;
+    if (was_started) *was_started = server->started;
+    server->running = false;
+    ez_socket_t sock = server->sock;
+    server->sock = EZ_INVALID_SOCKET;
+    pthread_mutex_unlock(&server->worker_lock);
+#endif
+    return sock;
+}
+
+static bool ez_http_server_running(EzHttpServer *server) {
+    if (!server || !server->sync_ready) return false;
+#if defined(_WIN32)
+    EnterCriticalSection(&server->worker_lock);
+    bool running = server->running;
+    LeaveCriticalSection(&server->worker_lock);
+#else
+    pthread_mutex_lock(&server->worker_lock);
+    bool running = server->running;
+    pthread_mutex_unlock(&server->worker_lock);
+#endif
+    return running;
+}
+
+static bool ez_http_wait_readable(ez_socket_t sock) {
+    fd_set read_fds;
+    FD_ZERO(&read_fds);
+    FD_SET(sock, &read_fds);
+    struct timeval timeout;
+    timeout.tv_sec = 0;
+    timeout.tv_usec = 100000;
+#if defined(_WIN32)
+    int ready = select(0, &read_fds, NULL, NULL, &timeout);
+#else
+    int ready = select(sock + 1, &read_fds, NULL, NULL, &timeout);
+#endif
+    return ready > 0 && FD_ISSET(sock, &read_fds);
+}
+
 static void ez_http_server_free(EzHttpServer *server) {
     if (!server) return;
-    if (server->sock != EZ_INVALID_SOCKET) ez_close_socket(server->sock);
+    ez_socket_t sock = ez_http_take_listener(server, NULL, NULL);
+    if (sock != EZ_INVALID_SOCKET) ez_close_socket(sock);
+    ez_http_wait_workers(server);
+    ez_http_server_sync_destroy(server);
     for (size_t i = 0; i < server->route_count; ++i) free(server->routes[i].path);
     free(server->routes);
     free(server->host);
@@ -858,6 +1332,81 @@ static bool ez_http_handle_client(EzHttpServer *server, ez_socket_t client) {
     return ok;
 }
 
+#if defined(_WIN32)
+static DWORD WINAPI ez_http_client_worker(LPVOID arg) {
+#else
+static void *ez_http_client_worker(void *arg) {
+#endif
+    EzHttpClientWorker *worker = (EzHttpClientWorker *)arg;
+    if (!worker) {
+#if defined(_WIN32)
+        return 0;
+#else
+        return NULL;
+#endif
+    }
+    EzHttpServer *server = worker->server;
+    ez_socket_t client = worker->client;
+    free(worker);
+    ez_http_handle_client(server, client);
+    ez_close_socket(client);
+    ez_http_worker_done(server);
+#if defined(_WIN32)
+    return 0;
+#else
+    return NULL;
+#endif
+}
+
+static void ez_http_worker_add(EzHttpServer *server) {
+    if (!server || !server->sync_ready) return;
+#if defined(_WIN32)
+    EnterCriticalSection(&server->worker_lock);
+    server->active_workers++;
+    LeaveCriticalSection(&server->worker_lock);
+#else
+    pthread_mutex_lock(&server->worker_lock);
+    server->active_workers++;
+    pthread_mutex_unlock(&server->worker_lock);
+#endif
+}
+
+static bool ez_http_start_client_worker(EzHttpServer *server, ez_socket_t client) {
+    if (!server || !server->sync_ready) return false;
+    EzHttpClientWorker *worker = (EzHttpClientWorker *)malloc(sizeof(EzHttpClientWorker));
+    if (!worker) return false;
+    worker->server = server;
+    worker->client = client;
+    ez_http_worker_add(server);
+#if defined(_WIN32)
+    HANDLE thread = CreateThread(NULL, 0, ez_http_client_worker, worker, 0, NULL);
+    if (!thread) {
+        ez_http_worker_done(server);
+        free(worker);
+        return false;
+    }
+    CloseHandle(thread);
+    return true;
+#else
+    pthread_attr_t attr;
+    if (pthread_attr_init(&attr) != 0) {
+        ez_http_worker_done(server);
+        free(worker);
+        return false;
+    }
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+    pthread_t thread;
+    int created = pthread_create(&thread, &attr, ez_http_client_worker, worker);
+    pthread_attr_destroy(&attr);
+    if (created != 0) {
+        ez_http_worker_done(server);
+        free(worker);
+        return false;
+    }
+    return true;
+#endif
+}
+
 static OptHttpResponse ez_http_fetch(const char *method, const char *url, const Dict *headers, const Blob *body) {
     int64_t body_size = 0;
     if (body) {
@@ -866,8 +1415,8 @@ static OptHttpResponse ez_http_fetch(const char *method, const char *url, const 
     }
     EzUrlParts parts = {0};
     if (!ez_parse_http_url(url, &parts)) return ez_http_none();
-    ez_socket_t sock = ez_http_connect(parts.host, parts.port);
-    if (sock == EZ_INVALID_SOCKET) {
+    EzHttpConnection conn = {0};
+    if (!ez_http_conn_open(&parts, &conn)) {
         ez_url_parts_free(&parts);
         return ez_http_none();
     }
@@ -878,14 +1427,14 @@ static OptHttpResponse ez_http_fetch(const char *method, const char *url, const 
         "%s %s HTTP/1.0\r\nHost: %s\r\nConnection: close\r\nContent-Length: %lld\r\n",
         verb, parts.path, parts.host_header, (long long)body_size);
     if (req_len < 0) {
-        ez_close_socket(sock);
+        ez_http_conn_close(&conn);
         ez_url_parts_free(&parts);
         return ez_http_none();
     }
     size_t request_size = (size_t)req_len + headers_len + 2;
     char *request = (char *)malloc(request_size + 1);
     if (!request) {
-        ez_close_socket(sock);
+        ez_http_conn_close(&conn);
         ez_url_parts_free(&parts);
         return ez_http_none();
     }
@@ -897,12 +1446,12 @@ static OptHttpResponse ez_http_fetch(const char *method, const char *url, const 
     offset += 2;
     request[offset] = '\0';
 
-    bool ok = ez_send_all(sock, request, offset);
-    if (ok && body_size > 0) ok = ez_send_all(sock, (const char *)body->data, (size_t)body_size);
+    bool ok = ez_http_conn_send_all(&conn, request, offset);
+    if (ok && body_size > 0) ok = ez_http_conn_send_all(&conn, (const char *)body->data, (size_t)body_size);
     free(request);
     ez_url_parts_free(&parts);
     if (!ok) {
-        ez_close_socket(sock);
+        ez_http_conn_close(&conn);
         return ez_http_none();
     }
 
@@ -911,24 +1460,20 @@ static OptHttpResponse ez_http_fetch(const char *method, const char *url, const 
     size_t response_cap = 0;
     uint8_t chunk[4096];
     for (;;) {
-#if defined(_WIN32)
-        int n = recv(sock, (char *)chunk, (int)sizeof(chunk), 0);
-#else
-        ssize_t n = recv(sock, chunk, sizeof(chunk), 0);
-#endif
+        int n = ez_http_conn_recv(&conn, chunk, sizeof(chunk));
         if (n < 0) {
             free(response);
-            ez_close_socket(sock);
+            ez_http_conn_close(&conn);
             return ez_http_none();
         }
         if (n == 0) break;
         if (!ez_append_bytes(&response, &response_len, &response_cap, chunk, (size_t)n)) {
             free(response);
-            ez_close_socket(sock);
+            ez_http_conn_close(&conn);
             return ez_http_none();
         }
     }
-    ez_close_socket(sock);
+    ez_http_conn_close(&conn);
     if (!response || response_len == 0) {
         free(response);
         return ez_http_none();
@@ -974,7 +1519,9 @@ HttpServer createServer(const char *host, int32_t port) {
     server->host = ez_strdup_range(bind_host, strlen(bind_host));
     server->port = port;
     server->sock = EZ_INVALID_SOCKET;
-    if (!server->host) {
+    if (!server->host || !ez_http_server_sync_init(server)) {
+        ez_http_server_sync_destroy(server);
+        free(server->host);
         free(server);
         return (HttpServer){0};
     }
@@ -1007,16 +1554,19 @@ void HttpServer_start(HttpServer *value) {
     if (!server) return;
     if (server->sock == EZ_INVALID_SOCKET) server->sock = ez_http_listen_socket(server->host, server->port);
     if (server->sock == EZ_INVALID_SOCKET) return;
-    server->running = true;
-    while (server->running) {
+    ez_socket_t listener = ez_http_mark_started(server);
+    while (listener != EZ_INVALID_SOCKET && ez_http_server_running(server)) {
+        if (!ez_http_wait_readable(listener)) continue;
 #if defined(_WIN32)
-        ez_socket_t client = (ez_socket_t)accept(server->sock, NULL, NULL);
+        ez_socket_t client = (ez_socket_t)accept(listener, NULL, NULL);
 #else
-        ez_socket_t client = accept(server->sock, NULL, NULL);
+        ez_socket_t client = accept(listener, NULL, NULL);
 #endif
         if (client == EZ_INVALID_SOCKET) break;
-        ez_http_handle_client(server, client);
-        ez_close_socket(client);
+        if (!ez_http_start_client_worker(server, client)) {
+            ez_http_handle_client(server, client);
+            ez_close_socket(client);
+        }
     }
     ez_http_server_free(server);
     value->handle = 0;
@@ -1025,13 +1575,14 @@ void HttpServer_start(HttpServer *value) {
 void HttpServer_stop(HttpServer *value) {
     EzHttpServer *server = ez_server_from_value(value);
     if (!server) return;
-    bool was_running = server->running;
-    server->running = false;
-    if (server->sock != EZ_INVALID_SOCKET) {
-        ez_close_socket(server->sock);
-        server->sock = EZ_INVALID_SOCKET;
+    bool was_running = false;
+    bool was_started = false;
+    ez_socket_t sock = ez_http_take_listener(server, &was_running, &was_started);
+    if (sock != EZ_INVALID_SOCKET) {
+        shutdown(sock, EZ_SHUTDOWN_BOTH);
+        ez_close_socket(sock);
     }
-    if (was_running) {
+    if (was_running || was_started) {
         value->handle = 0;
         return;
     }

@@ -283,7 +283,7 @@ OptF64 parseF64(const char *s) {
     return ok ? (OptF64){true, value} : (OptF64){false, 0.0};
 }
 
-const char *format(const char *template, const StrList *args) {
+const char *fmtFormat(const char *template, const StrList *args) {
     if (!template) return ez_strdup_safe("");
     size_t cap = strlen(template) + 32;
     char *out = (char *)malloc(cap);

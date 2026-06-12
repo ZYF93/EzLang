@@ -2,11 +2,16 @@
 // 依赖: EzLang 标准库封装层（C/JS）
 
 extern "@std/native/net/http.c" for linux;
+extern "pthread" for linux;
+extern "dl" for linux;
 extern "@std/native/net/http.c" for macos;
+extern "pthread" for macos;
 extern "@std/native/net/http.c" for windows;
 extern "ws2_32" for windows;
 extern "@std/native/net/http.c" for android;
+extern "pthread" for android;
 extern "@std/native/net/http.c" for ios;
+extern "pthread" for ios;
 extern "@std/emcc/net/http.js" for emcc;
 
 export type Headers = { [key: Str]: Str };

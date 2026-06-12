@@ -154,7 +154,10 @@ struct Date {
 struct Error {
     code:    I32;    // 正值为业务错误，负值为系统错误（见 stdlib ErrCode 常量）
     message: Str;
-    data:    Blob?;
+    file:    Str;
+    line:    I32;
+    column:  I32;
+    trace:   Str;
 
     toString(this: Error) => Str;
 }
@@ -174,7 +177,7 @@ struct Blob {
 * **类型检查与方法**：每个结构体隐式包含 `I32` 类型标识，用于 `typeof` 和运行时检查。方法是内联函数，`this` 显式绑定到实例。
 * **内置结构体**：提供语言层面的通用数据结构封装。
   * `Date` 提供时间戳存储、基础的时间加减与格式化。
-  * `Error` 封装错误代码与信息及可选的二进制附加数据，方便统一异常处理。
+  * `Error` 封装错误代码、信息、抛出点文件/行/列和轻量调用栈片段，方便统一异常处理与诊断输出。
   * `Blob` 提供二进制块长度和底层指针访问能力。
 
 ### LLVM 映射
@@ -183,7 +186,7 @@ struct Blob {
 * 方法映射为函数指针字段，初始化时绑定对应函数。
 * 内置结构体映射：
   * `Date` 可优化为单一 timestamp 型（通常为 i64）。
-  * `Error` 映射为 `{ i32 code, i8* msg, ... }`。
+  * `Error` 映射为 `{ i32 code, i8* message, i8* file, i32 line, i32 column, i8* trace }`。
   * `Blob` 映射为 `{ i64 size, i8* data }`。
 
 ---
@@ -245,7 +248,7 @@ let addTwo = fn(a = 2, b = ?)
 
 ### 语义说明与规范
 * 显式声明 `this`，没有隐式上下文。`obj.fn()` 等价于 `fn(this = obj)`。`this` 总是以引用语义传递，避免结构体拷贝。普通变量使用值语义。
-* 函数调用仅支持命名参数（如 `fn(a = 1, b = 2)`），不支持匿名传参。
+* 函数调用支持位置参数和命名参数混用（如 `fn(1, c = 3)`），位置参数需位于具名参数之前。
 * 形参可声明默认值，调用时省略该参数即使用默认值。
 * 函数体使用 `{ ... }` block 时，必须通过 `return` 显式返回值，最后一个表达式不会隐式作为返回值。
 * `?` 占位符支持部分应用与柯里化，生成等待剩余参数的函数。
@@ -285,7 +288,7 @@ const ret = flow {
 ### 语义说明与规范
 * **flow**：`flow { ... }` 为并发调度作用域。flow 不改变程序的顺序语义。flow 内代码在语义上严格按源码顺序执行，但 runtime 可对无依赖阻塞操作进行调度优化，且调度不得改变可观察行为。
 * **当前实现**：编译器会记录 flow/parallel/suspend point 元数据，并在 LLVM IR 中生成可链接的 `__ezrt_flow_*`、`__ezrt_parallel_*`、`__ezrt_sleep`、`__ezrt_race` hook。`__ezrt_sleep` 会真实挂起当前执行点；`race(pl = [...], timeout = ...)` 对零捕获 `() => I32` 分支在 native 目标使用 C 任务运行时并发执行，在 emcc 目标使用 `packages/std/emcc/runtime.js` + Asyncify 协程运行时挂起和恢复。`flow` / `parallel` 块内的 `return` 会被捕获为表达式结果，不会提前退出外层函数；嵌套控制流中的 `return` 也参与表达式返回类型推断。
-* **阻塞操作**：flow 外部如 `fetch()` 保持用户体感上的同步调用。flow 内部的 `sleep`、`race(pl)`、零捕获 `I32` `parallel` 以及 emcc 下的 `fetch`、stdin、文件系统、进程和流式 I/O 会作为 suspend source 挂起后恢复；缺失能力的平台按接口约定返回失败值或继续使用阻塞 syscall，不做 CPU 忙等。
+* **阻塞操作**：flow 外部如 `fetch()` 保持用户体感上的同步调用。flow 内部的 `sleep`、`race(pl)`、零捕获 `I32` `parallel` 以及 emcc 下的 `fetch`、TCP/UDP、WebSocket、stdin、文件系统、进程和流式 I/O 会作为 suspend source 挂起后恢复；缺失能力的平台按接口约定返回失败值或继续使用阻塞 syscall，不做 CPU 忙等。
 * **parallel 块**：`const ret = parallel { code... return... }` 或 `const ret: I32 = parallel { code... return... }` 在 flow 内、初始化表达式本身就是 `parallel` 块、零捕获且返回 `I32` 时会启动后台任务；读取 `ret` 会等待任务完成，flow 退出前会 join 未读取任务，确保副作用提交。native、Android、iOS 使用 C 任务运行时，emcc 使用 JS 协程运行时；组合表达式、其它返回类型或捕获外层局部变量的场景保持同步协作 lowering。
 * **自动依赖等待**：读取 flow 内未完成的 `parallel` 结果会自动 join；当前依赖等待覆盖 native、Android、iOS 与 emcc 的零捕获 `I32` 任务，包括推断类型和显式 `I32` 声明。emcc 标准库 suspend source 通过 Asyncify 恢复 wasm 栈，保持顺序 ABI。
 * **flow 返回**：flow 返回前必须保证所有前序语义操作完成，且所有副作用已提交。
@@ -295,7 +298,7 @@ const ret = flow {
 * **副作用一致性**：runtime 不允许改变副作用顺序、锁语义、可观察行为。
 
 ### LLVM 映射
-* **当前**：lowering 为 runtime hook + flow/parallel 返回值槽；`sleep`、`race(pl)` 和 flow 内零捕获 `I32` `parallel` 已接入原生任务运行时，Android/iOS 复用同一 C runtime，emcc 通过 Asyncify JS 协程 runtime 提供可挂起行为。emcc 标准库中的 `sleep`、HTTP `fetch`、stdin、fs、process 和 stream I/O 都带 Asyncify 元数据；CLI 会自动追加 `-sASYNCIFY`。后续可继续以 JSPI 或 wasm pthread 替换 emcc backend，而不改变 EzLang 语法。
+* **当前**：lowering 为 runtime hook + flow/parallel 返回值槽；`sleep`、`race(pl)` 和 flow 内零捕获 `I32` `parallel` 已接入原生任务运行时，Android/iOS 复用同一 C runtime，emcc 通过 Asyncify JS 协程 runtime 提供可挂起行为。emcc 标准库中的 `sleep`、HTTP `fetch`、TCP/UDP、WebSocket `wsConnect` / `wsRecv`、stdin、fs、process 和 stream I/O 都带 Asyncify 元数据；CLI 会自动追加 `-sASYNCIFY`。后续可继续以 JSPI 或 wasm pthread 替换 emcc backend，而不改变 EzLang 语法。
 * **目标**：后续可继续把 native 阻塞 I/O 替换为状态机、平台等待源（epoll、io_uring、kqueue、timerfd 等）、结果存储、等待唤醒与更完整的捕获闭包调度。
 
 ---
@@ -329,9 +332,9 @@ match {
 
 // 异常捕获
 const err = catch {
-    throw Error(msg = "hello")
+    throw Error(code = 1, message = "hello")
 }
-(typeof err & Error == Error) ? print(msg = err.msg)
+(typeof err & Error == Error) ? print(msg = err.message)
 ```
 
 ### 语义说明与规范
@@ -341,8 +344,8 @@ const err = catch {
 * **match**：从上到下依次求值，匹配后继续下一条，除非显式 `break`。
 * **continue**：跳过当前 match 的后续分支，继续执行下一条。
 * **break**：退出当前 `loop` 或 `match`。
-* **throw**：当前在最近的 `catch {}` 块内写入抛出的异常值，并跳转到该 `catch` 出口；没有活动 `catch` 时会输出未捕获异常诊断并以退出码 1 终止。
-* **catch**：当前返回块内 `throw expr` 的异常值；没有 `throw` 时返回 `Void`。跨函数传播与携带完整异常对象的统一诊断链路是后续目标。
+* **throw**：写入 `Error` 异常槽并跳转到最近的 `catch {}` 出口；没有活动 `catch` 时会输出未捕获异常诊断并以退出码 1 终止。同步函数调用边界会检查异常槽并继续向外传播。
+* **catch**：返回块内或被调用函数传播出的 `throw expr` 异常值；没有 `throw` 时返回 `Void`。`Error` 会携带抛出点文件、行、列和轻量调用栈片段，可通过 `err.file`、`err.line`、`err.column`、`err.trace` 读取。
 
 ### LLVM 映射
 * 循环映射为 `br` 与 `phi` 节点结构。
@@ -376,7 +379,7 @@ let masked = (v1 < v2) ? v1 : v2
 
 ### 语义说明与规范
 * **算术与位运算**：支持 `+`, `-`, `*`, `/`, `%` 及 `&`, `|`, `^`, `<<`, `>>`。整数除法向下取整。浮点运算遵循 IEEE 754。无符号类型的除法、取余与右移分别生成无符号运算，右移填充零；有符号类型右移使用算术右移。移位右操作数必须为无符号类型。
-* **逻辑与比较运算**：支持 `&&`, `||`, `!` 与 `==`, `!=`, `<`, `>`, `<=`, `>=`。逻辑运算支持短路求值。不支持结构体/联合类型直接比较（除非实现相关方法）。
+* **逻辑与比较运算**：支持 `&&`, `||`, `!` 与 `==`, `!=`, `<`, `>`, `<=`, `>=`。逻辑运算支持短路求值。结构体、可选与联合值支持 `==`/`!=`，按同布局字段递归比较；其中 `Str` 字段沿用指针相等语义，按内容比较请使用标准库字符串函数。聚合类型不支持 `<`, `>`, `<=`, `>=`。
 * **复合赋值**：如 `+=`, `<<=` 等价于展开运算。当前实现对裸变量、结构体字段和数组/List 索引左值生成加载、运算、存储序列，并避免重复求值字段所属对象或索引表达式。
 * **优先级**：`!` > `*`, `/`, `%` > `+`, `-` > `<<`, `>>` > `&` > `^` > `|` > 比较 > `&&` > `||`。位运算 `&` 优先级高于比较运算 `==` 但低于移位。建议显式加括号以避免歧义。
 * **SIMD 语义**：`Vec<Type>[N]` 操作逐元素并行执行。向量长度必须匹配。标量与向量混合运算时，标量自动广播成等长向量后再计算；向量比较生成同宽布尔 mask。

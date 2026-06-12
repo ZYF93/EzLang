@@ -12,8 +12,8 @@ const main = (): I32 => {
 
     let label = "small";
     match {
-        (total > 10) ? { label = "large"; },
-        (total > 5) ? { label = "medium"; },
+        (total > 10) ? { label = "large"; break; },
+        (total > 5) ? { label = "medium"; break; },
         (true) ? { label = "small"; }
     };
 

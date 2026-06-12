@@ -1,7 +1,9 @@
 // EzLang std/net/http Emscripten JS 封装层
-// 浏览器/Worker 使用 fetch + Asyncify 挂起 HTTP 客户端；无 Asyncify 时保留同步 XHR fallback。服务端明确不支持。
+// 浏览器/Worker 使用 fetch + Asyncify 挂起 HTTP 客户端；无 Asyncify 时保留同步 XHR fallback。Node 风格运行时支持基础 HTTP 服务端。
 (function () {
-  var HTTP_SERVER_UNSUPPORTED_HANDLE = 0n;
+  var nextServerHandle = 1;
+  var servers = Object.create(null);
+  var root = typeof Module !== 'undefined' && Module ? Module : (typeof globalThis !== 'undefined' ? globalThis : this);
 
   function hasAsyncifyAsync() {
     return typeof Asyncify !== 'undefined' && Asyncify && typeof Asyncify.handleAsync === 'function';
@@ -9,6 +11,16 @@
 
   function ptrSize() {
     return typeof POINTER_SIZE !== 'undefined' ? POINTER_SIZE : 4;
+  }
+
+  function nodeRequire(name) {
+    if (typeof require === 'function') {
+      try { return require(name); } catch (e) {}
+    }
+    if (root && typeof root.require === 'function') {
+      try { return root.require(name); } catch (e) {}
+    }
+    return null;
   }
 
   function readStr(ptr) {
@@ -165,6 +177,30 @@
     writeResponse(ret + 8, ok ? response.status : 0, ok ? response.headers : [], ok ? response.body : new Uint8Array(0));
   }
 
+  function readHttpServer(serverPtr) {
+    return serverPtr ? servers[Number(getValue(serverPtr, 'i64'))] || null : null;
+  }
+
+  function callHandler(handler, reqPtr, respPtr) {
+    if (!handler) return false;
+    if (typeof dynCall_vii === 'function') {
+      dynCall_vii(handler, respPtr, reqPtr);
+      return true;
+    }
+    if (typeof Module !== 'undefined' && Module && typeof Module.dynCall_vii === 'function') {
+      Module.dynCall_vii(handler, respPtr, reqPtr);
+      return true;
+    }
+    var table = null;
+    if (typeof getWasmTableEntry === 'function') table = { get: getWasmTableEntry };
+    else if (typeof wasmTable !== 'undefined' && wasmTable && typeof wasmTable.get === 'function') table = wasmTable;
+    if (!table) return false;
+    var fn = table.get(Number(handler));
+    if (!fn) return false;
+    fn(respPtr, reqPtr);
+    return true;
+  }
+
   function readRequest(reqPtr) {
     if (!reqPtr) return null;
     var method = readStr(getValue(reqPtr, '*')) || 'GET';
@@ -178,6 +214,138 @@
       headers: dictEntries(reqPtr + 16),
       body: body,
     };
+  }
+
+  function requestUrl(req) {
+    var url = req && req.url ? String(req.url) : '/';
+    return url || '/';
+  }
+
+  function requestHeaders(req) {
+    var entries = [];
+    if (!req || !req.headers) return entries;
+    Object.keys(req.headers).forEach(function (key) {
+      var value = req.headers[key];
+      if (Array.isArray(value)) value = value.join(', ');
+      entries.push([key, value == null ? '' : String(value)]);
+    });
+    return entries;
+  }
+
+  function allocRequest(req, body) {
+    var ptr = _malloc(56);
+    setValue(ptr, stringToNewUTF8((req && req.method) || 'GET'), '*');
+    setValue(ptr + 8, stringToNewUTF8(requestUrl(req)), '*');
+    writeDict(ptr + 16, requestHeaders(req));
+    writeBlob(ptr + 40, body || new Uint8Array(0));
+    return ptr;
+  }
+
+  function responseFromPtr(respPtr) {
+    if (!respPtr) return { status: 404, headers: [], body: textBytes('not found') };
+    var body = blobBytes(respPtr + 32);
+    if (body === null) body = new Uint8Array(0);
+    return {
+      status: Number(getValue(respPtr, 'i32')) || 200,
+      headers: dictEntries(respPtr + 8),
+      body: body,
+    };
+  }
+
+  function skipServerHeader(key) {
+    key = String(key || '').toLowerCase();
+    return key === 'content-length' || key === 'connection';
+  }
+
+  function sendNodeResponse(res, response) {
+    var status = response && response.status > 0 ? response.status | 0 : 200;
+    var body = response && response.body ? response.body : new Uint8Array(0);
+    var headers = { 'Connection': 'close', 'Content-Length': String(body.length) };
+    (response && response.headers || []).forEach(function (entry) {
+      if (!entry || !entry[0] || skipServerHeader(entry[0])) return;
+      headers[entry[0]] = entry[1] || '';
+    });
+    if (res && typeof res.writeHead === 'function') res.writeHead(status, headers);
+    if (res && typeof res.end === 'function') res.end(bufferFor(body));
+  }
+
+  function bufferFor(bytes) {
+    if (typeof Buffer !== 'undefined') return Buffer.from(bytes || new Uint8Array(0));
+    return bytes || new Uint8Array(0);
+  }
+
+  function notFoundResponse() {
+    return { status: 404, headers: [], body: textBytes('not found') };
+  }
+
+  function handlerFor(server, url) {
+    if (!server || !url) return 0;
+    var pathLen = String(url).search(/[?#]/);
+    var path = pathLen < 0 ? String(url) : String(url).slice(0, pathLen);
+    return server.routes[path] || 0;
+  }
+
+  function collectBody(req, callback) {
+    var chunks = [];
+    var done = false;
+    function finish(bytes) {
+      if (done) return;
+      done = true;
+      callback(bytes || new Uint8Array(0));
+    }
+    if (!req || typeof req.on !== 'function') return finish(new Uint8Array(0));
+    req.on('data', function (chunk) { chunks.push(bufferFor(bytesValue(chunk))); });
+    req.on('end', function () {
+      if (typeof Buffer !== 'undefined') return finish(new Uint8Array(Buffer.concat(chunks)));
+      var total = chunks.reduce(function (sum, item) { return sum + item.length; }, 0);
+      var out = new Uint8Array(total);
+      var offset = 0;
+      chunks.forEach(function (item) { out.set(item, offset); offset += item.length; });
+      finish(out);
+    });
+    req.on('error', function () { finish(new Uint8Array(0)); });
+  }
+
+  function bytesValue(value) {
+    if (!value) return new Uint8Array(0);
+    if (value instanceof Uint8Array) return value;
+    if (typeof Buffer !== 'undefined' && Buffer.isBuffer && Buffer.isBuffer(value)) return new Uint8Array(value);
+    return new Uint8Array(value);
+  }
+
+  function handleNodeRequest(server, req, res) {
+    collectBody(req, function (body) {
+      var handler = handlerFor(server, requestUrl(req));
+      if (!handler) return sendNodeResponse(res, notFoundResponse());
+      var reqPtr = allocRequest(req, body);
+      var respPtr = _malloc(48);
+      writeResponse(respPtr, 404, [], textBytes('not found'));
+      var ok = callHandler(handler, reqPtr, respPtr);
+      sendNodeResponse(res, ok ? responseFromPtr(respPtr) : notFoundResponse());
+    });
+  }
+
+  function startServerAsync(server) {
+    if (!server || server.running || !server.nodeServer || !hasAsyncifyAsync()) return false;
+    server.running = true;
+    return Asyncify.handleAsync(function () {
+      return new Promise(function (resolve) {
+        var settled = false;
+        function done(value) {
+          if (settled) return;
+          settled = true;
+          resolve(!!value);
+        }
+        try {
+          server.nodeServer.once('error', function () { server.running = false; done(false); });
+          server.nodeServer.once('listening', function () { done(true); });
+          server.nodeServer.listen({ host: server.host || undefined, port: server.port });
+        } catch (e) {
+          server.running = false;
+          done(false);
+        }
+      });
+    });
   }
 
   function requestSync(req) {
@@ -238,9 +406,42 @@
       writeOptResponse(ret, !!response, response);
     },
     createServer: function (host, port) {
-      void host;
-      void port;
-      return HTTP_SERVER_UNSUPPORTED_HANDLE;
+      port = Number(port);
+      if (!Number.isInteger(port) || port < 0 || port > 65535) return 0n;
+      var http = nodeRequire('http');
+      if (!http || typeof http.createServer !== 'function' || !hasAsyncifyAsync()) return 0n;
+      var handle = nextServerHandle++;
+      var server = {
+        handle: handle,
+        host: readStr(host) || '127.0.0.1',
+        port: port,
+        routes: Object.create(null),
+        nodeServer: null,
+        running: false,
+      };
+      server.nodeServer = http.createServer(function (req, res) { handleNodeRequest(server, req, res); });
+      servers[handle] = server;
+      return BigInt(handle);
+    },
+    HttpServer_on: function (serverPtr, path, handler) {
+      var server = readHttpServer(serverPtr);
+      var route = readStr(path);
+      if (!server || !route || !handler) return;
+      server.routes[route] = handler;
+    },
+    HttpServer_start__async: 'auto',
+    HttpServer_start: function (serverPtr) {
+      startServerAsync(readHttpServer(serverPtr));
+    },
+    HttpServer_stop: function (serverPtr) {
+      var server = readHttpServer(serverPtr);
+      if (!server) return;
+      delete servers[server.handle];
+      if (server.nodeServer && typeof server.nodeServer.close === 'function') {
+        try { server.nodeServer.close(); } catch (e) {}
+      }
+      server.running = false;
+      if (serverPtr) setValue(serverPtr, 0, 'i64');
     },
     HttpResponse_text: function (resp) {
       return stringToNewUTF8(responseBodyText(resp));

@@ -1,7 +1,11 @@
 // EzLang std/compress Emscripten JS 封装层
-// 同步 ABI 下使用 Node zlib；浏览器端暂无同步压缩 API，返回空可选值。
+// Node 风格运行时优先使用 zlib 同步封装；浏览器/Worker 使用 CompressionStream + Asyncify，缺能力时显式失败。
 (function () {
   var root = typeof Module !== 'undefined' && Module ? Module : (typeof globalThis !== 'undefined' ? globalThis : this);
+
+  function hasAsyncifyAsync() {
+    return typeof Asyncify !== 'undefined' && Asyncify && typeof Asyncify.handleAsync === 'function';
+  }
 
   function blobBytes(blobPtr) {
     if (!blobPtr) return null;
@@ -33,16 +37,55 @@
     try { return require('zlib'); } catch (e) { return null; }
   }
 
-  function run(method, dataPtr) {
+  function methodFormat(method) {
+    if (method === 'gzipSync' || method === 'gunzipSync') return 'gzip';
+    if (method === 'deflateSync' || method === 'inflateSync') return 'deflate';
+    if (method === 'deflateRawSync' || method === 'inflateRawSync') return 'deflate-raw';
+    return '';
+  }
+
+  function isCompressMethod(method) {
+    return method === 'gzipSync' || method === 'deflateSync' || method === 'deflateRawSync';
+  }
+
+  function runNode(method, input) {
     var zlib = nodeZlib();
     if (!zlib || typeof zlib[method] !== 'function') return null;
     try {
-      var input = blobBytes(dataPtr);
-      if (input === null) return null;
       return new Uint8Array(zlib[method](Buffer.from(input)));
     } catch (e) {
       return null;
     }
+  }
+
+  function runWeb(method, input) {
+    if (!hasAsyncifyAsync()) return null;
+    var format = methodFormat(method);
+    var ctorName = isCompressMethod(method) ? 'CompressionStream' : 'DecompressionStream';
+    var StreamCtor = root && root[ctorName] ? root[ctorName] : (typeof globalThis !== 'undefined' ? globalThis[ctorName] : null);
+    if (!format || typeof StreamCtor !== 'function' || typeof Blob === 'undefined' || typeof Response === 'undefined') return null;
+    return Asyncify.handleAsync(function () {
+      return new Promise(function (resolve) {
+        try {
+          var stream = new Blob([input]).stream().pipeThrough(new StreamCtor(format));
+          new Response(stream).arrayBuffer().then(function (buffer) {
+            resolve(new Uint8Array(buffer));
+          }, function () {
+            resolve(null);
+          });
+        } catch (e) {
+          resolve(null);
+        }
+      });
+    });
+  }
+
+  function run(method, dataPtr) {
+    var input = blobBytes(dataPtr);
+    if (input === null) return null;
+    var nodeOut = runNode(method, input);
+    if (nodeOut !== null) return nodeOut;
+    return runWeb(method, input);
   }
 
   function freePtr(ptr) {
@@ -121,12 +164,12 @@
   }
 
   function runStream(method, dstPtr, srcPtr, bufferSize) {
-    var zlib = nodeZlib();
-    if (!zlib || typeof zlib[method] !== 'function') return -1;
     try {
       var input = readAllStream(srcPtr, bufferSize);
       if (input === null) return -1;
-      var output = new Uint8Array(zlib[method](Buffer.from(input)));
+      var output = runNode(method, input);
+      if (output === null) output = runWeb(method, input);
+      if (output === null) return -1;
       return writeAllStream(dstPtr, output);
     } catch (e) {
       return -1;
@@ -134,45 +177,57 @@
   }
 
   mergeInto(LibraryManager.library, {
+    compressGzip__async: 'auto',
     compressGzip: function (ret, data) {
       var out = run('gzipSync', data);
       writeOptBlob(ret, !!out, out);
     },
+    decompressGzip__async: 'auto',
     decompressGzip: function (ret, data) {
       var out = run('gunzipSync', data);
       writeOptBlob(ret, !!out, out);
     },
+    compressZlib__async: 'auto',
     compressZlib: function (ret, data) {
       var out = run('deflateSync', data);
       writeOptBlob(ret, !!out, out);
     },
+    decompressZlib__async: 'auto',
     decompressZlib: function (ret, data) {
       var out = run('inflateSync', data);
       writeOptBlob(ret, !!out, out);
     },
+    compressDeflate__async: 'auto',
     compressDeflate: function (ret, data) {
       var out = run('deflateRawSync', data);
       writeOptBlob(ret, !!out, out);
     },
+    decompressDeflate__async: 'auto',
     decompressDeflate: function (ret, data) {
       var out = run('inflateRawSync', data);
       writeOptBlob(ret, !!out, out);
     },
+    compressGzipStream__async: 'auto',
     compressGzipStream: function (dst, src, bufferSize) {
       return runStream('gzipSync', dst, src, bufferSize);
     },
+    decompressGzipStream__async: 'auto',
     decompressGzipStream: function (dst, src, bufferSize) {
       return runStream('gunzipSync', dst, src, bufferSize);
     },
+    compressZlibStream__async: 'auto',
     compressZlibStream: function (dst, src, bufferSize) {
       return runStream('deflateSync', dst, src, bufferSize);
     },
+    decompressZlibStream__async: 'auto',
     decompressZlibStream: function (dst, src, bufferSize) {
       return runStream('inflateSync', dst, src, bufferSize);
     },
+    compressDeflateStream__async: 'auto',
     compressDeflateStream: function (dst, src, bufferSize) {
       return runStream('deflateRawSync', dst, src, bufferSize);
     },
+    decompressDeflateStream__async: 'auto',
     decompressDeflateStream: function (dst, src, bufferSize) {
       return runStream('inflateRawSync', dst, src, bufferSize);
     },

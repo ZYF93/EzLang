@@ -116,7 +116,10 @@ OptI64 mathMulI64Checked(int64_t a, int64_t b) {
 
 OptI64 mathDivI64Checked(int64_t a, int64_t b) {
     if (b == 0 || (a == INT64_MIN && b == -1)) return (OptI64){false, 0};
-    return (OptI64){true, a / b};
+    int64_t q = a / b;
+    int64_t r = a % b;
+    if (r != 0 && ((a < 0) != (b < 0))) q -= 1;
+    return (OptI64){true, q};
 }
 
 OptI32 mathF64ToI32(double value) {

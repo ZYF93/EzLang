@@ -121,9 +121,7 @@ bool platformHasDom(void) {
 }
 
 bool platformHasSubprocess(void) {
-#if defined(__ANDROID__)
-    return false;
-#elif defined(__APPLE__) && TARGET_OS_IPHONE
+#if defined(__APPLE__) && TARGET_OS_IPHONE
     return false;
 #else
     return true;

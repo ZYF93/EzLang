@@ -1,6 +1,9 @@
 // EzLang std/regex Emscripten JS 封装层
 (function () {
   var PTR = typeof POINTER_SIZE !== 'undefined' ? POINTER_SIZE : 4;
+  var MAX_PATTERN_BYTES = 4096;
+  var MAX_GROUPS = 64;
+  var MAX_BOUNDED_REPEAT = 1024;
 
   function text(ptr) {
     return UTF8ToString(ptr || 0);
@@ -46,12 +49,140 @@
   }
 
   function compile(regex, forceGlobal) {
-    if (!regex.ok) return null;
+    if (!regex.ok || !safePattern(regex.pattern)) return null;
     try {
       return new RegExp(regex.pattern, jsFlags(regex.flags, forceGlobal));
     } catch (e) {
       return null;
     }
+  }
+
+  function pushPending(stack, pending) {
+    if (!pending.exists || stack.length === 0) return;
+    var frame = stack[stack.length - 1];
+    frame.hasVariableRepeat = frame.hasVariableRepeat || pending.hasVariableRepeat;
+    frame.hasAlternation = frame.hasAlternation || pending.hasAlternation;
+    pending.exists = false;
+    pending.hasVariableRepeat = false;
+    pending.hasAlternation = false;
+  }
+
+  function parseInterval(pattern, start) {
+    var i = start + 1;
+    if (i >= pattern.length || !/[0-9]/.test(pattern.charAt(i))) return null;
+    var min = 0;
+    while (i < pattern.length && /[0-9]/.test(pattern.charAt(i))) {
+      min = min * 10 + (pattern.charCodeAt(i) - 48);
+      if (min > MAX_BOUNDED_REPEAT) return { invalid: true };
+      i++;
+    }
+    var max = min;
+    var hasMax = true;
+    if (pattern.charAt(i) === ',') {
+      i++;
+      if (pattern.charAt(i) === '}') {
+        hasMax = false;
+      } else {
+        if (i >= pattern.length || !/[0-9]/.test(pattern.charAt(i))) return null;
+        max = 0;
+        while (i < pattern.length && /[0-9]/.test(pattern.charAt(i))) {
+          max = max * 10 + (pattern.charCodeAt(i) - 48);
+          if (max > MAX_BOUNDED_REPEAT) return { invalid: true };
+          i++;
+        }
+      }
+    }
+    if (pattern.charAt(i) !== '}') return null;
+    if (hasMax && max < min) return null;
+    return { end: i + 1, variable: !hasMax || max !== min };
+  }
+
+  function skipClass(pattern, start) {
+    var i = start + 1;
+    if (pattern.charAt(i) === '^') i++;
+    if (pattern.charAt(i) === ']') i++;
+    while (i < pattern.length) {
+      if (pattern.charAt(i) === '\\' && i + 1 < pattern.length) {
+        i += 2;
+        continue;
+      }
+      if (pattern.charAt(i) === ']') return i + 1;
+      i++;
+    }
+    return pattern.length;
+  }
+
+  function safePattern(pattern) {
+    pattern = pattern || '';
+    if (lengthBytesUTF8(pattern) > MAX_PATTERN_BYTES) return false;
+    var stack = [{ hasVariableRepeat: false, hasAlternation: false }];
+    var pending = { exists: false, hasVariableRepeat: false, hasAlternation: false };
+    for (var i = 0; i < pattern.length;) {
+      var ch = pattern.charAt(i);
+      if (ch === '\\') {
+        pushPending(stack, pending);
+        pending = { exists: true, hasVariableRepeat: false, hasAlternation: false };
+        i += i + 1 < pattern.length ? 2 : 1;
+        continue;
+      }
+      if (ch === '[') {
+        pushPending(stack, pending);
+        pending = { exists: true, hasVariableRepeat: false, hasAlternation: false };
+        i = skipClass(pattern, i);
+        continue;
+      }
+      if (ch === '(') {
+        pushPending(stack, pending);
+        if (stack.length >= MAX_GROUPS + 1) return false;
+        stack.push({ hasVariableRepeat: false, hasAlternation: false });
+        i++;
+        continue;
+      }
+      if (ch === ')') {
+        pushPending(stack, pending);
+        if (stack.length <= 1) {
+          i++;
+          continue;
+        }
+        var group = stack.pop();
+        pending = { exists: true, hasVariableRepeat: group.hasVariableRepeat, hasAlternation: group.hasAlternation };
+        i++;
+        continue;
+      }
+      if (ch === '|') {
+        pushPending(stack, pending);
+        stack[stack.length - 1].hasAlternation = true;
+        i++;
+        continue;
+      }
+      if (ch === '?' || ch === '*' || ch === '+') {
+        if (!pending.exists) {
+          i++;
+          continue;
+        }
+        if (pending.hasVariableRepeat || pending.hasAlternation) return false;
+        pending.hasVariableRepeat = true;
+        pushPending(stack, pending);
+        i++;
+        continue;
+      }
+      if (ch === '{' && pending.exists) {
+        var interval = parseInterval(pattern, i);
+        if (interval && interval.invalid) return false;
+        if (interval) {
+          if (interval.variable && (pending.hasVariableRepeat || pending.hasAlternation)) return false;
+          if (interval.variable) pending.hasVariableRepeat = true;
+          pushPending(stack, pending);
+          i = interval.end;
+          continue;
+        }
+      }
+      pushPending(stack, pending);
+      pending = { exists: true, hasVariableRepeat: false, hasAlternation: false };
+      i++;
+    }
+    pushPending(stack, pending);
+    return true;
   }
 
   function byteLengthPrefix(value, end) {
@@ -125,12 +256,13 @@
   mergeInto(LibraryManager.library, {
     regexCompile: function (ret, pattern, flags) {
       var textPattern = text(pattern);
-      var ok = true;
-      try { new RegExp(textPattern, jsFlags(flags | 0, false)); } catch (e) { ok = false; }
+      var ok = safePattern(textPattern);
+      try { if (ok) new RegExp(textPattern, jsFlags(flags | 0, false)); } catch (e) { ok = false; }
       writeRegex(ret, { pattern: textPattern, flags: flags | 0, ok: ok });
     },
     regexIsValid: function (regexPtr) {
-      return readRegex(regexPtr).ok ? 1 : 0;
+      var regex = readRegex(regexPtr);
+      return regex.ok && safePattern(regex.pattern) ? 1 : 0;
     },
     regexTest: function (regexPtr, inputPtr) {
       var re = compile(readRegex(regexPtr), false);

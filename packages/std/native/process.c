@@ -15,7 +15,7 @@
 #endif
 
 // Windows 有独立 Win32 实现；该宏只表示 POSIX fork/exec 分支可用。
-#if !defined(_WIN32) && !defined(__ANDROID__) && !(defined(__APPLE__) && TARGET_OS_IPHONE)
+#if !defined(_WIN32) && !(defined(__APPLE__) && TARGET_OS_IPHONE)
 #define EZ_PROCESS_POSIX_SUPPORTED 1
 #else
 #define EZ_PROCESS_POSIX_SUPPORTED 0

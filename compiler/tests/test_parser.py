@@ -92,6 +92,40 @@ class TestParser:
         assert len(errors) == 0, f'解析错误: {errors}'
         assert tree is not None
 
+    def test_prefix_type_assertion_parses(self):
+        """Type! expr 前缀类型断言应进入专用语法分支。"""
+        tree, errors = parse_source('let x = I32! 42;')
+
+        def has_prefix_type_assertion(node):
+            if type(node).__name__ == 'PrefixTypeAssertionContext':
+                return True
+            return any(
+                has_prefix_type_assertion(node.getChild(index))
+                for index in range(node.getChildCount())
+                if hasattr(node.getChild(index), 'getChildCount')
+            )
+
+        assert len(errors) == 0, f'解析错误: {errors}'
+        assert has_prefix_type_assertion(tree)
+
+    def test_dict_literal_accepts_semicolon_separators(self):
+        """文档对象/Dict 字面量允许使用分号分隔字段。"""
+        source = 'let s = { name = "Square"; side: Str = "10"; };'
+        tree, errors = parse_source(source)
+        assert len(errors) == 0, f'解析错误: {errors}'
+
+        def has_dict_expr(node):
+            if type(node).__name__ == 'DictExprContext':
+                return True
+            return any(
+                has_dict_expr(node.getChild(index))
+                for index in range(node.getChildCount())
+                if hasattr(node.getChild(index), 'getChildCount')
+            )
+
+        assert tree is not None
+        assert has_dict_expr(tree)
+
     def test_shift_expression_still_accepts_adjacent_right_angles(self):
         """>> 仍应作为右移运算被语法接受。"""
         tree, errors = parse_source('let shift: U32 = 1; let value: U32 = 8 >> shift;')
@@ -216,9 +250,16 @@ class TestParser:
         let arr: I32[]?;
         let headers = { "Content-Type" = "text/plain", ["Accept"] = "application/json" };
         let ptr: *I8;
+        (ptr == ptr) ? ptr = ptr;
         const p = parallel { return 1; };
         ''')
         assert len(errors) == 0, f'解析错误: {errors}'
+
+    def test_if_like_expression_statement_parses_as_if_like(self):
+        """文档中的 `(cond) ? expression` 应作为条件语句解析。"""
+        tree, errors = parse_source('let x = 1; (x > 0) ? x = 2;')
+        assert len(errors) == 0, f'解析错误: {errors}'
+        assert 'ifLikeExpr' in tree.toStringTree(recog=EzLangParser(None))
 
     def test_variable_decl_without_initializer_parses(self):
         """显式类型变量允许省略初始化器。"""

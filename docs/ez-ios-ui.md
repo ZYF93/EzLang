@@ -2,7 +2,7 @@
 
 `ez-ios-ui` 提供面向 `ios` 目标的**原生 UIKit View 底层绑定**（基于 Objective-C runtime 桥接）。包本身不做框架和调度——这些由使用者自行实现。**View 树修改必须在主线程执行**，包提供主线程调度桥接。
 
-> **当前实现状态**：仓库内已提供可编译链接的原生句柄状态层，可维护根视图、节点表、父子关系、文本、frame、可见性等基础状态；配置 `output.sdk` 构建 iOS 目标且项目导入 `ez-ios-ui` 时，CLI 会随 `lib<name>.dylib` 生成 `ez-ios-ui-bridge/` 宿主模板（Swift ViewController、Package.swift、Info.plist），用于把动态库接入 Xcode/UIKit 工程。`runOnMainThread` / `scheduleFrame` 在最小句柄层内同步执行回调；真实 iOS 主线程队列、事件分发与权限查询由宿主模板扩展实现，公开签名保持稳定。
+> **当前实现状态**：仓库内已提供可编译链接的原生句柄状态层，可维护根视图、节点表、父子关系、文本、富文本可见文本、frame、可见性、屏幕尺寸、缩放比例和安全区等基础状态；配置 `output.sdk` 构建 iOS 目标且项目导入 `ez-ios-ui` 时，CLI 会随 `lib<name>.dylib` 生成 `ez-ios-ui-bridge/` 宿主模板（Swift ViewController、Package.swift、Info.plist），用于把动态库接入 Xcode/UIKit 工程，并在 ViewController 启动时把 `UIScreen` 与 `safeAreaInsets` 注入原生状态层。`runOnMainThread` / `scheduleFrame` 在最小句柄层内同步执行回调；真实 iOS 主线程队列、事件分发与权限查询由宿主模板扩展实现，公开签名保持稳定。
 
 > **使用前提**：`project.toml` 中 `os = "ios"`，`sdk` 指向 Xcode SDK；构建产物中的 `ez-ios-ui-bridge/` 可加入 Xcode 工程。
 
@@ -179,7 +179,7 @@ declare const setNeedsLayout:     (node: Node) => Void
 ```ez
 declare const setText:            (node: Node, text: Str) => Void
 declare const getText:            (node: Node) => Str
-declare const setAttributedText:  (node: Node, html: Str) => Void   // 简易 HTML 富文本
+declare const setAttributedText:  (node: Node, html: Str) => Void   // HTML 富文本；状态层会同步保存去标签可见文本
 declare const setFont:            (node: Node, name: Str, size: F32) => Void
 declare const setSystemFont:      (node: Node, size: F32, weight: F32) => Void  // UIFontWeight
 declare const setTextColor:       (node: Node, color: Color) => Void

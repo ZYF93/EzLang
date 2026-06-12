@@ -1,5 +1,5 @@
 // ez-ios-ui - iOS UIKit 绑定包
-// 当前提供可编译链接的 ABI 占位；真实 Objective-C/UIKit 桥接后续接入。
+// 当前提供可编译链接的原生句柄状态层；真实 Objective-C/UIKit 桥接由宿主模板接入。
 
 extern "@pkg/ez-ios-ui/native/ios_ui.c" for linux;
 extern "@pkg/ez-ios-ui/native/ios_ui.c" for macos;
@@ -46,6 +46,10 @@ export type ActionHandler = () => Void;
 export type TouchHandler = (e: TouchEvent) => Void;
 export type TextChangeHandler = (e: TextChangedEvent) => Void;
 export type ValueChangeHandler = (value: F32) => Void;
+export type TableRowCount = (section: I32) => I32;
+export type TableCreateCell = (reuseId: Str) => Node;
+export type TableBindCell = (cell: Node, row: I32, section: I32) => Void;
+export type TableCellHeight = (row: I32, section: I32) => F32;
 
 export const contentMode.scaleToFill: I32 = 0;
 export const contentMode.scaleAspectFit: I32 = 1;
@@ -75,37 +79,98 @@ export declare const createTextView: () => Node;
 export declare const createButton: () => Node;
 export declare const createSwitch: () => Node;
 export declare const createSlider: () => Node;
+export declare const createSegmentControl: (segments: Str[]) => Node;
+export declare const createStepper: () => Node;
+export declare const createActivityIndicator: () => Node;
 export declare const createImageView: () => Node;
+export declare const createTableView: () => Node;
+export declare const createCollectionView: () => Node;
 export declare const destroyNode: (node: Node) => Void;
 
 export declare const addSubview: (parent: Node, child: Node) => Void;
 export declare const insertSubviewAt: (parent: Node, child: Node, index: I32) => Void;
+export declare const insertSubviewAbove: (parent: Node, child: Node, ref: Node) => Void;
+export declare const insertSubviewBelow: (parent: Node, child: Node, ref: Node) => Void;
 export declare const removeFromSuperview: (node: Node) => Void;
+export declare const bringToFront: (node: Node) => Void;
+export declare const sendToBack: (node: Node) => Void;
 export declare const getSubviewAt: (parent: Node, index: I32) => Node?;
 export declare const getSubviewCount: (parent: Node) => I32;
 export declare const getSuperview: (node: Node) => Node?;
 export declare const getRootView: () => Node;
+export declare const setTableAdapter: (table: Node, rowCount: TableRowCount, createCell: TableCreateCell, bindCell: TableBindCell, cellHeight: TableCellHeight) => Void;
 
 export declare const setFrame: (node: Node, rect: Rect) => Void;
 export declare const getFrame: (node: Node) => Rect;
+export declare const setBounds: (node: Node, rect: Rect) => Void;
+export declare const getBounds: (node: Node) => Rect;
 export declare const pinToEdges: (node: Node, insets: Insets) => Void;
 export declare const centerInParent: (node: Node) => Void;
 export declare const setWidth: (node: Node, width: F32) => Void;
 export declare const setHeight: (node: Node, height: F32) => Void;
+export declare const sizeToFit: (node: Node) => Void;
+export declare const setSpacing: (node: Node, spacing: F32) => Void;
+export declare const setAlignment: (node: Node, align: I32) => Void;
+export declare const setDistribution: (node: Node, dist: I32) => Void;
 
 export declare const setText: (node: Node, text: Str) => Void;
 export declare const getText: (node: Node) => Str;
+export declare const setAttributedText: (node: Node, html: Str) => Void;
+export declare const setFont: (node: Node, name: Str, size: F32) => Void;
+export declare const setSystemFont: (node: Node, size: F32, weight: F32) => Void;
 export declare const setTextColor: (node: Node, color: Color) => Void;
+export declare const setTextAlign: (node: Node, align: I32) => Void;
+export declare const setNumberOfLines: (node: Node, n: I32) => Void;
+export declare const setLineBreakMode: (node: Node, mode: I32) => Void;
+export declare const setPlaceholder: (node: Node, text: Str) => Void;
+export declare const setKeyboardType: (node: Node, type_: I32) => Void;
+export declare const setSecureEntry: (node: Node, secure: Bool) => Void;
+export declare const setReturnKeyType: (node: Node, type_: I32) => Void;
 export declare const setBackgroundColor: (node: Node, color: Color) => Void;
 export declare const setAlpha: (node: Node, alpha: F32) => Void;
 export declare const setHidden: (node: Node, hidden: Bool) => Void;
+export declare const setUserInteraction: (node: Node, enabled: Bool) => Void;
+export declare const setClipsToBounds: (node: Node, clips: Bool) => Void;
+export declare const setCornerRadius: (node: Node, radius: F32) => Void;
+export declare const setBorderWidth: (node: Node, width: F32) => Void;
+export declare const setBorderColor: (node: Node, color: Color) => Void;
+export declare const setShadow: (node: Node, color: Color, offset: Rect, radius: F32, opacity: F32) => Void;
+export declare const setTag_: (node: Node, tag: I32) => Void;
+export declare const getTag_: (node: Node) => I32;
+export declare const setAccessLabel: (node: Node, label: Str) => Void;
+export declare const layoutIfNeeded: (node: Node) => Void;
+export declare const setNeedsLayout: (node: Node) => Void;
+
+export declare const setImageUrl: (node: Node, url: Str) => Void;
+export declare const setImageName: (node: Node, name: Str) => Void;
+export declare const setSystemImage: (node: Node, sfName: Str) => Void;
+export declare const setImageBlob: (node: Node, data: Blob) => Void;
 export declare const setContentMode: (node: Node, mode: I32) => Void;
+export declare const setTintColor: (node: Node, color: Color) => Void;
+
+export declare const setButtonTitle: (node: Node, title: Str, state: I32) => Void;
+export declare const setButtonImage: (node: Node, name: Str, state: I32) => Void;
+export declare const setButtonEnabled: (node: Node, enabled: Bool) => Void;
+export declare const setSwitchOn: (node: Node, on: Bool, animated: Bool) => Void;
+export declare const getSwitchOn: (node: Node) => Bool;
+export declare const setSwitchTintColor: (node: Node, color: Color) => Void;
+export declare const setSliderValue: (node: Node, value: F32, animated: Bool) => Void;
+export declare const getSliderValue: (node: Node) => F32;
+export declare const setSliderRange: (node: Node, min: F32, max: F32) => Void;
+export declare const startAnimating: (node: Node) => Void;
+export declare const stopAnimating: (node: Node) => Void;
 
 export declare const addTarget: (node: Node, event: I32, handler: ActionHandler) => Void;
 export declare const removeTarget: (node: Node, event: I32) => Void;
 export declare const setOnTextChanged: (node: Node, handler: TextChangeHandler) => Void;
+export declare const setOnReturn: (node: Node, handler: ActionHandler) => Void;
 export declare const addTapGesture: (node: Node, taps: I32, handler: ActionHandler) => Void;
+export declare const addLongPressGesture: (node: Node, minDuration: F32, handler: ActionHandler) => Void;
+export declare const addPanGesture: (node: Node, handler: TouchHandler) => Void;
+export declare const addSwipeGesture: (node: Node, direction: I32, handler: ActionHandler) => Void;
 export declare const removeTapGesture: (node: Node) => Void;
+export declare const becomeFirstResponder: (node: Node) => Void;
+export declare const resignFirstResponder: (node: Node) => Void;
 
 export declare const runOnMainThread: (work: () => Void) => Void;
 export declare const postToMain: (work: () => Void) => Void;

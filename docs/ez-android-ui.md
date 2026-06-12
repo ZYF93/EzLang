@@ -2,7 +2,7 @@
 
 `ez-android-ui` 提供面向 `android` 目标的**原生 View 底层绑定**（基于 Android NDK + JNI）。包本身不做框架和调度——这些由使用者自行实现。所有 UI 原语均为同步 JNI 调用，**View 树修改必须在主线程执行**，包提供主线程调度桥接。
 
-> **当前实现状态**：仓库内已提供可编译链接的原生句柄状态层，可维护根视图、节点表、父子关系、文本、frame、可见性等基础状态；配置 `output.sdk` 构建 Android 目标且项目导入 `ez-android-ui` 时，CLI 会随 `lib<name>.so` 生成 `ez-android-ui-bridge/` 宿主模板（Activity、Manifest、CMake 入口），用于把动态库接入 Android 工程。`runOnMainThread` / `scheduleFrame` 在最小句柄层内同步执行回调；真实 Android 主线程消息队列、事件分发与权限申请由宿主模板扩展实现，公开签名保持稳定。
+> **当前实现状态**：仓库内已提供可编译链接的原生句柄状态层，可维护根视图、节点表、父子关系、文本、frame、可见性、屏幕尺寸与密度等基础状态；配置 `output.sdk` 构建 Android 目标且项目导入 `ez-android-ui` 时，CLI 会随 `lib<name>.so` 生成 `ez-android-ui-bridge/` 宿主模板（Activity、Manifest、CMake 入口），用于把动态库接入 Android 工程，并在 Activity 启动时把真实 `DisplayMetrics` 注入原生状态层。`runOnMainThread` / `scheduleFrame` 在最小句柄层内同步执行回调；真实 Android 主线程消息队列、事件分发与权限申请由宿主模板扩展实现，公开签名保持稳定。
 
 > **Fiber 调度可行性**：完全可行。EzLang 的 `flow` 已是协作式调度器，reconcile（差量计算）阶段在 `flow` 内并发运行；commit（View 修改）阶段通过 `runOnMainThread` 桥接回 UI 线程，架构与 React Native Fabric 一致。
 
