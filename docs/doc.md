@@ -263,6 +263,13 @@ let addTwo = fn(a = 2, b = ?)
 
 ### 语法
 ```ez
+from "std/io" import { print }
+
+declare const fetchA: () => I32
+declare const fetchB: () => I32
+declare const fetchC: () => I32
+declare const fetch: () => I32
+
 const ret = flow {
     const a = fetchA()
     const b = fetchB()
@@ -307,9 +314,12 @@ const ret = flow {
 
 ### 语法
 ```ez
+from "std/fmt" import { toString }
+from "std/io" import { print }
+
 // 循环与范围
 loop i in 0...10 { 
-    print(msg = i)
+    print(msg = toString<I32>(value = i))
 }
 
 // 块条件语句
@@ -451,29 +461,48 @@ declare static version: Str
 
 ### 语法
 ```ez
+from "std/io" import { print }
+
 // 元编程：装饰器
-const log = (this: Meta<I32>) => {
-    this.setter = (v: I32) => {
-        print(msg = "writing...")
-        this.value = v
-    }
+const setX = (meta: Meta<I32>, v: I32): Void => {
+    print(msg = "writing...")
+    meta.value = v
+}
+const log = (this: Meta<I32>): Void => {
+    this.setter = setX
 }
 @log let x = 1
 x = 2 // 触发拦截打印
 
 // 标记语法与语法糖
+struct Node {
+    id: I32;
+}
+const div = (id: I32): Node => {
+    return Node(id = id)
+}
+const text = (color: Str, children: (Str | Node | I32)[]): Node => {
+    return Node(id = 1)
+}
 let ui = <text color="blue">
     "Welcome"
     <div id=1 />
     {1+2}
-</text> // 等同于 text(color = "blue", children = ["Welcome", div(id=1), 1+2])
+</text> // 等同于 text(color = "blue", children = ["Welcome", div(id = 1), 1+2])
 
+const add = (a: I32, b: I32): I32 => {
+    return a + b
+}
 let val = 10 -> add(a = %, b = 5) // 管道语法，等同于 add(a = 10, b = 5)
+let name = "EzLang"
 let msg = "Hello {{name}}"        // 字符串插值
 
 // 安全机制：类型断言与运行时检查
+declare const malloc: (size: I32) => Blob
+type User = Blob
 let b: Blob = malloc(size = 10)
 let user = User! b
+let err = Error(code = 1, message = "boom")
 let isError = typeof err & Error == Error
 ```
 

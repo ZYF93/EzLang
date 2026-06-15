@@ -61,10 +61,15 @@ typedef struct {
 } HttpResponse;
 
 typedef struct {
+    bool ok;
+    Blob value;
+} OptBlob;
+
+typedef struct {
     const char *method;
     const char *url;
     Dict headers;
-    Blob body;
+    OptBlob body;
 } HttpRequest;
 
 typedef struct {
@@ -1236,7 +1241,7 @@ static bool ez_parse_server_request(uint8_t *raw, size_t raw_len, size_t header_
         }
         memcpy(body, raw + header_len, body_size);
     }
-    *out = (HttpRequest){method, url, headers, {body, (int64_t)body_size}};
+    *out = (HttpRequest){method, url, headers, {true, {body, (int64_t)body_size}}};
     return true;
 }
 
@@ -1245,7 +1250,7 @@ static void ez_free_server_request(HttpRequest *req) {
     free((char *)req->method);
     free((char *)req->url);
     ez_free_headers(&req->headers);
-    free(req->body.data);
+    free(req->body.value.data);
     *req = (HttpRequest){0};
 }
 
@@ -1508,7 +1513,7 @@ OptHttpResponse fetch(const char *url) {
 
 OptHttpResponse fetchEx(const HttpRequest *req) {
     if (!req) return ez_http_none();
-    return ez_http_fetch(req->method, req->url, &req->headers, &req->body);
+    return ez_http_fetch(req->method, req->url, &req->headers, req->body.ok ? &req->body.value : NULL);
 }
 
 HttpServer createServer(const char *host, int32_t port) {

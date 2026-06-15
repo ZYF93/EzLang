@@ -848,6 +848,9 @@ declare const fetchEx:  (req: HttpRequest) => HttpResponse?
 **使用示例**：
 
 ```ez
+from "std/io" import { print }
+from "std/net/http" import { fetch, HttpResponse }
+
 // flow 外：同步阻塞
 const resp = fetch(url = "https://api.example.com/data")
 (typeof resp & HttpResponse == HttpResponse) ? {
@@ -862,13 +865,15 @@ const result = flow {
 }
 
 // 竞速：取第一个响应
-const winner = race(
-    pl = [
-        () => fetch(url = "https://cdn1.example.com/res"),
-        () => fetch(url = "https://cdn2.example.com/res")
-    ],
-    timeout = 5000
-)
+const winner = flow {
+    return race(
+        pl = [
+            () => fetch(url = "https://cdn1.example.com/res"),
+            () => fetch(url = "https://cdn2.example.com/res")
+        ],
+        timeout = 5000
+    )
+}
 ```
 
 **当前平台行为**：
@@ -900,6 +905,8 @@ declare const createServer: (host: Str, port: I32) => HttpServer;
 **使用示例**：
 
 ```ez
+from "std/net/http" import { createServer, HttpRequest, HttpResponse }
+
 const server = createServer(host = "0.0.0.0", port = 8080);
 
 server.on(path = "/hello", handler = (req: HttpRequest) => {

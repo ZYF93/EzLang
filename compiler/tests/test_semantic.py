@@ -24,13 +24,8 @@ def markdown_ez_blocks(filepath: Path):
 
 
 DOC_SEMANTIC_SKIP = {
-    ('docs/doc.md', 6): 'flow/race 调度展示，依赖示例外部 fetch 函数',
-    ('docs/doc.md', 7): '控制流展示，依赖示例外部 print 函数',
     ('docs/doc.md', 9): 'extern 路径和跨平台库声明展示，依赖示例外部库文件',
-    ('docs/doc.md', 10): '装饰器和标记语法展示，依赖示例外部 print 与 UI 工厂函数',
     ('docs/stdlib.md', 1): 'extern 搜索路径展示，依赖示例外部库文件',
-    ('docs/stdlib.md', 24): 'HTTP flow 使用示例，依赖示例外部网络接口上下文',
-    ('docs/stdlib.md', 26): 'HTTP 服务端使用示例，依赖前置 HTTP 类型和服务端上下文',
 }
 
 
@@ -472,6 +467,25 @@ class TestSemantic:
         ''')
         assert any('重复提供参数' in e for e in anal.symbols.errors), f'应有重复参数错误: {anal.symbols.errors}'
 
+    def test_function_named_args_do_not_degrade_to_positional(self):
+        """函数具名参数必须按名称绑定，不能退化为位置参数。"""
+        anal = analyze('''
+        const sub = (a: I32, b: I32): I32 => {
+            return a - b;
+        };
+        const ok: I32 = sub(b = 1, a = 3);
+        ''')
+        assert not anal.symbols.has_errors(), f'语义错误: {anal.symbols.errors}'
+
+    def test_union_type_flattens_declaration_order(self):
+        """多元联合类型应按源码顺序展平，不保留左递归嵌套。"""
+        anal = analyze('type Value = Str | I32 | Bool;')
+        assert not anal.symbols.has_errors(), f'语义错误: {anal.symbols.errors}'
+        symbol = anal.symbols.resolve('Value')
+        assert symbol is not None
+        assert symbol.type is not None
+        assert [str(t) for t in symbol.type.union_types] == ['Str', 'I32', 'Bool']
+
     def test_function_call_missing_required_arg(self):
         """缺少无默认值的必填参数应报错"""
         anal = analyze('''
@@ -567,14 +581,28 @@ class TestSemantic:
         assert any("参数 'children' 类型不匹配" in e for e in anal.symbols.errors), anal.symbols.errors
 
     def test_markup_literal_rejects_mixed_children_type(self):
-        """标记子节点数组元素类型不一致时应报错。"""
+        """标记 children 元素不满足工厂函数数组元素类型时应报错。"""
         anal = analyze('''
         const text = (children: Str[]): I32 => {
             return 1;
         };
         let ui = <text>"Welcome"{1 + 2}</text>;
         ''')
-        assert any('标记子节点类型不一致' in e for e in anal.symbols.errors), anal.symbols.errors
+        assert any("参数 'children' 类型不匹配" in e for e in anal.symbols.errors), anal.symbols.errors
+
+    def test_markup_literal_accepts_union_children(self):
+        """工厂函数显式声明联合元素 children 时，标记可包含异构子节点。"""
+        anal = analyze('''
+        type Node = { id: I32 };
+        const div = (id: I32): Node => {
+            return { id = id };
+        };
+        const text = (color: Str, children: (Str | Node | I32)[]): Node => {
+            return { id = 1 };
+        };
+        let ui = <text color="blue">"Welcome"<div id=1 />{1 + 2}</text>;
+        ''')
+        assert not anal.symbols.has_errors(), f'语义错误: {anal.symbols.errors}'
 
     def test_markup_literal_rejects_children_without_parameter(self):
         """工厂函数未声明 children 参数时，标记子节点应报未知参数。"""

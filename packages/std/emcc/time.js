@@ -112,5 +112,18 @@
     }
     return stringToNewUTF8(out);
   },
+  getYear: function (datePtr) { return LibraryManager.library.dateGetYear(datePtr); },
+  getMonth: function (datePtr) { return LibraryManager.library.dateGetMonth(datePtr); },
+  getDay: function (datePtr) { return LibraryManager.library.dateGetDay(datePtr); },
+  getHour: function (datePtr) { return LibraryManager.library.dateGetHour(datePtr); },
+  getMinute: function (datePtr) { return LibraryManager.library.dateGetMinute(datePtr); },
+  getSecond: function (datePtr) { return LibraryManager.library.dateGetSecond(datePtr); },
+  add: function (datePtr, yearPtr, monthPtr, dayPtr, hourPtr, minutePtr, secondPtr) {
+    return LibraryManager.library.dateAdd(datePtr, yearPtr, monthPtr, dayPtr, hourPtr, minutePtr, secondPtr);
+  },
+  sub: function (datePtr, yearPtr, monthPtr, dayPtr, hourPtr, minutePtr, secondPtr) {
+    return LibraryManager.library.dateSub(datePtr, yearPtr, monthPtr, dayPtr, hourPtr, minutePtr, secondPtr);
+  },
+  format: function (datePtr, fmtPtr) { return LibraryManager.library.dateFormat(datePtr, fmtPtr); },
   });
 })();

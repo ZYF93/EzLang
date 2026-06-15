@@ -20,7 +20,7 @@ export struct HttpRequest {
     method: Str;
     url: Str;
     headers: Headers;
-    body: Blob;
+    body: Blob?;
 };
 
 export struct HttpResponse {

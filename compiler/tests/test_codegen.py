@@ -558,6 +558,35 @@ class TestCodegen:
         assert '_markup_children' in ir_text
         assert '_markup_attr' in ir_text
 
+    def test_markup_literal_lowers_union_children(self):
+        """联合元素 children 应按工厂函数形参类型打包，允许异构子节点。"""
+        source = '''
+        struct Node {
+            id: I32;
+        }
+        const div = (id: I32): Node => {
+            return Node(id = id);
+        };
+        const text = (color: Str, children: (Str | Node | I32)[]): Node => {
+            return Node(id = 1);
+        };
+        const test_markup_union_children = (): I32 => {
+            let ui = <text color="blue">"Welcome"<div id=1 />{1 + 2}</text>;
+            return ui.id;
+        };
+        '''
+        module, errors, _ = compile_source(source)
+        assert module is not None
+        assert len(errors) == 0, f'编译错误: {errors}'
+        ir_text = str(module)
+        binding.parse_assembly(ir_text).verify()
+        assert 'call %"Node" @"text"' in ir_text
+        assert '_union_pack_payload' in ir_text
+        assert '_markup_children' in ir_text
+        assert re.search(r'insertvalue \{i32, i8\*\} undef, i32 0, 0', ir_text), ir_text
+        assert re.search(r'store i32 1, i32\* %"\.\d+"', ir_text), ir_text
+        assert re.search(r'insertvalue \{i32, i8\*\} undef, i32 2, 0', ir_text), ir_text
+
     def test_markup_literal_codegen_reports_attr_type_mismatch(self):
         """直接 codegen 路径也应报告标记属性类型不匹配。"""
         source = '''
@@ -1256,6 +1285,44 @@ class TestCodegen:
         ir_text = str(module)
         assert 'call i32 @"identity_I32"(i32 7)' in ir_text
         assert 'store i32 0, i32* %"inferred"' not in ir_text
+
+    def test_function_named_args_do_not_degrade_to_positional_call(self):
+        """函数具名参数 codegen 必须按名称重排，不能退化为位置参数。"""
+        source = '''
+        const sub = (a: I32, b: I32): I32 => {
+            return a - b;
+        };
+        const run = (): I32 => {
+            return sub(b = 1, a = 3);
+        };
+        '''
+        module, errors, _ = compile_source(source)
+        assert module is not None
+        assert len(errors) == 0, f'编译错误: {errors}'
+        ir_text = str(module)
+        assert 'call i32 @"sub"(i32 3, i32 1)' in ir_text
+        assert 'call i32 @"sub"(i32 1, i32 3)' not in ir_text
+
+    def test_struct_named_args_do_not_degrade_to_positional_init(self):
+        """结构体具名构造必须按字段名写入，不能退化为位置参数。"""
+        source = '''
+        struct Pair {
+            left: I32;
+            right: I32;
+        }
+        const run = (): I32 => {
+            let p = Pair(right = 1, left = 3);
+            return p.left - p.right;
+        };
+        '''
+        module, errors, _ = compile_source(source)
+        assert module is not None
+        assert len(errors) == 0, f'编译错误: {errors}'
+        ir_text = str(module)
+        binding.parse_assembly(ir_text).verify()
+        run_ir = function_ir(ir_text, 'run')
+        assert re.search(r'getelementptr inbounds %"Pair", %"Pair"\* %"_tmp_Pair", i32 0, i32 1\n  store i32 1, i32\*', run_ir), run_ir
+        assert re.search(r'getelementptr inbounds %"Pair", %"Pair"\* %"_tmp_Pair", i32 0, i32 0\n  store i32 3, i32\*', run_ir), run_ir
 
     def test_generic_struct_explicit_args_monomorphize_layout(self):
         """显式泛型结构体实参应生成具体字段布局。"""
@@ -2045,8 +2112,8 @@ class TestCodegen:
         ir_text = str(module)
         # 应包含 llvm.memcpy 调用，且不保留 copy 外部符号
         assert 'llvm.memcpy' in ir_text, f'未找到 llvm.memcpy 调用:\n{ir_text}'
-        assert 'getelementptr inbounds %"Blob", %"Blob"* %"dst.1", i32 0, i32 0' in ir_text
-        assert 'getelementptr inbounds %"Blob", %"Blob"* %"src.1", i32 0, i32 0' in ir_text
+        assert re.search(r'getelementptr inbounds %"Blob", %"Blob"\* %"dst\.\d+"', ir_text), ir_text
+        assert re.search(r'getelementptr inbounds %"Blob", %"Blob"\* %"src\.\d+"', ir_text), ir_text
         assert 'bitcast %"Blob"' not in ir_text
         assert '@"copy"' not in ir_text
 
@@ -2065,7 +2132,7 @@ class TestCodegen:
         ir_text = str(module)
         # 应包含 llvm.memset 调用，且不保留 set 外部符号
         assert 'llvm.memset' in ir_text, f'未找到 llvm.memset 调用:\n{ir_text}'
-        assert 'getelementptr inbounds %"Blob", %"Blob"* %"dst.1", i32 0, i32 0' in ir_text
+        assert re.search(r'getelementptr inbounds %"Blob", %"Blob"\* %"dst\.\d+"', ir_text), ir_text
         assert 'bitcast %"Blob"' not in ir_text
         assert '@"set"' not in ir_text
 
@@ -3270,10 +3337,14 @@ class TestCodegen:
         assert 'call i8* @"Duration_toString"' in ir_text
         assert 'call i8* @"durationToString"' in ir_text
         check_ir = function_ir(ir_text, 'check_time')
-        assert check_ir.count('call i32 @"getYear"') >= 2
-        assert check_ir.count('call void @"add"') >= 2
-        assert check_ir.count('call void @"sub"') >= 2
-        assert check_ir.count('call i8* @"format"') >= 2
+        assert 'call i32 @"getYear"' in check_ir
+        assert 'call i32 @"dateGetYear"' in check_ir
+        assert 'call void @"add"' in check_ir
+        assert 'call void @"dateAdd"' in check_ir
+        assert 'call void @"sub"' in check_ir
+        assert 'call void @"dateSub"' in check_ir
+        assert 'call i8* @"format"' in check_ir
+        assert 'call i8* @"dateFormat"' in check_ir
         assert 'declare i8* @"__durationToString"' in ir_text
 
     def test_stdlib_time_target_filter(self):
@@ -3917,6 +3988,9 @@ class TestCodegen:
         from "./std/net/http.ez" import { Headers, HttpRequest, HttpResponse, fetch, fetchEx };
 
         const call_http = (): Str => {
+            const headers = { accept: Str = "application/json" };
+            const req = HttpRequest(method = "GET", url = "https://example.com", headers = headers, body = ?);
+            const via_req = fetchEx(req = req);
             const resp = fetch(url = "https://example.com");
             return resp.ok ? resp.value.text() : "";
         };
@@ -3930,6 +4004,7 @@ class TestCodegen:
         assert module.get_global('HttpResponse_text') is not None
         ir_text = str(module)
         assert 'HttpRequest' in ir_text
+        assert '%"HttpRequest" = type {i8*, i8*, %"Dict", {i1, %"Blob"}}' in ir_text
         assert 'HttpResponse' in ir_text
         assert 'sret({i1, %"HttpResponse"})' in ir_text
         assert 'call i8* @"HttpResponse_text"' in ir_text

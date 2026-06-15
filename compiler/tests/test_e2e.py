@@ -3021,7 +3021,7 @@ def test_e2e_time_wrappers_use_millisecond_clock_sleep_and_utc_fields():
 def test_e2e_std_net_http_client_imports_and_builds(tmp_path):
     source = tmp_path / "std_http_client.ez"
     source.write_text(
-        'from "std/net/http" import { fetch, fetchEx, HttpRequest, HttpResponse };\n\nlet headers = { accept: Str = "application/json" };\nlet empty_body = Blob(data = "", size = 0);\nlet req = HttpRequest(method = "GET", url = "https://example.com", headers = headers, body = empty_body);\nlet res1 = fetch(url = "https://example.com");\nlet res2 = fetchEx(req = req);\n',
+        'from "std/net/http" import { fetch, fetchEx, HttpRequest, HttpResponse };\n\nlet headers = { accept: Str = "application/json" };\nlet empty_body = Blob(data = "", size = 0);\nlet req = HttpRequest(method = "GET", url = "https://example.com", headers = headers, body = empty_body);\nlet req_without_body = HttpRequest(method = "GET", url = "https://example.com", headers = headers, body = ?);\nlet res1 = fetch(url = "https://example.com");\nlet res2 = fetchEx(req = req);\nlet res3 = fetchEx(req = req_without_body);\n',
         encoding="utf-8",
     )
     project_toml = write_project(tmp_path, source)
@@ -3030,6 +3030,7 @@ def test_e2e_std_net_http_client_imports_and_builds(tmp_path):
     ir_file = tmp_path / "dist" / "native" / "e2e.ll"
     ir_text = ir_file.read_text(encoding="utf-8")
     assert '%"HttpRequest" = type' in ir_text
+    assert '%"HttpRequest" = type {i8*, i8*, %"Dict", {i1, %"Blob"}}' in ir_text
     assert '%"HttpResponse" = type' in ir_text
     assert 'declare void @"fetch"({i1, %"HttpResponse"}* sret({i1, %"HttpResponse"})' in ir_text
     assert 'declare void @"fetchEx"({i1, %"HttpResponse"}* sret({i1, %"HttpResponse"})' in ir_text
@@ -3123,16 +3124,19 @@ def test_e2e_native_http_fetch_ex_rejects_invalid_body_blob_before_connect(tmp_p
 #include <stddef.h>
 
 typedef struct { uint8_t *data; int64_t size; } Blob;
+typedef struct { bool ok; Blob value; } OptBlob;
 typedef struct { char ***key_pages; char ***value_pages; int32_t count; int32_t capacity; int32_t page_count; } Dict;
 typedef struct { int32_t status; Dict headers; Blob body; } HttpResponse;
-typedef struct { const char *method; const char *url; Dict headers; Blob body; } HttpRequest;
+typedef struct { const char *method; const char *url; Dict headers; OptBlob body; } HttpRequest;
 typedef struct { bool ok; HttpResponse value; } OptHttpResponse;
 
 OptHttpResponse fetchEx(const HttpRequest *req);
 
 int main(void) {
-    HttpRequest negative = {"POST", "http://127.0.0.1:1/", {0}, {0, -1}};
-    HttpRequest missing_data = {"POST", "http://127.0.0.1:1/", {0}, {0, 1}};
+    HttpRequest none = {"POST", "http://127.0.0.1:1/", {0}, {false, {0, 0}}};
+    HttpRequest negative = {"POST", "http://127.0.0.1:1/", {0}, {true, {0, -1}}};
+    HttpRequest missing_data = {"POST", "http://127.0.0.1:1/", {0}, {true, {0, 1}}};
+    if (fetchEx(&none).ok) return 1;
     if (fetchEx(&negative).ok) return 2;
     if (fetchEx(&missing_data).ok) return 3;
     return 0;
@@ -3262,9 +3266,10 @@ def test_e2e_native_http_server_handles_connections_concurrently(tmp_path):
 #include <unistd.h>
 
 typedef struct { uint8_t *data; int64_t size; } Blob;
+typedef struct { bool ok; Blob value; } OptBlob;
 typedef struct { char ***key_pages; char ***value_pages; int32_t count; int32_t capacity; int32_t page_count; } Dict;
 typedef struct { int32_t status; Dict headers; Blob body; } HttpResponse;
-typedef struct { const char *method; const char *url; Dict headers; Blob body; } HttpRequest;
+typedef struct { const char *method; const char *url; Dict headers; OptBlob body; } HttpRequest;
 typedef struct { int64_t handle; } HttpServer;
 typedef HttpResponse (*RouteHandler)(const HttpRequest *req);
 
@@ -6231,7 +6236,7 @@ vm.runInNewContext(code, {
 }, { filename: process.argv[1] });
 
 function makeRequest(bodyPtr, bodySize) {
-  const req = _malloc(56);
+  const req = _malloc(64);
   setValue(req, stringToNewUTF8('POST'), '*');
   setValue(req + 8, stringToNewUTF8('http://example.test/'), '*');
   setValue(req + 16, 0, '*');
@@ -6239,8 +6244,14 @@ function makeRequest(bodyPtr, bodySize) {
   setValue(req + 32, 0, 'i32');
   setValue(req + 36, 0, 'i32');
   setValue(req + 40, 0, 'i32');
-  setValue(req + 40, bodyPtr, '*');
-  setValue(req + 48, bodySize, 'i64');
+  HEAPU8[req + 40] = 1;
+  setValue(req + 48, bodyPtr, '*');
+  setValue(req + 56, bodySize, 'i64');
+  return req;
+}
+function makeRequestWithoutBody() {
+  const req = makeRequest(0, 0);
+  HEAPU8[req + 40] = 0;
   return req;
 }
 function fetchEx(req) {
@@ -6253,9 +6264,11 @@ assert.strictEqual(fetchEx(makeRequest(0, -1)), false);
 assert.strictEqual(fetchEx(makeRequest(0, 1)), false);
 assert.strictEqual(fetchEx(makeRequest(HEAPU8.length - 1, 2)), false);
 assert.deepStrictEqual(sendCalls, []);
+assert.strictEqual(fetchEx(makeRequestWithoutBody()), true);
 assert.strictEqual(fetchEx(makeRequest(0, 0)), true);
-assert.strictEqual(sendCalls.length, 1);
+assert.strictEqual(sendCalls.length, 2);
 assert.strictEqual(sendCalls[0], null);
+assert.strictEqual(sendCalls[1], null);
 '''
     subprocess.run([node, "-e", script, str(ROOT / "packages" / "std" / "emcc" / "net" / "http.js")], check=True)
 
@@ -6501,7 +6514,8 @@ function handler(respPtr, reqPtr) {
   assert.strictEqual(UTF8ToString(getValue(reqPtr, '*')), 'POST');
   assert.strictEqual(UTF8ToString(getValue(reqPtr + 8, '*')), '/hello?name=ez');
   assert.strictEqual(dictValue(reqPtr + 16, 'x-ez'), 'ping');
-  assert.strictEqual(blobText(reqPtr + 40), 'data');
+  assert.strictEqual(HEAPU8[reqPtr + 40], 1);
+  assert.strictEqual(blobText(reqPtr + 48), 'data');
   setValue(respPtr, 201, 'i32');
   writeDict(respPtr + 8, [['X-Ez', 'pong'], ['Content-Length', '999']]);
   writeBlob(respPtr + 32, 'ok');

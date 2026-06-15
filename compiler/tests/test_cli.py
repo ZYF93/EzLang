@@ -3549,7 +3549,8 @@ from "std/str" import {{ strEqual }};
 
 let server = createServer(host = "127.0.0.1", port = {port});
 const handler = (req: HttpRequest): HttpResponse => {{
-    const status = !strEqual(a = req.method, b = "POST") ? 410 : (!strEqual(a = req.url, b = "/hello?name=ez") ? 411 : (req.body.size != 4 ? 412 : (!strEqual(a = req.headers["X-Ez"], b = "ping") ? 413 : 201)));
+    const body = req.body;
+    const status = !strEqual(a = req.method, b = "POST") ? 410 : (!strEqual(a = req.url, b = "/hello?name=ez") ? 411 : (!body.ok ? 412 : (body.value.size != 4 ? 412 : (!strEqual(a = req.headers["X-Ez"], b = "ping") ? 413 : 201))));
     server.stop();
     return HttpResponse(status = status, headers = {{ "X-Ez": Str = "pong" }}, body = Blob(data = "ok", size = 2));
 }};

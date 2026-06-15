@@ -54,6 +54,7 @@ class LLVMCodeGenerator(EzLangVisitor):
         self.type_aliases: dict[str, ir.Type] = {}
         self.func_defaults: dict[str, dict[str, ir.Value]] = {}
         self.func_param_names: dict[str, list[str]] = {}
+        self.func_param_type_ctxs: dict[str, list[object]] = {}
         self.func_return_unsigned: dict[str, bool] = {}
         self.func_return_dict_types: dict[str, tuple[ir.Type, ir.Type]] = {}
         self.generic_templates: dict[str, tuple] = {}
@@ -816,6 +817,15 @@ class LLVMCodeGenerator(EzLangVisitor):
     @staticmethod
     def _is_union_type(t: ir.Type) -> bool:
         return isinstance(t, ir.LiteralStructType) and len(t.elements) == 2 and isinstance(t.elements[0], ir.IntType) and t.elements[0].width == 32
+
+    def _union_type_ctxs(self, union_ctx) -> list:
+        """把左递归解析得到的联合类型上下文展平为源码顺序。"""
+        if not isinstance(union_ctx, EzLangParser.UnionTypeContext):
+            return [union_ctx]
+        result = []
+        for child_ctx in union_ctx.type_():
+            result.extend(self._union_type_ctxs(child_ctx))
+        return result
 
     @staticmethod
     def _is_str_type(t: ir.Type) -> bool:
@@ -1613,7 +1623,7 @@ class LLVMCodeGenerator(EzLangVisitor):
 
         # 联合类型: T1 | T2 → {i32, [max_type]}
         if isinstance(ctx, P.UnionTypeContext):
-            types = [self._map_type(t) for t in ctx.type_()]
+            types = [self._map_type(t) for t in self._union_type_ctxs(ctx)]
             max_type = max(types, key=lambda t: self._type_width(t))
             return ir.LiteralStructType([ir.IntType(32), max_type])
 
@@ -1682,15 +1692,16 @@ class LLVMCodeGenerator(EzLangVisitor):
         """按联合类型声明顺序计算变体 tag。"""
         if not isinstance(union_ctx, EzLangParser.UnionTypeContext):
             return 0
-        for index, type_ctx in enumerate(union_ctx.type_()):
+        type_ctxs = self._union_type_ctxs(union_ctx)
+        for index, type_ctx in enumerate(type_ctxs):
             variant_type = self._map_type(type_ctx)
             if variant_type == value_type:
                 return index
-        for index, type_ctx in enumerate(union_ctx.type_()):
+        for index, type_ctx in enumerate(type_ctxs):
             variant_type = self._map_type(type_ctx)
             if isinstance(value_type, ir.PointerType) and isinstance(variant_type, ir.PointerType):
                 return index
-        for index, type_ctx in enumerate(union_ctx.type_()):
+        for index, type_ctx in enumerate(type_ctxs):
             variant_type = self._map_type(type_ctx)
             if isinstance(value_type, ir.IntType) and isinstance(variant_type, ir.IntType):
                 return index
@@ -3666,10 +3677,13 @@ class LLVMCodeGenerator(EzLangVisitor):
                 self._c_abi_return_bridges[name] = (ret_type, bridged_ret_type)
             # 记录参数名供 visitCall 使用
             param_names = []
+            param_type_ctxs = []
             if params is not None:
                 for p in params.paramType():
                     param_names.append(p.VAR_IDENTIFIER().getText())
+                    param_type_ctxs.append(p.type_())
             self.func_param_names[name] = param_names
+            self.func_param_type_ctxs[name] = param_type_ctxs
             return func
         else:
             # 外部全局变量
@@ -4037,6 +4051,7 @@ class LLVMCodeGenerator(EzLangVisitor):
             self.func_return_dict_types[func_name] = ret_dict_types
         param_types = []
         param_names = []
+        param_type_ctxs = []
         params = sig_ctx.paramList()
         if params is not None:
             for index, p in enumerate(params.param()):
@@ -4048,12 +4063,14 @@ class LLVMCodeGenerator(EzLangVisitor):
                     ptype = self._c_abi_param_type(ptype)
                 param_types.append(ptype)
                 param_names.append(pname)
+                param_type_ctxs.append(p.type_())
         if func_name in self.module.globals:
             return self.module.globals[func_name]
         func = ir.Function(self.module, ir.FunctionType(ret_type, param_types), func_name)
         for i, pn in enumerate(param_names):
             func.args[i].name = pn
         self.func_param_names[func_name] = param_names
+        self.func_param_type_ctxs[func_name] = param_type_ctxs
         return func
 
     def _gen_method_func(self, func_name: str, fn_lit_ctx, struct_name: str,
@@ -4070,6 +4087,7 @@ class LLVMCodeGenerator(EzLangVisitor):
                 self.func_return_dict_types[func_name] = ret_dict_types
             param_types = []
             param_names = []
+            param_type_ctxs = []
             params = fn_lit_ctx.paramList()
             if params is not None:
                 for index, p in enumerate(params.param()):
@@ -4079,6 +4097,7 @@ class LLVMCodeGenerator(EzLangVisitor):
                         ptype = ir.PointerType(ptype)
                     param_types.append(ptype)
                     param_names.append(pname)
+                    param_type_ctxs.append(p.type_())
 
             func_type = ir.FunctionType(ret_type, param_types)
             func = ir.Function(self.module, func_type, func_name)
@@ -4086,6 +4105,7 @@ class LLVMCodeGenerator(EzLangVisitor):
                 func.args[i].name = pn
 
             self.func_param_names[func_name] = param_names
+            self.func_param_type_ctxs[func_name] = param_type_ctxs
             self.func_defaults[func_name] = {}
         finally:
             if pushed_context:
@@ -4151,6 +4171,7 @@ class LLVMCodeGenerator(EzLangVisitor):
         param_types = []
         params = fn_lit_ctx.paramList()
         param_names = []
+        param_type_ctxs = []
         if params is not None:
             for index, p in enumerate(params.param()):
                 pname = p.VAR_IDENTIFIER().getText()
@@ -4159,6 +4180,7 @@ class LLVMCodeGenerator(EzLangVisitor):
                     ptype = ir.PointerType(ptype)
                 param_types.append(ptype)
                 param_names.append(pname)
+                param_type_ctxs.append(p.type_())
 
         func_type = ir.FunctionType(ret_type, param_types)
         func = ir.Function(self.module, func_type, name)
@@ -4168,6 +4190,7 @@ class LLVMCodeGenerator(EzLangVisitor):
 
         # 记录参数名和默认值（供调用时具名参数重排和默认参数注入）
         self.func_param_names[name] = param_names
+        self.func_param_type_ctxs[name] = param_type_ctxs
         if params is not None:
             defaults = {}
             for p in params.param():
@@ -7450,6 +7473,11 @@ class LLVMCodeGenerator(EzLangVisitor):
             inner = self._map_type_with_map(ctx.type_(), type_map, unsigned_map, type_name_map)
             return ir.LiteralStructType([ir.PointerType(ir.PointerType(inner)), ir.IntType(64), ir.IntType(64), ir.IntType(64)])
 
+        if isinstance(ctx, P.UnionTypeContext):
+            types = [self._map_type_with_map(t, type_map, unsigned_map, type_name_map) for t in self._union_type_ctxs(ctx)]
+            max_type = max(types, key=lambda t: self._type_width(t))
+            return ir.LiteralStructType([ir.IntType(32), max_type])
+
         if isinstance(ctx, P.FunctionTypeRefContext):
             fn_ctx = ctx.functionType()
             ret_type = self._map_type_with_map(fn_ctx.type_(), type_map, unsigned_map, type_name_map)
@@ -8175,7 +8203,27 @@ class LLVMCodeGenerator(EzLangVisitor):
             return self._make_global_string(decode_string_literal_token(child.STRING_LITERAL().getText()), prefix="_markup_child")
         return None
 
-    def _markup_children_array(self, children) -> ir.Value:
+    def _markup_children_expected_elem_type(self, expected_type: ir.Type | None) -> ir.Type | None:
+        if expected_type is None:
+            return None
+        if isinstance(expected_type, ir.PointerType):
+            expected_type = expected_type.pointee
+        if self._is_list_type(expected_type):
+            return expected_type.elements[0].pointee.pointee
+        return None
+
+    def _markup_children_expected_elem_ctx(self, expected_ctx):
+        if expected_ctx is None:
+            return None
+        if isinstance(expected_ctx, (EzLangParser.ArrayTypeContext, EzLangParser.ListTypeContext)):
+            elem_ctx = expected_ctx.type_()
+            while isinstance(elem_ctx, EzLangParser.ParenTypeContext):
+                elem_ctx = elem_ctx.type_()
+            return elem_ctx
+        return None
+
+    def _markup_children_array(self, children, expected_type: ir.Type | None = None,
+                               line: int | None = None, expected_elem_ctx=None) -> ir.Value:
         values = []
         for child in children:
             value = self._markup_child_value(child)
@@ -8185,7 +8233,9 @@ class LLVMCodeGenerator(EzLangVisitor):
                 value = self.builder.load(value)
             values.append((child, value))
 
-        elem_type = values[0][1].type if values else ir.PointerType(ir.IntType(8))
+        elem_type = self._markup_children_expected_elem_type(expected_type)
+        if elem_type is None:
+            elem_type = values[0][1].type if values else ir.PointerType(ir.IntType(8))
         i64 = ir.IntType(64)
         page_size = 8
         page_count = max((len(values) + page_size - 1) // page_size, 1)
@@ -8210,10 +8260,13 @@ class LLVMCodeGenerator(EzLangVisitor):
 
         for index, (child, value) in enumerate(values):
             if value.type != elem_type:
-                coerced = self._coerce_value(value, elem_type)
+                if expected_elem_ctx is not None and isinstance(expected_elem_ctx, EzLangParser.UnionTypeContext) and self._is_union_type(elem_type):
+                    coerced = self._coerce_union_value(value, elem_type, self._union_variant_tag(expected_elem_ctx, value.type))
+                else:
+                    coerced = self._coerce_value(value, elem_type)
                 if coerced.type != elem_type:
                     self._extern_diagnostics.append(
-                        f"行 {child.start.line}: 标记子节点类型不一致"
+                        f"行 {line or child.start.line}: 参数 'children' 类型不匹配"
                     )
                     value = self._zero_constant(elem_type)
                 else:
@@ -8280,6 +8333,7 @@ class LLVMCodeGenerator(EzLangVisitor):
             return None
 
         expected_names = self.func_param_names.get(tag_name, [])
+        expected_type_ctxs = self.func_param_type_ctxs.get(tag_name, [])
         expected_name_set = set(expected_names)
         provided = {}
         for attr in ctx.markupAttr():
@@ -8287,12 +8341,11 @@ class LLVMCodeGenerator(EzLangVisitor):
             value = self._markup_attr_value(attr)
             if value is not None:
                 provided[attr_name] = value
-        if ctx.markupChild():
-            provided['children'] = self._markup_children_array(ctx.markupChild())
-
         for pname in provided:
             if pname not in expected_name_set:
                 self._extern_diagnostics.append(f"行 {ctx.start.line}: 未知参数 '{pname}'")
+        if ctx.markupChild() and 'children' not in expected_name_set:
+            self._extern_diagnostics.append(f"行 {ctx.start.line}: 未知参数 'children'")
 
         call_args = []
         defaults = self.func_defaults.get(tag_name, {})
@@ -8300,6 +8353,12 @@ class LLVMCodeGenerator(EzLangVisitor):
         if expected_names:
             for index, pname in enumerate(expected_names):
                 param_type = abi_arg_types[index] if index < len(abi_arg_types) else ir.IntType(32)
+                if pname == 'children' and ctx.markupChild() and pname in expected_name_set:
+                    param_ctx = expected_type_ctxs[index] if index < len(expected_type_ctxs) else None
+                    expected_elem_ctx = self._markup_children_expected_elem_ctx(param_ctx)
+                    provided[pname] = self._markup_children_array(
+                        ctx.markupChild(), param_type, ctx.start.line, expected_elem_ctx
+                    )
                 if pname in provided:
                     call_args.append(self._markup_prepare_arg(tag_name, pname, provided[pname], param_type, ctx.start.line))
                 elif pname in defaults:
@@ -10884,6 +10943,18 @@ class LLVMCodeGenerator(EzLangVisitor):
         lhs_list = ctx.equalityExpression()
         if len(lhs_list) == 0:
             return None
+        if_like = self._if_like_operand(lhs_list[-1]) if len(lhs_list) > 1 else None
+        if if_like is not None:
+            left = self._eval(lhs_list[0])
+            for item in lhs_list[1:-1]:
+                left = self._short_circuit(left, [item], 'and')
+            if_ctx, negated = if_like
+            cond = self._short_circuit_eval(
+                left,
+                [lambda if_ctx=if_ctx, negated=negated: self._eval_if_like_condition(if_ctx, negated)],
+                'and',
+            )
+            return self._eval_if_like_with_condition(if_ctx, cond)
         left = self._eval(lhs_list[0])
         return self._short_circuit(left, lhs_list[1:], 'and')
 
@@ -10981,6 +11052,9 @@ class LLVMCodeGenerator(EzLangVisitor):
         if ctx.QUESTION() is None:
             return self._eval(ctx.rangeExpression())
 
+        if self._is_misparsed_prefix_not_conditional(ctx):
+            return self._eval(ctx.rangeExpression())
+
         cond = self._eval(ctx.rangeExpression())
         if cond is None:
             return None
@@ -11018,6 +11092,136 @@ class LLVMCodeGenerator(EzLangVisitor):
             phi.add_incoming(else_val, else_block)
             return phi
         return then_val
+
+    def _is_misparsed_prefix_not_conditional(self, ctx) -> bool:
+        """识别 `!(cond) ? a : b` 被解析成 `!((cond) ? a : b)` 的兼容形状。"""
+        if not isinstance(ctx, EzLangParser.ConditionalExpressionContext) or ctx.QUESTION() is None:
+            return False
+        text = ctx.getText() if hasattr(ctx, 'getText') else ''
+        return text.startswith('!(')
+
+    def _control_flow_dict_literal(self, ctx):
+        if isinstance(ctx, EzLangParser.DictExprContext):
+            return ctx.dictLiteral()
+        if hasattr(ctx, 'getChildCount') and ctx.getChildCount() == 1:
+            return self._control_flow_dict_literal(ctx.getChild(0))
+        return None
+
+    def _eval_control_flow_body(self, ctx):
+        literal = self._control_flow_dict_literal(ctx)
+        if literal is None:
+            return self._eval(ctx)
+        last_value = None
+        for field in literal.dictField():
+            key = field.dictKey()
+            if key is None or key.VAR_IDENTIFIER() is None or field.type_() is not None:
+                return self._eval(ctx)
+            name = key.VAR_IDENTIFIER().getText()
+            val = self._eval(field.expression())
+            if val is None:
+                continue
+            store_val = self.builder.load(val) if self._is_aggregate_ptr(val) else val
+            target = self.locals.get(name) or self.globals.get(name)
+            if target is None:
+                continue
+            store_val = self._emit_locked_assignment(name, target, store_val, None)
+            last_value = store_val
+        return last_value
+
+    def _if_like_operand(self, ctx):
+        if ctx is None:
+            return None
+        if isinstance(ctx, EzLangParser.IfLikeExprContext):
+            return ctx, False
+        if isinstance(ctx, EzLangParser.IfLikePrimaryExprContext):
+            return ctx.ifLikeExpr(), False
+        if isinstance(ctx, EzLangParser.PrefixUnaryExpressionContext) and ctx.BANG() is not None:
+            inner = self._if_like_operand(ctx.unaryExpression())
+            if inner is not None:
+                if_ctx, negated = inner
+                return if_ctx, not negated
+            return None
+        if hasattr(ctx, 'getChildCount') and ctx.getChildCount() == 1:
+            return self._if_like_operand(ctx.getChild(0))
+        return None
+
+    def _eval_if_like_condition(self, ctx: EzLangParser.IfLikeExprContext, negated: bool = False):
+        cond = self._eval(ctx.expression(0))
+        cond = self._truthy_value(cond)
+        return self.builder.not_(cond) if negated else cond
+
+    def _eval_if_like_with_condition(self, ctx: EzLangParser.IfLikeExprContext, cond):
+        if cond is None:
+            return None
+        cond = self._truthy_value(cond)
+
+        then_bb = self.builder.append_basic_block(name="if_then")
+        else_bb = self.builder.append_basic_block(name="if_else")
+        merge_bb = self.builder.append_basic_block(name="if_merge")
+
+        self.builder.cbranch(cond, then_bb, else_bb)
+        then_ctx, else_ctx = self._if_like_branch_ctxs(ctx)
+        eval_branch = self._eval_control_flow_body if else_ctx is None else self._eval
+
+        self.builder.position_at_start(then_bb)
+        then_val = eval_branch(then_ctx) if then_ctx is not None else None
+        then_block = self.builder.block
+        if not then_block.is_terminated:
+            self.builder.branch(merge_bb)
+
+        self.builder.position_at_start(else_bb)
+        else_val = eval_branch(else_ctx) if else_ctx is not None else None
+        else_block = self.builder.block
+        if not else_block.is_terminated:
+            self.builder.branch(merge_bb)
+
+        self.builder.position_at_start(merge_bb)
+        if else_ctx is None:
+            return None
+        if then_val and else_val and then_val.type == else_val.type:
+            phi = self.builder.phi(then_val.type)
+            phi.add_incoming(then_val, then_block)
+            phi.add_incoming(else_val, else_block)
+            return phi
+        return then_val or else_val
+
+    def _short_circuit_eval(self, left, rhs_evaluators, op: str):
+        if self.builder is None or not rhs_evaluators:
+            return left
+
+        b_false = ir.Constant(ir.IntType(1), 0)
+        b_true = ir.Constant(ir.IntType(1), 1)
+        left = self._truthy_value(left)
+
+        for i, rhs_eval in enumerate(rhs_evaluators):
+            rhs_bb = self.builder.append_basic_block(name=f"{op}_rhs")
+            merge_bb = self.builder.append_basic_block(name=f"{op}_merge")
+
+            if op == 'and':
+                skip_val = b_false
+                self.builder.cbranch(left, rhs_bb, merge_bb)
+            else:
+                skip_val = b_true
+                self.builder.cbranch(left, merge_bb, rhs_bb)
+
+            from_block = self.builder.block
+            self.builder.position_at_start(rhs_bb)
+            right = rhs_eval()
+            right = self._truthy_value(right)
+            rhs_block = self.builder.block
+            self.builder.branch(merge_bb)
+
+            self.builder.position_at_start(merge_bb)
+            if right and left.type == right.type:
+                phi = self.builder.phi(left.type)
+                phi.add_incoming(skip_val, from_block)
+                phi.add_incoming(right, rhs_block)
+                left = phi
+            else:
+                left = right or skip_val
+            left = self._truthy_value(left)
+
+        return left
 
     # 表达式入口
     def visitExpression(self, ctx: EzLangParser.ExpressionContext):
@@ -11332,7 +11536,7 @@ class LLVMCodeGenerator(EzLangVisitor):
                 self.loop_continue_blocks.append(next_bb)
                 try:
                     if clause.statement() is not None:
-                        self._eval(clause.statement())
+                        self._eval_control_flow_body(clause.statement())
                     elif clause.block() is not None:
                         self._eval(clause.block())
                 finally:
@@ -11446,7 +11650,7 @@ class LLVMCodeGenerator(EzLangVisitor):
         self.builder.position_at_start(then_bb)
         then_val = None
         if then_ctx is not None:
-            then_val = self._eval(then_ctx)
+            then_val = self._eval_control_flow_body(then_ctx) if else_ctx is None else self._eval(then_ctx)
         then_block = self.builder.block
         if not then_block.is_terminated:
             self.builder.branch(merge_bb)

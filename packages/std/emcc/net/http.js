@@ -206,7 +206,8 @@
     var method = readStr(getValue(reqPtr, '*')) || 'GET';
     var url = readStr(getValue(reqPtr + 8, '*'));
     if (!url) return null;
-    var body = blobBytes(reqPtr + 40);
+    var hasBody = !!HEAPU8[reqPtr + 40];
+    var body = hasBody ? blobBytes(reqPtr + 48) : new Uint8Array(0);
     if (body === null) return null;
     return {
       method: method,
@@ -233,11 +234,13 @@
   }
 
   function allocRequest(req, body) {
-    var ptr = _malloc(56);
+    var ptr = _malloc(64);
     setValue(ptr, stringToNewUTF8((req && req.method) || 'GET'), '*');
     setValue(ptr + 8, stringToNewUTF8(requestUrl(req)), '*');
     writeDict(ptr + 16, requestHeaders(req));
-    writeBlob(ptr + 40, body || new Uint8Array(0));
+    HEAPU8[ptr + 40] = 1;
+    for (var i = 41; i < 48; i++) HEAPU8[ptr + i] = 0;
+    writeBlob(ptr + 48, body || new Uint8Array(0));
     return ptr;
   }
 

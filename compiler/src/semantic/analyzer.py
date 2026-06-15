@@ -70,6 +70,15 @@ class SemanticAnalyzer(EzLangVisitor):
 
     # ==================== 辅助方法 ====================
 
+    def _union_type_ctxs(self, union_ctx) -> list:
+        """把左递归解析得到的联合类型上下文展平为源码顺序。"""
+        if not isinstance(union_ctx, EzLangParser.UnionTypeContext):
+            return [union_ctx]
+        result = []
+        for child_ctx in union_ctx.type_():
+            result.extend(self._union_type_ctxs(child_ctx))
+        return result
+
     def _get_type_from_ctx(self, type_ctx) -> Optional[Type]:
         """从类型上下文中提取类型信息（支持复合类型）"""
         if type_ctx is None:
@@ -89,10 +98,29 @@ class SemanticAnalyzer(EzLangVisitor):
                 result.element_type = inner
                 return result
 
+        if isinstance(type_ctx, EzLangParser.ListTypeContext):
+            inner = self._get_type_from_ctx(type_ctx.type_())
+            if inner:
+                result = Type(kind=TypeKind.LIST, name=f"List<{inner.name}>")
+                result.element_type = inner
+                return result
+
+        if isinstance(type_ctx, EzLangParser.VecTypeContext):
+            inner = self._get_type_from_ctx(type_ctx.type_())
+            if inner:
+                size = int(type_ctx.INTEGER_LITERAL().getText()) if type_ctx.INTEGER_LITERAL() is not None else 0
+                result = Type(kind=TypeKind.VEC, name=f"Vec<{inner.name}>[{size}]")
+                result.element_type = inner
+                result.vec_size = size
+                return result
+
         if isinstance(type_ctx, EzLangParser.UnionTypeContext):
             result = Type(kind=TypeKind.UNION, name="union")
-            result.union_types = [self._get_type_from_ctx(t) for t in type_ctx.type_()]
+            result.union_types = [self._get_type_from_ctx(t) for t in self._union_type_ctxs(type_ctx)]
             return result
+
+        if isinstance(type_ctx, EzLangParser.ParenTypeContext):
+            return self._get_type_from_ctx(type_ctx.type_())
 
         # 指针类型 *T。当前运行时按裸指针处理，语义阶段保留指向类型。
         if isinstance(type_ctx, EzLangParser.PointerTypeContext):
@@ -130,7 +158,7 @@ class SemanticAnalyzer(EzLangVisitor):
             types = type_ctx.type_()
             if isinstance(types, list) and len(types) >= 2:
                 result = Type(kind=TypeKind.UNION, name="union")
-                result.union_types = [self._get_type_from_ctx(t) for t in types]
+                result.union_types = [self._get_type_from_ctx(t) for t in self._union_type_ctxs(type_ctx)]
                 return result
 
         # 数组类型 Type[]
@@ -1306,6 +1334,13 @@ class SemanticAnalyzer(EzLangVisitor):
         return ctx.getChild(0).accept(self) if ctx.getChildCount() > 0 else None
 
     def visitAndExpression(self, ctx: EzLangParser.AndExpressionContext) -> Optional[Type]:
+        exprs = list(ctx.equalityExpression()) if ctx.equalityExpression() else []
+        if len(exprs) > 1 and self._if_like_operand(exprs[-1]) is not None:
+            for expr in exprs[:-1]:
+                expr.accept(self)
+            if_ctx, _negated = self._if_like_operand(exprs[-1])
+            self._visit_if_like_condition(if_ctx)
+            return self._visit_if_like_branches(if_ctx, statement_context=False)
         if self._has_token(ctx, 'AND'):
             return self._binop_type(ctx)
         return ctx.getChild(0).accept(self) if ctx.getChildCount() > 0 else None
@@ -1343,6 +1378,12 @@ class SemanticAnalyzer(EzLangVisitor):
         return postfix.accept(self) if postfix is not None else None
 
     def visitPrefixUnaryExpression(self, ctx: EzLangParser.PrefixUnaryExpressionContext) -> Optional[Type]:
+        if ctx.BANG() is not None:
+            if_like = self._if_like_operand(ctx)
+            if if_like is not None:
+                if_ctx, _negated = if_like
+                self._visit_if_like_condition(if_ctx)
+                return self._visit_if_like_branches(if_ctx, statement_context=False)
         inner = ctx.unaryExpression()
         inner_type = inner.accept(self) if inner is not None else None
         if ctx.BANG() is not None:
@@ -1760,11 +1801,89 @@ class SemanticAnalyzer(EzLangVisitor):
         result = None
         if ctx.getChildCount() > 0:
             result = ctx.getChild(0).accept(self)  # rangeExpression
+        if self._is_misparsed_prefix_not_conditional(ctx):
+            return Type(name="Bool", kind=TypeKind.BASIC)
         if ctx.QUESTION() is not None:
             cond_exprs = ctx.conditionalExpression()
             if cond_exprs is not None and len(cond_exprs) > 1:
                 result = cond_exprs[1].accept(self)  # else 分支
         return result
+
+    def _is_misparsed_prefix_not_conditional(self, ctx) -> bool:
+        """识别 `!(cond) ? a : b` 被解析成 `!((cond) ? a : b)` 的兼容形状。"""
+        if not isinstance(ctx, EzLangParser.ConditionalExpressionContext) or ctx.QUESTION() is None:
+            return False
+        text = ctx.getText() if hasattr(ctx, 'getText') else ''
+        return text.startswith('!(')
+
+    def _control_flow_dict_literal(self, ctx):
+        if isinstance(ctx, EzLangParser.DictExprContext):
+            return ctx.dictLiteral()
+        if hasattr(ctx, 'getChildCount') and ctx.getChildCount() == 1:
+            return self._control_flow_dict_literal(ctx.getChild(0))
+        return None
+
+    def _visit_control_flow_body(self, ctx) -> Optional[Type]:
+        literal = self._control_flow_dict_literal(ctx)
+        if literal is None:
+            return ctx.accept(self) if ctx is not None else None
+        last_type = None
+        for field in literal.dictField():
+            key = field.dictKey()
+            if key is None or key.VAR_IDENTIFIER() is None or field.type_() is not None:
+                return ctx.accept(self)
+            name = key.VAR_IDENTIFIER().getText()
+            symbol = self.symbols.resolve(name)
+            if symbol is None:
+                self.symbols.add_error(f"行 {field.start.line}: 未定义的变量 '{name}'")
+                continue
+            if not symbol.mutable:
+                self.symbols.add_error(f"行 {field.start.line}: 不能修改常量 '{name}'")
+            value_type = self._with_expected_expr_type(symbol.type, field.expression())
+            if symbol.type is not None and value_type is not None:
+                self._check_type_compat(symbol.type, value_type, field, "赋值类型")
+            last_type = symbol.type
+        return last_type
+
+    def _if_like_operand(self, ctx):
+        if ctx is None:
+            return None
+        if isinstance(ctx, EzLangParser.IfLikeExprContext):
+            return ctx, False
+        if isinstance(ctx, EzLangParser.IfLikePrimaryExprContext):
+            return ctx.ifLikeExpr(), False
+        if isinstance(ctx, EzLangParser.PrefixUnaryExpressionContext) and ctx.BANG() is not None:
+            inner = self._if_like_operand(ctx.unaryExpression())
+            if inner is not None:
+                if_ctx, negated = inner
+                return if_ctx, not negated
+            return None
+        if hasattr(ctx, 'getChildCount') and ctx.getChildCount() == 1:
+            return self._if_like_operand(ctx.getChild(0))
+        return None
+
+    def _visit_if_like_condition(self, ctx: EzLangParser.IfLikeExprContext) -> Optional[Type]:
+        cond_type = ctx.expression(0).accept(self) if ctx.expression(0) is not None else None
+        if cond_type and cond_type.name != "Bool" and cond_type.name != "unknown":
+            self.symbols.add_warning(
+                f"行 {ctx.start.line}: 条件表达式应为 Bool 类型，当前为 '{cond_type}'"
+            )
+        return cond_type
+
+    def _visit_if_like_branches(self, ctx: EzLangParser.IfLikeExprContext, statement_context: bool) -> Optional[Type]:
+        then_type = None
+        else_type = None
+        then_ctx, else_ctx = self._if_like_branch_ctxs(ctx)
+        if then_ctx is not None:
+            then_type = self._visit_control_flow_body(then_ctx) if statement_context and else_ctx is None else then_ctx.accept(self)
+        if else_ctx is not None:
+            else_type = else_ctx.accept(self)
+        if then_type is not None and else_type is not None:
+            if then_type.name != else_type.name:
+                self.symbols.add_warning(
+                    f"行 {ctx.start.line}: 条件分支类型不一致：'{then_type}' 和 '{else_type}'"
+                )
+        return then_type or else_type
 
     def visitRangeExpression(self, ctx: EzLangParser.RangeExpressionContext) -> Optional[Type]:
         if ctx.getChildCount() > 0:
@@ -1932,27 +2051,8 @@ class SemanticAnalyzer(EzLangVisitor):
 
     def visitIfLikeExpr(self, ctx: EzLangParser.IfLikeExprContext) -> Optional[Type]:
         """类 if 表达式: (cond) ? a : b"""
-        if ctx.expression(0) is not None:
-            cond_type = ctx.expression(0).accept(self)
-            if cond_type and cond_type.name != "Bool" and cond_type.name != "unknown":
-                self.symbols.add_warning(
-                    f"行 {ctx.start.line}: 条件表达式应为 Bool 类型，当前为 '{cond_type}'"
-                )
-        # 判断分支类型的一致性
-        then_type = None
-        else_type = None
-        then_ctx, else_ctx = self._if_like_branch_ctxs(ctx)
-        if then_ctx is not None:
-            then_type = then_ctx.accept(self)
-        if else_ctx is not None:
-            else_type = else_ctx.accept(self)
-
-        if then_type is not None and else_type is not None:
-            if then_type.name != else_type.name:
-                self.symbols.add_warning(
-                    f"行 {ctx.start.line}: 条件分支类型不一致：'{then_type}' 和 '{else_type}'"
-                )
-        return then_type or else_type
+        self._visit_if_like_condition(ctx)
+        return self._visit_if_like_branches(ctx, statement_context=True)
 
     def visitLoopExpr(self, ctx: EzLangParser.LoopExprContext) -> Optional[Type]:
         """循环表达式"""
@@ -2080,6 +2180,32 @@ class SemanticAnalyzer(EzLangVisitor):
         result.element_type = element_type or Type(name="Str", kind=TypeKind.BASIC)
         return result
 
+    def _check_markup_children_against_expected(self, ctx, expected: Optional[Type]) -> None:
+        """按工厂函数的 children 元素类型逐项检查标记子节点。"""
+        if expected is None or expected.kind not in (TypeKind.ARRAY, TypeKind.LIST):
+            actual = self._markup_children_type(ctx)
+            if expected and actual and not expected.compatible_with(actual):
+                self.symbols.add_error(
+                    f"行 {ctx.start.line}: 参数 'children' 类型不匹配：期望 '{expected}'，实际 '{actual}'"
+                )
+            return
+        elem_expected = expected.element_type
+        actual = self._markup_children_type(ctx) if elem_expected is None else None
+        if elem_expected is None:
+            return
+        for child in ctx.markupChild():
+            child_type = None
+            if child.markupLiteral() is not None:
+                child_type = self.visitMarkupLiteral(child.markupLiteral())
+            elif child.expression() is not None:
+                child_type = child.expression().accept(self)
+            elif child.STRING_LITERAL() is not None:
+                child_type = Type(name="Str", kind=TypeKind.BASIC)
+            if child_type is not None and not elem_expected.compatible_with(child_type):
+                self.symbols.add_error(
+                    f"行 {ctx.start.line}: 参数 'children' 类型不匹配：期望元素 '{elem_expected}'，实际 '{child_type}'"
+                )
+
     def visitMarkupExpr(self, ctx: EzLangParser.MarkupExprContext) -> Optional[Type]:
         return self.visitMarkupLiteral(ctx.markupLiteral())
 
@@ -2115,11 +2241,7 @@ class SemanticAnalyzer(EzLangVisitor):
                 if 'children' in func_type.param_names:
                     idx = func_type.param_names.index('children')
                     expected = func_type.param_types[idx] if idx < len(func_type.param_types) else None
-                    actual = self._markup_children_type(ctx)
-                    if expected and actual and not expected.compatible_with(actual):
-                        self.symbols.add_error(
-                            f"行 {ctx.start.line}: 参数 'children' 类型不匹配：期望 '{expected}'，实际 '{actual}'"
-                        )
+                    self._check_markup_children_against_expected(ctx, expected)
                 else:
                     self._markup_children_type(ctx)
                     self.symbols.add_error(f"行 {ctx.start.line}: 未知参数 'children'")
@@ -2327,7 +2449,7 @@ class SemanticAnalyzer(EzLangVisitor):
         if ctx.expression() is not None:
             ctx.expression().accept(self)
         if ctx.statement() is not None:
-            ctx.statement().accept(self)
+            self._visit_control_flow_body(ctx.statement())
         if ctx.block() is not None:
             ctx.block().accept(self)
         return None
