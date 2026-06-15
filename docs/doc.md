@@ -87,7 +87,7 @@ let inferred = identity(42)  // 推断为 I32
   * List 数组：所有数组均为动态数组。支持 `List<Type>`，语法上可以直接使用 `Type[]`。
     可以使用 `typeof Type[]` 语法来显式获取 `List` 类型。
   * 向量：`Vec<Type>[N]`（SIMD 向量，N 为 2, 4, 8, 16，Type 为数值类型）。它表示寄存器内的 SIMD 向量。
-  * 函数类型：`(name: Type, ...) => ReturnType`。
+  * 函数类型：`(name: Type, ...) => ReturnType`。函数值按闭包值处理，可保存普通函数、匿名函数、柯里化结果和捕获外层变量的函数。
   * 可选类型：`Type?`。底层为 `Option<T>`，访问时使用 `expr?` 或强制拆包 `Type! expr`。
   * 联合类型：`Type1 | Type2`。必须通过模式匹配或类型检查区分具体分支。
 * **类型别名与鸭子类型**：
@@ -105,7 +105,7 @@ let inferred = identity(42)  // 推断为 I32
 * 无符号类型映射为相应无符号 LLVM 整数。
 * `Type[]` / `List<Type>` 映射为分页数组 ABI：`{ Type** pages, i64 length, i64 capacity, i64 page_count }`，索引时先按固定页大小定位页，再访问页内元素。
 * `Vec<Type>[N]` 映射为 LLVM `<N x Type>`。
-* `Fn` 映射为函数指针。
+* 函数类型在 EzLang 内部映射为闭包值：`{ invoke, env }`。`invoke` 是带环境指针的调用入口，`env` 保存捕获环境；传给 `declare` 外部 C ABI 时，零捕获普通函数可降低为 C 函数指针。
 * 可选类型映射为 `{ i1 has_value, T value }`。
 * 联合类型映射为带 tag 的变体结构。
 * 泛型通过单态化实现，每个具体类型实例在编译时生成独立 LLVM 函数或类型替换。
@@ -134,7 +134,7 @@ let user = User(name = "s", id = 1);
 let user2 = User(id = 2); // name 使用默认值
 let user3 = User(...user, age = 20);
 
-// 内置结构体：Date, Error, Blob
+// 内置结构体：Date, Error, Blob, Meta<T>
 struct Date {
     timestamp: I64;
 
@@ -163,11 +163,19 @@ struct Error {
 }
 
 struct Blob {
+    data: *U8;
     size: I64;
-    data: *I8;
 
-    get(this: Blob, index: I64) => I8;
+    get(this: Blob, index: I64) => U8;
     slice(this: Blob, start: I64, len: I64) => Blob;
+}
+
+struct Meta<T> {
+    value: T;
+    getter: () => T;
+    setter: (value: T) => Void;
+    type: Str;
+    name: Str;
 }
 ```
 
@@ -175,10 +183,13 @@ struct Blob {
 * **结构体基础**：定义支持 `struct Name<T> { ...Base?; field: Type = default?; method = (this: Type, args...) => expr?; }`。支持名称参数初始化与默认字段值。结构体使用静态布局。
 * **组合与复用**：`...Base` 将基础结构体字段平铺到当前结构体开头，实现布局复用。实例化时复制基础结构的内存并写入新增字段。
 * **类型检查与方法**：每个结构体隐式包含 `I32` 类型标识，用于 `typeof` 和运行时检查。方法是内联函数，`this` 显式绑定到实例。
-* **内置结构体**：提供语言层面的通用数据结构封装。
+* **内置结构体与内置类型**：提供语言层面的通用数据结构封装。这些类型由编译器预声明，不需要从标准库导入。
   * `Date` 提供时间戳存储、基础的时间加减与格式化。
   * `Error` 封装错误代码、信息、抛出点文件/行/列和轻量调用栈片段，方便统一异常处理与诊断输出。
   * `Blob` 提供二进制块长度和底层指针访问能力。
+  * `Dict` 是字典的运行时承载类型，用户通常通过 `{ key: Type; ... }` 形状或 `Dict<K, V>` 使用。
+  * `List<T>` / `T[]` 是动态数组类型。
+  * `Meta<T>` 是装饰器变量的元对象类型，保存原始值、读写拦截闭包、类型名和变量名。
 
 ### LLVM 映射
 * 结构体映射为平铺的 LLVM 结构体类型。
@@ -187,7 +198,8 @@ struct Blob {
 * 内置结构体映射：
   * `Date` 可优化为单一 timestamp 型（通常为 i64）。
   * `Error` 映射为 `{ i32 code, i8* message, i8* file, i32 line, i32 column, i8* trace }`。
-  * `Blob` 映射为 `{ i64 size, i8* data }`。
+  * `Blob` 映射为 `{ i8* data, i64 size }`。
+  * `Meta<T>` 映射为 `{ T value, Closure<T()> getter, Closure<Void(T)> setter, i8* type, i8* name }`。
 
 ---
 
@@ -244,6 +256,15 @@ const walk = (x: I32): I32 => {
 
 // 柯里化与参数占位
 let addTwo = fn(a = 2, b = ?)
+
+// 捕获闭包
+const makeAdder = (base: I32): (x: I32) => I32 => {
+    return (x: I32): I32 => {
+        return base + x
+    }
+}
+let add10 = makeAdder(base = 10)
+let value = add10(x = 5)
 ```
 
 ### 语义说明与规范
@@ -251,11 +272,12 @@ let addTwo = fn(a = 2, b = ?)
 * 函数调用支持位置参数和命名参数混用（如 `fn(1, c = 3)`），位置参数需位于具名参数之前。
 * 形参可声明默认值，调用时省略该参数即使用默认值。
 * 函数体使用 `{ ... }` block 时，必须通过 `return` 显式返回值，最后一个表达式不会隐式作为返回值。
-* `?` 占位符支持部分应用与柯里化，生成等待剩余参数的函数。
+* 匿名函数可以捕获当前作用域内使用到的局部变量，生成闭包值。捕获环境存放在当前 Arena 中，因此闭包应遵循普通 Arena 生命周期规则，不应在捕获环境已结束后跨作用域长期保存。
+* `?` 占位符支持部分应用与柯里化，生成等待剩余参数的闭包。
 
 ### LLVM 映射
 * 具名参数在编译期重排以生成标准 `call`。
-* 柯里化生成闭包结构体，并在 Arena 中存储捕获的变量。
+* 函数值生成闭包结构体 `{ invoke, env }`；匿名函数和柯里化结果在 Arena 中存储捕获的变量，调用时先取出 `invoke` 与 `env` 再执行。
 
 ---
 
@@ -464,12 +486,14 @@ declare static version: Str
 from "std/io" import { print }
 
 // 元编程：装饰器
-const setX = (meta: Meta<I32>, v: I32): Void => {
-    print(msg = "writing...")
-    meta.value = v
-}
 const log = (this: Meta<I32>): Void => {
-    this.setter = setX
+    this.getter = (): I32 => {
+        return this.value + 10
+    }
+    this.setter = (v: I32): Void => {
+        print(msg = "writing...")
+        this.value = v
+    }
 }
 @log let x = 1
 x = 2 // 触发拦截打印
@@ -507,7 +531,12 @@ let isError = typeof err & Error == Error
 ```
 
 ### 语义说明与规范
-* **元编程与装饰器**：`@Dec` 将变量包装为 `Meta<T>`。`Meta<T>` 包含 `value`, `getter`, `setter`, `type`, `name`，访问时通过函数指针调用拦截逻辑。
+* **元编程与装饰器**：`@Dec` 将顶层变量包装为 `Meta<T>` 并在模块初始化阶段调用装饰器函数。装饰器函数接收 `Meta<T>` 或 `this: Meta<T>`，可读写 `value`, `getter`, `setter`, `type`, `name`。
+  * `value` 是被装饰变量的真实存储。
+  * `getter` 是 `() => T` 闭包；未设置时读取直接返回 `value`。
+  * `setter` 是 `(value: T) => Void` 闭包；未设置时写入直接更新 `value`。
+  * `type` 与 `name` 是编译器生成的类型名和变量名，供诊断、日志和元编程使用。
+  * 装饰器可以是泛型函数，编译器会按被装饰变量类型单态化。
 * **标记语法**：XML 风格标记语法只会 lowering 为普通函数调用。作用域内必须存在同名工厂函数，编译器会将属性按具名参数传入，并把子节点打包为 `children` 数组；若不存在同名工厂函数、属性类型不匹配或 `children` 类型不匹配，语义分析会直接报错。
 * **管道与插值**：管道 `->` 配合 `%` 占位符重写为命名参数调用（如 `a -> fn(x = %)` 重写为 `fn(x = a)`）；字符串插值编译为最小内存复制拼接逻辑。
 * **类型安全机制**：
@@ -515,7 +544,7 @@ let isError = typeof err & Error == Error
   * `typeof`：基于结构体头部的 TypeID 进行快速类型判断，返回运行时结构体类型标识或结构体类型，而非类型别名。
 
 ### LLVM 映射
-* 装饰器生成 `Meta<T>` 结构体，按值传递，拦截逻辑表现为 `call` 指令调用 `getter`/`setter`。
+* 装饰器生成 `Meta<T>` 结构体，`getter`/`setter` 使用闭包槽保存；读写被装饰变量时，如果闭包入口不为空则调用闭包，否则直接读写 `value`。
 * 标记语法必须找到同名工厂函数并生成普通 `call` 指令，属性按函数参数名重排，子节点通过当前数组/List ABI 传给 `children`；无工厂函数或参数类型不匹配时是编译错误。管道语法在编译前端翻译展开；字符串插值生成相应的内存复制拼接逻辑。
 * `Type! expr` 映射为位级重解释（`bitcast`）或 `load` 操作。
 * `typeof` 映射为通过结构体内部隐含的 TypeID 进行数值比较。

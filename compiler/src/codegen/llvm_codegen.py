@@ -114,7 +114,89 @@ class LLVMCodeGenerator(EzLangVisitor):
         self._struct_type_build_stack: list[str] = []
         self._decorated_globals: set[str] = set()
         self._decorator_init_functions: list[ir.Function] = []
+        self._closure_types: dict[str, ir.LiteralStructType] = {}
+        self._closure_invokers: dict[str, ir.Function] = {}
+        self._function_literal_counter = 0
         self._declare_builtins()
+
+    def _closure_key(self, ret_type: ir.Type, param_types: list[ir.Type]) -> str:
+        return str(ir.FunctionType(ret_type, [ir.PointerType(ir.IntType(8))] + param_types))
+
+    def _closure_type(self, ret_type: ir.Type, param_types: list[ir.Type]) -> ir.LiteralStructType:
+        key = self._closure_key(ret_type, param_types)
+        existing = self._closure_types.get(key)
+        if existing is not None:
+            return existing
+        i8_ptr = ir.PointerType(ir.IntType(8))
+        invoke_type = ir.PointerType(ir.FunctionType(ret_type, [i8_ptr] + param_types))
+        closure_type = ir.LiteralStructType([invoke_type, i8_ptr])
+        self._closure_types[key] = closure_type
+        return closure_type
+
+    def _is_closure_type(self, typ: ir.Type) -> bool:
+        if not isinstance(typ, ir.LiteralStructType) or len(typ.elements) != 2:
+            return False
+        invoke_ptr, env_ptr = typ.elements
+        return (
+            isinstance(invoke_ptr, ir.PointerType)
+            and isinstance(invoke_ptr.pointee, ir.FunctionType)
+            and len(invoke_ptr.pointee.args) >= 1
+            and invoke_ptr.pointee.args[0] == ir.PointerType(ir.IntType(8))
+            and env_ptr == ir.PointerType(ir.IntType(8))
+        )
+
+    def _closure_signature(self, closure_type: ir.Type) -> tuple[ir.Type, list[ir.Type]] | None:
+        if not self._is_closure_type(closure_type):
+            return None
+        invoke_type = closure_type.elements[0].pointee
+        return invoke_type.return_type, list(invoke_type.args[1:])
+
+    def _closure_from_function(self, func: ir.Function, target_type: ir.Type | None = None) -> ir.Value:
+        func_type = func.function_type
+        if target_type is not None and self._is_closure_type(target_type):
+            signature = self._closure_signature(target_type)
+            ret_type, param_types = signature if signature is not None else (func_type.return_type, list(func_type.args))
+        else:
+            ret_type, param_types = func_type.return_type, list(func_type.args)
+            target_type = self._closure_type(ret_type, param_types)
+        invoke_type = target_type.elements[0].pointee
+        if func.type == target_type.elements[0]:
+            invoke = func
+        else:
+            invoke = self._get_plain_function_closure_invoker(func, invoke_type)
+        i8_ptr = ir.PointerType(ir.IntType(8))
+        value = ir.Constant(target_type, ir.Undefined)
+        value = self.builder.insert_value(value, invoke, 0)
+        value = self.builder.insert_value(value, ir.Constant(i8_ptr, None), 1)
+        return value
+
+    def _get_plain_function_closure_invoker(self, func: ir.Function, invoke_type: ir.FunctionType) -> ir.Function:
+        key = f"{func.name}:{invoke_type}"
+        cached = self._closure_invokers.get(key)
+        if cached is not None:
+            return cached
+        base_name = re.sub(r'[^0-9A-Za-z_]', '_', func.name)
+        name = f"{base_name}_closure_invoke"
+        counter = 0
+        while name in self.module.globals:
+            counter += 1
+            name = f"{base_name}_closure_invoke_{counter}"
+        invoker = ir.Function(self.module, invoke_type, name)
+        self._closure_invokers[key] = invoker
+        old_builder = self.builder
+        old_func = self.current_function
+        block = invoker.append_basic_block('entry')
+        self.builder = ir.IRBuilder(block)
+        self.current_function = invoker
+        args = [arg for arg in invoker.args[1:]]
+        if isinstance(func.function_type.return_type, ir.VoidType):
+            self.builder.call(func, args)
+            self.builder.ret_void()
+        else:
+            self.builder.ret(self.builder.call(func, args))
+        self.builder = old_builder
+        self.current_function = old_func
+        return invoker
 
     def _declare_builtins(self):
         """声明 LLVM 内建函数和内置结构体类型"""
@@ -1656,14 +1738,12 @@ class LLVMCodeGenerator(EzLangVisitor):
             if ptl is not None:
                 for p in ptl.paramType():
                     param_types.append(self._map_type(p.type_()))
-            func_type = ir.FunctionType(ret_type, param_types)
-            return ir.PointerType(func_type)
+            return self._closure_type(ret_type, param_types)
 
         # 泛型函数类型: <T> => Ret（无参数）
         if isinstance(ctx, P.GenericFunctionTypeContext):
             ret_type = self._map_type(ctx.type_())
-            func_type = ir.FunctionType(ret_type, [])
-            return ir.PointerType(func_type)
+            return self._closure_type(ret_type, [])
 
         # 泛型参数函数类型: <T>(params) => Ret（带参数，用于 declare）
         if isinstance(ctx, P.GenericParamFunctionTypeContext):
@@ -1673,8 +1753,7 @@ class LLVMCodeGenerator(EzLangVisitor):
             if ptl is not None:
                 for p in ptl.paramType():
                     param_types.append(self._map_type(p.type_()))
-            func_type = ir.FunctionType(ret_type, param_types)
-            return ir.PointerType(func_type)
+            return self._closure_type(ret_type, param_types)
 
         # typeof 类型: typeof expr → 编译时类型查询（暂返回 i32）
         if isinstance(ctx, P.TypeofTypeContext):
@@ -1824,8 +1903,8 @@ class LLVMCodeGenerator(EzLangVisitor):
         meta_type = self.context.get_identified_type(meta_name)
         if meta_type.is_opaque:
             i8_ptr = ir.PointerType(ir.IntType(8))
-            func_ptr = ir.PointerType(ir.FunctionType(value_type, [ir.PointerType(meta_type)]))
-            setter_ptr = ir.PointerType(ir.FunctionType(ir.VoidType(), [ir.PointerType(meta_type), value_type]))
+            func_ptr = self._closure_type(value_type, [])
+            setter_ptr = self._closure_type(ir.VoidType(), [value_type])
             meta_type.set_body(value_type, func_ptr, setter_ptr, i8_ptr, i8_ptr)
         self.structs[meta_name] = meta_type
         self.struct_fields[meta_name] = ['value', 'getter', 'setter', 'type', 'name']
@@ -1855,6 +1934,14 @@ class LLVMCodeGenerator(EzLangVisitor):
         self.globals[name] = gv
         self._decorated_globals.add(name)
         self._remember_type_name(name, value.type, value=value, global_scope=True)
+        if decorator_name in self.generic_templates:
+            decorator_name = self._monomorphize(
+                decorator_name,
+                [value.type],
+                [self._type_name(value.type)],
+                [False],
+                [self._type_name_from_ir_type(value.type)],
+            )
         decorator = self.module.globals.get(decorator_name)
         if isinstance(decorator, ir.Function):
             init_name = f"__decorator_init_{name}"
@@ -1909,7 +1996,8 @@ class LLVMCodeGenerator(EzLangVisitor):
     def _load_decorated_global(self, name: str, meta_ptr: ir.Value) -> ir.Value:
         value_ptr = self._meta_value_ptr(meta_ptr)
         getter = self.builder.load(self._meta_getter_ptr(meta_ptr), name=f'_{name}_getter')
-        has_getter = self.builder.icmp_unsigned('!=', getter, ir.Constant(getter.type, None), name=f'_{name}_has_getter')
+        getter_invoke = self.builder.extract_value(getter, 0, name=f'_{name}_getter_invoke')
+        has_getter = self.builder.icmp_unsigned('!=', getter_invoke, ir.Constant(getter_invoke.type, None), name=f'_{name}_has_getter')
         value_type = meta_ptr.type.pointee.elements[0]
         result_ptr = self.builder.alloca(value_type, name=f'_{name}_read')
         call_block = self.builder.append_basic_block(f'{name}_getter_call')
@@ -1918,7 +2006,7 @@ class LLVMCodeGenerator(EzLangVisitor):
         self.builder.cbranch(has_getter, call_block, raw_block)
 
         self.builder.position_at_start(call_block)
-        self.builder.store(self.builder.call(getter, [meta_ptr], name=f'_{name}_got'), result_ptr)
+        self.builder.store(self._call_closure(getter, []), result_ptr)
         self.builder.branch(done_block)
 
         self.builder.position_at_start(raw_block)
@@ -1944,14 +2032,15 @@ class LLVMCodeGenerator(EzLangVisitor):
             store_val = self._coerce_preserve_unsigned(store_val, value_type)
 
         setter = self.builder.load(self._meta_setter_ptr(meta_ptr), name=f'_{name}_setter')
-        has_setter = self.builder.icmp_unsigned('!=', setter, ir.Constant(setter.type, None), name=f'_{name}_has_setter')
+        setter_invoke = self.builder.extract_value(setter, 0, name=f'_{name}_setter_invoke')
+        has_setter = self.builder.icmp_unsigned('!=', setter_invoke, ir.Constant(setter_invoke.type, None), name=f'_{name}_has_setter')
         call_block = self.builder.append_basic_block(f'{name}_setter_call')
         raw_block = self.builder.append_basic_block(f'{name}_setter_raw')
         done_block = self.builder.append_basic_block(f'{name}_setter_done')
         self.builder.cbranch(has_setter, call_block, raw_block)
 
         self.builder.position_at_start(call_block)
-        self.builder.call(setter, [meta_ptr, store_val])
+        self._call_closure(setter, [store_val])
         self.builder.branch(done_block)
 
         self.builder.position_at_start(raw_block)
@@ -2178,6 +2267,11 @@ class LLVMCodeGenerator(EzLangVisitor):
 
     def _c_abi_param_type(self, param_type: ir.Type) -> ir.Type:
         """外部 C ABI 参数类型：聚合按指针传递，函数指针递归按 C ABI 降低。"""
+        if self._is_closure_type(param_type):
+            signature = self._closure_signature(param_type)
+            if signature is not None:
+                ret_type, param_types = signature
+                return self._c_abi_function_pointer_type(ir.PointerType(ir.FunctionType(ret_type, param_types)))
         if isinstance(param_type, ir.PointerType) and isinstance(param_type.pointee, ir.FunctionType):
             return self._c_abi_function_pointer_type(param_type)
         if isinstance(param_type, (ir.LiteralStructType, ir.IdentifiedStructType)):
@@ -2209,6 +2303,11 @@ class LLVMCodeGenerator(EzLangVisitor):
         return self.builder.load(raw_slot, name="_callback_abi_ret")
 
     def _coerce_call_arg(self, arg: ir.Value, target_type: ir.Type) -> ir.Value:
+        if self._is_closure_type(target_type):
+            if isinstance(arg, ir.Function):
+                return self._closure_from_function(arg, target_type)
+            if isinstance(arg, ir.Value) and arg.type == target_type:
+                return arg
         callback = self._coerce_c_abi_callback_arg(arg, target_type)
         if callback is not None:
             return callback
@@ -2216,6 +2315,8 @@ class LLVMCodeGenerator(EzLangVisitor):
 
     def _coerce_c_abi_callback_arg(self, arg: ir.Value, target_type: ir.Type) -> ir.Value | None:
         if not (isinstance(target_type, ir.PointerType) and isinstance(target_type.pointee, ir.FunctionType)):
+            return None
+        if isinstance(arg, ir.Value) and self._is_closure_type(arg.type):
             return None
         if isinstance(arg, ir.Function):
             source_ptr_type = arg.type
@@ -2333,6 +2434,11 @@ class LLVMCodeGenerator(EzLangVisitor):
 
     def _coerce_value(self, val: ir.Value, target_type: ir.Type) -> ir.Value:
         """值类型自动适配：可选类型/联合类型自动包装"""
+        if self._is_closure_type(target_type):
+            if isinstance(val, ir.Function):
+                return self._closure_from_function(val, target_type)
+            if isinstance(val, ir.Value) and val.type == target_type:
+                return val
         if val.type == target_type:
             return val
         if self._is_aggregate_ptr(val) and val.type.pointee == target_type:
@@ -7454,6 +7560,9 @@ class LLVMCodeGenerator(EzLangVisitor):
                 if name == 'List':
                     inner = self._map_type_with_map(args[0], type_map, unsigned_map, type_name_map) if args else ir.IntType(32)
                     return ir.LiteralStructType([ir.PointerType(ir.PointerType(inner)), ir.IntType(64), ir.IntType(64), ir.IntType(64)])
+                if name == 'Meta':
+                    inner = self._map_type_with_map(args[0], type_map, unsigned_map, type_name_map) if args else ir.IntType(32)
+                    return self._get_meta_type(inner)
             return self._map_type(ctx)
 
         # 可选类型: T? → {i1, T}
@@ -7486,7 +7595,7 @@ class LLVMCodeGenerator(EzLangVisitor):
             if ptl is not None:
                 for p in ptl.paramType():
                     param_types.append(self._map_type_with_map(p.type_(), type_map, unsigned_map, type_name_map))
-            return ir.PointerType(ir.FunctionType(ret_type, param_types))
+            return self._closure_type(ret_type, param_types)
 
         return self._map_type(ctx)
 
@@ -8783,6 +8892,116 @@ class LLVMCodeGenerator(EzLangVisitor):
                     return result
         return None
 
+    def _function_literal_param_info(self, fn_lit) -> tuple[ir.Type, list[str], list[ir.Type]]:
+        ret_type = self._map_type(fn_lit.type_()) if fn_lit.type_() is not None else self._infer_function_literal_return_type(fn_lit)
+        param_names: list[str] = []
+        param_types: list[ir.Type] = []
+        params = fn_lit.paramList()
+        if params is not None:
+            for param in params.param():
+                param_names.append(param.VAR_IDENTIFIER().getText())
+                param_types.append(self._map_type(param.type_()) if param.type_() is not None else ir.IntType(32))
+        return ret_type, param_names, param_types
+
+    def _function_literal_capture_names(self, fn_lit, param_names: set[str]) -> list[str]:
+        names: list[str] = []
+        seen: set[str] = set()
+
+        def add(name: str) -> None:
+            if name in seen or name in param_names:
+                return
+            if name in self.locals:
+                seen.add(name)
+                names.append(name)
+
+        def walk(node) -> None:
+            if node is None:
+                return
+            if node is not fn_lit and isinstance(node, EzLangParser.FunctionLiteralContext):
+                return
+            if isinstance(node, EzLangParser.IdentifierExprContext):
+                token = node.VAR_IDENTIFIER() or node.TYPE_IDENTIFIER()
+                if token is not None:
+                    add(token.getText())
+                return
+            if hasattr(node, 'getChildCount'):
+                for i in range(node.getChildCount()):
+                    walk(node.getChild(i))
+
+        walk(fn_lit.block() or fn_lit.expression())
+        return names
+
+    def visitFnLiteralExpr(self, ctx: EzLangParser.FnLiteralExprContext):
+        return self._gen_function_literal_closure(ctx.functionLiteral())
+
+    def _gen_function_literal_closure(self, fn_lit) -> ir.Value:
+        ret_type, param_names, param_types = self._function_literal_param_info(fn_lit)
+        closure_type = self._closure_type(ret_type, param_types)
+        capture_names = self._function_literal_capture_names(fn_lit, set(param_names))
+        capture_types: list[ir.Type] = []
+        capture_values: list[ir.Value] = []
+        for name in capture_names:
+            storage = self.locals.get(name)
+            if storage is None:
+                continue
+            capture_types.append(storage.type)
+            capture_values.append(storage)
+
+        env_type = ir.LiteralStructType(capture_types) if capture_types else ir.LiteralStructType([])
+        env_ptr = self._arena_allocate(env_type, name='_closure_env')
+        for index, value in enumerate(capture_values):
+            slot = self.builder.gep(env_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), index)], inbounds=True)
+            self.builder.store(value, slot)
+        env_i8 = self.builder.bitcast(env_ptr, ir.PointerType(ir.IntType(8)))
+
+        invoke_type = closure_type.elements[0].pointee
+        name = f"__lambda_{self._function_literal_counter}"
+        self._function_literal_counter += 1
+        invoke = ir.Function(self.module, invoke_type, name)
+        invoke.args[0].name = '__env'
+        for index, pname in enumerate(param_names):
+            invoke.args[index + 1].name = pname
+
+        old_builder = self.builder
+        old_func = self.current_function
+        old_locals = self.locals
+        old_type_names = self._locals_type_names
+        old_method_this = self._method_this
+        old_stack = self._function_return_type_ctx_stack
+
+        block = invoke.append_basic_block('entry')
+        self.builder = ir.IRBuilder(block)
+        self.current_function = invoke
+        self.locals = {}
+        self._locals_type_names = {}
+        self._method_this = None
+        self._function_return_type_ctx_stack = [fn_lit.type_()]
+        throw_exit = invoke.append_basic_block('throw_exit')
+        self._function_throw_exit_stack.append(throw_exit)
+
+        typed_env = self.builder.bitcast(invoke.args[0], ir.PointerType(env_type), name='_closure_env_typed')
+        for index, cap_name in enumerate(capture_names):
+            slot = self.builder.gep(typed_env, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), index)], inbounds=True)
+            self.locals[cap_name] = self.builder.load(slot, name=cap_name)
+        for index, pname in enumerate(param_names):
+            self._bind_function_param(pname, param_types[index], invoke.args[index + 1])
+
+        body = fn_lit.block() or fn_lit.expression()
+        value = self._eval(body) if body is not None else None
+        self._finish_function_with_throw_exit(ret_type, value)
+
+        self.builder = old_builder
+        self.current_function = old_func
+        self.locals = old_locals
+        self._locals_type_names = old_type_names
+        self._method_this = old_method_this
+        self._function_return_type_ctx_stack = old_stack
+
+        closure = ir.Constant(closure_type, ir.Undefined)
+        closure = self.builder.insert_value(closure, invoke, 0)
+        closure = self.builder.insert_value(closure, env_i8, 1)
+        return closure
+
     # ==================== SIMD 向量 ====================
 
     def visitVecLiteral(self, ctx: EzLangParser.VecLiteralContext):
@@ -9127,6 +9346,11 @@ class LLVMCodeGenerator(EzLangVisitor):
             call_args.extend(positional_values)
             call_args.extend(provided.values())
 
+        closure_call = self._call_closure(func, call_args)
+        if closure_call is not None:
+            self._emit_throw_check_after_call()
+            return closure_call
+
         # 检查是否为编译器内建函数
         intrinsic_result = self._try_gen_intrinsic_call(func_name, call_args)
         if intrinsic_result is not None:
@@ -9310,7 +9534,39 @@ class LLVMCodeGenerator(EzLangVisitor):
     def _is_callable_value(value) -> bool:
         if isinstance(value, ir.Function):
             return True
-        return isinstance(value, ir.Value) and isinstance(value.type, ir.PointerType) and isinstance(value.type.pointee, ir.FunctionType)
+        if isinstance(value, ir.Value) and isinstance(value.type, ir.PointerType) and isinstance(value.type.pointee, ir.FunctionType):
+            return True
+        return isinstance(value, ir.Value) and LLVMCodeGenerator._static_is_closure_value_type(value.type)
+
+    @staticmethod
+    def _static_is_closure_value_type(typ: ir.Type) -> bool:
+        if isinstance(typ, ir.PointerType):
+            typ = typ.pointee
+        if not isinstance(typ, ir.LiteralStructType) or len(typ.elements) != 2:
+            return False
+        invoke_ptr, env_ptr = typ.elements
+        return (
+            isinstance(invoke_ptr, ir.PointerType)
+            and isinstance(invoke_ptr.pointee, ir.FunctionType)
+            and len(invoke_ptr.pointee.args) >= 1
+            and invoke_ptr.pointee.args[0] == ir.PointerType(ir.IntType(8))
+            and env_ptr == ir.PointerType(ir.IntType(8))
+        )
+
+    def _call_closure(self, closure: ir.Value, args: list[ir.Value]) -> ir.Value | None:
+        if closure is None or not isinstance(closure, ir.Value):
+            return None
+        if isinstance(closure.type, ir.PointerType) and self._is_closure_type(closure.type.pointee):
+            closure_value = self.builder.load(closure, name='_closure_value')
+        elif self._is_closure_type(closure.type):
+            closure_value = closure
+        else:
+            return None
+        invoke = self.builder.extract_value(closure_value, 0, name='_closure_invoke')
+        env = self.builder.extract_value(closure_value, 1, name='_closure_env')
+        invoke_type = invoke.type.pointee
+        coerced = [self._coerce_call_arg(arg, invoke_type.args[i + 1]) if i + 1 < len(invoke_type.args) else arg for i, arg in enumerate(args)]
+        return self.builder.call(invoke, [env] + coerced)
 
     def _blob_data_ptr(self, value: ir.Value) -> ir.Value:
         """提取 Blob.data 指针，供 std/mem 内建函数操作底层字节。"""
