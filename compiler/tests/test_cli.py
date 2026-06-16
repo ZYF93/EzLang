@@ -6812,6 +6812,37 @@ def test_fmt_check_parses_ez_files(tmp_path, capsys):
     assert "checked 1 file" in out
 
 
+def test_fmt_check_does_not_compile_ez_files(tmp_path, monkeypatch, capsys):
+    project_toml = write_project(tmp_path)
+    source = tmp_path / "src" / "index.ez"
+    source.write_text(
+        'let value: I32 = 1;\n',
+        encoding="utf-8",
+    )
+
+    def fail_compile_load():
+        raise AssertionError("fmt 不应加载完整编译器")
+
+    monkeypatch.setattr(ez, "_load_compiler_modules", fail_compile_load)
+
+    assert ez.main(["fmt", "--project", str(project_toml), "--check", str(source)]) == 0
+
+    out = capsys.readouterr().out
+    assert "checked 1 file" in out
+
+
+def test_fmt_reports_syntax_errors(tmp_path, capsys):
+    project_toml = write_project(tmp_path)
+    source = tmp_path / "src" / "index.ez"
+    source.write_text("let value: I32 = ;\n", encoding="utf-8")
+
+    assert ez.main(["fmt", "--project", str(project_toml), "--check", str(source)]) == 1
+
+    err = capsys.readouterr().err
+    assert str(source) in err
+    assert "行" in err
+
+
 
 def test_fmt_rewrites_single_file(tmp_path, capsys):
     project_toml = write_project(tmp_path)
@@ -6820,9 +6851,138 @@ def test_fmt_rewrites_single_file(tmp_path, capsys):
 
     assert ez.main(["fmt", "--project", str(project_toml), str(source)]) == 0
 
-    assert source.read_text(encoding="utf-8") == "let $x: I32 = 1;\nconst main = (): I32 => {\n    return $x;\n}\n"
+    assert source.read_text(encoding="utf-8") == "let $x: I32 = 1;\nconst main = (): I32 => {return $x;}\n"
     out = capsys.readouterr().out
     assert "formatted 1 file" in out
+
+
+def test_fmt_preserves_comments_and_keeps_imports_single_line(tmp_path, capsys):
+    project_toml = write_project(tmp_path)
+    source = tmp_path / "src" / "index.ez"
+    source.write_text(
+        'from "std/fmt" import {\n    format, toString\n};\n'
+        '// 输出函数\n'
+        'println(msg = format(template = "count = {}", args = countArgs));\n'
+        '// 压缩后的坏形态 export declare const print:( msg: Str) => Void;\n'
+        '/* 多行\n   注释 */\n'
+        'const value=toString<I32>(value = count);\n'
+        'const text= "a+b => c";\n',
+        encoding="utf-8",
+    )
+
+    assert ez.main(["fmt", "--project", str(project_toml), str(source)]) == 0
+
+    assert source.read_text(encoding="utf-8") == (
+        'from "std/fmt" import { format, toString };\n'
+        '// 输出函数\n'
+        'println(msg = format(template = "count = {}", args = countArgs));\n'
+        '// 压缩后的坏形态\n'
+        'export declare const print: (msg: Str) => Void;\n'
+        '/* 多行\n'
+        '注释 */\n'
+        'const value = toString<I32>(value = count);\n'
+        'const text = "a+b => c";\n'
+    )
+
+    assert "formatted 1 file" in capsys.readouterr().out
+
+
+def test_fmt_preserves_compound_assignment_and_optional_types(tmp_path, capsys):
+    project_toml = write_project(tmp_path)
+    source = tmp_path / "src" / "index.ez"
+    source.write_text(
+        'let count:I32=40;\n'
+        'count += 2;\n'
+        'export declare const readLine: () => Str?;\n'
+        'return count == 42 ? 0:1;\n',
+        encoding="utf-8",
+    )
+
+    assert ez.main(["fmt", "--project", str(project_toml), str(source)]) == 0
+
+    assert source.read_text(encoding="utf-8") == (
+        'let count: I32 = 40;\n'
+        'count += 2;\n'
+        'export declare const readLine: () => Str?;\n'
+        'return count == 42 ? 0 : 1;\n'
+    )
+
+    assert "formatted 1 file" in capsys.readouterr().out
+
+
+def test_fmt_preserves_unary_minus_without_breaking_subtraction(tmp_path, capsys):
+    project_toml = write_project(tmp_path)
+    source = tmp_path / "src" / "index.ez"
+    source.write_text(
+        'const one=-1;\n'
+        'const two = -value;\n'
+        'const three = a-1;\n'
+        'return -1;\n',
+        encoding="utf-8",
+    )
+
+    assert ez.main(["fmt", "--project", str(project_toml), str(source)]) == 0
+
+    assert source.read_text(encoding="utf-8") == (
+        'const one = -1;\n'
+        'const two = -value;\n'
+        'const three = a - 1;\n'
+        'return -1;\n'
+    )
+
+    assert "formatted 1 file" in capsys.readouterr().out
+
+
+def test_fmt_indents_multiline_array_items(tmp_path, capsys):
+    project_toml = write_project(tmp_path)
+    source = tmp_path / "src" / "index.ez"
+    source.write_text(
+        'const args: Str[] = [\n'
+        'toString<I32>(value = named),\n'
+        'toString<I32>(value = defaulted),\n'
+        '];\n',
+        encoding="utf-8",
+    )
+
+    assert ez.main(["fmt", "--project", str(project_toml), str(source)]) == 0
+
+    assert source.read_text(encoding="utf-8") == (
+        'const args: Str[] = [\n'
+        '    toString<I32>(value = named),\n'
+        '    toString<I32>(value = defaulted),\n'
+        '];\n'
+    )
+
+    assert "formatted 1 file" in capsys.readouterr().out
+
+
+def test_fmt_indents_multiline_call_array_argument_once(tmp_path, capsys):
+    project_toml = write_project(tmp_path)
+    source = tmp_path / "src" / "index.ez"
+    source.write_text(
+        'const value = flow {\n'
+        'const fastest = race(pl = [\n'
+        '() => { sleep(ms = 40); return 1; },\n'
+        '() => { sleep(ms = 5); return 2; },\n'
+        '], timeout = 200);\n'
+        'return fastest;\n'
+        '};\n',
+        encoding="utf-8",
+    )
+
+    assert ez.main(["fmt", "--project", str(project_toml), str(source)]) == 0
+
+    assert source.read_text(encoding="utf-8") == (
+        'const value = flow {\n'
+        '    const fastest = race(pl = [\n'
+        '        () => { sleep(ms = 40); return 1; },\n'
+        '        () => { sleep(ms = 5); return 2; },\n'
+        '    ], timeout = 200);\n'
+        '    return fastest;\n'
+        '};\n'
+    )
+
+    assert "formatted 1 file" in capsys.readouterr().out
 
 
 
@@ -6861,6 +7021,21 @@ def test_fmt_without_paths_formats_current_directory_tree(tmp_path, monkeypatch,
     assert project_entry.read_text(encoding="utf-8") == "let   projectValue:I32=1;\n"
     out = capsys.readouterr().out
     assert "formatted 2 files" in out
+
+
+def test_fmt_without_paths_skips_ez_cache_directory(tmp_path, monkeypatch, capsys):
+    project_toml = write_project(tmp_path)
+    cache_dir = tmp_path / ".ez"
+    cache_dir.mkdir()
+    (cache_dir / "cache.ez").write_text("let   cached:I32=1;\n", encoding="utf-8")
+    source = tmp_path / "main.ez"
+    source.write_text("let value: I32 = 1;\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+
+    assert ez.main(["fmt", "--project", str(project_toml), "--check"]) == 0
+
+    out = capsys.readouterr().out
+    assert "checked 2 files" in out
 
 
 

@@ -5,7 +5,17 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from lsp.server import EzLanguageServer, analyze_document, definition_at, document_symbols, format_document, index_document
+from lsp.server import (
+    EzLanguageServer,
+    analyze_document,
+    declaration_at,
+    definition_at,
+    document_symbols,
+    format_document,
+    index_document,
+    inlay_hints,
+    semantic_tokens,
+)
 
 
 def test_lsp_reports_syntax_diagnostic(tmp_path):
@@ -91,7 +101,7 @@ def test_lsp_document_symbols_include_top_level_declarations(tmp_path):
 def test_lsp_format_document_reuses_cli_formatter():
     formatted = format_document('let value:I32=1;\nloop {value=value+1;}\n')
 
-    assert formatted == 'let value: I32 = 1;\nloop {\n    value = value + 1;\n}\n'
+    assert formatted == 'let value: I32 = 1;\nloop {value = value + 1;}\n'
 
 
 def test_lsp_initialize_advertises_editor_features():
@@ -101,4 +111,60 @@ def test_lsp_initialize_advertises_editor_features():
     assert capabilities["definitionProvider"] is True
     assert capabilities["documentSymbolProvider"] is True
     assert capabilities["documentFormattingProvider"] is True
+    assert capabilities["inlayHintProvider"] is True
     assert "completionProvider" in capabilities
+
+
+def test_lsp_hover_metadata_uses_std_comments(tmp_path):
+    source = 'from "std/io" import { println };\nprintln(msg = "ok");\n'
+
+    declaration = declaration_at(source, "println", tmp_path, ROOT)
+
+    assert declaration is not None
+    assert "追加换行" in declaration.documentation
+    assert "println" in declaration.signature
+
+
+def test_lsp_hover_metadata_includes_struct_definition():
+    source = '// 用户数据。\nstruct User {\n    name: Str;\n    age: I32;\n};\nlet value: User;\n'
+
+    declaration = declaration_at(source, "User", Path.cwd(), ROOT)
+
+    assert declaration is not None
+    assert "struct User" in declaration.definition
+    assert "name: Str" in declaration.definition
+    assert "用户数据" in declaration.documentation
+
+
+def test_lsp_semantic_tokens_marks_named_argument_and_suspend(tmp_path):
+    source = '''
+from "std/io" import { println, readLine };
+const main = (): Void => {
+    println(msg = "ok");
+    readLine();
+};
+'''
+
+    tokens = semantic_tokens(source, tmp_path, ROOT)
+
+    assert tokens
+    assert len(tokens) % 5 == 0
+    assert 0 in tokens[3::5]
+    assert 3 in tokens[4::5]
+
+
+def test_lsp_inlay_hint_marks_suspend_source_and_transitive_function(tmp_path):
+    source = '''
+from "std/io" import { readLine };
+const readName = (): Str? => {
+    return readLine();
+};
+const main = (): Void => {
+    readName();
+};
+'''
+
+    hints = inlay_hints(source, tmp_path, ROOT)
+    labels = [hint["label"].strip() for hint in hints]
+
+    assert labels.count("suspend") >= 2

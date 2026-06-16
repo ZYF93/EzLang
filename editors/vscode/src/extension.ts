@@ -23,7 +23,12 @@ export function activate(context: vscode.ExtensionContext): void {
 
   client = new LanguageClient('ezlang', 'EzLang Language Server', serverOptions, clientOptions);
   context.subscriptions.push(client);
-  client.start();
+  client.start().catch((error: unknown) => {
+    const detail = error instanceof Error ? error.message : String(error);
+    vscode.window.showErrorMessage(
+      `EzLang LSP 启动失败，hover、跳转定义、suspend 标志和语义着色不可用。请确认已安装 ez-lsp，或配置 ezlang.server.command。${detail ? `错误: ${detail}` : ''}`
+    );
+  });
 }
 
 export function deactivate(): Thenable<void> | undefined {

@@ -198,7 +198,7 @@ EOF
         register_profile_file "$HOME/.bash_profile"
         register_profile_file "$HOME/.profile"
     fi
-    PATH_STATUS="已写入 $PROFILE_SNIPPET，并注册到 $PROFILE_STATUS"
+    PATH_STATUS="已写入 ${PROFILE_SNIPPET}，并注册到 ${PROFILE_STATUS}"
 }
 
 require_python

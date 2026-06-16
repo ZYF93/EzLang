@@ -95,6 +95,10 @@ SYMBOL_KIND_STRUCT = 23
 SYMBOL_KIND_TYPE = 26
 DIAGNOSTIC_ERROR = 1
 DIAGNOSTIC_WARNING = 2
+SEMANTIC_TOKEN_TYPES = ["parameter", "function", "class", "type", "keyword"]
+SEMANTIC_TOKEN_MODIFIERS = ["declaration", "readonly", "modification", "async"]
+SEMANTIC_TOKEN_TYPE_INDEX = {name: index for index, name in enumerate(SEMANTIC_TOKEN_TYPES)}
+SEMANTIC_TOKEN_MODIFIER_INDEX = {name: index for index, name in enumerate(SEMANTIC_TOKEN_MODIFIERS)}
 
 DECLARATION_PATTERNS = [
     (re.compile(r"\b(?:export\s+)?struct\s+([A-Z][A-Za-z0-9_]*)"), SymbolKind.STRUCT),
@@ -104,6 +108,15 @@ DECLARATION_PATTERNS = [
 ]
 IMPORT_RE = re.compile(r'\bfrom\s+"([^"]+)"\s+import\s*\{([^}]*)\}', re.S)
 IMPORT_PREFIX_RE = re.compile(r'from\s+"([^"]+)"\s+import\s*\{[^}]*$')
+SUSPEND_SOURCES = {
+    "sleep", "fetch", "fetchEx", "readFile", "writeFile", "appendFile", "start",
+    "tcpConnect", "tcpConnectTimeout", "tcpTlsConnect", "tcpTlsRead", "tcpTlsWrite",
+    "tcpListen", "tcpAccept", "tcpAcceptTimeout", "tcpRead", "tcpReadTimeout",
+    "tcpWrite", "tcpWriteTimeout", "udpBind", "udpRecvFrom", "udpRecvFromTimeout",
+    "udpRecvTimeout", "udpSendTimeout", "wsConnect", "wsRecv", "streamRead",
+    "streamWrite", "streamCopy", "processExec", "processSpawn", "processWait", "readLine",
+}
+CALL_RE = re.compile(r'\b([a-z_][A-Za-z0-9_]*|\$[A-Za-z0-9_]+)\s*(?:<[^>]+>\s*)?\(')
 
 
 @dataclass
@@ -122,6 +135,10 @@ class Declaration:
     character: int
     end_character: int
     uri: str | None = None
+    signature: str = ""
+    documentation: str = ""
+    suspend: bool = False
+    definition: str = ""
 
     def location(self, fallback_uri: str) -> dict[str, Any]:
         uri = self.uri or fallback_uri
@@ -237,6 +254,10 @@ class EzLanguageServer:
                 return self._response(message, self._document_symbol(message.get("params") or {}))
             if method == "textDocument/formatting":
                 return self._response(message, self._formatting(message.get("params") or {}))
+            if method == "textDocument/inlayHint":
+                return self._response(message, self._inlay_hint(message.get("params") or {}))
+            if method == "textDocument/semanticTokens/full":
+                return self._response(message, self._semantic_tokens(message.get("params") or {}))
             if method == "shutdown":
                 self.shutdown_requested = True
                 return self._response(message, None)
@@ -267,6 +288,11 @@ class EzLanguageServer:
                 "definitionProvider": True,
                 "documentSymbolProvider": True,
                 "documentFormattingProvider": True,
+                "inlayHintProvider": True,
+                "semanticTokensProvider": {
+                    "legend": {"tokenTypes": SEMANTIC_TOKEN_TYPES, "tokenModifiers": SEMANTIC_TOKEN_MODIFIERS},
+                    "full": True,
+                },
             },
             "serverInfo": {"name": "ezlang-lsp", "version": "0.1.0"},
         }
@@ -309,6 +335,9 @@ class EzLanguageServer:
         token_label = TOKEN_TYPES.get(word.upper())
         if token_label:
             return {"contents": {"kind": "markdown", "value": f"`{word}`\n\nEzLang {token_label}"}}
+        declaration = declaration_at(text, word, self._base_dir_for_uri(uri, text), self.workspace_root)
+        if declaration is not None:
+            return {"contents": {"kind": "markdown", "value": _declaration_markdown(declaration)}}
         _, analyzer = analyze_document(text, base_dir=self._base_dir_for_uri(uri, text))
         if analyzer is not None:
             symbol = analyzer.symbols.global_scope.symbols.get(word)
@@ -342,6 +371,16 @@ class EzLanguageServer:
         if formatted == text:
             return []
         return [{"range": _full_document_range(text), "newText": formatted}]
+
+    def _inlay_hint(self, params: dict[str, Any]) -> list[dict[str, Any]]:
+        uri = ((params.get("textDocument") or {}).get("uri")) or ""
+        text = self._document_text(uri) or ""
+        return inlay_hints(text, self._base_dir_for_uri(uri, text), self.workspace_root)
+
+    def _semantic_tokens(self, params: dict[str, Any]) -> dict[str, Any]:
+        uri = ((params.get("textDocument") or {}).get("uri")) or ""
+        text = self._document_text(uri) or ""
+        return {"data": semantic_tokens(text, self._base_dir_for_uri(uri, text), self.workspace_root)}
 
     def _document_text(self, uri: str) -> str | None:
         if uri in self.documents:
@@ -404,6 +443,23 @@ def definition_at(source: str, uri: str, line: int, character: int, base_dir: Pa
     return None
 
 
+def declaration_at(source: str, word: str, base_dir: Path, workspace_root: Path) -> Declaration | None:
+    """查找当前文件或 import 目标里的声明元数据。"""
+    local = index_document(source).get(word)
+    if local is not None:
+        return local
+    for binding in _import_bindings(source):
+        if binding.name != word:
+            continue
+        module_file = _resolve_module_path(binding.module, base_dir, workspace_root)
+        if module_file is None:
+            continue
+        imported = _index_file(module_file).get(binding.source_name)
+        if imported is not None:
+            return imported
+    return None
+
+
 def document_symbols(source: str, uri: str) -> list[dict[str, Any]]:
     """生成 VS Code 大纲使用的文档符号。"""
     return [_declaration_symbol(decl, uri) for decl in index_document(source, uri).values()]
@@ -416,10 +472,91 @@ def format_document(source: str) -> str:
     return _format_ez_source(source)
 
 
+def inlay_hints(source: str, base_dir: Path, workspace_root: Path) -> list[dict[str, Any]]:
+    """生成参数名和 suspend source 提示。"""
+    hints: list[dict[str, Any]] = []
+    suspend_names = _suspend_names_for_document(source, base_dir, workspace_root)
+    for line_number, line in enumerate(source.splitlines()):
+        for match in CALL_RE.finditer(line):
+            name = match.group(1)
+            args_text, _ = _call_args_on_line(line, match.end() - 1)
+            if args_text is None:
+                continue
+            if name in suspend_names:
+                hints.append({
+                    "position": {"line": line_number, "character": match.end(1)},
+                    "label": " suspend",
+                    "kind": 1,
+                    "tooltip": "suspend source：在 flow 中会传播挂起语义",
+                    "paddingLeft": True,
+                })
+    return hints
+
+
+def _suspend_names_for_document(source: str, base_dir: Path, workspace_root: Path) -> set[str]:
+    suspend_names = set(SUSPEND_SOURCES)
+    for binding in _import_bindings(source):
+        module_file = _resolve_module_path(binding.module, base_dir, workspace_root)
+        if module_file is None:
+            continue
+        declaration = _index_file(module_file).get(binding.source_name)
+        if declaration is not None and declaration.suspend:
+            suspend_names.add(binding.name)
+
+    changed = True
+    while changed:
+        changed = False
+        for name, body in _function_bodies(source).items():
+            if name in suspend_names:
+                continue
+            if any(re.search(rf'\b{re.escape(suspend_name)}\s*(?:<[^>]+>\s*)?\(', body) for suspend_name in suspend_names):
+                suspend_names.add(name)
+                changed = True
+    return suspend_names
+
+
+def _function_bodies(source: str) -> dict[str, str]:
+    bodies: dict[str, str] = {}
+    pattern = re.compile(r'\b(?:let|const)\s+([a-z_][A-Za-z0-9_]*|\$[A-Za-z0-9_]+)\s*(?:<[^>]+>\s*)?=\s*\([^)]*\)\s*(?::[^=]+)?=>\s*\{', re.S)
+    for match in pattern.finditer(source):
+        body_start = match.end()
+        body_end = _matching_brace(source, body_start - 1)
+        if body_end is not None:
+            bodies[match.group(1)] = source[body_start:body_end]
+    return bodies
+
+
+def _matching_brace(source: str, open_index: int) -> int | None:
+    depth = 0
+    in_string = False
+    escape = False
+    for index in range(open_index, len(source)):
+        ch = source[index]
+        if in_string:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+            continue
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return index
+    return None
+
+
 def index_document(source: str, uri: str | None = None) -> dict[str, Declaration]:
     """轻量索引当前文件的顶层声明。"""
     declarations: dict[str, Declaration] = {}
-    for line_number, line in enumerate(source.splitlines()):
+    lines = source.splitlines()
+    for line_number, line in enumerate(lines):
         stripped = line.lstrip()
         offset = len(line) - len(stripped)
         for pattern, kind in DECLARATION_PATTERNS:
@@ -429,6 +566,9 @@ def index_document(source: str, uri: str | None = None) -> dict[str, Declaration
             name = match.group(1).split(".")[-1]
             actual_kind = _declaration_kind_from_line(stripped, kind, match.end(1))
             start = offset + match.start(1) + match.group(1).rfind(name)
+            definition = _definition_snippet(source, line_number, actual_kind, offset + match.start(0))
+            signature = _signature_from_definition(definition or stripped)
+            documentation = _join_documentation(_leading_doc(lines, line_number), _inline_doc_before(stripped[:match.start(0)]))
             declarations[name] = Declaration(
                 name=name,
                 kind=actual_kind,
@@ -436,9 +576,190 @@ def index_document(source: str, uri: str | None = None) -> dict[str, Declaration
                 character=start,
                 end_character=start + len(name),
                 uri=uri,
+                signature=signature,
+                documentation=documentation,
+                suspend=_is_suspend_source(name, stripped),
+                definition=definition,
             )
             break
     return declarations
+
+
+def _signature_from_line(line: str) -> str:
+    signature = re.sub(r"^export\s+", "", line.strip()).rstrip(";")
+    signature = re.sub(r"\s*=>\s*.*$", "", signature)
+    return signature
+
+
+def _signature_from_definition(definition: str) -> str:
+    first_line = definition.strip().splitlines()[0] if definition.strip() else ""
+    return _signature_from_line(first_line)
+
+
+def _definition_snippet(source: str, line_number: int, kind: SymbolKind, declaration_start: int | None = None) -> str:
+    lines = source.splitlines()
+    if line_number < 0 or line_number >= len(lines):
+        return ""
+    start_offset = sum(len(line) + 1 for line in lines[:line_number])
+    if declaration_start is not None:
+        start_offset += declaration_start - (len(lines[line_number]) - len(lines[line_number].lstrip()))
+    line = lines[line_number]
+    stripped = source[start_offset:source.find("\n", start_offset) if source.find("\n", start_offset) >= 0 else len(source)].strip()
+    if kind == SymbolKind.STRUCT:
+        open_index = source.find("{", start_offset)
+        if open_index >= 0:
+            close_index = _matching_brace(source, open_index)
+            if close_index is not None:
+                end = close_index + 1
+                if end < len(source) and source[end:end + 1] == ";":
+                    end += 1
+                return source[start_offset:end].strip()
+    if kind == SymbolKind.FUNCTION:
+        arrow = source.find("=>", start_offset)
+        if arrow >= 0:
+            brace = source.find("{", arrow)
+            line_end = source.find("\n", start_offset)
+            line_end = len(source) if line_end < 0 else line_end
+            if brace >= 0 and brace < line_end + 1:
+                return source[start_offset:brace].strip()
+    return stripped
+
+
+def _inline_doc_before(prefix: str) -> str:
+    comments = [part.strip() for part in prefix.split("//") if part.strip()]
+    docs = [comment for comment in comments if not comment.startswith("===")]
+    return "\n".join(docs)
+
+
+def _join_documentation(*parts: str) -> str:
+    return "\n".join(part for part in parts if part)
+
+
+def _leading_doc(lines: list[str], line_number: int) -> str:
+    docs: list[str] = []
+    index = line_number - 1
+    while index >= 0:
+        stripped = lines[index].strip()
+        if stripped.startswith("//"):
+            text = stripped[2:].strip()
+            if not text.startswith("==="):
+                docs.append(text)
+            index -= 1
+            continue
+        if stripped == "":
+            index -= 1
+            continue
+        break
+    docs.reverse()
+    return "\n".join(docs)
+
+
+def _is_suspend_source(name: str, line: str) -> bool:
+    if name in SUSPEND_SOURCES:
+        return True
+    return "@suspend" in line or "suspend source" in line or "挂起" in line
+
+
+def _declaration_markdown(declaration: Declaration) -> str:
+    signature = declaration.definition or declaration.signature or declaration.name
+    lines = [f"```ez\n{signature}\n```"]
+    if declaration.suspend:
+        lines.append("`suspend source`：在 `flow` 中会传播挂起语义。")
+    if declaration.documentation:
+        lines.append(declaration.documentation)
+    return "\n\n".join(lines)
+
+
+def semantic_tokens(source: str, base_dir: Path, workspace_root: Path) -> list[int]:
+    """生成 VS Code semantic token，用于参数名、类型、函数和 suspend 调用着色。"""
+    raw_tokens: list[tuple[int, int, int, str, list[str]]] = []
+    suspend_names = _suspend_names_for_document(source, base_dir, workspace_root)
+    known_types = set(TYPE_COMPLETIONS)
+    known_types.update(name for name, decl in index_document(source).items() if decl.kind in (SymbolKind.STRUCT, SymbolKind.TYPE_ALIAS))
+    for binding in _import_bindings(source):
+        module_file = _resolve_module_path(binding.module, base_dir, workspace_root)
+        if module_file is None:
+            continue
+        declaration = _index_file(module_file).get(binding.source_name)
+        if declaration is not None and declaration.kind in (SymbolKind.STRUCT, SymbolKind.TYPE_ALIAS):
+            known_types.add(binding.name)
+
+    for line_number, line in enumerate(source.splitlines()):
+        for match in re.finditer(r'\b(struct|type)\s+([A-Z][A-Za-z0-9_]*)', line):
+            raw_tokens.append((line_number, match.start(1), len(match.group(1)), "keyword", []))
+            token_type = "class" if match.group(1) == "struct" else "type"
+            raw_tokens.append((line_number, match.start(2), len(match.group(2)), token_type, ["declaration"]))
+        for match in re.finditer(r'\b(?:export\s+)?(?:(declare)\s+)?(let|const|static)\s+([a-z_][A-Za-z0-9_]*|\$[A-Za-z0-9_]+)', line):
+            if match.group(1):
+                raw_tokens.append((line_number, match.start(1), len(match.group(1)), "keyword", []))
+            raw_tokens.append((line_number, match.start(2), len(match.group(2)), "keyword", []))
+            suffix = line[match.end(3):]
+            token_type = "function" if re.match(r'\s*(?:<[^>]+>\s*)?=\s*\(', suffix) or match.group(1) else "parameter"
+            modifiers = ["declaration"]
+            if match.group(2) == "const":
+                modifiers.append("readonly")
+            raw_tokens.append((line_number, match.start(3), len(match.group(3)), token_type, modifiers))
+        for match in CALL_RE.finditer(line):
+            modifiers = ["async"] if match.group(1) in suspend_names else []
+            raw_tokens.append((line_number, match.start(1), len(match.group(1)), "function", modifiers))
+            args_text, args_start = _call_args_on_line(line, match.end() - 1)
+            if args_text is not None:
+                for arg_match in re.finditer(r'\b([a-z_][A-Za-z0-9_]*|\$[A-Za-z0-9_]+)(?=\s*=)(?!\s*=>)', args_text):
+                    raw_tokens.append((line_number, args_start + arg_match.start(1), len(arg_match.group(1)), "parameter", []))
+        for match in re.finditer(r'\b([A-Z][A-Za-z0-9_]*)\b', line):
+            name = match.group(1)
+            if name in known_types or name in TYPE_COMPLETIONS:
+                raw_tokens.append((line_number, match.start(1), len(name), "type", []))
+    return _encode_semantic_tokens(raw_tokens)
+
+
+def _encode_semantic_tokens(tokens: list[tuple[int, int, int, str, list[str]]]) -> list[int]:
+    encoded: list[int] = []
+    previous_line = 0
+    previous_start = 0
+    seen: set[tuple[int, int, int]] = set()
+    for line, start, length, token_type, modifiers in sorted(tokens):
+        key = (line, start, length)
+        if key in seen or length <= 0:
+            continue
+        seen.add(key)
+        delta_line = line - previous_line
+        delta_start = start - previous_start if delta_line == 0 else start
+        modifier_bits = 0
+        for modifier in modifiers:
+            modifier_index = SEMANTIC_TOKEN_MODIFIER_INDEX.get(modifier)
+            if modifier_index is not None:
+                modifier_bits |= 1 << modifier_index
+        encoded.extend([delta_line, delta_start, length, SEMANTIC_TOKEN_TYPE_INDEX[token_type], modifier_bits])
+        previous_line = line
+        previous_start = start
+    return encoded
+
+
+def _call_args_on_line(line: str, open_paren: int) -> tuple[str | None, int]:
+    depth = 0
+    in_string = False
+    escape = False
+    for index in range(open_paren, len(line)):
+        ch = line[index]
+        if in_string:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+            continue
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                return line[open_paren + 1:index], open_paren + 1
+    return None, open_paren + 1
 
 
 def _declaration_kind_from_line(line: str, fallback: SymbolKind, name_end: int) -> SymbolKind:

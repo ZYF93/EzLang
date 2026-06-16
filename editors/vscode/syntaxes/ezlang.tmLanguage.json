@@ -6,9 +6,14 @@
     { "include": "#comments" },
     { "include": "#strings" },
     { "include": "#numbers" },
+    { "include": "#imports" },
+    { "include": "#declarations" },
+    { "include": "#calls" },
+    { "include": "#named-arguments" },
+    { "include": "#operators" },
     { "include": "#keywords" },
     { "include": "#types" },
-    { "include": "#functions" }
+    { "include": "#identifiers" }
   ],
   "repository": {
     "comments": {
@@ -19,7 +24,15 @@
     },
     "strings": {
       "patterns": [
-        { "name": "string.quoted.double.ezlang", "begin": "\"", "end": "\"", "patterns": [{ "name": "constant.character.escape.ezlang", "match": "\\\\." }] }
+        {
+          "name": "string.quoted.double.ezlang",
+          "begin": "\"",
+          "end": "\"",
+          "patterns": [
+            { "name": "constant.character.escape.ezlang", "match": "\\\\." },
+            { "name": "meta.interpolation.ezlang", "begin": "\\{\\{", "end": "\\}\\}", "patterns": [{ "include": "$self" }] }
+          ]
+        }
       ]
     },
     "numbers": {
@@ -27,23 +40,111 @@
         { "name": "constant.numeric.ezlang", "match": "\\b(0x[0-9a-fA-F_]+|0b[01_]+|0o[0-7_]+|[0-9][0-9_]*(\\.[0-9_]+)?([eE][+-]?[0-9_]+)?)\\b" }
       ]
     },
+    "imports": {
+      "patterns": [
+        {
+          "name": "meta.import.ezlang",
+          "match": "\\b(from)\\s+(\"[^\"]+\")\\s+(import)\\b",
+          "captures": {
+            "1": { "name": "keyword.control.import.from.ezlang" },
+            "2": { "name": "string.quoted.double.module.ezlang" },
+            "3": { "name": "keyword.control.import.ezlang" }
+          }
+        }
+      ]
+    },
+    "declarations": {
+      "patterns": [
+        {
+          "name": "meta.function.declaration.ezlang",
+          "match": "\\b(let|const)\\s+([a-z_][A-Za-z0-9_]*|\\$[A-Za-z0-9_]+)(?=\\s*(?:<[^>]+>\\s*)?=\\s*\\()",
+          "captures": {
+            "1": { "name": "storage.type.function.ezlang" },
+            "2": { "name": "entity.name.function.declaration.ezlang" }
+          }
+        },
+        {
+          "name": "meta.variable.declaration.ezlang",
+          "match": "\\b(let|const|static)\\s+([a-z_][A-Za-z0-9_]*|\\$[A-Za-z0-9_]+)",
+          "captures": {
+            "1": { "name": "storage.modifier.ezlang" },
+            "2": { "name": "variable.other.declaration.ezlang" }
+          }
+        },
+        {
+          "name": "meta.type.declaration.ezlang",
+          "match": "\\b(struct|type)\\s+([A-Z][A-Za-z0-9_]*)",
+          "captures": {
+            "1": { "name": "storage.type.ezlang" },
+            "2": { "name": "entity.name.type.declaration.ezlang" }
+          }
+        },
+        {
+          "name": "meta.extern.declaration.ezlang",
+          "match": "\\b(declare)\\s+(let|const|static)\\s+([a-z_][A-Za-z0-9_]*|\\$[A-Za-z0-9_]+)",
+          "captures": {
+            "1": { "name": "keyword.declaration.ezlang" },
+            "2": { "name": "storage.modifier.ezlang" },
+            "3": { "name": "entity.name.function.declaration.extern.ezlang" }
+          }
+        }
+      ]
+    },
+    "calls": {
+      "patterns": [
+        {
+          "name": "meta.function-call.ezlang",
+          "match": "\\b([a-z_][A-Za-z0-9_]*|\\$[A-Za-z0-9_]+)(?=\\s*(?:<[^>]+>\\s*)?\\()",
+          "captures": {
+            "1": { "name": "entity.name.function.call.ezlang" }
+          }
+        },
+        {
+          "name": "meta.method-call.ezlang",
+          "match": "(?<=\\.)\\s*([a-z_][A-Za-z0-9_]*|\\$[A-Za-z0-9_]+)(?=\\s*(?:<[^>]+>\\s*)?\\()",
+          "captures": {
+            "1": { "name": "entity.name.function.method.call.ezlang" }
+          }
+        }
+      ]
+    },
+    "named-arguments": {
+      "patterns": [
+        {
+          "name": "variable.parameter.name.ezlang",
+          "match": "\\b([a-z_][A-Za-z0-9_]*|\\$[A-Za-z0-9_]+)(?=\\s*=)(?!\\s*=>)"
+        }
+      ]
+    },
+    "operators": {
+      "patterns": [
+        { "name": "keyword.operator.arrow.fat.ezlang", "match": "=>" },
+        { "name": "keyword.operator.arrow.thin.ezlang", "match": "->" },
+        { "name": "keyword.operator.assignment.compound.ezlang", "match": "\\+=|-=|\\*=|/=|%=|&=|\\|=|\\^=|<<=|>>=" },
+        { "name": "keyword.operator.comparison.ezlang", "match": "==|!=|<=|>=" },
+        { "name": "keyword.operator.logical.ezlang", "match": "&&|\\|\\|" },
+        { "name": "keyword.operator.bitwise.ezlang", "match": "<<|>>|[&|^~]" },
+        { "name": "keyword.operator.arithmetic.ezlang", "match": "[+\\-*/%]" },
+        { "name": "keyword.operator.assignment.ezlang", "match": "=" }
+      ]
+    },
     "keywords": {
       "patterns": [
-        { "name": "keyword.control.ezlang", "match": "\\b(let|const|static|struct|type|declare|loop|break|continue|import|export|from|match|catch|throw|flow|parallel|return|extern|for|as|in)\\b" },
+        { "name": "storage.modifier.async.ezlang", "match": "\\b(suspend)\\b" },
+        { "name": "keyword.control.ezlang", "match": "\\b(loop|break|continue|match|catch|throw|flow|parallel|return|for|as|in|extern|export)\\b" },
         { "name": "constant.language.boolean.ezlang", "match": "\\b(true|false)\\b" }
       ]
     },
     "types": {
       "patterns": [
-        { "name": "storage.type.ezlang", "match": "\\b(I8|I32|I64|U8|U32|U64|F32|F64|Str|Bool|Void|Vec|List|Dict)\\b" },
+        { "name": "storage.type.primitive.ezlang", "match": "\\b(I8|I32|I64|U8|U32|U64|F32|F64|Str|Bool|Void|Vec|List|Dict)\\b" },
         { "name": "entity.name.type.ezlang", "match": "\\b[A-Z][A-Za-z0-9_]*\\b" }
       ]
     },
-    "functions": {
+    "identifiers": {
       "patterns": [
-        { "name": "entity.name.function.ezlang", "match": "\\b[a-z_][A-Za-z0-9_]*(?=\\s*=\\s*(<[^>]+>\\s*)?\\()" }
+        { "name": "variable.other.ezlang", "match": "\\b[a-z_][A-Za-z0-9_]*\\b|\\$[A-Za-z0-9_]+" }
       ]
     }
   }
 }
-

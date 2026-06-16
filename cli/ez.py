@@ -34,6 +34,7 @@ _llvm_import_error: ModuleNotFoundError | ImportError | None = None
 _analyze = None
 _compile_source = None
 _compiler_import_error: ModuleNotFoundError | ImportError | None = None
+_parser_modules = None
 
 VERSION = "0.1.0"
 NATIVE_UNSUPPORTED = {"android", "ios", "emcc", "freestanding"}
@@ -206,6 +207,71 @@ def _load_compiler_modules():
     _compile_source = loaded_compile_source
     _compiler_import_error = None
     return _analyze, _compile_source
+
+
+class _SyntaxErrorCollector:
+    """收集 ANTLR 语法错误，避免 fmt 输出原始 traceback。"""
+
+    def __init__(self):
+        from antlr4.error.ErrorListener import ErrorListener
+
+        class Collector(ErrorListener):
+            def __init__(self):
+                self.errors: list[str] = []
+
+            def syntaxError(self, recognizer, offendingSymbol, line, column, msg, e):
+                self.errors.append(f"行 {line}:{column} - {msg}")
+
+            def reportAmbiguity(self, recognizer, dfa, startIndex, stopIndex, exact, ambigAlts, configs):
+                pass
+
+            def reportAttemptingFullContext(self, recognizer, dfa, startIndex, stopIndex, conflictingAlts, configs):
+                pass
+
+            def reportContextSensitivity(self, recognizer, dfa, startIndex, stopIndex, prediction, configs):
+                pass
+
+        self.listener = Collector()
+
+    @property
+    def errors(self) -> list[str]:
+        return self.listener.errors
+
+
+def _load_parser_modules():
+    global _parser_modules
+    if _parser_modules is not None:
+        return _parser_modules
+    try:
+        from antlr4 import CommonTokenStream, InputStream
+        from parser.EzLangLexer import EzLangLexer
+        from parser.EzLangParser import EzLangParser
+    except (ModuleNotFoundError, ImportError) as first_exc:
+        compiler_src = ROOT / "compiler" / "src"
+        if str(compiler_src) not in sys.path:
+            sys.path.insert(0, str(compiler_src))
+        try:
+            from antlr4 import CommonTokenStream, InputStream
+            from parser.EzLangLexer import EzLangLexer
+            from parser.EzLangParser import EzLangParser
+        except (ModuleNotFoundError, ImportError) as exc:
+            missing = getattr(exc, "name", None) or str(exc)
+            raise CliError(f"解析器依赖不可用: {missing}。请先在仓库根目录执行 `pip install -e .`") from first_exc
+    _parser_modules = (CommonTokenStream, InputStream, EzLangLexer, EzLangParser)
+    return _parser_modules
+
+
+def _parse_ez_source_errors(source: str) -> list[str]:
+    CommonTokenStream, InputStream, EzLangLexer, EzLangParser = _load_parser_modules()
+    errors = _SyntaxErrorCollector()
+    lexer = EzLangLexer(InputStream(source))
+    lexer.removeErrorListeners()
+    lexer.addErrorListener(errors.listener)
+    parser = EzLangParser(CommonTokenStream(lexer))
+    parser.removeErrorListeners()
+    parser.addErrorListener(errors.listener)
+    parser.compilationUnit()
+    return errors.errors
 
 
 def _load_llvm_binding():
@@ -503,12 +569,11 @@ def cmd_install(args) -> int:
 
 def cmd_fmt(args) -> int:
     config = load_project(args.project, require_main=False)
-    _, compile_source = _load_compiler_modules()
     files = _collect_fmt_files(config, args.paths)
     changed: list[Path] = []
     for file in files:
         source = file.read_text(encoding="utf-8")
-        _, errors, _ = compile_source(source, module_name=file.stem, base_dir=file.parent, source_name=file)
+        errors = _parse_ez_source_errors(source)
         if errors:
             raise CliError(f"{file}: {'; '.join(errors)}")
         formatted = _format_ez_source(source)
@@ -1636,12 +1701,26 @@ def _collect_fmt_files(config: ProjectConfig, paths: list[str]) -> list[Path]:
         if root is None:
             continue
         if root.is_dir():
-            files.extend(sorted(root.rglob("*.ez")))
-        elif root.suffix == ".ez":
+            files.extend(_iter_fmt_files(root))
+        elif root.is_file() and root.suffix == ".ez":
             files.append(root)
         else:
             raise CliError(f"fmt 只支持 .ez 文件或目录: {root}")
-    return sorted(dict.fromkeys(files))
+    return sorted(dict.fromkeys(path.resolve() for path in files))
+
+
+_FMT_SKIP_DIRS = {".ez", ".git", ".venv", "venv", "node_modules", "dist", "out", "__pycache__"}
+
+
+def _iter_fmt_files(root: Path) -> list[Path]:
+    files: list[Path] = []
+    for current, dirnames, filenames in os.walk(root):
+        dirnames[:] = [name for name in dirnames if name not in _FMT_SKIP_DIRS]
+        current_path = Path(current)
+        for filename in filenames:
+            if filename.endswith(".ez"):
+                files.append(current_path / filename)
+    return sorted(files)
 
 
 def _collect_test_files(config: ProjectConfig, paths: list[str]) -> list[Path]:
@@ -1697,33 +1776,232 @@ def _annotate_test_failure_detail(detail: str, test_file: Path, locations: dict[
 
 
 def _format_ez_source(source: str) -> str:
-    tokens = _tokenize_format_source(source)
-    lines: list[str] = []
-    current = ""
+    raw_lines = source.splitlines()
+    formatted: list[str] = []
     indent = 0
-    for token in tokens:
-        if token == "}":
-            if current.strip():
-                lines.append("    " * indent + current.strip())
-                current = ""
+    index = 0
+    in_block_comment = False
+    while index < len(raw_lines):
+        line = raw_lines[index]
+        stripped = line.strip()
+        if not stripped:
+            formatted.append("")
+            index += 1
+            continue
+
+        if in_block_comment:
+            formatted.append("    " * indent + stripped)
+            if "*/" in stripped:
+                in_block_comment = False
+            index += 1
+            continue
+
+        if stripped.startswith("/*"):
+            formatted.append("    " * indent + stripped)
+            in_block_comment = "*/" not in stripped
+            index += 1
+            continue
+
+        if stripped.startswith("//"):
+            comment, code = _split_comment_code_line(stripped)
+            formatted.append("    " * indent + comment)
+            if not code:
+                index += 1
+                continue
+            stripped = code
+
+        if _starts_multiline_import(stripped):
+            import_lines = [stripped]
+            index += 1
+            while index < len(raw_lines):
+                import_lines.append(raw_lines[index].strip())
+                if "}" in raw_lines[index]:
+                    break
+                index += 1
+            formatted.append("    " * indent + _format_import_lines(import_lines))
+            index += 1
+            continue
+
+        leading_closes = _leading_format_closes(stripped)
+        if leading_closes:
+            indent = max(indent - leading_closes, 0)
+        if stripped.startswith("}"):
             indent = max(indent - 1, 0)
-            current = "}"
+        formatted_line = _format_ez_line(stripped)
+        formatted.append("    " * indent + formatted_line)
+        indent += _format_line_indent_delta(formatted_line)
+        index += 1
+    while formatted and formatted[-1] == "":
+        formatted.pop()
+    return "\n".join(line.rstrip() for line in formatted) + "\n"
+
+
+def _split_comment_code_line(line: str) -> tuple[str, str]:
+    code_match = re.search(
+        r"\s((?:export\s+)?(?:from\s+\"|extern\s+\"|declare\b|struct\b|type\b|let\b|const\b|static\b))",
+        line[2:],
+    )
+    if code_match is None:
+        return line, ""
+    start = 2 + code_match.start(1)
+    return line[:start].rstrip(), line[start:].strip()
+
+
+def _starts_multiline_import(line: str) -> bool:
+    return bool(re.match(r'from\s+"[^"]+"\s+import\s*\{\s*$', line))
+
+
+def _format_import_lines(lines: list[str]) -> str:
+    text = " ".join(line.strip() for line in lines)
+    match = re.match(r'from\s+("[^"]+")\s+import\s*\{(.*?)\}\s*;?$', text)
+    if match is None:
+        return _format_ez_line(text)
+    names = [name.strip() for name in match.group(2).split(",") if name.strip()]
+    return f"from {match.group(1)} import {{ {', '.join(names)} }};"
+
+
+def _format_ez_line(line: str) -> str:
+    trailing_comment = ""
+    code = line
+    comment_index = _line_comment_index(line)
+    if comment_index is not None:
+        code = line[:comment_index].rstrip()
+        trailing_comment = " " + line[comment_index:].strip()
+    code = _normalize_ez_code_spacing(code.strip())
+    return (code + trailing_comment).rstrip()
+
+
+def _leading_format_closes(line: str) -> int:
+    count = 0
+    for ch in line:
+        if ch in ")]":
+            return 1
             continue
-        if token == "{":
-            current = _append_token(current, token)
-            lines.append("    " * indent + current.strip())
-            current = ""
-            indent += 1
+        break
+    return count
+
+
+def _format_line_indent_delta(line: str) -> int:
+    code = line
+    comment_index = _line_comment_index(line)
+    if comment_index is not None:
+        code = line[:comment_index]
+    opens = 0
+    closes = 0
+    in_string = False
+    escape = False
+    for ch in code:
+        if in_string:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
             continue
-        if token == ";":
-            current = _append_token(current, token)
-            lines.append("    " * indent + current.strip())
-            current = ""
+        if ch == '"':
+            in_string = True
             continue
-        current = _append_token(current, token)
-    if current.strip():
-        lines.append("    " * indent + current.strip())
-    return "\n".join(line.rstrip() for line in lines if line.strip()) + "\n"
+        if ch in "{[(":
+            opens += 1
+        elif ch in "}])":
+            closes += 1
+    return 1 if opens > closes else 0
+
+
+def _line_comment_index(line: str) -> int | None:
+    in_string = False
+    escape = False
+    for index in range(len(line) - 1):
+        ch = line[index]
+        if in_string:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+            continue
+        if line[index:index + 2] == "//":
+            return index
+    return None
+
+
+def _normalize_ez_code_spacing(code: str) -> str:
+    if not code:
+        return code
+    code, strings = _protect_format_strings(code)
+    code, compound_ops = _protect_format_compound_ops(code)
+    code = re.sub(r"\s+", " ", code)
+    code = re.sub(r"\s*\.\s*", ".", code)
+    code = re.sub(r"\s*,\s*", ", ", code)
+    code = re.sub(r"\s*;\s*$", ";", code)
+    code = re.sub(r"\(\s+", "(", code)
+    code = re.sub(r"\s+\)", ")", code)
+    code = re.sub(r"\[\s+", "[", code)
+    code = re.sub(r"\s+\]", "]", code)
+    code = re.sub(r"\{\s+", "{ ", code)
+    code = re.sub(r"\s+\}", " }", code)
+    code = re.sub(r"\s*(==|!=|<=|>=|&&|\|\||=>|->|=)\s*", r" \1 ", code)
+    code = re.sub(r"\s*([+\-*/%])\s*", r" \1 ", code)
+    code = _compact_unary_minus(code)
+    code = re.sub(r"\s*:\s*", ": ", code)
+    code = re.sub(r"(?<=\s)\?\s*([^:;]+?):\s*", r"? \1 : ", code)
+    code = re.sub(r"\s*\?\s*(?=[,);])", "?", code)
+    code = re.sub(r"\b([A-Za-z_][A-Za-z0-9_]*|\$[A-Za-z0-9_]+)\s*<\s*([^<>\n]+?)\s*>\s*(?=\()", _compact_generic_match, code)
+    code = re.sub(r"\b(List|Dict|Vec)\s*<\s*([^<>\n]+?)\s*>", _compact_generic_match, code)
+    code = re.sub(r"\s+", " ", code).strip()
+    code = re.sub(r"\( ", "(", code)
+    code = re.sub(r" \)", ")", code)
+    code = re.sub(r"\[ ", "[", code)
+    code = re.sub(r" \]", "]", code)
+    code = _restore_format_compound_ops(code, compound_ops)
+    return _restore_format_strings(code, strings)
+
+
+def _protect_format_strings(code: str) -> tuple[str, list[str]]:
+    strings: list[str] = []
+
+    def repl(match: re.Match) -> str:
+        strings.append(match.group(0))
+        return f"__EZ_FMT_STRING_{len(strings) - 1}__"
+
+    return re.sub(r'"(?:[^"\\\r\n]|\\.)*"', repl, code), strings
+
+
+def _restore_format_strings(code: str, strings: list[str]) -> str:
+    for index, value in enumerate(strings):
+        code = code.replace(f"__EZ_FMT_STRING_{index}__", value)
+    return code
+
+
+def _protect_format_compound_ops(code: str) -> tuple[str, list[str]]:
+    operators: list[str] = []
+
+    def repl(match: re.Match) -> str:
+        operators.append(match.group(0))
+        return f"__EZ_FMT_OP_{len(operators) - 1}__"
+
+    return re.sub(r"\+=|-=|\*=|/=|%=|&=|\|=|\^=|<<=|>>=", repl, code), operators
+
+
+def _restore_format_compound_ops(code: str, operators: list[str]) -> str:
+    for index, value in enumerate(operators):
+        code = code.replace(f"__EZ_FMT_OP_{index}__", value)
+    return code
+
+
+def _compact_unary_minus(code: str) -> str:
+    unary_prefix = r"(^|(?:[=(\[{,:?]|=>|return|throw)\s+)"
+    return re.sub(rf"{unary_prefix}-\s+([A-Za-z_$0-9])", r"\1-\2", code)
+
+
+def _compact_generic_match(match: re.Match) -> str:
+    inner = re.sub(r"\s*,\s*", ", ", match.group(2).strip())
+    return f"{match.group(1)}<{inner}>"
 
 
 

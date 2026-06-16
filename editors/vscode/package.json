@@ -41,6 +41,19 @@
         "path": "./syntaxes/ezlang.tmLanguage.json"
       }
     ],
+    "semanticTokenScopes": [
+      {
+        "language": "ezlang",
+        "scopes": {
+          "parameter": ["variable.parameter.ezlang"],
+          "function": ["entity.name.function.ezlang"],
+          "class": ["entity.name.type.struct.ezlang"],
+          "type": ["entity.name.type.ezlang"],
+          "keyword": ["keyword.control.ezlang"],
+          "function.async": ["entity.name.function.suspend.ezlang"]
+        }
+      }
+    ],
     "configuration": {
       "title": "EzLang",
       "properties": {
@@ -69,8 +82,7 @@
     "@types/node": "^20.11.0",
     "@types/vscode": "^1.85.0",
     "@vscode/vsce": "^3.6.0",
-    "typescript": "^5.3.0",
-    "vsce": "npm:@vscode/vsce@^3.6.0"
+    "typescript": "^5.3.0"
   },
   "dependencies": {
     "vscode-languageclient": "^9.0.1"
