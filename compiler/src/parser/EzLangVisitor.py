@@ -129,6 +129,11 @@ class EzLangVisitor(ParseTreeVisitor):
         return self.visitChildren(ctx)
 
 
+    # Visit a parse tree produced by EzLangParser#weakType.
+    def visitWeakType(self, ctx:EzLangParser.WeakTypeContext):
+        return self.visitChildren(ctx)
+
+
     # Visit a parse tree produced by EzLangParser#arrayType.
     def visitArrayType(self, ctx:EzLangParser.ArrayTypeContext):
         return self.visitChildren(ctx)
@@ -316,6 +321,11 @@ class EzLangVisitor(ParseTreeVisitor):
 
     # Visit a parse tree produced by EzLangParser#prefixTypeAssertion.
     def visitPrefixTypeAssertion(self, ctx:EzLangParser.PrefixTypeAssertionContext):
+        return self.visitChildren(ctx)
+
+
+    # Visit a parse tree produced by EzLangParser#weakRefExpression.
+    def visitWeakRefExpression(self, ctx:EzLangParser.WeakRefExpressionContext):
         return self.visitChildren(ctx)
 
 

@@ -224,6 +224,15 @@ class EzLangListener(ParseTreeListener):
         pass
 
 
+    # Enter a parse tree produced by EzLangParser#weakType.
+    def enterWeakType(self, ctx:EzLangParser.WeakTypeContext):
+        pass
+
+    # Exit a parse tree produced by EzLangParser#weakType.
+    def exitWeakType(self, ctx:EzLangParser.WeakTypeContext):
+        pass
+
+
     # Enter a parse tree produced by EzLangParser#arrayType.
     def enterArrayType(self, ctx:EzLangParser.ArrayTypeContext):
         pass
@@ -563,6 +572,15 @@ class EzLangListener(ParseTreeListener):
 
     # Exit a parse tree produced by EzLangParser#prefixTypeAssertion.
     def exitPrefixTypeAssertion(self, ctx:EzLangParser.PrefixTypeAssertionContext):
+        pass
+
+
+    # Enter a parse tree produced by EzLangParser#weakRefExpression.
+    def enterWeakRefExpression(self, ctx:EzLangParser.WeakRefExpressionContext):
+        pass
+
+    # Exit a parse tree produced by EzLangParser#weakRefExpression.
+    def exitWeakRefExpression(self, ctx:EzLangParser.WeakRefExpressionContext):
         pass
 
 

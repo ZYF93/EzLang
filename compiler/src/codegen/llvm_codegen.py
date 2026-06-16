@@ -151,6 +151,17 @@ class LLVMCodeGenerator(EzLangVisitor):
         invoke_type = closure_type.elements[0].pointee
         return invoke_type.return_type, list(invoke_type.args[1:])
 
+    def _callable_return_type(self, value: ir.Value | None) -> ir.Type | None:
+        """从函数值或闭包值推断返回类型。"""
+        if value is None or not hasattr(value, 'type'):
+            return None
+        typ = value.type
+        if isinstance(typ, ir.PointerType) and isinstance(typ.pointee, ir.FunctionType):
+            return typ.pointee.return_type
+        closure_type = typ.pointee if isinstance(typ, ir.PointerType) else typ
+        signature = self._closure_signature(closure_type)
+        return signature[0] if signature is not None else None
+
     def _closure_from_function(self, func: ir.Function, target_type: ir.Type | None = None) -> ir.Value:
         func_type = func.function_type
         if target_type is not None and self._is_closure_type(target_type):
@@ -897,6 +908,15 @@ class LLVMCodeGenerator(EzLangVisitor):
         return isinstance(t, ir.LiteralStructType) and len(t.elements) == 2 and t.elements[0] == ir.IntType(1)
 
     @staticmethod
+    def _is_weak_ref_type(t: ir.Type) -> bool:
+        return (
+            isinstance(t, ir.LiteralStructType)
+            and len(t.elements) == 2
+            and t.elements[0] == ir.IntType(1)
+            and isinstance(t.elements[1], ir.PointerType)
+        )
+
+    @staticmethod
     def _is_union_type(t: ir.Type) -> bool:
         return isinstance(t, ir.LiteralStructType) and len(t.elements) == 2 and isinstance(t.elements[0], ir.IntType) and t.elements[0].width == 32
 
@@ -1086,6 +1106,8 @@ class LLVMCodeGenerator(EzLangVisitor):
             return f"Vec<{self._type_ctx_name(ctx.type_())}>[{ctx.INTEGER_LITERAL().getText()}]"
         if isinstance(ctx, EzLangParser.PointerTypeContext):
             return f"*{self._type_ctx_name(ctx.type_())}"
+        if isinstance(ctx, EzLangParser.WeakTypeContext):
+            return f"#{self._type_ctx_name(ctx.type_())}"
         if isinstance(ctx, EzLangParser.ParenTypeContext):
             return self._type_ctx_name(ctx.type_())
         if isinstance(ctx, EzLangParser.UnionTypeContext):
@@ -1114,6 +1136,8 @@ class LLVMCodeGenerator(EzLangVisitor):
             return f"Vec<{self._type_ctx_name_with_map(ctx.type_(), type_map, unsigned_map, type_name_map)}>[{ctx.INTEGER_LITERAL().getText()}]"
         if isinstance(ctx, EzLangParser.PointerTypeContext):
             return f"*{self._type_ctx_name_with_map(ctx.type_(), type_map, unsigned_map, type_name_map)}"
+        if isinstance(ctx, EzLangParser.WeakTypeContext):
+            return f"#{self._type_ctx_name_with_map(ctx.type_(), type_map, unsigned_map, type_name_map)}"
         if isinstance(ctx, EzLangParser.ParenTypeContext):
             return self._type_ctx_name_with_map(ctx.type_(), type_map, unsigned_map, type_name_map)
         if isinstance(ctx, EzLangParser.UnionTypeContext):
@@ -1692,6 +1716,10 @@ class LLVMCodeGenerator(EzLangVisitor):
         if isinstance(ctx, P.PointerTypeContext):
             return ir.PointerType(self._map_type(ctx.type_()))
 
+        # 弱引用类型 #T：运行时表示为 { ok, T* }。
+        if isinstance(ctx, P.WeakTypeContext):
+            return ir.LiteralStructType([ir.IntType(1), ir.PointerType(self._map_type(ctx.type_()))])
+
         # 匿名类型结构：动态键结构按 Dict ABI，普通结构使用字面结构。
         if isinstance(ctx, P.TypeShapeTypeContext):
             return self._map_type_shape(ctx.typeShape())
@@ -1953,7 +1981,19 @@ class LLVMCodeGenerator(EzLangVisitor):
             meta_arg = gv
             if decorator_arg_types:
                 expected = decorator_arg_types[0]
-                if expected == meta_type:
+                expected_value_type = expected.pointee if isinstance(expected, ir.PointerType) else expected
+                if self._is_weak_ref_type(expected_value_type) and expected_value_type.elements[1] == gv.type:
+                    weak_type = expected_value_type
+                    weak = ir.Constant(weak_type, ir.Undefined)
+                    weak = builder.insert_value(weak, ir.Constant(ir.IntType(1), 1), 0)
+                    weak = builder.insert_value(weak, gv, 1)
+                    if isinstance(expected, ir.PointerType):
+                        weak_slot = builder.alloca(weak_type, name='_decorator_this')
+                        builder.store(weak, weak_slot)
+                        meta_arg = weak_slot
+                    else:
+                        meta_arg = weak
+                elif expected == meta_type:
                     meta_arg = builder.load(gv)
                 elif expected != gv.type:
                     meta_arg = builder.bitcast(gv, expected) if isinstance(expected, ir.PointerType) else builder.load(gv)
@@ -2267,6 +2307,8 @@ class LLVMCodeGenerator(EzLangVisitor):
 
     def _c_abi_param_type(self, param_type: ir.Type) -> ir.Type:
         """外部 C ABI 参数类型：聚合按指针传递，函数指针递归按 C ABI 降低。"""
+        if self._is_weak_ref_type(param_type):
+            return param_type.elements[1]
         if self._is_closure_type(param_type):
             signature = self._closure_signature(param_type)
             if signature is not None:
@@ -2434,11 +2476,30 @@ class LLVMCodeGenerator(EzLangVisitor):
 
     def _coerce_value(self, val: ir.Value, target_type: ir.Type) -> ir.Value:
         """值类型自动适配：可选类型/联合类型自动包装"""
+        if (
+            self._is_weak_ref_type(val.type)
+            and isinstance(target_type, ir.PointerType)
+            and val.type.elements[1] == target_type
+        ):
+            return self.builder.extract_value(val, 1, name='_weak_arg_ptr')
+        if (
+            isinstance(val.type, ir.PointerType)
+            and self._is_weak_ref_type(val.type.pointee)
+            and isinstance(target_type, ir.PointerType)
+            and val.type.pointee.elements[1] == target_type
+        ):
+            ptr_slot = self.builder.gep(val, [
+                ir.Constant(ir.IntType(32), 0),
+                ir.Constant(ir.IntType(32), 1),
+            ], inbounds=True)
+            return self.builder.load(ptr_slot, name='_weak_arg_ptr')
         if self._is_closure_type(target_type):
             if isinstance(val, ir.Function):
                 return self._closure_from_function(val, target_type)
             if isinstance(val, ir.Value) and val.type == target_type:
                 return val
+        if self._is_weak_ref_type(target_type):
+            return self._coerce_weak_ref_value(val, target_type)
         if val.type == target_type:
             return val
         if self._is_aggregate_ptr(val) and val.type.pointee == target_type:
@@ -2669,9 +2730,10 @@ class LLVMCodeGenerator(EzLangVisitor):
         if opt_val is None or not hasattr(opt_val, 'type'):
             return None
         opt_type = opt_val.type.pointee if isinstance(opt_val.type, ir.PointerType) else opt_val.type
+        is_weak = self._is_weak_ref_type(opt_type)
         if not self._is_optional_type(opt_type):
             return None
-        value_type = opt_type.elements[1]
+        value_type = opt_type.elements[1].pointee if is_weak else opt_type.elements[1]
         if not isinstance(value_type, ir.IdentifiedStructType):
             return None
         struct_name = value_type.name
@@ -2889,6 +2951,7 @@ class LLVMCodeGenerator(EzLangVisitor):
         obj_ptr = self._eval(member_ctx.postfixExpression())
         if obj_ptr is None or not hasattr(obj_ptr, 'type'):
             return None
+        obj_ptr = self._weak_ref_pointee_ptr(obj_ptr) or obj_ptr
         pointee = obj_ptr.type.pointee if hasattr(obj_ptr.type, 'pointee') else obj_ptr.type
         if not isinstance(pointee, (ir.IdentifiedStructType, ir.LiteralStructType)):
             return None
@@ -3644,6 +3707,55 @@ class LLVMCodeGenerator(EzLangVisitor):
         if receiver_type is None:
             return None
         return self.struct_methods.get(receiver_type, {}).get(method_name)
+
+    def _collection_method_call_info(self, target) -> tuple[str, ir.Value] | None:
+        """识别 List/Dict 对象方法糖，并返回对应内建函数名和接收者。"""
+        if not isinstance(target, EzLangParser.MemberAccessContext):
+            return None
+        method_name = target.VAR_IDENTIFIER().getText()
+        receiver = self._eval(target.postfixExpression())
+        if receiver is None or not hasattr(receiver, 'type'):
+            return None
+        receiver_type = receiver.type.pointee if isinstance(receiver.type, ir.PointerType) else receiver.type
+        if self._is_list_type(receiver_type):
+            list_ptr = self._as_list_ptr(receiver)
+            if list_ptr is None:
+                return None
+            elem_type = self._list_elem_type(list_ptr)
+            suffix = self._type_name_from_ir_type(elem_type)
+            mapping = {
+                'len': 'listLen',
+                'push': 'listPush',
+                'pop': 'listPop',
+                'shift': 'listShift',
+                'unshift': 'listUnshift',
+                'slice': 'listSlice',
+                'sort': 'listSort',
+                'filter': 'listFilter',
+                'map': 'listMap',
+                'find': 'listFind',
+            }
+            base = mapping.get(method_name)
+            if base is not None:
+                return f"{base}_{suffix}", self._weak_ref_value(list_ptr, list_ptr.type.pointee)
+        if receiver_type == self.structs.get('Dict'):
+            key_type, value_type = self._dict_item_types_for_value(receiver)
+            key_suffix = self._type_name_from_ir_type(key_type)
+            value_suffix = self._type_name_from_ir_type(value_type)
+            mapping = {
+                'len': 'dictLen',
+                'has': 'dictHas',
+                'delete': 'dictDelete',
+                'keys': 'dictKeys',
+                'values': 'dictValues',
+            }
+            base = mapping.get(method_name)
+            if base is not None:
+                dict_ptr = self._as_dict_ptr(receiver)
+                if dict_ptr is None:
+                    return None
+                return f"{base}_{key_suffix}_{value_suffix}", self._weak_ref_value(dict_ptr, dict_ptr.type.pointee)
+        return None
 
     def _method_receiver_struct_name(self, ctx) -> str | None:
         if isinstance(ctx, EzLangParser.CallContext):
@@ -7336,6 +7448,8 @@ class LLVMCodeGenerator(EzLangVisitor):
     # 标识符引用
     def visitIdentifierExpr(self, ctx: EzLangParser.IdentifierExprContext):
         id_token = ctx.VAR_IDENTIFIER() or ctx.TYPE_IDENTIFIER()
+        if id_token is None and ctx.VOID() is not None:
+            return ir.Constant(ir.IntType(32), self._type_id("Void"))
         name = id_token.getText()
 
         # 泛型实例化: func<T1, T2>
@@ -7571,6 +7685,10 @@ class LLVMCodeGenerator(EzLangVisitor):
             if self._struct_type_build_stack and inner == self.structs.get(self._struct_type_build_stack[-1]):
                 inner = ir.PointerType(inner)
             return ir.LiteralStructType([ir.IntType(1), inner])
+
+        if isinstance(ctx, P.WeakTypeContext):
+            inner = self._map_type_with_map(ctx.type_(), type_map, unsigned_map, type_name_map)
+            return ir.LiteralStructType([ir.IntType(1), ir.PointerType(inner)])
 
         # List 类型: List<T> → { pages, length, capacity, page_count }
         if isinstance(ctx, P.ListTypeContext):
@@ -7865,9 +7983,10 @@ class LLVMCodeGenerator(EzLangVisitor):
         if opt_val is None or not hasattr(opt_val, 'type'):
             return None
         opt_type = opt_val.type.pointee if isinstance(opt_val.type, ir.PointerType) else opt_val.type
+        is_weak = self._is_weak_ref_type(opt_type)
         if not self._is_optional_type(opt_type):
             return None
-        value_type = opt_type.elements[1]
+        value_type = opt_type.elements[1].pointee if is_weak else opt_type.elements[1]
         if not isinstance(value_type, (ir.IdentifiedStructType, ir.LiteralStructType)):
             return None
         if not isinstance(opt_val.type, ir.PointerType):
@@ -7902,6 +8021,8 @@ class LLVMCodeGenerator(EzLangVisitor):
             ir.Constant(ir.IntType(32), 0),
             ir.Constant(ir.IntType(32), 1),
         ], inbounds=True)
+        if is_weak:
+            value_ptr = self.builder.load(value_ptr, name='_weak_chain_ptr')
         field_ptr = self.builder.gep(value_ptr, [
             ir.Constant(ir.IntType(32), 0),
             ir.Constant(ir.IntType(32), field_index),
@@ -8027,6 +8148,7 @@ class LLVMCodeGenerator(EzLangVisitor):
         obj_ptr = self._eval(ctx.postfixExpression())
         if obj_ptr is None:
             return None
+        obj_ptr = self._weak_ref_pointee_ptr(obj_ptr) or obj_ptr
         if (
             not isinstance(obj_ptr.type, ir.PointerType)
             and isinstance(obj_ptr.type, (ir.IdentifiedStructType, ir.LiteralStructType, ir.ArrayType))
@@ -8088,7 +8210,7 @@ class LLVMCodeGenerator(EzLangVisitor):
                 else:
                     func = self.module.get_global(func_name)
                 if func is not None:
-                    self._method_this = obj_ptr
+                    self._method_this = self._weak_ref_value(obj_ptr, obj_ptr.type.pointee)
                     return func
 
         if struct_name and struct_name in self.struct_fields:
@@ -8106,7 +8228,7 @@ class LLVMCodeGenerator(EzLangVisitor):
                     return gep
                 value = self._load_with_unsigned(gep, name=field_name)
                 if isinstance(value.type, ir.PointerType) and isinstance(value.type.pointee, ir.FunctionType):
-                    self._method_this = obj_ptr
+                    self._method_this = self._weak_ref_value(obj_ptr, obj_ptr.type.pointee)
                 return value
 
         return None
@@ -9071,6 +9193,22 @@ class LLVMCodeGenerator(EzLangVisitor):
         if opt_ptr is None or not hasattr(opt_ptr, 'type'):
             return None
         opt_type = opt_ptr.type.pointee if isinstance(opt_ptr.type, ir.PointerType) else opt_ptr.type
+        if self._is_weak_ref_type(opt_type):
+            if not isinstance(opt_ptr.type, ir.PointerType):
+                tmp = self.builder.alloca(opt_type, name='_weak_tmp')
+                self.builder.store(opt_ptr, tmp)
+                opt_ptr = tmp
+            value_ptr = self.builder.gep(opt_ptr, [
+                ir.Constant(ir.IntType(32), 0),
+                ir.Constant(ir.IntType(32), 1),
+            ], inbounds=True)
+            ref_ptr = self.builder.load(value_ptr, name='_weak_value_ptr')
+            pointee = opt_type.elements[1].pointee
+            if isinstance(pointee, (ir.IdentifiedStructType, ir.LiteralStructType, ir.ArrayType)):
+                return ref_ptr
+            is_null = self.builder.icmp_unsigned('==', ref_ptr, ir.Constant(ref_ptr.type, None), name='_weak_is_null')
+            value = self.builder.load(ref_ptr, name='_weak_value')
+            return self.builder.select(is_null, self._zero_constant(pointee), value, name='_weak_unwrapped')
         if not self._is_optional_type(opt_type):
             return opt_ptr
         if not isinstance(opt_ptr.type, ir.PointerType):
@@ -9086,11 +9224,36 @@ class LLVMCodeGenerator(EzLangVisitor):
             return value_ptr
         return self._load_with_unsigned(value_ptr, name='_optional_value')
 
+    def _weak_ref_pointee_ptr(self, value: ir.Value) -> ir.Value | None:
+        """弱引用值或弱引用槽解包为内部对象指针。"""
+        if value is None or not hasattr(value, 'type'):
+            return None
+        value_type = value.type.pointee if isinstance(value.type, ir.PointerType) else value.type
+        if not self._is_weak_ref_type(value_type):
+            return None
+        if isinstance(value.type, ir.PointerType):
+            ptr_slot = self.builder.gep(value, [
+                ir.Constant(ir.IntType(32), 0),
+                ir.Constant(ir.IntType(32), 1),
+            ], inbounds=True)
+            return self.builder.load(ptr_slot, name='_weak_pointee_ptr')
+        return self.builder.extract_value(value, 1, name='_weak_pointee_ptr')
+
     def visitTypeAssertion(self, ctx: EzLangParser.TypeAssertionContext):
         return self._optional_unwrapped_value(ctx.postfixExpression())
 
     def visitOptionalUnwrap(self, ctx: EzLangParser.OptionalUnwrapContext):
         return self._optional_unwrapped_value(ctx.postfixExpression())
+
+    def visitWeakRefExpression(self, ctx: EzLangParser.WeakRefExpressionContext):
+        inner = self._eval(ctx.unaryExpression())
+        if inner is None or not hasattr(inner, 'type'):
+            return self._weak_ref_value(None, ir.IntType(32))
+        if isinstance(inner.type, ir.PointerType):
+            return self._weak_ref_value(inner, inner.type.pointee)
+        ptr = self._arena_allocate(inner.type, name='_weak_tmp')
+        self.builder.store(inner, ptr)
+        return self._weak_ref_value(ptr, inner.type)
 
     def _call_arg_items(self, arg_list_ctx) -> list[tuple[Optional[str], object]]:
         """返回调用实参；name 为 None 表示位置参数。"""
@@ -9172,6 +9335,54 @@ class LLVMCodeGenerator(EzLangVisitor):
             )
             if safe_call is not None:
                 return safe_call
+
+        collection_method = self._collection_method_call_info(target_expr)
+        if collection_method is not None:
+            func_name, receiver = collection_method
+            expected_names_by_base = {
+                'listLen': ['this'],
+                'listPush': ['this', 'item'],
+                'listPop': ['this'],
+                'listShift': ['this'],
+                'listUnshift': ['this', 'item'],
+                'listSlice': ['this', 'start', 'end'],
+                'listSort': ['this', 'cmp'],
+                'listFilter': ['this', 'pred'],
+                'listMap': ['this', 'f'],
+                'listFind': ['this', 'pred'],
+                'dictLen': ['this'],
+                'dictHas': ['this', 'key'],
+                'dictDelete': ['this', 'key'],
+                'dictKeys': ['this'],
+                'dictValues': ['this'],
+            }
+            base_name = self._list_builtin_base(func_name) or self._dict_builtin_base(func_name)
+            expected_names = expected_names_by_base.get(base_name, ['this'])
+            provided: dict[str, ir.Value] = {}
+            positional_values: list[ir.Value] = []
+            if ctx.namedArgList() is not None:
+                provided, positional_values, _placeholder_params = self._map_call_args_to_params(
+                    ctx.namedArgList(), expected_names
+                )
+            call_args = [receiver]
+            for pname in expected_names[1:]:
+                if pname in provided:
+                    call_args.append(provided[pname])
+                elif positional_values:
+                    call_args.append(positional_values.pop(0))
+            if base_name == 'listMap' and len(call_args) >= 2:
+                list_ptr = self._as_list_ptr(receiver)
+                elem_type = self._list_elem_type(list_ptr) if list_ptr is not None else ir.IntType(32)
+                result_type = self._callable_return_type(call_args[1]) or ir.IntType(32)
+                elem_suffix = self._type_name_from_ir_type(elem_type) or 'unknown'
+                result_suffix = self._type_name_from_ir_type(result_type) or 'unknown'
+                func_name = f'listMap_{elem_suffix}_{result_suffix}'
+                self._collection_mono_types[func_name] = ('listMap', [elem_type, result_type])
+            intrinsic_result = self._try_gen_intrinsic_call(func_name, call_args)
+            if intrinsic_result is self._void_intrinsic_result:
+                return None
+            if intrinsic_result is not None:
+                return intrinsic_result
 
         # 方法调用：obj.method(...) → 先求值 postfixExpression
         # visitMemberAccess 返回 function 并设置 _method_this
@@ -9464,6 +9675,10 @@ class LLVMCodeGenerator(EzLangVisitor):
         if type_ctx is None or actual_type is None:
             return
         P = EzLangParser
+        if isinstance(type_ctx, P.WeakTypeContext):
+            if self._is_weak_ref_type(actual_type):
+                self._infer_generic_type_from_ctx(type_ctx.type_(), actual_type.elements[1].pointee, type_map, generic_names)
+            return
         if isinstance(type_ctx, P.OptionalTypeContext):
             if self._is_optional_type(actual_type):
                 self._infer_generic_type_from_ctx(type_ctx.type_(), actual_type.elements[1], type_map, generic_names)
@@ -9501,14 +9716,20 @@ class LLVMCodeGenerator(EzLangVisitor):
         if template is None or len(template) < 2:
             return None
         generic_names, template_ctx = template[0], template[1]
-        if not generic_names or not hasattr(template_ctx, 'functionLiteral'):
+        if not generic_names:
             return None
-        fn_lit = template_ctx.functionLiteral()
-        if fn_lit is None or fn_lit.paramList() is None:
+        params = None
+        if hasattr(template_ctx, 'paramTypeList'):
+            params = template_ctx.paramTypeList()
+        if params is None and hasattr(template_ctx, 'functionLiteral'):
+            fn_lit = template_ctx.functionLiteral()
+            params = fn_lit.paramList() if fn_lit is not None else None
+        if params is None:
             return None
         type_map: dict[str, ir.Type] = {}
         generic_set = set(generic_names)
-        for param in fn_lit.paramList().param():
+        param_items = params.paramType() if hasattr(params, 'paramType') else params.param()
+        for param in param_items:
             pname = param.VAR_IDENTIFIER().getText()
             if pname not in provided:
                 continue
@@ -9523,6 +9744,10 @@ class LLVMCodeGenerator(EzLangVisitor):
         if template is None or len(template) < 2:
             return []
         template_ctx = template[1]
+        if hasattr(template_ctx, 'paramTypeList'):
+            params = template_ctx.paramTypeList()
+            if params is not None:
+                return [param.VAR_IDENTIFIER().getText() for param in params.paramType()]
         if not hasattr(template_ctx, 'functionLiteral'):
             return []
         fn_lit = template_ctx.functionLiteral()
@@ -9740,6 +9965,15 @@ class LLVMCodeGenerator(EzLangVisitor):
         )
 
     def _as_list_ptr(self, value: ir.Value) -> ir.Value | None:
+        value_type = value.type.pointee if isinstance(value.type, ir.PointerType) else value.type
+        if self._is_weak_ref_type(value_type) and self._is_list_type(value_type.elements[1].pointee):
+            if isinstance(value.type, ir.PointerType):
+                ptr_slot = self.builder.gep(value, [
+                    ir.Constant(ir.IntType(32), 0),
+                    ir.Constant(ir.IntType(32), 1),
+                ], inbounds=True)
+                return self.builder.load(ptr_slot, name='_weak_list_ptr')
+            return self.builder.extract_value(value, 1, name='_weak_list_ptr')
         if isinstance(value.type, ir.PointerType) and self._is_list_type(value.type.pointee):
             return value
         if self._is_list_type(value.type):
@@ -9785,6 +10019,31 @@ class LLVMCodeGenerator(EzLangVisitor):
         if value.type != elem_type:
             value = self._coerce_value(value, elem_type)
         return value
+
+    def _weak_ref_value(self, ptr: ir.Value | None, pointee_type: ir.Type) -> ir.Value:
+        weak_type = ir.LiteralStructType([ir.IntType(1), ir.PointerType(pointee_type)])
+        result = ir.Constant(weak_type, ir.Undefined)
+        ok = ptr is not None
+        result = self.builder.insert_value(result, ir.Constant(ir.IntType(1), int(ok)), 0)
+        if ptr is None:
+            ptr = ir.Constant(ir.PointerType(pointee_type), None)
+        elif ptr.type != ir.PointerType(pointee_type):
+            ptr = self.builder.bitcast(ptr, ir.PointerType(pointee_type))
+        return self.builder.insert_value(result, ptr, 1)
+
+    def _coerce_weak_ref_value(self, value: ir.Value, target_type: ir.Type) -> ir.Value:
+        pointee_type = target_type.elements[1].pointee
+        if value.type == target_type:
+            return value
+        if isinstance(value.type, ir.PointerType) and value.type.pointee == pointee_type:
+            return self._weak_ref_value(value, pointee_type)
+        if value.type == pointee_type:
+            ptr = self._arena_allocate(pointee_type, name='_weak_tmp')
+            self.builder.store(value, ptr)
+            return self._weak_ref_value(ptr, pointee_type)
+        if self._is_aggregate_ptr(value) and value.type.pointee == pointee_type:
+            return self._weak_ref_value(value, pointee_type)
+        return self._zero_constant(target_type)
 
     def _optional_value(self, elem_type: ir.Type, ok: bool, value: ir.Value | None = None) -> ir.Value:
         opt_type = ir.LiteralStructType([ir.IntType(1), elem_type])
@@ -10162,6 +10421,8 @@ class LLVMCodeGenerator(EzLangVisitor):
         i64 = ir.IntType(64)
         random_type = self.structs.get('RandomSource')
         if random_type is not None:
+            if self._is_weak_ref_type(source_value.type) and source_value.type.elements[1].pointee == random_type:
+                source_value = self.builder.extract_value(source_value, 1, name='_random_source_ptr')
             if isinstance(source_value.type, ir.PointerType) and source_value.type.pointee == random_type:
                 return self.builder.gep(source_value, [
                     ir.Constant(ir.IntType(32), 0),
@@ -10357,6 +10618,15 @@ class LLVMCodeGenerator(EzLangVisitor):
 
     def _as_dict_ptr(self, value: ir.Value) -> ir.Value | None:
         dict_type = self.structs['Dict']
+        value_type = value.type.pointee if isinstance(value.type, ir.PointerType) else value.type
+        if self._is_weak_ref_type(value_type) and value_type.elements[1].pointee == dict_type:
+            if isinstance(value.type, ir.PointerType):
+                ptr_slot = self.builder.gep(value, [
+                    ir.Constant(ir.IntType(32), 0),
+                    ir.Constant(ir.IntType(32), 1),
+                ], inbounds=True)
+                return self.builder.load(ptr_slot, name='_weak_dict_ptr')
+            return self.builder.extract_value(value, 1, name='_weak_dict_ptr')
         if isinstance(value.type, ir.PointerType) and value.type.pointee == dict_type:
             return value
         if value.type == dict_type:
@@ -11074,12 +11344,69 @@ class LLVMCodeGenerator(EzLangVisitor):
             return self.builder.icmp_unsigned(op, left, right)
         return self.builder.icmp_signed(op, left, right)
 
+    def _typeof_void_weak_check(self, left_ctx, right_ctx, op: str) -> ir.Value | None:
+        """生成 typeof weakRef == Void / != Void 的空引用判断。"""
+        def _typeof_operand(ctx):
+            if ctx is None or not hasattr(ctx, 'getChildCount'):
+                return None
+            if ctx.getChildCount() == 1:
+                return _typeof_operand(ctx.getChild(0))
+            if isinstance(ctx, EzLangParser.TypeofPrimaryExprContext):
+                return ctx.typeofExpr().unaryExpression()
+            if hasattr(ctx, 'typeofExpr') and ctx.typeofExpr() is not None:
+                return ctx.typeofExpr().unaryExpression()
+            return None
+
+        def _is_void_type(ctx) -> bool:
+            if ctx is None:
+                return False
+            if hasattr(ctx, 'getChildCount') and ctx.getChildCount() == 1:
+                return _is_void_type(ctx.getChild(0))
+            operand = _typeof_operand(ctx)
+            if operand is not None:
+                return operand.getText() == 'Void'
+            return hasattr(ctx, 'getText') and ctx.getText() == 'Void'
+
+        def _weak_ok(expr_ctx):
+            operand = _typeof_operand(expr_ctx)
+            if operand is None:
+                return None
+            value = self._eval(operand)
+            if value is None or not hasattr(value, 'type'):
+                return None
+            value_type = value.type.pointee if isinstance(value.type, ir.PointerType) else value.type
+            if not self._is_weak_ref_type(value_type):
+                return None
+            if isinstance(value.type, ir.PointerType):
+                ok_ptr = self.builder.gep(value, [
+                    ir.Constant(ir.IntType(32), 0),
+                    ir.Constant(ir.IntType(32), 0),
+                ], inbounds=True)
+                return self.builder.load(ok_ptr, name='_weak_ok')
+            return self.builder.extract_value(value, 0, name='_weak_ok')
+
+        left_ok = _weak_ok(left_ctx)
+        right_is_void = _is_void_type(right_ctx)
+        if left_ok is not None and right_is_void:
+            is_void = self.builder.not_(left_ok)
+            return self.builder.not_(is_void) if op == '!=' else is_void
+        right_ok = _weak_ok(right_ctx)
+        left_is_void = _is_void_type(left_ctx)
+        if right_ok is not None and left_is_void:
+            is_void = self.builder.not_(right_ok)
+            return self.builder.not_(is_void) if op == '!=' else is_void
+        return None
+
     def visitEqualityExpression(self, ctx: EzLangParser.EqualityExpressionContext):
         left = self._eval(ctx.relationalExpression(0))
         for i in range(1, len(ctx.relationalExpression())):
+            op = ctx.getChild((i * 2) - 1).getText()
+            weak_typeof = self._typeof_void_weak_check(ctx.relationalExpression(i - 1), ctx.relationalExpression(i), op)
+            if weak_typeof is not None:
+                left = weak_typeof
+                continue
             right = self._eval(ctx.relationalExpression(i))
             if left is None or right is None: continue
-            op = ctx.getChild((i * 2) - 1).getText()
             left = self._gen_equality_comparison(left, right, op)
         return left
 

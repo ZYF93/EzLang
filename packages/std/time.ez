@@ -24,7 +24,7 @@ export struct Duration {
         return Duration(ms = m * msPerMin);
     };
 
-    toString = (this: Duration): Str => {
+    toString = (this: #Duration): Str => {
         return __durationToString(ms = this.ms);
     };
 };
@@ -39,26 +39,26 @@ export declare const timestamp: () => I64;
 export declare const sleep: (ms: I64) => Void;
 
 // === Date 方法 ===
-declare const dateGetYear: (this: Date) => I32;
-declare const dateGetMonth: (this: Date) => I32;
-declare const dateGetDay: (this: Date) => I32;
-declare const dateGetHour: (this: Date) => I32;
-declare const dateGetMinute: (this: Date) => I32;
-declare const dateGetSecond: (this: Date) => I32;
-declare const dateAdd: (this: Date, year: I32?, month: I32?, day: I32?, hour: I32?, minute: I32?, second: I32?) => Void;
-declare const dateSub: (this: Date, year: I32?, month: I32?, day: I32?, hour: I32?, minute: I32?, second: I32?) => Void;
-declare const dateFormat: (this: Date, fmt: Str) => Str;
+declare const dateGetYear: (this: #Date) => I32;
+declare const dateGetMonth: (this: #Date) => I32;
+declare const dateGetDay: (this: #Date) => I32;
+declare const dateGetHour: (this: #Date) => I32;
+declare const dateGetMinute: (this: #Date) => I32;
+declare const dateGetSecond: (this: #Date) => I32;
+declare const dateAdd: (this: #Date, year: I32?, month: I32?, day: I32?, hour: I32?, minute: I32?, second: I32?) => Void;
+declare const dateSub: (this: #Date, year: I32?, month: I32?, day: I32?, hour: I32?, minute: I32?, second: I32?) => Void;
+declare const dateFormat: (this: #Date, fmt: Str) => Str;
 
-export const getYear = (this: Date): I32 => dateGetYear(this = this);
-export const getMonth = (this: Date): I32 => dateGetMonth(this = this);
-export const getDay = (this: Date): I32 => dateGetDay(this = this);
-export const getHour = (this: Date): I32 => dateGetHour(this = this);
-export const getMinute = (this: Date): I32 => dateGetMinute(this = this);
-export const getSecond = (this: Date): I32 => dateGetSecond(this = this);
-export const add = (this: Date, year: I32?, month: I32?, day: I32?, hour: I32?, minute: I32?, second: I32?): Void => {
+export const getYear = (this: #Date): I32 => dateGetYear(this = this);
+export const getMonth = (this: #Date): I32 => dateGetMonth(this = this);
+export const getDay = (this: #Date): I32 => dateGetDay(this = this);
+export const getHour = (this: #Date): I32 => dateGetHour(this = this);
+export const getMinute = (this: #Date): I32 => dateGetMinute(this = this);
+export const getSecond = (this: #Date): I32 => dateGetSecond(this = this);
+export const add = (this: #Date, year: I32?, month: I32?, day: I32?, hour: I32?, minute: I32?, second: I32?): Void => {
     dateAdd(this = this, year = year, month = month, day = day, hour = hour, minute = minute, second = second);
 };
-export const sub = (this: Date, year: I32?, month: I32?, day: I32?, hour: I32?, minute: I32?, second: I32?): Void => {
+export const sub = (this: #Date, year: I32?, month: I32?, day: I32?, hour: I32?, minute: I32?, second: I32?): Void => {
     dateSub(this = this, year = year, month = month, day = day, hour = hour, minute = minute, second = second);
 };
-export const format = (this: Date, fmt: Str): Str => dateFormat(this = this, fmt = fmt);
+export const format = (this: #Date, fmt: Str): Str => dateFormat(this = this, fmt = fmt);

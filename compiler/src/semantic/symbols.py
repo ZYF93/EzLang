@@ -26,6 +26,7 @@ class TypeKind(Enum):
     FUNCTION = auto()    # (params) => returnType
     STRUCT = auto()      # struct 类型
     POINTER = auto()     # *T 指针类型
+    WEAK_REF = auto()    # #T 弱引用类型
 
 
 class Type:
@@ -49,6 +50,7 @@ class Type:
         self.union_types: list[Type] = []          # 联合类型的成员类型
         self.fields: dict[str, "Type"] = {}        # 结构体字段名→类型映射
         self.pointee_type: Optional[Type] = None    # 指针指向的类型
+        self.referent_type: Optional[Type] = None    # 弱引用指向的类型
 
     def __repr__(self):
         if self.kind == TypeKind.ARRAY:
@@ -70,6 +72,8 @@ class Type:
             return f"({params}) => {self.return_type}"
         if self.kind == TypeKind.POINTER:
             return f"*{self.pointee_type}"
+        if self.kind == TypeKind.WEAK_REF:
+            return f"#{self.referent_type}"
         opt = "?" if self.is_optional else ""
         return f"{self.name}{opt}"
 
@@ -92,6 +96,8 @@ class Type:
             return self.param_types == other.param_types and self.return_type == other.return_type
         if self.kind == TypeKind.POINTER:
             return self.pointee_type == other.pointee_type
+        if self.kind == TypeKind.WEAK_REF:
+            return self.referent_type == other.referent_type
         return self.name == other.name
 
     def is_numeric(self) -> bool:
@@ -167,6 +173,18 @@ class Type:
             if self.pointee_type is None or other.pointee_type is None:
                 return True
             return self.pointee_type.compatible_with(other.pointee_type)
+        if self.kind == TypeKind.WEAK_REF and other.kind == TypeKind.WEAK_REF:
+            if self.referent_type is None or other.referent_type is None:
+                return True
+            return self.referent_type.compatible_with(other.referent_type)
+        if self.kind == TypeKind.WEAK_REF and other.kind == TypeKind.OPTIONAL:
+            if self.referent_type is None or other.element_type is None:
+                return True
+            return self.referent_type.compatible_with(other.element_type)
+        if self.kind == TypeKind.OPTIONAL and other.kind == TypeKind.WEAK_REF:
+            if self.element_type is None or other.referent_type is None:
+                return True
+            return self.element_type.compatible_with(other.referent_type)
         return False
 
 
@@ -311,6 +329,13 @@ def _make_optional(inner: Type) -> Type:
     return t
 
 
+def _make_weak(inner: Type) -> Type:
+    t = Type(name=f"#{inner.name}", kind=TypeKind.WEAK_REF)
+    t.referent_type = inner
+    t.element_type = inner
+    return t
+
+
 BUILTIN_TYPES = {
     "I8": _make_basic("I8"),
     "I32": _make_basic("I32"),
@@ -339,17 +364,18 @@ BUILTIN_TYPES = {
 }
 
 BUILTIN_TYPES["Error"].methods = {
-    "toString": _make_function([("this", BUILTIN_TYPES["Error"])], BUILTIN_TYPES["Str"]),
+    "toString": _make_function([("this", _make_weak(BUILTIN_TYPES["Error"]))], BUILTIN_TYPES["Str"]),
 }
+_DATE_THIS = _make_weak(BUILTIN_TYPES["Date"])
 BUILTIN_TYPES["Date"].methods = {
-    "getYear": _make_function([("this", BUILTIN_TYPES["Date"])], BUILTIN_TYPES["I32"]),
-    "getMonth": _make_function([("this", BUILTIN_TYPES["Date"])], BUILTIN_TYPES["I32"]),
-    "getDay": _make_function([("this", BUILTIN_TYPES["Date"])], BUILTIN_TYPES["I32"]),
-    "getHour": _make_function([("this", BUILTIN_TYPES["Date"])], BUILTIN_TYPES["I32"]),
-    "getMinute": _make_function([("this", BUILTIN_TYPES["Date"])], BUILTIN_TYPES["I32"]),
-    "getSecond": _make_function([("this", BUILTIN_TYPES["Date"])], BUILTIN_TYPES["I32"]),
+    "getYear": _make_function([("this", _DATE_THIS)], BUILTIN_TYPES["I32"]),
+    "getMonth": _make_function([("this", _DATE_THIS)], BUILTIN_TYPES["I32"]),
+    "getDay": _make_function([("this", _DATE_THIS)], BUILTIN_TYPES["I32"]),
+    "getHour": _make_function([("this", _DATE_THIS)], BUILTIN_TYPES["I32"]),
+    "getMinute": _make_function([("this", _DATE_THIS)], BUILTIN_TYPES["I32"]),
+    "getSecond": _make_function([("this", _DATE_THIS)], BUILTIN_TYPES["I32"]),
     "add": _make_function([
-        ("this", BUILTIN_TYPES["Date"]),
+        ("this", _DATE_THIS),
         ("year", _make_optional(BUILTIN_TYPES["I32"])),
         ("month", _make_optional(BUILTIN_TYPES["I32"])),
         ("day", _make_optional(BUILTIN_TYPES["I32"])),
@@ -358,7 +384,7 @@ BUILTIN_TYPES["Date"].methods = {
         ("second", _make_optional(BUILTIN_TYPES["I32"])),
     ], BUILTIN_TYPES["Void"]),
     "sub": _make_function([
-        ("this", BUILTIN_TYPES["Date"]),
+        ("this", _DATE_THIS),
         ("year", _make_optional(BUILTIN_TYPES["I32"])),
         ("month", _make_optional(BUILTIN_TYPES["I32"])),
         ("day", _make_optional(BUILTIN_TYPES["I32"])),
@@ -366,15 +392,16 @@ BUILTIN_TYPES["Date"].methods = {
         ("minute", _make_optional(BUILTIN_TYPES["I32"])),
         ("second", _make_optional(BUILTIN_TYPES["I32"])),
     ], BUILTIN_TYPES["Void"]),
-    "format": _make_function([("this", BUILTIN_TYPES["Date"]), ("fmt", BUILTIN_TYPES["Str"])], BUILTIN_TYPES["Str"]),
+    "format": _make_function([("this", _DATE_THIS), ("fmt", BUILTIN_TYPES["Str"])], BUILTIN_TYPES["Str"]),
 }
+_BLOB_THIS = _make_weak(BUILTIN_TYPES["Blob"])
 BUILTIN_TYPES["Blob"].methods = {
     "get": _make_function(
-        [("this", BUILTIN_TYPES["Blob"]), ("index", BUILTIN_TYPES["I64"])],
+        [("this", _BLOB_THIS), ("index", BUILTIN_TYPES["I64"])],
         BUILTIN_TYPES["I8"],
     ),
     "slice": _make_function(
-        [("this", BUILTIN_TYPES["Blob"]), ("start", BUILTIN_TYPES["I64"]), ("len", BUILTIN_TYPES["I64"])],
+        [("this", _BLOB_THIS), ("start", BUILTIN_TYPES["I64"]), ("len", BUILTIN_TYPES["I64"])],
         BUILTIN_TYPES["Blob"],
     ),
 }

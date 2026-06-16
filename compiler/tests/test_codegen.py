@@ -198,7 +198,7 @@ class TestCodegen:
     def test_decorator_meta_wrapper(self):
         """装饰器变量生成 Meta<T> 包装结构"""
         source = '''
-        const log = (this: Meta<I32>): Void => { return; };
+        const log = (this: #Meta<I32>): Void => { return; };
         @log let watched = 1;
         '''
         module, errors, _ = compile_source(source)
@@ -207,14 +207,14 @@ class TestCodegen:
         ir_text = str(module)
         assert '%"Meta_i32"' in ir_text
         assert '@"watched" = global %"Meta_i32"' in ir_text
-        assert 'call void @"log"(%"Meta_i32"*' in ir_text
+        assert 'call void @"log"({i1, %"Meta_i32"*}* %"_decorator_this")' in ir_text
 
     def test_decorator_meta_getter_setter_ir(self):
         """装饰器变量读写应通过 Meta getter/setter 函数指针拦截"""
         source = '''
-        const get_watched = (meta: Meta<I32>): I32 => { return meta.value + 10; };
-        const set_watched = (meta: Meta<I32>, v: I32): Void => { meta.value = v + 1; };
-        const log = (this: Meta<I32>): Void => {
+        const get_watched = (): I32 => { return 11; };
+        const set_watched = (v: I32): Void => { return; };
+        const log = (this: #Meta<I32>): Void => {
             this.getter = get_watched;
             this.setter = set_watched;
         };
@@ -228,10 +228,10 @@ class TestCodegen:
         assert module is not None
         assert len(errors) == 0, f'编译错误: {errors}'
         ir_text = str(module)
-        assert 'store i32 (%"Meta_i32"*)* @"get_watched"' in ir_text
-        assert 'store void (%"Meta_i32"*, i32)* @"set_watched"' in ir_text
-        assert 'call void %"_watched_setter"(%"Meta_i32"* @"watched", i32 2)' in ir_text
-        assert 'call i32 %"_watched_getter"(%"Meta_i32"* @"watched")' in ir_text
+        assert 'store {i32 (i8*)*, i8*}' in ir_text
+        assert 'store {void (i8*, i32)*, i8*}' in ir_text
+        assert 'call void %"_closure_invoke"(i8* %"_closure_env", i32 2)' in ir_text
+        assert 'call i32 %"_closure_invoke.1"(i8* %"_closure_env.1")' in ir_text
 
     def test_functions_example_codegen(self):
         """functions.ez 应可生成函数相关 IR"""
@@ -882,6 +882,23 @@ class TestCodegen:
         ir_text = str(module)
         assert '{i1, i32}' in ir_text
 
+    def test_weak_reference_type_and_value(self):
+        """#T 弱引用类型映射为 {i1, T*}，使用方式按 T 透明访问。"""
+        source = '''
+        struct Box { value: I32; };
+        const run = (): I32 => {
+            let box = Box(value = 7);
+            let ref: #Box = #box;
+            return (typeof ref == Void) ? 0 : ref.value;
+        };
+        '''
+        module, errors, _ = compile_source(source)
+        assert module is not None
+        assert len(errors) == 0, f'编译错误: {errors}'
+        ir_text = str(module)
+        binding.parse_assembly(ir_text).verify()
+        assert '{i1, %"Box"*}' in ir_text
+
     def test_union_type(self):
         """联合类型 T1 | T2 映射为 {i32, T_max}"""
         source = 'let y: I32 | Str = 42;'
@@ -1026,7 +1043,7 @@ class TestCodegen:
         struct Point {
             x: I32;
             y: I32;
-            distance = (this: Point, other: Point): I32 => {
+            distance = (this: #Point, other: Point): I32 => {
                 let dx: I32 = this.x - other.x;
                 let dy: I32 = this.y - other.y;
                 return dx * dx + dy * dy;
@@ -1386,7 +1403,7 @@ class TestCodegen:
         struct Pair<T, U> {
             first: T;
             second: U;
-            swap = (this: Pair<T, U>): Pair<U, T> => {
+            swap = (this: #Pair<T, U>): Pair<U, T> => {
                 return Pair<U, T>(first = this.second, second = this.first);
             };
         };
@@ -1412,7 +1429,7 @@ class TestCodegen:
             fromSec = (s: I64): Duration => {
                 return Duration(ms = s);
             };
-            toText = (this: Duration): Str => {
+            toText = (this: #Duration): Str => {
                 return "ok";
             };
         };
@@ -2000,7 +2017,7 @@ class TestCodegen:
         struct Point {
             x: I32;
             y: I32;
-            distance = (this: Point, other: Point): I32 => {
+            distance = (this: #Point, other: Point): I32 => {
                 let dx: I32 = this.x - other.x;
                 let dy: I32 = this.y - other.y;
                 return dx * dx + dy * dy;
@@ -2607,13 +2624,13 @@ class TestCodegen:
 
         const check_random = (): I32 => {
             let source = randomSeed(seed = 42);
-            const n32 = randomNextU32(this = source);
-            const n64 = randomNextU64(this = source);
-            const ranged_i = randomRangeI64(this = source, minValue = 1, maxValue = 10);
-            const ranged_f = randomRangeF64(this = source, minValue = 0.0, maxValue = 1.0);
-            const shuffled = randomShuffleBytes(this = source, data = Blob(data = "abcd", size = 4));
+            const n32 = randomNextU32(this = #source);
+            const n64 = randomNextU64(this = #source);
+            const ranged_i = randomRangeI64(this = #source, minValue = 1, maxValue = 10);
+            const ranged_f = randomRangeF64(this = #source, minValue = 0.0, maxValue = 1.0);
+            const shuffled = randomShuffleBytes(this = #source, data = Blob(data = "abcd", size = 4));
             let nums: List<I32> = [1, 2, 3, 4];
-            let shuffled_nums: List<I32> = randomShuffle<I32>(this = source, list = nums);
+            let shuffled_nums: List<I32> = randomShuffle<I32>(this = #source, list = nums);
             const entropy = randomEntropy(size = 8);
             const secure = randomSecureBytes(size = 8);
             const secure64 = randomSecureU64();
@@ -3308,18 +3325,18 @@ class TestCodegen:
             const d = now();
             const ts = timestamp();
             sleep(ms = 1);
-            const y = getYear(this = d);
+            const y = getYear(this = #d);
             const y2 = d.getYear();
-            const m = getMonth(this = d);
-            const day = getDay(this = d);
-            const hour = getHour(this = d);
-            const minute = getMinute(this = d);
-            const second = getSecond(this = d);
-            add(this = d, year = 1, month = 1, day = 1, hour = 1, minute = 1, second = 1);
-            sub(this = d, year = 1, month = 1, day = 1, hour = 1, minute = 1, second = 1);
+            const m = getMonth(this = #d);
+            const day = getDay(this = #d);
+            const hour = getHour(this = #d);
+            const minute = getMinute(this = #d);
+            const second = getSecond(this = #d);
+            add(this = #d, year = 1, month = 1, day = 1, hour = 1, minute = 1, second = 1);
+            sub(this = #d, year = 1, month = 1, day = 1, hour = 1, minute = 1, second = 1);
             d.add(year = 1, month = 0, day = 0, hour = 0, minute = 0, second = 0);
             d.sub(year = 1, month = 0, day = 0, hour = 0, minute = 0, second = 0);
-            const s = format(this = d, fmt = "yyyy-MM-dd");
+            const s = format(this = #d, fmt = "yyyy-MM-dd");
             const s2 = d.format(fmt = "yyyy-MM-dd");
             return y;
         };
@@ -4176,9 +4193,9 @@ class TestCodegen:
     # ==================== 泛型 declare 单态化测试 ====================
 
     def test_generic_declare_simple(self):
-        """泛型 declare: <T>(list: List<T>, item: T) => Void"""
+        """泛型 declare: <T>(this: #List<T>, item: T) => Void"""
         source = '''
-        declare const listPush: <T>(list: List<T>, item: T) => Void;
+        declare const listPush: <T>(this: #List<T>, item: T) => Void;
         '''
         module, errors, _ = compile_source(source)
         assert module is not None
@@ -4187,9 +4204,9 @@ class TestCodegen:
         # 泛型 declare 仅注册模板，不生成 LLVM 函数（调用时单态化）
 
     def test_generic_declare_multi_param(self):
-        """泛型 declare: <K, V>(dict: Dict<K, V>, key: K) => Bool — 多参数模板注册"""
+        """泛型 declare: <K, V>(this: #Dict<K, V>, key: K) => Bool — 多参数模板注册"""
         source = '''
-        declare const dictHas: <K, V>(dict: Dict<K, V>, key: K) => Bool;
+        declare const dictHas: <K, V>(this: #Dict<K, V>, key: K) => Bool;
         '''
         module, errors, _ = compile_source(source)
         assert module is not None
@@ -4204,12 +4221,12 @@ class TestCodegen:
 
         const test_list = (): I64 => {
             let nums: List<I32> = [1, 2, 3];
-            listPush<I32>(list = nums, item = 4);
-            listUnshift<I32>(list = nums, item = 0);
-            const tail = listPop<I32>(list = nums);
-            const head = listShift<I32>(list = nums);
-            let part: List<I32> = listSlice<I32>(list = nums, start = 0, end = 2);
-            return listLen<I32>(list = part);
+            listPush<I32>(this = #nums, item = 4);
+            listUnshift<I32>(this = #nums, item = 0);
+            const tail = listPop<I32>(this = #nums);
+            const head = listShift<I32>(this = #nums);
+            let part: List<I32> = listSlice<I32>(this = #nums, start = 0, end = 2);
+            return listLen<I32>(this = #part);
         };
         '''
         module, errors, _ = compile_source(source)
@@ -4244,20 +4261,20 @@ class TestCodegen:
 
         const test_list = (): I64 => {
             let nums: List<I32> = [3, 1, 2];
-            listSort<I32>(list = nums, cmp = cmp);
-            let found = listFind<I32>(list = nums, pred = pred);
-            let filtered: List<I32> = listFilter<I32>(list = nums, pred = pred);
-            let mapped: List<I64> = listMap<I32, I64>(list = filtered, f = mapper);
-            return listLen<I64>(list = mapped);
+            listSort<I32>(this = #nums, cmp = cmp);
+            let found = listFind<I32>(this = #nums, pred = pred);
+            let filtered: List<I32> = listFilter<I32>(this = #nums, pred = pred);
+            let mapped: List<I64> = listMap<I32, I64>(this = #filtered, f = mapper);
+            return listLen<I64>(this = #mapped);
         };
 
         const test_dict = (): I64 => {
             let meta = { name: Str = "ez", lang: Str = "EzLang" };
-            let has_name = dictHas<Str, Str>(dict = meta, key = "name");
-            let keys: List<Str> = dictKeys<Str, Str>(dict = meta);
-            let values: List<Str> = dictValues<Str, Str>(dict = meta);
-            let removed = dictDelete<Str, Str>(dict = meta, key = "name");
-            return dictLen<Str, Str>(dict = meta);
+            let has_name = dictHas<Str, Str>(this = #meta, key = "name");
+            let keys: List<Str> = dictKeys<Str, Str>(this = #meta);
+            let values: List<Str> = dictValues<Str, Str>(this = #meta);
+            let removed = dictDelete<Str, Str>(this = #meta, key = "name");
+            return dictLen<Str, Str>(this = #meta);
         };
         '''
         module, errors, _ = compile_source(source)
@@ -4273,6 +4290,50 @@ class TestCodegen:
         assert 'list_sort_outer_cond' in ir_text
         assert 'dict_find_cond' in ir_text
         assert 'dict_list_cond' in ir_text
+
+    def test_stdlib_collections_object_methods(self):
+        """List/Dict 标准库函数支持对象方法糖调用"""
+        source = '''
+        from "./std/collections.ez" import {
+            listMap
+        };
+
+        const pred = (item: I32): Bool => {
+            return item > 1;
+        };
+
+        const mapper = (item: I32): I64 => {
+            return item;
+        };
+
+        const test_list = (): I64 => {
+            let nums: List<I32> = [3, 1, 2];
+            nums.push(item = 4);
+            nums.unshift(item = 0);
+            const tail = nums.pop();
+            const head = nums.shift();
+            let part: List<I32> = nums.slice(start = 0, end = 2);
+            let filtered: List<I32> = part.filter(pred = pred);
+            let mapped: List<I64> = filtered.map(f = mapper);
+            return mapped.len();
+        };
+
+        const test_dict = (): I64 => {
+            let meta = { name: Str = "ez", lang: Str = "EzLang" };
+            let has_name = meta.has(key = "name");
+            let keys: List<Str> = meta.keys();
+            let values: List<Str> = meta.values();
+            let removed = meta.delete(key = "name");
+            return meta.len();
+        };
+        '''
+        module, errors, _ = compile_source(source)
+        assert module is not None
+        assert len(errors) == 0, f'编译错误: {errors}'
+        ir_text = str(module)
+        binding.parse_assembly(ir_text).verify()
+        assert 'list_map_cond' in ir_text
+        assert 'dict_find_cond' in ir_text
 
     # ==================== Arena 分配器测试 ====================
 
@@ -4700,7 +4761,7 @@ class TestCodegen:
         source = '''
         struct Date {
             timestamp: I64;
-            add(this: Date, year: I32?) => Void;
+            add(this: #Date, year: I32?) => Void;
         };
         type Headers = { [key: Str]: Str };
         const permission.camera: Str = "camera";

@@ -212,12 +212,12 @@ API：
 API：
 
 - `randomSeed(seed: U64) -> RandomSource`
-- `randomNextU32(this: RandomSource) -> U32`
-- `randomNextU64(this: RandomSource) -> U64`
-- `randomRangeI64(this: RandomSource, minValue: I64, maxValue: I64) -> I64`
-- `randomRangeF64(this: RandomSource, minValue: F64, maxValue: F64) -> F64`
-- `randomShuffleBytes(this: RandomSource, data: Blob) -> Blob`
-- `randomShuffle<T>(this: RandomSource, list: List<T>) -> List<T>`
+- `randomNextU32(this: #RandomSource) -> U32`
+- `randomNextU64(this: #RandomSource) -> U64`
+- `randomRangeI64(this: #RandomSource, minValue: I64, maxValue: I64) -> I64`
+- `randomRangeF64(this: #RandomSource, minValue: F64, maxValue: F64) -> F64`
+- `randomShuffleBytes(this: #RandomSource, data: Blob) -> Blob`
+- `randomShuffle<T>(this: #RandomSource, list: List<T>) -> List<T>`
 - `randomEntropy(size: I64) -> Blob?`
 - `randomSecureBytes(size: I64) -> Blob?`
 - `randomSecureU64() -> U64?`
@@ -457,20 +457,20 @@ API：
 
 - `Duration.fromSec(s: I64) -> Duration`
 - `Duration.fromMin(m: I64) -> Duration`
-- `Duration.toString(this: Duration) -> Str`
+- `Duration.toString(this: #Duration) -> Str`
 - `durationToString(value: Duration) -> Str`
 - `now() -> Date`
 - `timestamp() -> I64`
 - `sleep(ms: I64) -> Void`
-- `getYear(this: Date) -> I32`
-- `getMonth(this: Date) -> I32`
-- `getDay(this: Date) -> I32`
-- `getHour(this: Date) -> I32`
-- `getMinute(this: Date) -> I32`
-- `getSecond(this: Date) -> I32`
-- `add(this: Date, year: I32?, month: I32?, day: I32?, hour: I32?, minute: I32?, second: I32?) -> Void`
-- `sub(this: Date, year: I32?, month: I32?, day: I32?, hour: I32?, minute: I32?, second: I32?) -> Void`
-- `format(this: Date, fmt: Str) -> Str`
+- `getYear(this: #Date) -> I32`
+- `getMonth(this: #Date) -> I32`
+- `getDay(this: #Date) -> I32`
+- `getHour(this: #Date) -> I32`
+- `getMinute(this: #Date) -> I32`
+- `getSecond(this: #Date) -> I32`
+- `add(this: #Date, year: I32?, month: I32?, day: I32?, hour: I32?, minute: I32?, second: I32?) -> Void`
+- `sub(this: #Date, year: I32?, month: I32?, day: I32?, hour: I32?, minute: I32?, second: I32?) -> Void`
+- `format(this: #Date, fmt: Str) -> Str`
 
 `add` / `sub` 原地修改传入的 `Date`，不会返回新 `Date`。
 
@@ -556,23 +556,25 @@ JSON 与 MessagePack 当前覆盖 `I8`、`I32`、`I64`、`U8`、`U32`、`U64`、
 
 ## std/collections
 
-`std/collections` 的公开接口由编译器内建 lowering 实现，不需要外部运行时链接。
+`List<T>`、`T[]` 与 `Dict<K, V>` 是编译器预声明的内置类型，用户可直接使用。`std/collections` 的公开接口由编译器内建 lowering 实现，不需要外部运行时链接；集合扩展函数的第一个参数统一是弱引用 `this`。
 
-- `listPush<T>(list: List<T>, item: T) -> Void`
-- `listPop<T>(list: List<T>) -> T?`
-- `listShift<T>(list: List<T>) -> T?`
-- `listUnshift<T>(list: List<T>, item: T) -> Void`
-- `listSort<T>(list: List<T>, cmp: (a: T, b: T) -> I32) -> Void`
-- `listFilter<T>(list: List<T>, pred: (item: T) -> Bool) -> List<T>`
-- `listMap<T, U>(list: List<T>, f: (item: T) -> U) -> List<U>`
-- `listFind<T>(list: List<T>, pred: (item: T) -> Bool) -> T?`
-- `listLen<T>(list: List<T>) -> I64`
-- `listSlice<T>(list: List<T>, start: I64, end: I64) -> List<T>`
-- `dictKeys<K, V>(dict: Dict<K, V>) -> K[]`
-- `dictValues<K, V>(dict: Dict<K, V>) -> V[]`
-- `dictHas<K, V>(dict: Dict<K, V>, key: K) -> Bool`
-- `dictDelete<K, V>(dict: Dict<K, V>, key: K) -> Bool`
-- `dictLen<K, V>(dict: Dict<K, V>) -> I64`
+- `listPush<T>(this: #List<T>, item: T) -> Void`
+- `listPop<T>(this: #List<T>) -> T?`
+- `listShift<T>(this: #List<T>) -> T?`
+- `listUnshift<T>(this: #List<T>, item: T) -> Void`
+- `listSort<T>(this: #List<T>, cmp: (a: T, b: T) -> I32) -> Void`
+- `listFilter<T>(this: #List<T>, pred: (item: T) -> Bool) -> List<T>`
+- `listMap<T, U>(this: #List<T>, f: (item: T) -> U) -> List<U>`
+- `listFind<T>(this: #List<T>, pred: (item: T) -> Bool) -> T?`
+- `listLen<T>(this: #List<T>) -> I64`
+- `listSlice<T>(this: #List<T>, start: I64, end: I64) -> List<T>`
+- `dictKeys<K, V>(this: #Dict<K, V>) -> K[]`
+- `dictValues<K, V>(this: #Dict<K, V>) -> V[]`
+- `dictHas<K, V>(this: #Dict<K, V>, key: K) -> Bool`
+- `dictDelete<K, V>(this: #Dict<K, V>, key: K) -> Bool`
+- `dictLen<K, V>(this: #Dict<K, V>) -> I64`
+
+推荐使用对象方法糖：`nums.push(item = 4)`、`nums.len()`、`meta.has(key = "name")`。显式调用时使用 `this = #nums` / `this = #meta`。
 
 `List<T>` 支持 `listLen`、`listPush`、`listPop`、`listShift`、`listUnshift`、`listSlice`、`listSort`、`listFilter`、`listMap`、`listFind`。当前数组/List ABI 使用分页布局 `{ pages, length, capacity, page_count }`，`push/unshift/filter` 会按需扩页。
 

@@ -29,6 +29,7 @@ let a = 1; // 语句由 ; 分隔，表达式可以直接作为语句使用
 // 基本类型与可选、联合类型
 let a: I32? = 10;
 let value: I32 | Str = "hello";
+let weakUser: #User = #user;
 
 // List (动态数组) 与 SIMD 向量
 let arr: User[]?;                    // 动态数组（List）
@@ -66,7 +67,7 @@ type UserShape = {
 struct Pair<T, U> {
     first: T
     second: U
-    swap = (this: Pair<T, U>) => Pair<U, T>(first = this.second, second = this.first)
+    swap = (this: #Pair<T, U>) => Pair<U, T>(first = this.second, second = this.first)
 }
 let p = Pair<I32, Str>(first = 42, second = "hello")
 let swapped = p.swap()  // Pair<Str, I32>
@@ -89,6 +90,7 @@ let inferred = identity(42)  // 推断为 I32
   * 向量：`Vec<Type>[N]`（SIMD 向量，N 为 2, 4, 8, 16，Type 为数值类型）。它表示寄存器内的 SIMD 向量。
   * 函数类型：`(name: Type, ...) => ReturnType`。函数值按闭包值处理，可保存普通函数、匿名函数、柯里化结果和捕获外层变量的函数。
   * 可选类型：`Type?`。底层为 `Option<T>`，访问时使用 `expr?` 或强制拆包 `Type! expr`。
+  * 弱引用类型：`#Type`。`#expr` 生成指向 `expr` 的弱引用值，语义上表示“可能因 Arena 生命周期结束而失效的 Type 引用”。弱引用按 `Type` 透明使用：`#var.field`、`#var.method()` 与 `var.field`、`var.method()` 写法一致；判空使用 `typeof ref == Void`。
   * 联合类型：`Type1 | Type2`。必须通过模式匹配或类型检查区分具体分支。
 * **类型别名与鸭子类型**：
   * 使用 `type Alias = { ... }` 定义的形状采用鸭子类型（Duck Typing）进行验证。任何结构（包括 `Struct` 或 `Dict`）只要包含形状要求的字段，即可视为匹配该类型。
@@ -107,6 +109,7 @@ let inferred = identity(42)  // 推断为 I32
 * `Vec<Type>[N]` 映射为 LLVM `<N x Type>`。
 * 函数类型在 EzLang 内部映射为闭包值：`{ invoke, env }`。`invoke` 是带环境指针的调用入口，`env` 保存捕获环境；传给 `declare` 外部 C ABI 时，零捕获普通函数可降低为 C 函数指针。
 * 可选类型映射为 `{ i1 has_value, T value }`。
+* 弱引用映射为 `{ i1 ok, T* ptr }`。语言层不暴露 `.ok/.value` 包装字段，字段访问和方法调用会直接解到内部 `T`；`typeof ref == Void` 映射为检查 `ok` 位。当前编译器已提供类型、访问与调用 ABI 表示，运行时 Arena 销毁后的统一失效标记仍按运行时能力逐步接入。
 * 联合类型映射为带 tag 的变体结构。
 * 泛型通过单态化实现，每个具体类型实例在编译时生成独立 LLVM 函数或类型替换。
 * `Dict` 类型映射为哈希表。
@@ -121,7 +124,7 @@ let inferred = identity(42)  // 推断为 I32
 struct Person {
     name: Str = "default";
     id: I32;
-    say = (this: Person): Str => { return this.name; };
+    say = (this: #Person): Str => { return this.name; };
 }
 
 struct User {
@@ -138,17 +141,17 @@ let user3 = User(...user, age = 20);
 struct Date {
     timestamp: I64;
 
-    getYear(this: Date) => I32;
-    getMonth(this: Date) => I32;
-    getDay(this: Date) => I32;
-    getHour(this: Date) => I32;
-    getMinute(this: Date) => I32;
-    getSecond(this: Date) => I32;
+    getYear(this: #Date) => I32;
+    getMonth(this: #Date) => I32;
+    getDay(this: #Date) => I32;
+    getHour(this: #Date) => I32;
+    getMinute(this: #Date) => I32;
+    getSecond(this: #Date) => I32;
 
-    add(this: Date, year: I32?, month: I32?, day: I32?, hour: I32?, minute: I32?, second: I32?) => Void;
-    sub(this: Date, year: I32?, month: I32?, day: I32?, hour: I32?, minute: I32?, second: I32?) => Void;
+    add(this: #Date, year: I32?, month: I32?, day: I32?, hour: I32?, minute: I32?, second: I32?) => Void;
+    sub(this: #Date, year: I32?, month: I32?, day: I32?, hour: I32?, minute: I32?, second: I32?) => Void;
 
-    format(this: Date, fmt: Str) => Str;
+    format(this: #Date, fmt: Str) => Str;
 }
 
 struct Error {
@@ -159,15 +162,15 @@ struct Error {
     column:  I32;
     trace:   Str;
 
-    toString(this: Error) => Str;
+    toString(this: #Error) => Str;
 }
 
 struct Blob {
     data: *U8;
     size: I64;
 
-    get(this: Blob, index: I64) => U8;
-    slice(this: Blob, start: I64, len: I64) => Blob;
+    get(this: #Blob, index: I64) => U8;
+    slice(this: #Blob, start: I64, len: I64) => Blob;
 }
 
 struct Meta<T> {
@@ -180,15 +183,15 @@ struct Meta<T> {
 ```
 
 ### 语义说明与规范
-* **结构体基础**：定义支持 `struct Name<T> { ...Base?; field: Type = default?; method = (this: Type, args...) => expr?; }`。支持名称参数初始化与默认字段值。结构体使用静态布局。
+* **结构体基础**：定义支持 `struct Name<T> { ...Base?; field: Type = default?; method = (this: #Type, args...) => expr?; }`。支持名称参数初始化与默认字段值。结构体使用静态布局。
 * **组合与复用**：`...Base` 将基础结构体字段平铺到当前结构体开头，实现布局复用。实例化时复制基础结构的内存并写入新增字段。
-* **类型检查与方法**：每个结构体隐式包含 `I32` 类型标识，用于 `typeof` 和运行时检查。方法是内联函数，`this` 显式绑定到实例。
+* **类型检查与方法**：每个结构体隐式包含 `I32` 类型标识，用于 `typeof` 和运行时检查。方法是内联函数，`this` 显式绑定到实例；对象方法调用会把接收者作为第一个 `this` 参数传入，集合扩展方法使用弱引用 `this`。
 * **内置结构体与内置类型**：提供语言层面的通用数据结构封装。这些类型由编译器预声明，不需要从标准库导入。
   * `Date` 提供时间戳存储、基础的时间加减与格式化。
   * `Error` 封装错误代码、信息、抛出点文件/行/列和轻量调用栈片段，方便统一异常处理与诊断输出。
   * `Blob` 提供二进制块长度和底层指针访问能力。
-  * `Dict` 是字典的运行时承载类型，用户通常通过 `{ key: Type; ... }` 形状或 `Dict<K, V>` 使用。
-  * `List<T>` / `T[]` 是动态数组类型。
+  * `Dict<K, V>` 是字典的运行时承载类型，用户通常通过 `{ key: Type; ... }` 形状或 `Dict<K, V>` 使用；`std/collections` 暴露 `dictHas`、`dictKeys` 等扩展函数，首参为 `this: #Dict<K, V>`。
+  * `List<T>` / `T[]` 是动态数组类型；`std/collections` 暴露 `listPush`、`listLen`、`listMap` 等扩展函数，首参为 `this: #List<T>`。
   * `Meta<T>` 是装饰器变量的元对象类型，保存原始值、读写拦截闭包、类型名和变量名。
 
 ### LLVM 映射
@@ -268,7 +271,7 @@ let value = add10(x = 5)
 ```
 
 ### 语义说明与规范
-* 显式声明 `this`，没有隐式上下文。`obj.fn()` 等价于 `fn(this = obj)`。`this` 总是以引用语义传递，避免结构体拷贝。普通变量使用值语义。
+* 显式声明 `this` 时必须使用弱引用类型 `#Type`。`obj.fn()` 会自动把 `#obj` 传入 `this`，用户不需要显式填写；直接调用函数时可写 `fn(this = #obj)`。普通变量仍使用值语义。
 * 函数调用支持位置参数和命名参数混用（如 `fn(1, c = 3)`），位置参数需位于具名参数之前。
 * 形参可声明默认值，调用时省略该参数即使用默认值。
 * 函数体使用 `{ ... }` block 时，必须通过 `return` 显式返回值，最后一个表达式不会隐式作为返回值。
@@ -486,7 +489,7 @@ declare static version: Str
 from "std/io" import { print }
 
 // 元编程：装饰器
-const log = (this: Meta<I32>): Void => {
+const log = (this: #Meta<I32>): Void => {
     this.getter = (): I32 => {
         return this.value + 10
     }
@@ -531,7 +534,7 @@ let isError = typeof err & Error == Error
 ```
 
 ### 语义说明与规范
-* **元编程与装饰器**：`@Dec` 将顶层变量包装为 `Meta<T>` 并在模块初始化阶段调用装饰器函数。装饰器函数接收 `Meta<T>` 或 `this: Meta<T>`，可读写 `value`, `getter`, `setter`, `type`, `name`。
+* **元编程与装饰器**：`@Dec` 将顶层变量包装为 `Meta<T>` 并在模块初始化阶段调用装饰器函数。装饰器函数接收 `Meta<T>` 或 `this: #Meta<T>`，可读写 `value`, `getter`, `setter`, `type`, `name`。
   * `value` 是被装饰变量的真实存储。
   * `getter` 是 `() => T` 闭包；未设置时读取直接返回 `value`。
   * `setter` 是 `(value: T) => Void` 闭包；未设置时写入直接更新 `value`。

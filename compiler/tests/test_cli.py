@@ -488,7 +488,7 @@ def test_run_decorator_meta_getter_setter_intercepts_global_access(tmp_path):
         'const set_watched = (meta: Meta<I32>, v: I32): Void => {\n'
         '    meta.value = v + 1;\n'
         '};\n'
-        'const log = (this: Meta<I32>): Void => {\n'
+        'const log = (this: #Meta<I32>): Void => {\n'
         '    this.getter = get_watched;\n'
         '    this.setter = set_watched;\n'
         '};\n'
@@ -990,32 +990,32 @@ def test_run_links_std_time_date_methods_native_abi(tmp_path):
         'const main = (): I32 => {\n'
         '    testReset();\n'
         '    const current = now();\n'
-        '    const year = getYear(this = current);\n'
+        '    const year = getYear(this = #current);\n'
         '    const method_year = current.getYear();\n'
-        '    const month = getMonth(this = current);\n'
-        '    const day = getDay(this = current);\n'
-        '    const hour = getHour(this = current);\n'
-        '    const minute = getMinute(this = current);\n'
-        '    const second = getSecond(this = current);\n'
-        '    add(this = current, year = 1, month = 0, day = 0, hour = 0, minute = 0, second = 0);\n'
-        '    sub(this = current, year = 1, month = 0, day = 0, hour = 0, minute = 0, second = 0);\n'
+        '    const month = getMonth(this = #current);\n'
+        '    const day = getDay(this = #current);\n'
+        '    const hour = getHour(this = #current);\n'
+        '    const minute = getMinute(this = #current);\n'
+        '    const second = getSecond(this = #current);\n'
+        '    add(this = #current, year = 1, month = 0, day = 0, hour = 0, minute = 0, second = 0);\n'
+        '    sub(this = #current, year = 1, month = 0, day = 0, hour = 0, minute = 0, second = 0);\n'
         '    let epoch = Date(timestamp = 0);\n'
         '    const before_epoch = Date(timestamp = -1);\n'
-        '    testEqualStr(actual = format(this = epoch, fmt = "YYYY-MM-DD HH:%M:SS"), expected = "1970-01-01 00:00:00", msg = "mixed time format");\n'
+        '    testEqualStr(actual = format(this = #epoch, fmt = "YYYY-MM-DD HH:%M:SS"), expected = "1970-01-01 00:00:00", msg = "mixed time format");\n'
         '    testEqualStr(actual = epoch.format(fmt = "YYYY-MM-DD"), expected = "1970-01-01", msg = "date method format");\n'
-        '    testEqualStr(actual = format(this = epoch, fmt = "YYYY-MM-DD HH:mm:SS"), expected = "1970-01-01 00:00:00", msg = "named minute time format");\n'
-        '    testEqualStr(actual = format(this = epoch, fmt = "%Y-%m-%d %H:%M:%S"), expected = "1970-01-01 00:00:00", msg = "strftime time format");\n'
-        '    add(this = epoch, year = 1, month = 0, day = 0, hour = 0, minute = 0, second = 0);\n'
-        '    testEqualStr(actual = format(this = epoch, fmt = "%Y-%m-%d"), expected = "1971-01-01", msg = "date add mutates this");\n'
-        '    sub(this = epoch, year = 1, month = 0, day = 0, hour = 0, minute = 0, second = 0);\n'
-        '    testEqualStr(actual = format(this = epoch, fmt = "%Y-%m-%d"), expected = "1970-01-01", msg = "date sub mutates this");\n'
+        '    testEqualStr(actual = format(this = #epoch, fmt = "YYYY-MM-DD HH:mm:SS"), expected = "1970-01-01 00:00:00", msg = "named minute time format");\n'
+        '    testEqualStr(actual = format(this = #epoch, fmt = "%Y-%m-%d %H:%M:%S"), expected = "1970-01-01 00:00:00", msg = "strftime time format");\n'
+        '    add(this = #epoch, year = 1, month = 0, day = 0, hour = 0, minute = 0, second = 0);\n'
+        '    testEqualStr(actual = format(this = #epoch, fmt = "%Y-%m-%d"), expected = "1971-01-01", msg = "date add mutates this");\n'
+        '    sub(this = #epoch, year = 1, month = 0, day = 0, hour = 0, minute = 0, second = 0);\n'
+        '    testEqualStr(actual = format(this = #epoch, fmt = "%Y-%m-%d"), expected = "1970-01-01", msg = "date sub mutates this");\n'
         '    epoch.add(year = 1, month = 0, day = 0, hour = 0, minute = 0, second = 0);\n'
         '    testEqualStr(actual = epoch.format(fmt = "%Y-%m-%d"), expected = "1971-01-01", msg = "date method add mutates this");\n'
         '    epoch.sub(year = 1, month = 0, day = 0, hour = 0, minute = 0, second = 0);\n'
         '    testEqualStr(actual = epoch.format(fmt = "%Y-%m-%d"), expected = "1970-01-01", msg = "date method sub mutates this");\n'
         '    testEqualI64(actual = method_year, expected = year, msg = "date method getYear");\n'
-        '    testEqualI64(actual = getYear(this = before_epoch), expected = 1969, msg = "negative timestamp year");\n'
-        '    testEqualStr(actual = format(this = before_epoch, fmt = "%Y-%m-%d %H:%M:%S"), expected = "1969-12-31 23:59:59", msg = "negative timestamp floor seconds");\n'
+        '    testEqualI64(actual = getYear(this = #before_epoch), expected = 1969, msg = "negative timestamp year");\n'
+        '    testEqualStr(actual = format(this = #before_epoch, fmt = "%Y-%m-%d %H:%M:%S"), expected = "1969-12-31 23:59:59", msg = "negative timestamp floor seconds");\n'
         '    return testFailed();\n'
         '};\n',
         encoding="utf-8",
@@ -1040,7 +1040,7 @@ def test_run_links_std_time_duration_and_long_format(tmp_path):
         '    const seconds = Duration.fromSec(s = 2);\n'
         '    const minutes = Duration.fromMin(m = 1);\n'
         '    const epoch = Date(timestamp = 0);\n'
-        f'    const formatted = format(this = epoch, fmt = "{long_fmt}");\n'
+        f'    const formatted = format(this = #epoch, fmt = "{long_fmt}");\n'
         '    testEqualI64(actual = seconds.ms, expected = 2000, msg = "seconds to milliseconds");\n'
         '    testEqualI64(actual = minutes.ms, expected = 60000, msg = "minutes to milliseconds");\n'
         '    testEqualStr(actual = seconds.toString(), expected = "2000ms", msg = "duration method string");\n'
@@ -1629,7 +1629,7 @@ const main = (): I32 => {
     const parsed = jsonParse<Dict<Str, I32>>(s = "{\"x\":4,\"y\":5}");
     testEqualI64(actual = parsed["x"], expected = 4, msg = "json dict parse x");
     testEqualI64(actual = parsed["y"], expected = 5, msg = "json dict parse y");
-    testEqualI64(actual = dictLen<Str, I32>(dict = parsed), expected = 2, msg = "json dict len");
+    testEqualI64(actual = dictLen<Str, I32>(this = #parsed), expected = 2, msg = "json dict len");
 
     const decoded = msgpackDecode<Dict<Str, I32>>(data = msgpackEncode<Dict<Str, I32>>(data = scores));
     testEqualI64(actual = decoded["a"], expected = 1, msg = "msgpack dict a");
@@ -1670,7 +1670,7 @@ const main = (): I32 => {
     const parsed = jsonParse<Dict<I32, Str>>(s = "[{\"key\":3,\"value\":\"three\"},{\"key\":4,\"value\":\"four\"}]");
     testEqualStr(actual = parsed[3], expected = "three", msg = "json dict non-str parse first");
     testEqualStr(actual = parsed[4], expected = "four", msg = "json dict non-str parse second");
-    testEqualI64(actual = dictLen<I32, Str>(dict = parsed), expected = 2, msg = "json dict non-str len");
+    testEqualI64(actual = dictLen<I32, Str>(this = #parsed), expected = 2, msg = "json dict non-str len");
 
     const decoded = msgpackDecode<Dict<I32, Str>>(data = msgpackEncode<Dict<I32, Str>>(data = scores));
     testEqualStr(actual = decoded[1], expected = "one", msg = "msgpack dict non-str first");
@@ -2048,11 +2048,11 @@ def test_run_links_std_str_basic_native_functions(tmp_path):
         '    testAssert(condition = strContains(s = text, needle = "Ez") && strStartsWith(s = text, prefix = " ") && strEndsWith(s = text, suffix = " "), msg = "contains starts ends");\n'
         '    testEqualI64(actual = strIndexOf(s = text, needle = "语言"), expected = 3, msg = "index byte offset");\n'
         '    const parts = strSplit(s = "a,,b", sep = ",");\n'
-        '    testEqualI64(actual = listLen<Str>(list = parts), expected = 3, msg = "split preserves empty fields");\n'
+        '    testEqualI64(actual = listLen<Str>(this = #parts), expected = 3, msg = "split preserves empty fields");\n'
         '    testEqualStr(actual = parts[1], expected = "", msg = "split empty middle");\n'
         '    testEqualStr(actual = strJoin(parts = parts, sep = "|"), expected = "a||b", msg = "join fields");\n'
         '    const chars = strSplit(s = "语言", sep = "");\n'
-        '    testEqualI64(actual = listLen<Str>(list = chars), expected = 2, msg = "split empty separator by char");\n'
+        '    testEqualI64(actual = listLen<Str>(this = #chars), expected = 2, msg = "split empty separator by char");\n'
         '    testEqualStr(actual = chars[1], expected = "言", msg = "split unicode char");\n'
         '    testEqualStr(actual = strTrim(s = "  EzLang  "), expected = "EzLang", msg = "trim spaces");\n'
         '    testEqualStr(actual = strTrim(s = "\u00A0\u3000EzLang\u2003\u202F"), expected = "EzLang", msg = "trim unicode spaces");\n'
@@ -2311,15 +2311,15 @@ def test_run_links_std_random_basic_native_functions(tmp_path):
         '    testReset();\n'
         '    let source = randomSeed(seed = 42);\n'
         '    let same_seed = randomSeed(seed = 42);\n'
-        '    const n32 = randomNextU32(this = source);\n'
-        '    const same_n32 = randomNextU32(this = same_seed);\n'
-        '    const n64 = randomNextU64(this = source);\n'
-        '    const ranged_i = randomRangeI64(this = source, minValue = 10, maxValue = 1);\n'
-        '    const ranged_f = randomRangeF64(this = source, minValue = 1.0, maxValue = 0.0);\n'
-        '    const shuffled = randomShuffleBytes(this = source, data = Blob(data = "abcd", size = 4));\n'
+        '    const n32 = randomNextU32(this = #source);\n'
+        '    const same_n32 = randomNextU32(this = #same_seed);\n'
+        '    const n64 = randomNextU64(this = #source);\n'
+        '    const ranged_i = randomRangeI64(this = #source, minValue = 10, maxValue = 1);\n'
+        '    const ranged_f = randomRangeF64(this = #source, minValue = 1.0, maxValue = 0.0);\n'
+        '    const shuffled = randomShuffleBytes(this = #source, data = Blob(data = "abcd", size = 4));\n'
         '    let nums: List<I32> = [1, 2, 3, 4];\n'
         '    let list_source = randomSeed(seed = 42);\n'
-        '    let shuffled_nums: List<I32> = randomShuffle<I32>(this = list_source, list = nums);\n'
+        '    let shuffled_nums: List<I32> = randomShuffle<I32>(this = #list_source, list = nums);\n'
         '    const empty_secure = randomSecureBytes(size = 0);\n'
         '    const bad_secure = randomSecureBytes(size = -1);\n'
         '    const secure = randomSecureBytes(size = 8);\n'
@@ -2333,8 +2333,8 @@ def test_run_links_std_random_basic_native_functions(tmp_path):
         '    testEqualI64(actual = ranged_i, expected = 10, msg = "range i64 swaps bounds");\n'
         '    testAssert(condition = ranged_f >= 0.0 && ranged_f < 1.0, msg = "range f64 swaps bounds");\n'
         '    testEqualI64(actual = shuffled.size, expected = 4, msg = "shuffle preserves byte count");\n'
-        '    testEqualI64(actual = listLen<I32>(list = nums), expected = 4, msg = "list shuffle keeps original length");\n'
-        '    testEqualI64(actual = listLen<I32>(list = shuffled_nums), expected = 4, msg = "list shuffle preserves length");\n'
+        '    testEqualI64(actual = listLen<I32>(this = #nums), expected = 4, msg = "list shuffle keeps original length");\n'
+        '    testEqualI64(actual = listLen<I32>(this = #shuffled_nums), expected = 4, msg = "list shuffle preserves length");\n'
         '    testEqualI64(actual = nums[1], expected = 2, msg = "list shuffle leaves source list unchanged");\n'
         '    testEqualI64(actual = shuffled_nums[0], expected = 1, msg = "list shuffle item 0");\n'
         '    testEqualI64(actual = shuffled_nums[1], expected = 4, msg = "list shuffle item 1");\n'
@@ -2754,7 +2754,7 @@ def test_run_std_regex_find_all_zero_width_anchors_once(tmp_path):
         '    testReset();\n'
         '    const boundary = regexCompile(pattern = "^", flags = 0);\n'
         '    const found = regexFindAll(regex = boundary, input = "abc");\n'
-        '    testEqualI64(actual = listLen<Str>(list = found), expected = 1, msg = "find all start anchor once");\n'
+        '    testEqualI64(actual = listLen<Str>(this = #found), expected = 1, msg = "find all start anchor once");\n'
         '    return testFailed();\n'
         '};\n',
         encoding="utf-8",
@@ -2777,8 +2777,8 @@ def test_run_std_regex_find_all_zero_width_empty_input_once(tmp_path):
         '    testReset();\n'
         '    const starts = regexFindAll(regex = regexCompile(pattern = "^", flags = 0), input = "");\n'
         '    const ends = regexFindAll(regex = regexCompile(pattern = "$", flags = 0), input = "");\n'
-        '    testEqualI64(actual = listLen<Str>(list = starts), expected = 1, msg = "find all start anchor on empty input once");\n'
-        '    testEqualI64(actual = listLen<Str>(list = ends), expected = 1, msg = "find all end anchor on empty input once");\n'
+        '    testEqualI64(actual = listLen<Str>(this = #starts), expected = 1, msg = "find all start anchor on empty input once");\n'
+        '    testEqualI64(actual = listLen<Str>(this = #ends), expected = 1, msg = "find all end anchor on empty input once");\n'
         '    return testFailed();\n'
         '};\n',
         encoding="utf-8",
@@ -2800,11 +2800,11 @@ def test_run_std_regex_split_anchors_and_utf8_zero_width(tmp_path):
         'const main = (): I32 => {\n'
         '    testReset();\n'
         '    const anchored = regexSplit(regex = regexCompile(pattern = "^", flags = 0), input = "abc");\n'
-        '    testEqualI64(actual = listLen<Str>(list = anchored), expected = 2, msg = "split start anchor only at input start");\n'
+        '    testEqualI64(actual = listLen<Str>(this = #anchored), expected = 2, msg = "split start anchor only at input start");\n'
         '    testEqualStr(actual = anchored[0], expected = "", msg = "split start anchor prefix");\n'
         '    testEqualStr(actual = anchored[1], expected = "bc", msg = "split start anchor suffix after zero-width progress");\n'
         '    const utf = regexSplit(regex = regexCompile(pattern = "^", flags = 0), input = "中a");\n'
-        '    testEqualI64(actual = listLen<Str>(list = utf), expected = 2, msg = "split start anchor advances by UTF-8 scalar");\n'
+        '    testEqualI64(actual = listLen<Str>(this = #utf), expected = 2, msg = "split start anchor advances by UTF-8 scalar");\n'
         '    testEqualStr(actual = utf[1], expected = "a", msg = "split start anchor skips one UTF-8 scalar");\n'
         '    return testFailed();\n'
         '};\n',
@@ -2833,9 +2833,9 @@ def test_run_std_regex_respects_invalid_regex_flag(tmp_path):
         '    const parts = regexSplit(regex = invalid, input = "a");\n'
         '    testAssert(condition = !regexIsValid(regex = invalid), msg = "invalid regex flag stays invalid");\n'
         '    testAssert(condition = !regexTest(regex = invalid, input = "a") && !found.ok, msg = "invalid regex does not match");\n'
-        '    testEqualI64(actual = listLen<Str>(list = all), expected = 0, msg = "invalid regex find all empty");\n'
+        '    testEqualI64(actual = listLen<Str>(this = #all), expected = 0, msg = "invalid regex find all empty");\n'
         '    testEqualStr(actual = replaced, expected = "a", msg = "invalid regex replace returns input");\n'
-        '    testEqualI64(actual = listLen<Str>(list = parts), expected = 1, msg = "invalid regex split returns input list");\n'
+        '    testEqualI64(actual = listLen<Str>(this = #parts), expected = 1, msg = "invalid regex split returns input list");\n'
         '    testEqualStr(actual = parts[0], expected = "a", msg = "invalid regex split input value");\n'
         '    return testFailed();\n'
         '};\n',
@@ -4618,7 +4618,7 @@ def test_run_struct_method_this_uses_reference_semantics(tmp_path):
     (tmp_path / "src" / "index.ez").write_text(
         'struct Counter {\n'
         '    value: I32;\n'
-        '    set = (this: Counter, v: I32): Void => {\n'
+        '    set = (this: #Counter, v: I32): Void => {\n'
         '        this.value = v;\n'
         '    };\n'
         '};\n'
@@ -4741,7 +4741,7 @@ def test_run_optional_method_access_short_circuits(tmp_path):
         'from "std/str" import { strEqual };\n'
         'struct TextBox {\n'
         '    value: Str;\n'
-        '    text = (this: TextBox): Str => { return this.value; };\n'
+        '    text = (this: #TextBox): Str => { return this.value; };\n'
         '};\n'
         'const main = (): I32 => {\n'
         '    let empty: TextBox?;\n'
@@ -4989,7 +4989,7 @@ def test_run_generic_struct_method_swap_monomorphizes(tmp_path):
         'struct Pair<T, U> {\n'
         '    first: T;\n'
         '    second: U;\n'
-        '    swap = (this: Pair<T, U>): Pair<U, T> => {\n'
+        '    swap = (this: #Pair<T, U>): Pair<U, T> => {\n'
         '        return Pair<U, T>(first = this.second, second = this.first);\n'
         '    };\n'
         '};\n'
@@ -5744,7 +5744,7 @@ def test_run_std_fs_recursive_dir_list_and_millisecond_stat(tmp_path):
         '    const root_is_dir = isDir(path = root);\n'
         '    const removed = removeDir(path = root, recursive = true);\n'
         '    const gone = !exists(path = root);\n'
-        '    return (wrote && root_exists && root_is_dir && listLen<Str>(list = entries) > 0 && info.ok && info.value.size == 4 && info.value.modified > 1000000000000 && removed && gone) ? 0 : 1;\n'
+        '    return (wrote && root_exists && root_is_dir && listLen<Str>(this = #entries) > 0 && info.ok && info.value.size == 4 && info.value.modified > 1000000000000 && removed && gone) ? 0 : 1;\n'
         '};\n',
         encoding="utf-8",
     )
@@ -5770,7 +5770,7 @@ def test_run_std_fs_empty_path_returns_failure_values(tmp_path):
         '    const info = stat(path = empty);\n'
         '    const absolute = absPath(path = empty);\n'
         '    const ok = !writeFile(path = empty, content = content) && !appendFile(path = empty, content = content) && !removeFile(path = empty) && !mkdir(path = empty) && !removeDir(path = empty, recursive = true) && !exists(path = empty) && !isDir(path = empty);\n'
-        '    return (ok && data.size == 0 && listLen<Str>(list = names) == 0 && !info.ok && strIsEmpty(s = absolute)) ? 0 : 1;\n'
+        '    return (ok && data.size == 0 && listLen<Str>(this = #names) == 0 && !info.ok && strIsEmpty(s = absolute)) ? 0 : 1;\n'
         '};\n',
         encoding="utf-8",
     )
@@ -5862,7 +5862,7 @@ def test_run_std_os_args_returns_process_arguments(tmp_path):
         'from "std/collections" import { listLen };\n'
         'const main = (): I32 => {\n'
         '    const argv = args();\n'
-        '    const count = listLen<Str>(list = argv);\n'
+        '    const count = listLen<Str>(this = #argv);\n'
         '    return count > 0 ? 0 : 1;\n'
         '};\n',
         encoding="utf-8",
@@ -5913,23 +5913,23 @@ def test_run_std_collections_public_interfaces(tmp_path):
         'const cmp = (a: I32, b: I32): I32 => { return a - b; };\n'
         'const main = (): I32 => {\n'
         '    let nums: List<I32> = [3, 1, 2];\n'
-        '    listPush<I32>(list = nums, item = 4);\n'
-        '    listUnshift<I32>(list = nums, item = -1);\n'
-        '    listSort<I32>(list = nums, cmp = cmp);\n'
-        '    const first = listShift<I32>(list = nums);\n'
-        '    const last = listPop<I32>(list = nums);\n'
-        '    const found = listFind<I32>(list = nums, pred = pred);\n'
-        '    let filtered: List<I32> = listFilter<I32>(list = nums, pred = pred);\n'
-        '    let mapped: List<I64> = listMap<I32, I64>(list = filtered, f = mapper);\n'
-        '    let sliced: List<I32> = listSlice<I32>(list = nums, start = 1, end = 3);\n'
+        '    listPush<I32>(this = #nums, item = 4);\n'
+        '    listUnshift<I32>(this = #nums, item = -1);\n'
+        '    listSort<I32>(this = #nums, cmp = cmp);\n'
+        '    const first = listShift<I32>(this = #nums);\n'
+        '    const last = listPop<I32>(this = #nums);\n'
+        '    const found = listFind<I32>(this = #nums, pred = pred);\n'
+        '    let filtered: List<I32> = listFilter<I32>(this = #nums, pred = pred);\n'
+        '    let mapped: List<I64> = listMap<I32, I64>(this = #filtered, f = mapper);\n'
+        '    let sliced: List<I32> = listSlice<I32>(this = #nums, start = 1, end = 3);\n'
         '    let meta = { name: Str = "ez", lang: Str = "EzLang" };\n'
         '    const lang = meta["lang"];\n'
-        '    const has_name = dictHas<Str, Str>(dict = meta, key = "name");\n'
-        '    let keys: List<Str> = dictKeys<Str, Str>(dict = meta);\n'
-        '    let values: List<Str> = dictValues<Str, Str>(dict = meta);\n'
-        '    const removed = dictDelete<Str, Str>(dict = meta, key = "name");\n'
-        '    const missing = dictHas<Str, Str>(dict = meta, key = "name");\n'
-        '    return (first.ok && first.value == -1 && last.ok && last.value == 4 && found.ok && found.value == 2 && listLen<I32>(list = nums) == 3 && listLen<I32>(list = filtered) == 2 && listLen<I64>(list = mapped) == 2 && listLen<I32>(list = sliced) == 2 && strEqual(a = lang, b = "EzLang") && has_name && listLen<Str>(list = keys) == 2 && listLen<Str>(list = values) == 2 && removed && !missing && dictLen<Str, Str>(dict = meta) == 1) ? 0 : 1;\n'
+        '    const has_name = dictHas<Str, Str>(this = #meta, key = "name");\n'
+        '    let keys: List<Str> = dictKeys<Str, Str>(this = #meta);\n'
+        '    let values: List<Str> = dictValues<Str, Str>(this = #meta);\n'
+        '    const removed = dictDelete<Str, Str>(this = #meta, key = "name");\n'
+        '    const missing = dictHas<Str, Str>(this = #meta, key = "name");\n'
+        '    return (first.ok && first.value == -1 && last.ok && last.value == 4 && found.ok && found.value == 2 && listLen<I32>(this = #nums) == 3 && listLen<I32>(this = #filtered) == 2 && listLen<I64>(this = #mapped) == 2 && listLen<I32>(this = #sliced) == 2 && strEqual(a = lang, b = "EzLang") && has_name && listLen<Str>(this = #keys) == 2 && listLen<Str>(this = #values) == 2 && removed && !missing && dictLen<Str, Str>(this = #meta) == 1) ? 0 : 1;\n'
         '};\n',
         encoding="utf-8",
     )
@@ -5952,7 +5952,7 @@ def test_run_dict_index_assignment_updates_and_inserts(tmp_path):
         '    meta["lang"] = "ez";\n'
         '    const name = meta["name"];\n'
         '    const lang = meta["lang"];\n'
-        '    return (strEqual(a = name, b = "EzLang") && strEqual(a = lang, b = "ez") && dictLen<Str, Str>(dict = meta) == 2) ? 0 : 1;\n'
+        '    return (strEqual(a = name, b = "EzLang") && strEqual(a = lang, b = "ez") && dictLen<Str, Str>(this = #meta) == 2) ? 0 : 1;\n'
         '};\n',
         encoding="utf-8",
     )
@@ -6049,12 +6049,12 @@ def test_run_dict_hash_index_handles_delete_and_reinsert(tmp_path):
         'from "std/collections" import { dictDelete, dictHas, dictLen };\n'
         'const main = (): I32 => {\n'
         '    let values: { [key: I32]: I32 } = { [1] = 10, [2] = 20, [3] = 30, [4] = 40, [5] = 50, [6] = 60, [7] = 70, [8] = 80, [9] = 90 };\n'
-        '    const before = values[9] == 90 && dictHas<I32, I32>(dict = values, key = 2);\n'
-        '    const removed = dictDelete<I32, I32>(dict = values, key = 2);\n'
+        '    const before = values[9] == 90 && dictHas<I32, I32>(this = #values, key = 2);\n'
+        '    const removed = dictDelete<I32, I32>(this = #values, key = 2);\n'
         '    values[10] = 100;\n'
         '    values[9] += 1;\n'
-        '    const after = !dictHas<I32, I32>(dict = values, key = 2) && values[9] == 91 && values[10] == 100;\n'
-        '    return (before && removed && after && dictLen<I32, I32>(dict = values) == 9) ? 0 : 1;\n'
+        '    const after = !dictHas<I32, I32>(this = #values, key = 2) && values[9] == 91 && values[10] == 100;\n'
+        '    return (before && removed && after && dictLen<I32, I32>(this = #values) == 9) ? 0 : 1;\n'
         '};\n',
         encoding="utf-8",
     )

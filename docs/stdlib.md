@@ -426,12 +426,12 @@ struct RandomSource {
 }
 
 declare const randomSeed:         (seed: U64) => RandomSource
-declare const randomNextU32:      (this: RandomSource) => U32
-declare const randomNextU64:      (this: RandomSource) => U64
-declare const randomRangeI64:     (this: RandomSource, minValue: I64, maxValue: I64) => I64
-declare const randomRangeF64:     (this: RandomSource, minValue: F64, maxValue: F64) => F64
-declare const randomShuffleBytes: (this: RandomSource, data: Blob) => Blob
-declare const randomShuffle:      <T>(this: RandomSource, list: List<T>) => List<T>
+declare const randomNextU32:      (this: #RandomSource) => U32
+declare const randomNextU64:      (this: #RandomSource) => U64
+declare const randomRangeI64:     (this: #RandomSource, minValue: I64, maxValue: I64) => I64
+declare const randomRangeF64:     (this: #RandomSource, minValue: F64, maxValue: F64) => F64
+declare const randomShuffleBytes: (this: #RandomSource, data: Blob) => Blob
+declare const randomShuffle:      <T>(this: #RandomSource, list: List<T>) => List<T>
 
 declare const randomEntropy:      (size: I64) => Blob?
 declare const randomSecureBytes:  (size: I64) => Blob?
@@ -827,22 +827,22 @@ struct Duration {
 
     fromSec(s: I64) => Duration;
     fromMin(m: I64) => Duration;
-    toString(this: Duration) => Str;
+    toString(this: #Duration) => Str;
 }
 
 declare const now:       () => Date    // 返回内置 Date 结构体（见 doc.md §3）
 declare const durationToString: (value: Duration) => Str
 declare const timestamp: () => I64     // 自 Unix 纪元以来的毫秒数
 declare const sleep:     (ms: I64) => Void
-declare const getYear:   (this: Date) => I32
-declare const getMonth:  (this: Date) => I32
-declare const getDay:    (this: Date) => I32
-declare const getHour:   (this: Date) => I32
-declare const getMinute: (this: Date) => I32
-declare const getSecond: (this: Date) => I32
-declare const add:       (this: Date, year: I32?, month: I32?, day: I32?, hour: I32?, minute: I32?, second: I32?) => Void
-declare const sub:       (this: Date, year: I32?, month: I32?, day: I32?, hour: I32?, minute: I32?, second: I32?) => Void
-declare const format:    (this: Date, fmt: Str) => Str
+declare const getYear:   (this: #Date) => I32
+declare const getMonth:  (this: #Date) => I32
+declare const getDay:    (this: #Date) => I32
+declare const getHour:   (this: #Date) => I32
+declare const getMinute: (this: #Date) => I32
+declare const getSecond: (this: #Date) => I32
+declare const add:       (this: #Date, year: I32?, month: I32?, day: I32?, hour: I32?, minute: I32?, second: I32?) => Void
+declare const sub:       (this: #Date, year: I32?, month: I32?, day: I32?, hour: I32?, minute: I32?, second: I32?) => Void
+declare const format:    (this: #Date, fmt: Str) => Str
 ```
 
 - `sleep(ms)`：**flow 外**为同步 ABI；**flow 内**为 suspend point，runtime 挂起当前执行点并调度其它可运行逻辑。emcc 目标通过 Asyncify 恢复 wasm 栈；当前 `race` 的 `timeout` 返回超时零值，不会立即中断已进入同步代码的分支。
@@ -876,7 +876,7 @@ struct HttpResponse {
     headers: Headers
     body:    Blob
 
-    text: (this: HttpResponse) => Str
+    text: (this: #HttpResponse) => Str
 }
 
 // 便捷函数
@@ -933,9 +933,9 @@ const winner = flow {
 type RouteHandler = (req: HttpRequest) => HttpResponse;
 
 struct HttpServer {
-    on(this: HttpServer, path: Str, handler: RouteHandler) => Void;
-    start(this: HttpServer) => Void;    // 阻塞，推荐在 flow {} 内调用
-    stop(this: HttpServer) => Void;
+    on(this: #HttpServer, path: Str, handler: RouteHandler) => Void;
+    start(this: #HttpServer) => Void;    // 阻塞，推荐在 flow {} 内调用
+    stop(this: #HttpServer) => Void;
 }
 
 declare const createServer: (host: Str, port: I32) => HttpServer;
@@ -1049,28 +1049,41 @@ declare const wsClose: (conn: WsConn) => Bool
 
 ## 7. 数据结构扩展 (`std/collections`)
 
-`List` 和 `Dict` 是语言内置类型，标准库在此基础上提供扩展函数。
+`List` 和 `Dict` 是编译器预声明的语言内置类型，用户可直接在类型标注中使用，不需要从标准库导入。`std/collections` 在此基础上暴露扩展函数；这些函数的第一个参数统一命名为 `this`，类型是弱引用 `#List<T>` / `#Dict<K, V>`，因此既可显式传入 `this = #value`，也可用对象方法糖 `value.fn(...)` 调用。
 当前集合扩展均由编译器内建 lowering 实现。`List` 使用分页数组 ABI `{ pages, length, capacity, page_count }`；`Dict` 保持分页键值存储 ABI 以兼容原生/JS 标准库边界，并为编译器自建的 `Str` 与基础标量键字典维护开放寻址哈希索引。`dictKeys` / `dictValues` 仍按插入顺序返回；外部标准库返回的兼容 `Dict` 没有内部哈希标记时会自动走分页顺序扫描。
 
 ```ez
 // List<T> 扩展
-declare const listPush:    <T>(list: List<T>, item: T) => Void
-declare const listPop:     <T>(list: List<T>) => T?
-declare const listShift:   <T>(list: List<T>) => T?
-declare const listUnshift: <T>(list: List<T>, item: T) => Void
-declare const listSort:    <T>(list: List<T>, cmp: (a: T, b: T) => I32) => Void
-declare const listFilter:  <T>(list: List<T>, pred: (item: T) => Bool) => List<T>
-declare const listMap:     <T, U>(list: List<T>, f: (item: T) => U) => List<U>
-declare const listFind:    <T>(list: List<T>, pred: (item: T) => Bool) => T?
-declare const listLen:     <T>(list: List<T>) => I64
-declare const listSlice:   <T>(list: List<T>, start: I64, end: I64) => List<T>
+declare const listPush:    <T>(this: #List<T>, item: T) => Void
+declare const listPop:     <T>(this: #List<T>) => T?
+declare const listShift:   <T>(this: #List<T>) => T?
+declare const listUnshift: <T>(this: #List<T>, item: T) => Void
+declare const listSort:    <T>(this: #List<T>, cmp: (a: T, b: T) => I32) => Void
+declare const listFilter:  <T>(this: #List<T>, pred: (item: T) => Bool) => List<T>
+declare const listMap:     <T, U>(this: #List<T>, f: (item: T) => U) => List<U>
+declare const listFind:    <T>(this: #List<T>, pred: (item: T) => Bool) => T?
+declare const listLen:     <T>(this: #List<T>) => I64
+declare const listSlice:   <T>(this: #List<T>, start: I64, end: I64) => List<T>
 
 // Dict<K, V> 扩展
-declare const dictKeys:   <K, V>(dict: Dict<K, V>) => K[]
-declare const dictValues: <K, V>(dict: Dict<K, V>) => V[]
-declare const dictHas:    <K, V>(dict: Dict<K, V>, key: K) => Bool
-declare const dictDelete: <K, V>(dict: Dict<K, V>, key: K) => Bool
-declare const dictLen:    <K, V>(dict: Dict<K, V>) => I64
+declare const dictKeys:   <K, V>(this: #Dict<K, V>) => K[]
+declare const dictValues: <K, V>(this: #Dict<K, V>) => V[]
+declare const dictHas:    <K, V>(this: #Dict<K, V>, key: K) => Bool
+declare const dictDelete: <K, V>(this: #Dict<K, V>, key: K) => Bool
+declare const dictLen:    <K, V>(this: #Dict<K, V>) => I64
+```
+
+```ez
+let nums: List<I32> = [1, 2, 3]
+nums.push(item = 4)
+let n = nums.len()
+
+let meta = { name: Str = "ez" }
+let ok = meta.has(key = "name")
+
+// 等价的显式调用形式
+listPush<I32>(this = #nums, item = 5)
+let n2 = listLen<I32>(this = #nums)
 ```
 
 ---

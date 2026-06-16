@@ -228,8 +228,20 @@ class TestParser:
     def test_decorator_variable_decl(self):
         """测试变量声明装饰器语法"""
         tree, errors = parse_source('''
-        const log = (this: Meta<I32>): Void => { return; };
+        const log = (this: #Meta<I32>): Void => { return; };
         @log let watched = 1;
+        ''')
+        assert len(errors) == 0, f'解析错误: {errors}'
+
+    def test_weak_reference_type_and_value(self):
+        """测试 #T 弱引用类型与 #var 弱引用值语法"""
+        tree, errors = parse_source('''
+        struct Box { value: I32; };
+        const main = (): I32 => {
+            let box = Box(value = 1);
+            let ref: #Box = #box;
+            return (typeof ref == Void) ? 1 : ref.value;
+        };
         ''')
         assert len(errors) == 0, f'解析错误: {errors}'
 
@@ -238,7 +250,7 @@ class TestParser:
         tree, errors = parse_source('''
         struct Date {
             timestamp: I64;
-            add(this: Date, year: I32?) => Void;
+            add(this: #Date, year: I32?) => Void;
         };
         type Headers = { [key: Str]: Str };
         declare const requestPermissions: (perms: Str[]) => { [key: Str]: Bool };

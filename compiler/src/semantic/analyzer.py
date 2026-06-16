@@ -129,6 +129,14 @@ class SemanticAnalyzer(EzLangVisitor):
             result.pointee_type = inner
             return result
 
+        # 弱引用类型 #T。语义上类似 T?，但 value 是对 T 的弱引用。
+        if isinstance(type_ctx, EzLangParser.WeakTypeContext):
+            inner = self._get_type_from_ctx(type_ctx.type_())
+            result = Type(kind=TypeKind.WEAK_REF, name=f"#{inner.name if inner else 'unknown'}")
+            result.referent_type = inner
+            result.element_type = inner
+            return result
+
         # 类型结构 { field: T } / { [key: K]: V } 可直接出现在类型位置。
         if isinstance(type_ctx, EzLangParser.TypeShapeTypeContext):
             return self._type_from_shape(type_ctx.typeShape())
@@ -249,12 +257,12 @@ class SemanticAnalyzer(EzLangVisitor):
                     value_type = self._get_type_from_ctx(args[0]) if args else Type(name="unknown", kind=TypeKind.BASIC)
                     meta_type = Type(name=f"Meta<{value_type}>", kind=TypeKind.STRUCT)
                     getter_type = Type(name="function", kind=TypeKind.FUNCTION)
-                    getter_type.param_types = [meta_type]
-                    getter_type.param_names = ["this"]
+                    getter_type.param_types = []
+                    getter_type.param_names = []
                     getter_type.return_type = value_type
                     setter_type = Type(name="function", kind=TypeKind.FUNCTION)
-                    setter_type.param_types = [meta_type, value_type]
-                    setter_type.param_names = ["this", "value"]
+                    setter_type.param_types = [value_type]
+                    setter_type.param_names = ["value"]
                     setter_type.return_type = Type(name="Void", kind=TypeKind.BASIC)
                     meta_type.fields = {
                         "value": value_type,
@@ -772,6 +780,96 @@ class SemanticAnalyzer(EzLangVisitor):
             return self._replace_generic_type(method_type, dict(zip(generic_names, type_args)))
         return method_type
 
+    def _is_weak_this_param(self, func_type: Optional[Type], index: int = 0) -> bool:
+        """判断函数指定参数是否是规范的弱引用 this 参数。"""
+        if func_type is None or func_type.kind != TypeKind.FUNCTION:
+            return False
+        if index >= len(func_type.param_names) or func_type.param_names[index] != "this":
+            return False
+        if index >= len(func_type.param_types):
+            return False
+        param_type = func_type.param_types[index]
+        return param_type is not None and param_type.kind == TypeKind.WEAK_REF
+
+    def _collection_method_type(self, receiver_type: Optional[Type], method_name: str) -> Optional[Type]:
+        """List/Dict 的对象方法糖类型：nums.push(...) / dict.has(...)。"""
+        if receiver_type is None:
+            return None
+        if receiver_type.kind in (TypeKind.ARRAY, TypeKind.LIST):
+            item = receiver_type.element_type or Type(name="unknown", kind=TypeKind.BASIC)
+            result = Type(name="function", kind=TypeKind.FUNCTION)
+            if method_name in {"push", "unshift"}:
+                result.param_names = ["item"]
+                result.param_types = [item]
+                result.return_type = Type(name="Void", kind=TypeKind.BASIC)
+                return result
+            if method_name in {"pop", "shift"}:
+                result.return_type = Type(kind=TypeKind.OPTIONAL, name=f"{item.name}?")
+                result.return_type.element_type = item
+                return result
+            if method_name == "len":
+                result.return_type = Type(name="I64", kind=TypeKind.BASIC)
+                return result
+            if method_name == "slice":
+                result.param_names = ["start", "end"]
+                result.param_types = [Type(name="I64", kind=TypeKind.BASIC), Type(name="I64", kind=TypeKind.BASIC)]
+                result.return_type = receiver_type
+                return result
+            if method_name == "sort":
+                cmp_type = Type(name="function", kind=TypeKind.FUNCTION)
+                cmp_type.param_names = ["a", "b"]
+                cmp_type.param_types = [item, item]
+                cmp_type.return_type = Type(name="I32", kind=TypeKind.BASIC)
+                result.param_names = ["cmp"]
+                result.param_types = [cmp_type]
+                result.return_type = Type(name="Void", kind=TypeKind.BASIC)
+                return result
+            if method_name in {"filter", "find"}:
+                pred_type = Type(name="function", kind=TypeKind.FUNCTION)
+                pred_type.param_names = ["item"]
+                pred_type.param_types = [item]
+                pred_type.return_type = Type(name="Bool", kind=TypeKind.BASIC)
+                result.param_names = ["pred"]
+                result.param_types = [pred_type]
+                if method_name == "filter":
+                    result.return_type = receiver_type
+                else:
+                    result.return_type = Type(kind=TypeKind.OPTIONAL, name=f"{item.name}?")
+                    result.return_type.element_type = item
+                return result
+            if method_name == "map":
+                mapped = Type(name="unknown", kind=TypeKind.BASIC)
+                map_type = Type(name="function", kind=TypeKind.FUNCTION)
+                map_type.param_names = ["item"]
+                map_type.param_types = [item]
+                map_type.return_type = mapped
+                result.param_names = ["f"]
+                result.param_types = [map_type]
+                result.return_type = Type(kind=TypeKind.LIST, name=f"List<{mapped.name}>")
+                result.return_type.element_type = mapped
+                return result
+        if receiver_type.kind == TypeKind.DICT:
+            key = receiver_type.key_type or Type(name="unknown", kind=TypeKind.BASIC)
+            value = receiver_type.value_type or Type(name="unknown", kind=TypeKind.BASIC)
+            result = Type(name="function", kind=TypeKind.FUNCTION)
+            if method_name in {"has", "delete"}:
+                result.param_names = ["key"]
+                result.param_types = [key]
+                result.return_type = Type(name="Bool", kind=TypeKind.BASIC)
+                return result
+            if method_name == "len":
+                result.return_type = Type(name="I64", kind=TypeKind.BASIC)
+                return result
+            if method_name == "keys":
+                result.return_type = Type(kind=TypeKind.LIST, name=f"List<{key.name}>")
+                result.return_type.element_type = key
+                return result
+            if method_name == "values":
+                result.return_type = Type(kind=TypeKind.LIST, name=f"List<{value.name}>")
+                result.return_type.element_type = value
+                return result
+        return None
+
     def _bind_generic_type(self, expected: Optional[Type], actual: Optional[Type], type_map: dict[str, Type]) -> None:
         """根据形参类型和实参类型推导泛型参数。"""
         if expected is None or actual is None:
@@ -812,6 +910,10 @@ class SemanticAnalyzer(EzLangVisitor):
         if template is None or len(template) < 2:
             return []
         template_ctx = template[1]
+        if hasattr(template_ctx, 'paramTypeList'):
+            params = template_ctx.paramTypeList()
+            if params is not None:
+                return [param.VAR_IDENTIFIER().getText() for param in params.paramType()]
         if not hasattr(template_ctx, 'functionLiteral'):
             return []
         fn = template_ctx.functionLiteral()
@@ -1045,15 +1147,21 @@ class SemanticAnalyzer(EzLangVisitor):
             if params is not None and len(params.param()) > 0:
                 first_param = params.param(0)
                 pname = first_param.VAR_IDENTIFIER().getText()
-                # 验证 this 的类型匹配当前结构体
                 if pname == 'this' and self.current_struct and first_param.type_() is not None:
                     param_type = self._get_type_from_ctx(first_param.type_())
-                    param_base = getattr(param_type, 'generic_base', param_type.name if param_type else None)
-                    if param_type and param_base != self.current_struct and param_type.name != "unknown":
-                        self.symbols.add_warning(
-                            f"行 {ctx.start.line}: 方法 'this' 参数类型应为 '{self.current_struct}'，"
-                            f"实际为 '{param_type.name}'"
+                    if param_type is not None and param_type.kind != TypeKind.WEAK_REF:
+                        self.symbols.add_error(
+                            f"行 {ctx.start.line}: 方法 'this' 参数必须是弱引用类型 '#{self.current_struct}'，"
+                            f"实际为 '{param_type}'"
                         )
+                    elif param_type is not None:
+                        referent = param_type.referent_type or param_type.element_type
+                        param_base = getattr(referent, 'generic_base', referent.name if referent else None)
+                        if referent and param_base != self.current_struct and referent.name != "unknown":
+                            self.symbols.add_error(
+                                f"行 {ctx.start.line}: 方法 'this' 参数类型应为 '#{self.current_struct}'，"
+                                f"实际为 '{param_type}'"
+                            )
 
             self.symbols.push_scope(name)
             if params is not None:
@@ -1173,6 +1281,10 @@ class SemanticAnalyzer(EzLangVisitor):
         name = ctx.VAR_IDENTIFIER().getText()
         type_ctx = ctx.type_()
         type_ = self._get_type_from_ctx(type_ctx) if type_ctx is not None else None
+        if name == "this" and type_ is not None and type_.kind != TypeKind.WEAK_REF:
+            self.symbols.add_error(
+                f"行 {ctx.start.line}: 'this' 参数必须是弱引用类型，例如 '#{type_.name}'"
+            )
         symbol = Symbol(name, SymbolKind.PARAM, type_, line=ctx.start.line)
         self.symbols.define(symbol)
 
@@ -1192,6 +1304,8 @@ class SemanticAnalyzer(EzLangVisitor):
     def visitIdentifierExpr(self, ctx: EzLangParser.IdentifierExprContext) -> Optional[Type]:
         """标识符引用 — 返回符号的类型"""
         id_token = ctx.VAR_IDENTIFIER() or ctx.TYPE_IDENTIFIER()
+        if id_token is None and ctx.VOID() is not None:
+            return Type(name="I32", kind=TypeKind.BASIC)
         name = id_token.getText()
         symbol = self.symbols.resolve(name)
         if symbol is not None and symbol.kind in (SymbolKind.STRUCT, SymbolKind.TYPE_ALIAS):
@@ -1418,6 +1532,8 @@ class SemanticAnalyzer(EzLangVisitor):
         target_type = None
         if ctx.postfixExpression() is not None:
             target_type = ctx.postfixExpression().accept(self)
+        if target_type and target_type.kind == TypeKind.WEAK_REF:
+            target_type = target_type.referent_type or target_type.element_type
 
         if isinstance(ctx.postfixExpression(), EzLangParser.OptionalUnwrapContext) and target_type is not None:
             field_type = None
@@ -1449,11 +1565,15 @@ class SemanticAnalyzer(EzLangVisitor):
                 )
             return None
 
+        collection_method = self._collection_method_type(target_type, field_name)
+        if collection_method is not None:
+            return collection_method
+
         if target_type and target_type.kind == TypeKind.OPTIONAL:
             if field_name == "ok":
                 return Type(name="Bool", kind=TypeKind.BASIC)
             if field_name == "value":
-                return target_type.element_type
+                return target_type.element_type or target_type.referent_type
 
         if target_type and target_type.kind == TypeKind.UNION:
             if field_name == "tag":
@@ -1462,6 +1582,14 @@ class SemanticAnalyzer(EzLangVisitor):
                 return self._union_payload_type(target_type)
 
         return None
+
+    def visitWeakRefExpression(self, ctx: EzLangParser.WeakRefExpressionContext) -> Optional[Type]:
+        """弱引用表达式 #expr：返回 #T。"""
+        inner_type = ctx.unaryExpression().accept(self) if ctx.unaryExpression() is not None else None
+        result = Type(kind=TypeKind.WEAK_REF, name=f"#{inner_type.name if inner_type else 'unknown'}")
+        result.referent_type = inner_type
+        result.element_type = inner_type
+        return result
 
     def _static_struct_member_owner(self, ctx) -> Optional[str]:
         """识别 StructName.method 这种类型级结构体成员访问。"""
@@ -1537,9 +1665,12 @@ class SemanticAnalyzer(EzLangVisitor):
                             self.symbols.add_error(
                                 f"行 {ctx.start.line}: 未知参数 '{arg_name}'"
                             )
-                implicit_this_name = target_type.param_names[0] if implicit_this and target_type.param_names else None
+                implicit_this_name = target_type.param_names[0] if implicit_this and self._is_weak_this_param(target_type) else None
+                explicit_optional_this = target_type.param_names[0] if self._is_weak_this_param(target_type) else None
                 for pname in target_type.param_names:
                     if pname == implicit_this_name:
+                        continue
+                    if pname == explicit_optional_this and pname not in named_args:
                         continue
                     if pname not in named_args and pname not in target_type.default_param_names:
                         self.symbols.add_error(
@@ -1730,6 +1861,8 @@ class SemanticAnalyzer(EzLangVisitor):
             target_type = target.accept(self)
             if target_type and target_type.kind == TypeKind.OPTIONAL:
                 return target_type.element_type
+            if target_type and target_type.kind == TypeKind.WEAK_REF:
+                return target_type.referent_type
         return None
 
     def visitIndex(self, ctx: EzLangParser.IndexContext) -> Optional[Type]:

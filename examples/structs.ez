@@ -13,7 +13,7 @@ struct Point3D {
 
 struct Counter {
     value: I32;
-    set = (this: Counter, value: I32): Void => {
+    set = (this: #Counter, value: I32): Void => {
         this.value = value;
     };
 };

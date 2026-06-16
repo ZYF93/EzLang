@@ -80,6 +80,7 @@ ASSIGN: '=';
 QUESTION: '?';
 BANG: '!';
 AT: '@';
+HASH: '#';
 AMPERSAND: '&';
 PIPE: '|';
 CARET: '^';
@@ -214,6 +215,7 @@ type_:
     | type_ PIPE type_                                           # unionType
     | type_ '[' ']'                                              # arrayType
     | STAR type_                                                  # pointerType
+    | HASH type_                                                  # weakType
     | VEC '<' type_ '>' '[' INTEGER_LITERAL ']'                  # vecType
     | LIST '<' type_ '>'                                         # listType
     | LANGLE typeList RANGLE '(' paramTypeList? ')' FAT_ARROW type_  # genericParamFunctionType
@@ -302,6 +304,7 @@ multiplicativeExpression:
 // 一元表达式
 unaryExpression:
     type_ BANG unaryExpression                                         # prefixTypeAssertion
+    | HASH unaryExpression                                             # weakRefExpression
     | (BANG | MINUS | PLUS | TILDE) unaryExpression                    # prefixUnaryExpression
     | postfixExpression                                                # postfixUnaryExpression;
 
@@ -320,7 +323,7 @@ postfixExpression:
 primaryExpression:
     literal                                                             # literalExpr
     | structLiteral                                                      # structLiteralExpr
-    | (VAR_IDENTIFIER | TYPE_IDENTIFIER) genericArgs?                           # identifierExpr
+    | (VAR_IDENTIFIER | TYPE_IDENTIFIER | VOID) genericArgs?                    # identifierExpr
     | ifLikeExpr                                                         # ifLikePrimaryExpr
     | '(' expression ')'                                                 # parenExpr
     | QUESTION                                                           # placeholderExpr

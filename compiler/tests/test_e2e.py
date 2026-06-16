@@ -461,13 +461,13 @@ def test_e2e_std_random_imports_and_builds(tmp_path):
     source.write_text(
         'from "std/random" import { RandomSource, randomSeed, randomNextU32, randomNextU64, randomRangeI64, randomRangeF64, randomShuffleBytes, randomShuffle, randomEntropy, randomSecureBytes, randomSecureU64 };\n\n'
         'let source = randomSeed(seed = 42);\n'
-        'let n32 = randomNextU32(this = source);\n'
-        'let n64 = randomNextU64(this = source);\n'
-        'let ranged_i = randomRangeI64(this = source, minValue = 1, maxValue = 10);\n'
-        'let ranged_f = randomRangeF64(this = source, minValue = 0.0, maxValue = 1.0);\n'
-        'let shuffled = randomShuffleBytes(this = source, data = Blob(data = "abcd", size = 4));\n'
+        'let n32 = randomNextU32(this = #source);\n'
+        'let n64 = randomNextU64(this = #source);\n'
+        'let ranged_i = randomRangeI64(this = #source, minValue = 1, maxValue = 10);\n'
+        'let ranged_f = randomRangeF64(this = #source, minValue = 0.0, maxValue = 1.0);\n'
+        'let shuffled = randomShuffleBytes(this = #source, data = Blob(data = "abcd", size = 4));\n'
         'let nums: List<I32> = [1, 2, 3, 4];\n'
-        'let shuffled_nums: List<I32> = randomShuffle<I32>(this = source, list = nums);\n'
+        'let shuffled_nums: List<I32> = randomShuffle<I32>(this = #source, list = nums);\n'
         'let entropy = randomEntropy(size = 8);\n'
         'let secure = randomSecureBytes(size = 8);\n'
         'let secure64 = randomSecureU64();\n',
@@ -2986,7 +2986,7 @@ def test_e2e_std_os_imports_and_builds(tmp_path):
 def test_e2e_std_time_imports_and_builds(tmp_path):
     source = tmp_path / "std_time.ez"
     source.write_text(
-        'from "std/time" import { Duration, durationToString, now, timestamp, sleep, getYear, getMonth, getDay, getHour, getMinute, getSecond, add, sub, format };\n\nlet seconds = Duration.fromSec(s = 2);\nlet minutes = Duration.fromMin(m = 1);\nlet duration_text = seconds.toString();\nlet duration_fn_text = durationToString(value = minutes);\nlet current = now();\nlet ts = timestamp();\nsleep(ms = 1);\nlet year = getYear(this = current);\nlet month = getMonth(this = current);\nlet day = getDay(this = current);\nlet hour = getHour(this = current);\nlet minute = getMinute(this = current);\nlet second = getSecond(this = current);\nadd(this = current, year = 1, month = 0, day = 0, hour = 0, minute = 0, second = 0);\nsub(this = current, year = 0, month = 1, day = 0, hour = 0, minute = 0, second = 0);\nlet formatted = format(this = current, fmt = "YYYY-MM-DD");\n',
+        'from "std/time" import { Duration, durationToString, now, timestamp, sleep, getYear, getMonth, getDay, getHour, getMinute, getSecond, add, sub, format };\n\nlet seconds = Duration.fromSec(s = 2);\nlet minutes = Duration.fromMin(m = 1);\nlet duration_text = seconds.toString();\nlet duration_fn_text = durationToString(value = minutes);\nlet current = now();\nlet ts = timestamp();\nsleep(ms = 1);\nlet year = getYear(this = #current);\nlet month = getMonth(this = #current);\nlet day = getDay(this = #current);\nlet hour = getHour(this = #current);\nlet minute = getMinute(this = #current);\nlet second = getSecond(this = #current);\nadd(this = #current, year = 1, month = 0, day = 0, hour = 0, minute = 0, second = 0);\nsub(this = #current, year = 0, month = 1, day = 0, hour = 0, minute = 0, second = 0);\nlet formatted = format(this = #current, fmt = "YYYY-MM-DD");\n',
         encoding="utf-8",
     )
     project_toml = write_project(tmp_path, source)
@@ -3529,7 +3529,7 @@ def test_e2e_toolchain_docs_match_cli_defaults_and_targets():
 def test_e2e_std_collections_basic_list_builds(tmp_path):
     source = tmp_path / "std_collections.ez"
     source.write_text(
-        'from "std/collections" import { listLen, listPush, listPop, listShift, listUnshift, listSlice };\n\nlet nums: List<I32> = [1, 2, 3];\nlistPush<I32>(list = nums, item = 4);\nlistUnshift<I32>(list = nums, item = 0);\nlet tail = listPop<I32>(list = nums);\nlet head = listShift<I32>(list = nums);\nlet part: List<I32> = listSlice<I32>(list = nums, start = 0, end = 2);\nlet n: I64 = listLen<I32>(list = part);\n',
+        'from "std/collections" import { listLen, listPush, listPop, listShift, listUnshift, listSlice };\n\nlet nums: List<I32> = [1, 2, 3];\nlistPush<I32>(this = #nums, item = 4);\nlistUnshift<I32>(this = #nums, item = 0);\nlet tail = listPop<I32>(this = #nums);\nlet head = listShift<I32>(this = #nums);\nlet part: List<I32> = listSlice<I32>(this = #nums, start = 0, end = 2);\nlet n: I64 = listLen<I32>(this = #part);\n',
         encoding="utf-8",
     )
     project_toml = write_project(tmp_path, source)
@@ -3553,8 +3553,8 @@ def test_e2e_array_list_layout_is_paged_across_docs_codegen_and_wrappers(tmp_pat
     source.write_text(
         'from "std/collections" import { listLen, listPush };\n\n'
         'let nums: List<I32> = [1, 2, 3, 4, 5, 6, 7, 8, 9];\n'
-        'listPush<I32>(list = nums, item = 10);\n'
-        'let n: I64 = listLen<I32>(list = nums);\n',
+        'listPush<I32>(this = #nums, item = 10);\n'
+        'let n: I64 = listLen<I32>(this = #nums);\n',
         encoding="utf-8",
     )
     project_toml = write_project(tmp_path, source)
@@ -3619,7 +3619,7 @@ def test_e2e_operator_semantics_match_docs_and_codegen(tmp_path):
 def test_e2e_std_collections_higher_order_and_dict_build(tmp_path):
     source = tmp_path / "std_collections_more.ez"
     source.write_text(
-        'from "std/collections" import { listSort, listFilter, listMap, listFind, listLen, dictKeys, dictValues, dictHas, dictDelete, dictLen };\n\nconst pred = (item: I32): Bool => { return item > 1; };\nconst mapper = (item: I32): I64 => { return item; };\nconst cmp = (a: I32, b: I32): I32 => { return a - b; };\nlet nums: List<I32> = [3, 1, 2];\nlistSort<I32>(list = nums, cmp = cmp);\nlet found = listFind<I32>(list = nums, pred = pred);\nlet filtered: List<I32> = listFilter<I32>(list = nums, pred = pred);\nlet mapped: List<I64> = listMap<I32, I64>(list = filtered, f = mapper);\nlet mapped_len: I64 = listLen<I64>(list = mapped);\nlet meta = { name: Str = "ez", lang: Str = "EzLang" };\nlet has_name: Bool = dictHas<Str, Str>(dict = meta, key = "name");\nlet keys: List<Str> = dictKeys<Str, Str>(dict = meta);\nlet values: List<Str> = dictValues<Str, Str>(dict = meta);\nlet removed: Bool = dictDelete<Str, Str>(dict = meta, key = "name");\nlet remaining: I64 = dictLen<Str, Str>(dict = meta);\n',
+        'from "std/collections" import { listSort, listFilter, listMap, listFind, listLen, dictKeys, dictValues, dictHas, dictDelete, dictLen };\n\nconst pred = (item: I32): Bool => { return item > 1; };\nconst mapper = (item: I32): I64 => { return item; };\nconst cmp = (a: I32, b: I32): I32 => { return a - b; };\nlet nums: List<I32> = [3, 1, 2];\nlistSort<I32>(this = #nums, cmp = cmp);\nlet found = listFind<I32>(this = #nums, pred = pred);\nlet filtered: List<I32> = listFilter<I32>(this = #nums, pred = pred);\nlet mapped: List<I64> = listMap<I32, I64>(this = #filtered, f = mapper);\nlet mapped_len: I64 = listLen<I64>(this = #mapped);\nlet meta = { name: Str = "ez", lang: Str = "EzLang" };\nlet has_name: Bool = dictHas<Str, Str>(this = #meta, key = "name");\nlet keys: List<Str> = dictKeys<Str, Str>(this = #meta);\nlet values: List<Str> = dictValues<Str, Str>(this = #meta);\nlet removed: Bool = dictDelete<Str, Str>(this = #meta, key = "name");\nlet remaining: I64 = dictLen<Str, Str>(this = #meta);\n',
         encoding="utf-8",
     )
     project_toml = write_project(tmp_path, source)
@@ -3644,8 +3644,8 @@ def test_e2e_dict_literal_string_and_expression_keys_build(tmp_path):
         'let headers = { "Content-Type" = "text/plain", [headerName] = "application/json" };\n'
         'let contentType = headers["Content-Type"];\n'
         'let accept = headers[headerName];\n'
-        'let hasAccept = dictHas<Str, Str>(dict = headers, key = "Accept");\n'
-        'let count = dictLen<Str, Str>(dict = headers);\n'
+        'let hasAccept = dictHas<Str, Str>(this = #headers, key = "Accept");\n'
+        'let count = dictLen<Str, Str>(this = #headers);\n'
         'let ok = strEqual(a = contentType, b = "text/plain") && strEqual(a = accept, b = "application/json") && hasAccept && count == 2;\n',
         encoding="utf-8",
     )
@@ -7782,7 +7782,7 @@ def test_e2e_std_platform_externs_cover_mobile_and_emcc(tmp_path, capsys):
         ("path", 'from "std/path" import { pathNormalize };\nlet normalized = pathNormalize(path = "a/../b");\n', ["native/path.c", "emcc/path.js"]),
         ("str", 'from "std/str" import { strByteLen };\nlet n = strByteLen(s = "hello");\n', ["native/str.c", "emcc/str.js"]),
         ("math", 'from "std/math" import { mathSqrt };\nlet root = mathSqrt(value = 4.0);\n', ["native/math.c", "emcc/math.js"]),
-        ("random", 'from "std/random" import { randomSeed, randomNextU32 };\nlet source = randomSeed(seed = 1);\nlet n = randomNextU32(this = source);\n', ["native/random.c", "emcc/random.js"]),
+        ("random", 'from "std/random" import { randomSeed, randomNextU32 };\nlet source = randomSeed(seed = 1);\nlet n = randomNextU32(this = #source);\n', ["native/random.c", "emcc/random.js"]),
         ("hash", 'from "std/hash" import { crc32Str };\nlet n = crc32Str(s = "hello");\n', ["native/hash.c", "emcc/hash.js"]),
         ("platform", 'from "std/platform" import { platformOS };\nlet os_name = platformOS();\n', ["native/platform.c", "emcc/platform.js"]),
         ("uri", 'from "std/uri" import { uriNormalize };\nlet normalized = uriNormalize(url = "https://example.com/a/../b");\n', ["native/uri.c", "emcc/uri.js"]),

@@ -14,12 +14,12 @@ export struct RandomSource {
 };
 
 export declare const randomSeed: (seed: U64) => RandomSource;
-export declare const randomNextU32: (this: RandomSource) => U32;
-export declare const randomNextU64: (this: RandomSource) => U64;
-export declare const randomRangeI64: (this: RandomSource, minValue: I64, maxValue: I64) => I64;
-export declare const randomRangeF64: (this: RandomSource, minValue: F64, maxValue: F64) => F64;
-export declare const randomShuffleBytes: (this: RandomSource, data: Blob) => Blob;
-export declare const randomShuffle: <T>(this: RandomSource, list: List<T>) => List<T>;
+export declare const randomNextU32: (this: #RandomSource) => U32;
+export declare const randomNextU64: (this: #RandomSource) => U64;
+export declare const randomRangeI64: (this: #RandomSource, minValue: I64, maxValue: I64) => I64;
+export declare const randomRangeF64: (this: #RandomSource, minValue: F64, maxValue: F64) => F64;
+export declare const randomShuffleBytes: (this: #RandomSource, data: Blob) => Blob;
+export declare const randomShuffle: <T>(this: #RandomSource, list: List<T>) => List<T>;
 
 // === 系统安全随机 ===
 export declare const randomEntropy: (size: I64) => Blob?;

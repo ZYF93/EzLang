@@ -887,7 +887,7 @@ class TestSemantic:
         struct Pair<T, U> {
             first: T;
             second: U;
-            swap = (this: Pair<T, U>): Pair<U, T> => {
+            swap = (this: #Pair<T, U>): Pair<U, T> => {
                 return Pair<U, T>(first = this.second, second = this.first);
             };
         };
@@ -938,12 +938,25 @@ class TestSemantic:
         anal = analyze('''
         struct TextBox {
             value: I32;
-            text = (this: TextBox): Str => { return "box"; };
+            text = (this: #TextBox): Str => { return "box"; };
         };
         const main = (): I32 => {
             let box: TextBox?;
             const text = box?.text();
             return text.ok ? 1 : 0;
+        };
+        ''')
+        assert not anal.symbols.errors, f'不应产生语义错误: {anal.symbols.errors}'
+        assert not anal.symbols.warnings, f'不应产生语义警告: {anal.symbols.warnings}'
+
+    def test_weak_reference_type_and_direct_access(self):
+        """#T 弱引用类型按 T 透明访问，空值通过 typeof ref == Void 判断。"""
+        anal = analyze('''
+        struct Box { value: I32; };
+        const main = (): I32 => {
+            let box = Box(value = 1);
+            let ref: #Box = #box;
+            return (typeof ref == Void) ? 0 : ref.value;
         };
         ''')
         assert not anal.symbols.errors, f'不应产生语义错误: {anal.symbols.errors}'
@@ -988,7 +1001,7 @@ class TestSemantic:
         struct Point {
             x: I32;
             y: I32;
-            distance = (this: Point, other: Point): I32 => {
+            distance = (this: #Point, other: Point): I32 => {
                 return this.x - other.x;
             };
         };
@@ -1005,15 +1018,15 @@ class TestSemantic:
             calc = (this: I32): I32 => { return this; };
         };
         ''')
-        warnings = [w for w in anal.symbols.warnings if 'this' in w]
-        assert len(warnings) > 0, f'应有 this 类型警告: {warnings}'
+        errors = [e for e in anal.symbols.errors if 'this' in e]
+        assert len(errors) > 0, f'应有 this 类型错误: {anal.symbols.errors}'
 
     def test_meta_decorator_fields_are_typed(self):
         """Meta<T> 字段与 getter/setter 函数指针应参与语义检查"""
         anal = analyze('''
-        const get_watched = (meta: Meta<I32>): I32 => { return meta.value + 10; };
-        const set_watched = (meta: Meta<I32>, v: I32): Void => { meta.value = v + 1; };
-        const log = (this: Meta<I32>): Void => {
+        const get_watched = (): I32 => { return 11; };
+        const set_watched = (v: I32): Void => { return; };
+        const log = (this: #Meta<I32>): Void => {
             this.getter = get_watched;
             this.setter = set_watched;
         };
@@ -1280,7 +1293,7 @@ class TestSemantic:
         anal = analyze('''
         struct Date {
             timestamp: I64;
-            add(this: Date, year: I32?) => Void;
+            add(this: #Date, year: I32?) => Void;
         };
         type Headers = { [key: Str]: Str };
         rp let cache: I32[] = [];
