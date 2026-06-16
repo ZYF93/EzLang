@@ -17,6 +17,32 @@ sys.path.insert(0, str(ROOT / "compiler" / "src"))
 from cli import ez
 
 
+def _iter_export_const_functions(text: str):
+    """提取 export const name = (...) : Ret => 形式，支持参数中嵌套函数类型。"""
+    prefix_re = re.compile(r"export\s+const\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*\(")
+    for match in prefix_re.finditer(text):
+        name = match.group(1)
+        params_start = match.end() - 1
+        depth = 0
+        pos = params_start
+        while pos < len(text):
+            ch = text[pos]
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0:
+                    break
+            pos += 1
+        if pos >= len(text):
+            continue
+        rest = text[pos + 1:]
+        ret_match = re.match(r"\s*:\s*([^=]+)=>", rest)
+        if ret_match is None:
+            continue
+        yield name, text[params_start + 1:pos].strip(), ret_match.group(1).strip()
+
+
 def test_e2e_stdlib_documents_exported_declares():
     """标准库 API 文档应覆盖源码导出的公开符号。"""
     documents = {
@@ -46,10 +72,8 @@ def test_e2e_stdlib_documents_exported_declares():
             for doc_name, docs in documents.items():
                 if name not in docs:
                     missing_names.append(f"{doc_name} 缺少 {source.relative_to(ROOT)}:{name}")
-        for match in re.finditer(r"export\s+const\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*\(([^)]*)\)\s*:\s*([^=]+)=>", text):
-            name = match.group(1)
-            params = re.sub(r"\s+", " ", match.group(2).strip())
-            ret_type = match.group(3).strip()
+        for name, params_source, ret_type in _iter_export_const_functions(text):
+            params = re.sub(r"\s+", " ", params_source)
             expected = f"{name}({params}) -> {ret_type}"
             for doc_name, docs in documents.items():
                 if name not in docs:
@@ -70,6 +94,193 @@ def test_e2e_stdlib_documents_exported_declares():
                 missing_signatures.append(f"docs/stdlib-api.md 缺少 {source.relative_to(ROOT)}:{expected}")
     assert not missing_names, "标准库文档缺少公开接口: " + ", ".join(missing_names)
     assert not missing_signatures, "标准库 API 文档缺少公开签名: " + ", ".join(missing_signatures)
+
+
+def test_e2e_stdlib_documents_exported_struct_fields():
+    """标准库文档应暴露公开结构体的字段形状。"""
+    documents = {
+        "docs/stdlib-api.md": (ROOT / "docs" / "stdlib-api.md").read_text(encoding="utf-8"),
+        "docs/stdlib.md": (ROOT / "docs" / "stdlib.md").read_text(encoding="utf-8"),
+    }
+    missing = []
+    for source in sorted((ROOT / "packages" / "std").glob("**/*.ez")):
+        text = source.read_text(encoding="utf-8")
+        for match in re.finditer(r"export\s+struct\s+([A-Z][A-Za-z0-9_]*)\s*\{", text):
+            name = match.group(1)
+            start = match.end()
+            depth = 1
+            end = start
+            while end < len(text) and depth > 0:
+                if text[end] == "{":
+                    depth += 1
+                elif text[end] == "}":
+                    depth -= 1
+                end += 1
+            body = text[start:end - 1]
+            for field in re.finditer(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*:\s*([^;\n]+)", body, re.M):
+                field_name = field.group(1)
+                field_type = field.group(2).strip()
+                pattern = rf"{re.escape(field_name)}\s*:\s*{re.escape(field_type)}"
+                for doc_name, docs in documents.items():
+                    if re.search(pattern, docs) is None:
+                        missing.append(
+                            f"{doc_name} 缺少 {source.relative_to(ROOT)}:{name}.{field_name}: {field_type}"
+                        )
+    assert not missing, "标准库文档缺少公开结构体字段: " + ", ".join(missing)
+
+
+def test_e2e_stdlib_documents_exported_type_alias_shapes():
+    """标准库文档应暴露公开类型别名的具体形状。"""
+    documents = {
+        "docs/stdlib-api.md": (ROOT / "docs" / "stdlib-api.md").read_text(encoding="utf-8"),
+        "docs/stdlib.md": (ROOT / "docs" / "stdlib.md").read_text(encoding="utf-8"),
+    }
+    missing = []
+    for source in sorted((ROOT / "packages" / "std").glob("**/*.ez")):
+        text = source.read_text(encoding="utf-8")
+        for match in re.finditer(r"export\s+type\s+([A-Z][A-Za-z0-9_]*)\s*=\s*([^;]+);", text):
+            name = match.group(1)
+            shape = match.group(2).strip().replace("=>", "->")
+            pattern = re.escape(name) + r"\s*(?::|=)\s*" + re.escape(shape)
+            compact_shape = re.sub(r"\s+", "", f"{name}={shape}")
+            for doc_name, docs in documents.items():
+                compact_docs = re.sub(r"\s+", "", docs.replace("=>", "->"))
+                if re.search(pattern, docs.replace("=>", "->")) is None and compact_shape not in compact_docs:
+                    missing.append(f"{doc_name} 缺少 {source.relative_to(ROOT)}:{name} = {shape}")
+    assert not missing, "标准库文档缺少公开类型别名形状: " + ", ".join(missing)
+
+
+def test_e2e_stdlib_overview_declares_match_exported_signatures():
+    """stdlib 概览中写出的 declare const 必须对应真实导出签名。"""
+    def compact(signature: str) -> str:
+        signature = re.sub(r"//.*", "", signature)
+        return re.sub(r"\s+", "", signature.replace("=>", "->"))
+
+    exports = {}
+    for source in sorted((ROOT / "packages" / "std").glob("**/*.ez")):
+        text = source.read_text(encoding="utf-8")
+        module = source.relative_to(ROOT / "packages" / "std").with_suffix("").as_posix()
+        for match in re.finditer(r"export\s+declare\s+const\s+([A-Za-z_][A-Za-z0-9_]*)\s*:\s*([^;]+);", text):
+            exports.setdefault(match.group(1), set()).add((module, compact(match.group(2).strip())))
+        for name, params_source, ret_type in _iter_export_const_functions(text):
+            exports.setdefault(name, set()).add((module, compact(f"({params_source}) -> {ret_type}")))
+
+    docs = (ROOT / "docs" / "stdlib.md").read_text(encoding="utf-8")
+    issues = []
+    for match in re.finditer(r"declare\s+const\s+([A-Za-z_][A-Za-z0-9_]*)\s*:\s*([^\n;]+)", docs):
+        name = match.group(1)
+        signature = compact(match.group(2).strip())
+        candidates = exports.get(name, set())
+        if not candidates:
+            issues.append(f"docs/stdlib.md 声明了未导出的标准库 API: {name}")
+            continue
+        if all(candidate_signature != signature for _, candidate_signature in candidates):
+            actual = ", ".join(f"std/{module}:{candidate_signature}" for module, candidate_signature in sorted(candidates))
+            issues.append(f"docs/stdlib.md 中 {name} 签名不匹配，文档={signature}，实现={actual}")
+    assert not issues, "stdlib 概览声明与源码不一致: " + "; ".join(issues)
+
+
+def test_e2e_stdlib_overview_constants_match_exported_values():
+    """stdlib 概览中写出的公开常量必须对应真实导出值。"""
+    def strip_comment(text: str) -> str:
+        return re.sub(r"//.*", "", text).strip().rstrip(";")
+
+    exports = {}
+    for source in sorted((ROOT / "packages" / "std").glob("**/*.ez")):
+        text = source.read_text(encoding="utf-8")
+        module = source.relative_to(ROOT / "packages" / "std").with_suffix("").as_posix()
+        for match in re.finditer(
+            r"export\s+const\s+([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?)\s*:\s*([^=;]+)=\s*([^;]+);",
+            text,
+        ):
+            exports[match.group(1)] = (module, match.group(2).strip(), match.group(3).strip())
+
+    docs = (ROOT / "docs" / "stdlib.md").read_text(encoding="utf-8")
+    issues = []
+    const_re = re.compile(
+        r"^\s*const\s+([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?)\s*:\s*([^=\n]+)=(?!>)\s*([^\n]+)",
+        re.M,
+    )
+    for match in const_re.finditer(docs):
+        name = match.group(1)
+        value_type = strip_comment(match.group(2))
+        value = strip_comment(match.group(3))
+        exported = exports.get(name)
+        if exported is None:
+            issues.append(f"docs/stdlib.md 声明了未导出的标准库常量: {name}")
+            continue
+        module, actual_type, actual_value = exported
+        if value_type != actual_type or value != actual_value:
+            issues.append(
+                f"docs/stdlib.md 中 {name} 常量不匹配，文档={value_type}={value}，实现=std/{module}:{actual_type}={actual_value}"
+            )
+    assert not issues, "stdlib 概览常量与源码不一致: " + "; ".join(issues)
+
+
+def test_e2e_ui_package_docs_cover_exported_symbols():
+    """UI 包文档应覆盖 index.ez 导出的公开符号及其公开形状。"""
+    pairs = [
+        (ROOT / "packages" / "ez-android-ui" / "index.ez", ROOT / "docs" / "ez-android-ui.md"),
+        (ROOT / "packages" / "ez-ios-ui" / "index.ez", ROOT / "docs" / "ez-ios-ui.md"),
+        (ROOT / "packages" / "ez-web-ui" / "index.ez", ROOT / "docs" / "ez-web-ui.md"),
+    ]
+    missing = []
+
+    def compact(text: str) -> str:
+        return re.sub(r"\s+", "", text.replace("=>", "->"))
+
+    def find_struct_body(text: str, start: int) -> str:
+        depth = 1
+        end = start
+        while end < len(text) and depth > 0:
+            if text[end] == "{":
+                depth += 1
+            elif text[end] == "}":
+                depth -= 1
+            end += 1
+        return text[start:end - 1]
+
+    export_re = re.compile(
+        r"^\s*export\s+(?:declare\s+)?(?:const|struct|type)\s+"
+        r"([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?)",
+        re.M,
+    )
+    struct_re = re.compile(r"export\s+struct\s+([A-Za-z_][A-Za-z0-9_]*)\s*\{")
+    type_re = re.compile(r"export\s+type\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*([^;]+);")
+    declare_re = re.compile(r"export\s+declare\s+const\s+([A-Za-z_][A-Za-z0-9_]*)\s*:\s*([^;]+);")
+    for source, doc in pairs:
+        source_text = source.read_text(encoding="utf-8")
+        doc_text = doc.read_text(encoding="utf-8")
+        compact_doc = compact(doc_text)
+        for match in export_re.finditer(source_text):
+            name = match.group(1)
+            pattern = rf"(?<![A-Za-z0-9_.]){re.escape(name)}(?![A-Za-z0-9_])"
+            if re.search(pattern, doc_text) is None:
+                missing.append(f"{doc.relative_to(ROOT)} 缺少 {source.relative_to(ROOT)}:{name}")
+        for match in struct_re.finditer(source_text):
+            name = match.group(1)
+            body = find_struct_body(source_text, match.end())
+            for field in re.finditer(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*:\s*([^;\n]+)", body, re.M):
+                field_name = field.group(1)
+                field_type = field.group(2).strip()
+                expected = f"{field_name}:{field_type}"
+                if compact(expected) not in compact_doc:
+                    missing.append(
+                        f"{doc.relative_to(ROOT)} 缺少 {source.relative_to(ROOT)}:{name}.{field_name}: {field_type}"
+                    )
+        for match in type_re.finditer(source_text):
+            name = match.group(1)
+            shape = match.group(2).strip().replace("=>", "->")
+            expected = f"{name}={shape}"
+            if compact(expected) not in compact_doc:
+                missing.append(f"{doc.relative_to(ROOT)} 缺少 {source.relative_to(ROOT)}:{name} = {shape}")
+        for match in declare_re.finditer(source_text):
+            name = match.group(1)
+            signature = match.group(2).strip().replace("=>", "->")
+            expected = f"{name}:{signature}"
+            if compact(expected) not in compact_doc:
+                missing.append(f"{doc.relative_to(ROOT)} 缺少 {source.relative_to(ROOT)}:{name}: {signature}")
+    assert not missing, "UI 包文档缺少公开接口: " + ", ".join(missing)
 
 
 def test_e2e_stdlib_does_not_expose_low_level_concurrency_primitives():
@@ -3504,7 +3715,14 @@ def test_e2e_toolchain_docs_cover_test_and_release_install_zip_contract():
     assert "path/to/file.ez" in readme
     assert "<name>-<version>.zip" in toolchain
     assert "name-version.zip" in manual
+    assert "<registry>/<name>/<version>/<name>-<version>.zip" in toolchain
+    assert "<registry>/<name>/<version>/<name>-<version>.zip" in manual
+    assert "PUT <registry>/<name>/<version>/<name>-<version>.zip" in toolchain
+    assert "PUT <registry>/<name>/<version>/<name>-<version>.zip" in manual
+    assert "application/zip" in toolchain
+    assert "application/zip" in manual
     assert f'{{name}}-{{version}}.zip' in cli
+    assert 'method="PUT"' in cli
     assert "_extract_package_zip" in cli
     assert "global_install" in cli
     assert "_load_run_config" in cli
@@ -3520,11 +3738,99 @@ def test_e2e_toolchain_docs_match_cli_defaults_and_targets():
     for arch in ["x86_64", "aarch64", "arm", "wasm32", "riscv64"]:
         assert f'"{arch}"' in cli
         assert f'`"{arch}"`' in docs
+    assert 'arch == "wasm"' in cli
+    assert "旧配置中的 `\"wasm\"`" in docs
     for os_name in ["windows", "macos", "linux", "android", "ios", "emcc", "freestanding"]:
         assert f'"{os_name}"' in cli
         assert f'`"{os_name}"`' in docs
     for marker in ["LLVM IR、对象文件和同名可执行文件", "SDK 链接产物", "未配置 `output.sdk` 时仍保留 IR/对象文件输出"]:
         assert marker in docs
+
+
+def test_e2e_toolchain_docs_match_plugin_hook_api():
+    """工具链文档应匹配当前 Python 插件 hook API。"""
+    docs_list = [
+        (ROOT / "docs" / "toolchain.md").read_text(encoding="utf-8"),
+        (ROOT / "docs" / "cli-manual.md").read_text(encoding="utf-8"),
+    ]
+    cli = (ROOT / "cli" / "ez.py").read_text(encoding="utf-8")
+
+    for docs in docs_list:
+        assert "before_build(context)" in docs
+        assert "after_build(context)" in docs
+        assert "Python 构建 hook" in docs
+        assert "不替换编译器前端或后端" in docs
+        assert "编译器前端或后端插件" not in docs
+        for key in ["project", "version", "description", "root", "project_file", "main", "optimize", "output", "sources"]:
+            assert f'"{key}"' in cli
+            assert f"`{key}`" in docs
+        for key in ["ir", "object", "executable", "sdk_artifact", "extern_libs", "plugin", "args"]:
+            assert f'"{key}"' in cli
+            assert f"`{key}`" in docs
+
+
+def test_e2e_runtime_design_docs_match_arena_and_flow_runtime():
+    """运行时设计文档应匹配 Arena 与 Flow runtime 的当前实现。"""
+    docs = (ROOT / "docs" / "runtime-design.md").read_text(encoding="utf-8")
+    codegen = (ROOT / "compiler" / "src" / "codegen" / "llvm_codegen.py").read_text(encoding="utf-8")
+    native_runtime = (ROOT / "packages" / "std" / "native" / "runtime.c").read_text(encoding="utf-8")
+    emcc_runtime = (ROOT / "packages" / "std" / "emcc" / "runtime.js").read_text(encoding="utf-8")
+
+    assert "线程本地缓冲区指针" in docs
+    assert "`__arena_capacity`" in docs
+    assert "初始为 `null`" in docs
+    assert "首次容量从 1MB 起步" in docs
+    assert "默认 1MB 缓冲区" not in docs
+    for marker in ['storage_class = \'thread_local\'', "realloc", "1048576"]:
+        assert marker in codegen
+    for hook in ["__ezrt_flow_enter", "__ezrt_flow_exit", "__ezrt_sleep", "__ezrt_race_i32", "__ezrt_task_start_i32", "__ezrt_task_join_i32"]:
+        assert hook in docs
+        assert hook in codegen or hook in native_runtime or hook in emcc_runtime
+
+
+def test_e2e_readme_matches_shape_plugin_and_runnable_example_contracts():
+    """README 入口说明应匹配当前 shape、插件和示例语义。"""
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    assert "形状类型验证" in readme
+    assert "对象字面量在形状注解下按字段名校验" in readme
+    assert "字典自动匹配" not in readme
+    assert "Python 构建 hook 配置" in readme
+    assert "编译器插件配置" not in readme
+    assert 'from "std/io" import { print }' in readme
+    assert "struct User { name: Str; age: I32 }" in readme
+
+
+def test_e2e_parser_grammar_has_single_source_file():
+    """语法源文件只保留根目录 grammar/EzLang.g4，parser 目录只提交生成产物。"""
+    assert (ROOT / "grammar" / "EzLang.g4").exists()
+    assert not (ROOT / "compiler" / "src" / "parser" / "grammar").exists()
+    docs = (ROOT / "docs" / "compiler-architecture.md").read_text(encoding="utf-8")
+    assert "grammar/EzLang.g4" in docs
+
+
+def test_e2e_language_docs_cover_keyword_dict_key_rule():
+    """语言文档应说明关键字不能作为裸字段名或裸字典 key。"""
+    docs = (ROOT / "docs" / "doc.md").read_text(encoding="utf-8")
+    assert "关键字" in docs
+    assert "字符串 key" in docs
+    assert '"type": Str = "I32"' in docs
+
+
+def test_e2e_language_docs_match_extern_declare_linking_boundary():
+    """extern/declare 文档应说明编译器和链接器各自负责的检查。"""
+    docs = (ROOT / "docs" / "doc.md").read_text(encoding="utf-8")
+    assert "没有关联 `extern` 时编译器会给出链接诊断" in docs
+    assert "符号是否真实存在由后端链接器在链接阶段验证" in docs
+    assert "至少一个 `extern` 库中存在" not in docs
+
+
+def test_e2e_language_docs_match_shape_and_catch_semantics():
+    """语言文档应匹配当前形状匹配和 catch 表达式语义。"""
+    docs = (ROOT / "docs" / "doc.md").read_text(encoding="utf-8")
+    assert "结构体值只要包含形状要求的字段" in docs
+    assert "普通 `Dict` 变量不会自动转换成固定形状结构体" in docs
+    assert "没有捕获到异常时返回零值 `Error`" in docs
+    assert "没有 `throw` 时返回 `Void`" not in docs
 
 def test_e2e_std_collections_basic_list_builds(tmp_path):
     source = tmp_path / "std_collections.ez"

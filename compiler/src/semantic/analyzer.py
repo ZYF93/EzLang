@@ -268,7 +268,7 @@ class SemanticAnalyzer(EzLangVisitor):
                         "value": value_type,
                         "getter": getter_type,
                         "setter": setter_type,
-                        "type": Type(name="Str", kind=TypeKind.BASIC),
+                        "t": Type(name="Str", kind=TypeKind.BASIC),
                         "name": Type(name="Str", kind=TypeKind.BASIC),
                     }
                     return meta_type
@@ -446,8 +446,15 @@ class SemanticAnalyzer(EzLangVisitor):
             text = decode_string_literal_token(ctx.STRING_LITERAL().getText())
             for match in re.finditer(r"\{\{(.+?)\}\}", text):
                 expr_text = match.group(1).strip()
-                if _EZ_VAR_IDENTIFIER_RE.fullmatch(expr_text) and self.symbols.resolve(expr_text) is None:
+                if not _EZ_VAR_IDENTIFIER_RE.fullmatch(expr_text):
+                    self.symbols.add_error(f"行 {ctx.start.line}: 字符串插值只支持简单 Str 变量 '{{{{name}}}}'，不支持表达式 '{expr_text}'")
+                    continue
+                symbol = self.symbols.resolve(expr_text)
+                if symbol is None:
                     self.symbols.add_error(f"行 {ctx.start.line}: 未定义的变量 '{expr_text}'")
+                    continue
+                if symbol.type is not None and symbol.type.name != "Str":
+                    self.symbols.add_error(f"行 {ctx.start.line}: 字符串插值变量 '{expr_text}' 必须是 Str，实际为 '{symbol.type}'")
             return Type(name="Str", kind=TypeKind.BASIC)
         if ctx.BOOL_LITERAL() is not None:
             return Type(name="Bool", kind=TypeKind.BASIC)
@@ -664,6 +671,10 @@ class SemanticAnalyzer(EzLangVisitor):
         if hasattr(ctx, 'TYPE_IDENTIFIER') and ctx.TYPE_IDENTIFIER() is not None:
             return ctx.TYPE_IDENTIFIER().getText()
         return ""
+
+    def _field_name_text(self, ctx) -> str:
+        token = ctx.VAR_IDENTIFIER() if hasattr(ctx, 'VAR_IDENTIFIER') else None
+        return token.getText() if token is not None else ""
 
     def _is_in_flow(self) -> bool:
         return self.flow_depth > 0
@@ -896,7 +907,7 @@ class SemanticAnalyzer(EzLangVisitor):
         for init in init_list.structFieldInit():
             if init.ELLIPSIS() is not None or init.expression() is None:
                 continue
-            fname = init.VAR_IDENTIFIER().getText()
+            fname = self._field_name_text(init)
             expected = struct_type.fields.get(fname)
             actual = init.expression().accept(self)
             self._bind_generic_type(expected, actual, type_map)
@@ -1118,7 +1129,7 @@ class SemanticAnalyzer(EzLangVisitor):
 
     def visitStructField(self, ctx: EzLangParser.StructFieldContext):
         """处理结构体字段"""
-        name = ctx.VAR_IDENTIFIER().getText()
+        name = self._field_name_text(ctx)
         type_ctx = ctx.type_()
         type_ = self._get_type_from_ctx(type_ctx) if type_ctx is not None else None
         symbol = Symbol(name, SymbolKind.VARIABLE, type_, mutable=True, line=ctx.start.line)
@@ -1131,7 +1142,7 @@ class SemanticAnalyzer(EzLangVisitor):
 
     def visitStructMethod(self, ctx: EzLangParser.StructMethodContext):
         """处理结构体方法 — 检查 this 参数绑定"""
-        name = ctx.VAR_IDENTIFIER().getText()
+        name = self._field_name_text(ctx)
         symbol = Symbol(name, SymbolKind.FUNCTION, Type(name="function", kind=TypeKind.FUNCTION),
                        line=ctx.start.line)
         self.symbols.define(symbol)
@@ -1522,7 +1533,7 @@ class SemanticAnalyzer(EzLangVisitor):
 
     def visitMemberAccess(self, ctx: EzLangParser.MemberAccessContext) -> Optional[Type]:
         """成员访问：expr.field — 返回字段类型"""
-        field_name = ctx.VAR_IDENTIFIER().getText()
+        field_name = self._field_name_text(ctx)
         static_struct_name = self._static_struct_member_owner(ctx.postfixExpression())
         if static_struct_name is not None:
             method_type = self._method_type_for_struct(Type(name=static_struct_name, kind=TypeKind.STRUCT), field_name)
@@ -1965,7 +1976,7 @@ class SemanticAnalyzer(EzLangVisitor):
             key = field.dictKey()
             if key is None or key.VAR_IDENTIFIER() is None or field.type_() is not None:
                 return ctx.accept(self)
-            name = key.VAR_IDENTIFIER().getText()
+            name = self._dict_field_name(field)
             symbol = self.symbols.resolve(name)
             if symbol is None:
                 self.symbols.add_error(f"行 {field.start.line}: 未定义的变量 '{name}'")
@@ -2071,7 +2082,7 @@ class SemanticAnalyzer(EzLangVisitor):
                                     f"期望 '{target_field_type}'，实际 '{source_field_type}'"
                                 )
                     continue
-                fname = init.VAR_IDENTIFIER().getText()
+                fname = self._field_name_text(init)
                 if struct_type.fields and fname not in struct_type.fields:
                     self.symbols.add_warning(
                         f"行 {ctx.start.line}: 结构体 '{name}' 没有字段 '{fname}'"

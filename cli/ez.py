@@ -93,6 +93,7 @@ class ProjectConfig:
     root: Path
     name: str
     version: str
+    description: str = ""
     main: Path | None = None
     optimize: int = 0
     public: bool = True
@@ -401,6 +402,7 @@ def _single_file_run_config(source: Path) -> ProjectConfig:
         root=source.parent,
         name=name,
         version="0.0.0",
+        description="",
         main=source,
         optimize=0,
         public=False,
@@ -581,6 +583,9 @@ def load_project(path: str | Path | None, *, require_main: bool) -> ProjectConfi
         raise CliError("缺少 [project]")
     name = _required_str(project, "name", "project.name")
     version = _required_str(project, "version", "project.version")
+    description = project.get("description", "")
+    if description is not None and not isinstance(description, str):
+        raise CliError("project.description 必须是字符串")
     _validate_semver(version, "project.version")
     optimize = int(project.get("optimize", 2))
     if optimize < 0 or optimize > 3:
@@ -604,6 +609,7 @@ def load_project(path: str | Path | None, *, require_main: bool) -> ProjectConfi
         root=root,
         name=name,
         version=version,
+        description=description or "",
         main=main,
         optimize=optimize,
         public=public,
@@ -781,6 +787,7 @@ def _plugin_context(config: ProjectConfig, output: OutputConfig, source_plan: li
     return {
         "project": config.name,
         "version": config.version,
+        "description": config.description,
         "root": str(config.root),
         "project_file": str(config.path),
         "main": str(config.main) if config.main is not None else None,
@@ -1623,7 +1630,7 @@ def _format_sources(config: ProjectConfig, sources: list[Path]) -> str:
 
 
 def _collect_fmt_files(config: ProjectConfig, paths: list[str]) -> list[Path]:
-    roots = [_resolve_path(Path.cwd(), p) for p in paths] if paths else ([config.main] if config.main else [config.root])
+    roots = [_resolve_path(Path.cwd(), p) for p in paths] if paths else [Path.cwd()]
     files: list[Path] = []
     for root in roots:
         if root is None:

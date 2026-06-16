@@ -33,6 +33,10 @@ type ActionHandler     = () => Void
 type TouchHandler      = (e: TouchEvent) => Void
 type TextChangeHandler = (e: TextChangedEvent) => Void
 type ValueChangeHandler= (value: F32) => Void
+type TableRowCount     = (section: I32) => I32
+type TableCreateCell   = (reuseId: Str) => Node
+type TableBindCell     = (cell: Node, row: I32, section: I32) => Void
+type TableCellHeight   = (row: I32, section: I32) => F32
 
 // 颜色（RGBA，各分量 0.0–1.0）
 struct Color {
@@ -118,10 +122,10 @@ declare const getRootView:       () => Node
 // 设置 TableView / CollectionView 数据源（框架回调）
 declare const setTableAdapter: (
     table:      Node,
-    rowCount:   (section: I32) => I32,
-    createCell: (reuseId: Str) => Node,
-    bindCell:   (cell: Node, row: I32, section: I32) => Void,
-    cellHeight: (row: I32, section: I32) => F32
+    rowCount:   TableRowCount,
+    createCell: TableCreateCell,
+    bindCell:   TableBindCell,
+    cellHeight: TableCellHeight
 ) => Void
 ```
 

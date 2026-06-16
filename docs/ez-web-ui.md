@@ -24,6 +24,8 @@ struct Event {
 }
 
 type EventHandler = (e: Event) => Void
+type Attrs = { [key: Str]: Str }
+type Styles = { [key: Str]: Str }
 ```
 
 ---
@@ -67,7 +69,7 @@ declare const setAttribute:      (node: Node, key: Str, value: Str) => Void
 declare const removeAttribute:   (node: Node, key: Str) => Void
 
 // 批量设置属性（减少跨 FFI 调用次数）
-declare const setAttributes:     (node: Node, attrs: { [key: Str]: Str }) => Void
+declare const setAttributes:     (node: Node, attrs: Attrs) => Void
 
 // 直接读写 DOM property（区别于 attribute）
 declare const getProperty:       (node: Node, key: Str) => Str
@@ -82,7 +84,7 @@ declare const setProperty:       (node: Node, key: Str, value: Str) => Void
 declare const getStyle:          (node: Node, prop: Str) => Str
 declare const setStyle:          (node: Node, prop: Str, value: Str) => Void
 // 批量设置 style（驼峰 key，如 "backgroundColor"）
-declare const setStyles:         (node: Node, styles: { [key: Str]: Str }) => Void
+declare const setStyles:         (node: Node, styles: Styles) => Void
 
 declare const addClass:          (node: Node, name: Str) => Void
 declare const removeClass:       (node: Node, name: Str) => Void
@@ -109,8 +111,8 @@ declare const setInnerHTML:      (node: Node, html: Str) => Void
 ## 7. 事件系统
 
 ```ez
-// 注册 / 注销事件监听（capture 阶段可选）
-declare const addEventListener:      (node: Node, event: Str, handler: EventHandler, capture: Bool?) => Void
+// 注册 / 注销事件监听（capture 表示是否使用捕获阶段）
+declare const addEventListener:      (node: Node, event: Str, handler: EventHandler, capture: Bool) => Void
 declare const removeEventListener:   (node: Node, event: Str, handler: EventHandler) => Void
 
 // 事件委托（在 parent 上监听冒泡，通过 selector 过滤）

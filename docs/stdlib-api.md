@@ -81,6 +81,10 @@ API：
 
 ## std/fs
 
+类型：
+
+- `FileStat { size: I64, isDir: Bool, modified: I64, created: I64 }`
+
 - `readFile(path: Str) -> Blob`
 - `writeFile(path: Str, content: Blob) -> Bool`
 - `appendFile(path: Str, content: Blob) -> Bool`
@@ -113,6 +117,10 @@ API：
 平台说明：native `cwd` 不可探测时返回空字符串；emcc 目标在 Node 风格运行时读取 `Module.arguments` / `process.env` / `process.cwd()` / `process.pid`；浏览器缺少对应能力时按签名返回空列表、空可选值、`false`、`/` 或 `-1`。
 
 ## std/path
+
+类型：
+
+- `PathParts { root: Str, dir: Str, base: Str, name: Str, ext: Str }`
 
 - `pathSeparator() -> Str`
 - `pathJoin(parts: Str[]) -> Str`
@@ -486,11 +494,11 @@ API：
 
 类型：
 
-- `Headers`
-- `HttpRequest`
-- `HttpResponse`
-- `RouteHandler`
-- `HttpServer`
+- `Headers = { [key: Str]: Str }`
+- `HttpRequest { method: Str, url: Str, headers: Headers, body: Blob? }`
+- `HttpResponse { status: I32, headers: Headers, body: Blob }`
+- `RouteHandler = (req: HttpRequest) -> HttpResponse`
+- `HttpServer { handle: I64 }`
 
 原生平台支持 `http://` 客户端请求、合法端口、userinfo 剥离、IPv6 字面量、基础请求/响应头和 `Transfer-Encoding: chunked` 响应体解码；Linux/macOS 在可动态加载 OpenSSL TLS 后端、系统 CA 可用且证书链与主机名校验通过时支持 `https://`，否则返回空可选值。原生平台也支持基础 HTTP 服务端：`createServer` 创建句柄，`HttpServer.on` 注册精确路径路由，`start` 监听并将已接受连接交给 worker 处理，`stop` 关闭服务端。emcc 在浏览器/Worker 环境优先使用 `fetch` + Asyncify 挂起客户端请求，无 Asyncify 时保留同步 `XMLHttpRequest` fallback；Node 风格运行时通过 `http.createServer` + Asyncify 支持基础 HTTP 服务端，浏览器/Worker 服务端仍返回空句柄。`HttpResponse.text()` 仅在响应体是不含空字节的合法 UTF-8 时返回文本，否则返回空字符串。无 `fetch` 且无同步 XHR 的 emcc 环境返回空可选值。
 
@@ -556,7 +564,7 @@ JSON 与 MessagePack 当前覆盖 `I8`、`I32`、`I64`、`U8`、`U32`、`U64`、
 
 ## std/collections
 
-`List<T>`、`T[]` 与 `Dict<K, V>` 是编译器预声明的内置类型，用户可直接使用。`std/collections` 的公开接口由编译器内建 lowering 实现，不需要外部运行时链接；集合扩展函数的第一个参数统一是弱引用 `this`。
+`List<T>`、`T[]` 与 `Dict<K, V>` 是编译器预声明的内置类型，用户可直接使用。`std/collections` 通过标准库声明公开集合扩展 API；这些泛型函数由编译器单态化并 lowering，不需要外部 C/JS 运行时链接。集合扩展函数的第一个参数统一是弱引用 `this`。
 
 - `listPush<T>(this: #List<T>, item: T) -> Void`
 - `listPop<T>(this: #List<T>) -> T?`

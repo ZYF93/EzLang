@@ -94,5 +94,5 @@ dir = "dist/linux"
 运行：
 
 ```bash
-python -m cli.ez build --project project.toml
+ez build --project project.toml
 ```

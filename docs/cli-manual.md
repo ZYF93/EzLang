@@ -9,6 +9,15 @@ ez --help
 ez build --help
 ```
 
+## 初始化
+
+```bash
+ez init path/to/app --name app
+ez init path/to/app --template https://example.com/template.git
+```
+
+不指定模板时会创建 `project.toml` 和 `src/main.ez`；指定 `--template` 时会浅克隆模板仓库并复制其内容。
+
 ## 项目配置
 
 默认读取 `project.toml`：
@@ -103,15 +112,18 @@ ez fmt --project project.toml src/index.ez
 ez fmt --project project.toml --check src/index.ez
 ```
 
+传入文件或目录时只处理指定路径；未传路径时递归格式化执行命令所在目录下的 `.ez` 文件。`--check` / `--dry-run` 只检查，不写回。
+
 ## 发布
 
 ```bash
-python -m cli.ez release --project project.toml
-python -m cli.ez release --project project.toml --dry-run
+ez release --project project.toml
+ez release --project project.toml --dry-run
 ```
 
 发布会校验版本号、`public` 配置，并打包源码上传到 registry 或本地目录。
 发布包文件名为 `<name>-<version>.zip`，可被 `ez install` 作为版本依赖安装。
+本地 registry 写入 `<registry>/<name>/<version>/<name>-<version>.zip`；HTTP(S) registry 使用 `PUT <registry>/<name>/<version>/<name>-<version>.zip` 上传，Content-Type 为 `application/zip`。`--dry-run` 只校验，不写文件或上传。
 
 ## 插件 hook
 
@@ -123,9 +135,9 @@ name = "./plugin.py"
 args = ["release=true"]
 ```
 
-插件可实现：
+插件是 Python 构建 hook，不替换编译器前端或后端，只在每个输出目标构建前后观察构建上下文并执行自定义脚本。插件模块可实现：
 
 - `before_build(context)`
 - `after_build(context)`
 
-context 中包含项目名、输出目标、源文件、extern libs 等信息。
+`context` 包含 `project`、`version`、`description`、`root`、`project_file`、`main`、`optimize`、`output`、`sources`；`after_build` 还包含 `ir`、`object`、`executable`、`sdk_artifact`、`extern_libs`，并在每次 hook 调用时附加当前 `plugin` 与该插件的 `args`。

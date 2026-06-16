@@ -14,7 +14,8 @@ let a = 1; // 语句由 ; 分隔，表达式可以直接作为语句使用
 ### 语义说明与规范
 * **区分大小写**。
 * 标识符、关键字、类型名不允许包含空白字符。
-* **关键字**：`let`, `const`, `static`, `struct`, `type`, `declare`, `loop`, `break`, `continue`, `import`, `export`, `from`, `match`, `catch`, `throw`, `flow`, `parallel`, `rp`, `wp`, `typeof`, `return`, `in`, `for`, `as`, `extern`
+* **关键字**：`let`, `const`, `static`, `struct`, `type`, `declare`, `loop`, `break`, `continue`, `import`, `export`, `from`, `match`, `catch`, `throw`, `flow`, `parallel`, `rp`, `wp`, `typeof`, `return`, `in`, `for`, `as`, `extern`。
+* **保留词法单元**：基本类型名 `I8`, `I32`, `I64`, `U8`, `U32`, `U64`, `F32`, `F64`, `Str`, `Bool`, `Void`、复合类型构造名 `Vec`, `List`、布尔字面量 `true` / `false`、目标平台名 `linux`, `macos`, `windows`, `android`, `ios`, `emcc` 也是固定词法单元，不能作为普通标识符使用。`Dict`、`Date`、`Error`、`Blob`、`Meta` 是编译器预声明类型名。
 * **命名规范**：类型名应以大写字母开头（如 `User`, `Result`）；变量名可由小写字母、下划线或 `$` 开头（如 `user`, `_count`, `$state`）。
 
 ### LLVM 映射
@@ -27,6 +28,8 @@ let a = 1; // 语句由 ; 分隔，表达式可以直接作为语句使用
 ### 语法
 ```ez
 // 基本类型与可选、联合类型
+struct User { name: Str; }
+let user = User(name = "Ada");
 let a: I32? = 10;
 let value: I32 | Str = "hello";
 let weakUser: #User = #user;
@@ -55,6 +58,7 @@ let s: Shape = {
 }
 const a_obj = { props: I32 = 1 } // 显式类型指定
 const b_obj = { x = 10, y = 20 } // 自动推断为 { x: I32; y: I32 }
+const keyword_key = { "type": Str = "I32" } // 关键字只能写成字符串 key
 
 // 类型扩展
 type Named = { name: Str }
@@ -92,10 +96,11 @@ let inferred = identity(42)  // 推断为 I32
   * 可选类型：`Type?`。底层为 `Option<T>`，访问时使用 `expr?` 或强制拆包 `Type! expr`。
   * 弱引用类型：`#Type`。`#expr` 生成指向 `expr` 的弱引用值，语义上表示“可能因 Arena 生命周期结束而失效的 Type 引用”。弱引用按 `Type` 透明使用：`#var.field`、`#var.method()` 与 `var.field`、`var.method()` 写法一致；判空使用 `typeof ref == Void`。
   * 联合类型：`Type1 | Type2`。必须通过模式匹配或类型检查区分具体分支。
-* **类型别名与鸭子类型**：
-  * 使用 `type Alias = { ... }` 定义的形状采用鸭子类型（Duck Typing）进行验证。任何结构（包括 `Struct` 或 `Dict`）只要包含形状要求的字段，即可视为匹配该类型。
-  * `Dict` 类型（字典）可通过字面量 `{ prop: Type; ... }` 创建，支持固定字段和动态键。
-  * 支持 `{ prop = value }` 的推断初始化或 `{ prop: Type = value }`。
+* **类型别名与形状匹配**：
+  * 使用 `type Alias = { ... }` 定义的固定形状会记录字段集合。结构体值只要包含形状要求的字段且字段类型兼容，即可赋给该形状别名。
+  * 对象字面量在有形状期望类型时会按字段名校验并生成对应静态布局，例如 `let s: Shape = { name = "Square"; side = "10" }`。
+  * `Dict` 类型（字典）可通过字面量 `{ prop: Type = value }`、`{ prop = value }` 或动态键 `{ [expr] = value }` 创建，支持固定字段校验和动态键类型声明；但普通 `Dict` 变量不会自动转换成固定形状结构体。
+  * 裸字段名和裸字典 key 必须是普通变量标识符；关键字、保留类型名或包含特殊字符的键必须写成字符串 key，如 `{ "type": Str = "I32" }`。动态表达式 key 使用 `[expr] = value`。
   * 可以使用 `typeof { prop: Type = value }` 语法来获取对应的 `Dict` 类型。
 * **类型扩展**：`...BaseType` 将基础形状的字段展开并平铺到当前定义中。
 * **泛型系统**：
@@ -177,7 +182,7 @@ struct Meta<T> {
     value: T;
     getter: () => T;
     setter: (value: T) => Void;
-    type: Str;
+    t: Str;
     name: Str;
 }
 ```
@@ -185,24 +190,24 @@ struct Meta<T> {
 ### 语义说明与规范
 * **结构体基础**：定义支持 `struct Name<T> { ...Base?; field: Type = default?; method = (this: #Type, args...) => expr?; }`。支持名称参数初始化与默认字段值。结构体使用静态布局。
 * **组合与复用**：`...Base` 将基础结构体字段平铺到当前结构体开头，实现布局复用。实例化时复制基础结构的内存并写入新增字段。
-* **类型检查与方法**：每个结构体隐式包含 `I32` 类型标识，用于 `typeof` 和运行时检查。方法是内联函数，`this` 显式绑定到实例；对象方法调用会把接收者作为第一个 `this` 参数传入，集合扩展方法使用弱引用 `this`。
+* **类型检查与方法**：`typeof` 返回编译器为类型名生成的稳定 `I32` TypeID；对弱引用执行 `typeof ref == Void` / `typeof ref != Void` 时会检查弱引用的有效位。结构体实例本身不额外存储 TypeID 字段。方法会编译为 `Struct_method` 形式的独立函数并登记到结构体方法表；对象方法调用会把接收者的弱引用作为第一个 `this` 参数传入，直接调用时可显式写 `method(this = #value)`。
 * **内置结构体与内置类型**：提供语言层面的通用数据结构封装。这些类型由编译器预声明，不需要从标准库导入。
   * `Date` 提供时间戳存储、基础的时间加减与格式化。
   * `Error` 封装错误代码、信息、抛出点文件/行/列和轻量调用栈片段，方便统一异常处理与诊断输出。
   * `Blob` 提供二进制块长度和底层指针访问能力。
   * `Dict<K, V>` 是字典的运行时承载类型，用户通常通过 `{ key: Type; ... }` 形状或 `Dict<K, V>` 使用；`std/collections` 暴露 `dictHas`、`dictKeys` 等扩展函数，首参为 `this: #Dict<K, V>`。
   * `List<T>` / `T[]` 是动态数组类型；`std/collections` 暴露 `listPush`、`listLen`、`listMap` 等扩展函数，首参为 `this: #List<T>`。
-  * `Meta<T>` 是装饰器变量的元对象类型，保存原始值、读写拦截闭包、类型名和变量名。
+  * `Meta<T>` 是装饰器变量的元对象类型，保存原始值、读写拦截闭包、类型名和变量名；类型名字段使用 `t`，避免把关键字 `type` 暴露为字段名。
 
 ### LLVM 映射
 * 结构体映射为平铺的 LLVM 结构体类型。
 * 展开实例化时，先 `memcpy` 基础实例，再 `store` 新字段。
-* 方法映射为函数指针字段，初始化时绑定对应函数。
+* 方法不写入实例字段；编译器在编译期维护结构体方法表，方法体映射为独立 LLVM 函数，`obj.method(...)` lowering 为对应函数调用并补入 `this`。
 * 内置结构体映射：
   * `Date` 可优化为单一 timestamp 型（通常为 i64）。
   * `Error` 映射为 `{ i32 code, i8* message, i8* file, i32 line, i32 column, i8* trace }`。
   * `Blob` 映射为 `{ i8* data, i64 size }`。
-  * `Meta<T>` 映射为 `{ T value, Closure<T()> getter, Closure<Void(T)> setter, i8* type, i8* name }`。
+  * `Meta<T>` 映射为 `{ T value, Closure<T()> getter, Closure<Void(T)> setter, i8* t, i8* name }`。
 
 ---
 
@@ -319,7 +324,7 @@ const ret = flow {
 
 ### 语义说明与规范
 * **flow**：`flow { ... }` 为并发调度作用域。flow 不改变程序的顺序语义。flow 内代码在语义上严格按源码顺序执行，但 runtime 可对无依赖阻塞操作进行调度优化，且调度不得改变可观察行为。
-* **当前实现**：编译器会记录 flow/parallel/suspend point 元数据，并在 LLVM IR 中生成可链接的 `__ezrt_flow_*`、`__ezrt_parallel_*`、`__ezrt_sleep`、`__ezrt_race` hook。`__ezrt_sleep` 会真实挂起当前执行点；`race(pl = [...], timeout = ...)` 对零捕获 `() => I32` 分支在 native 目标使用 C 任务运行时并发执行，在 emcc 目标使用 `packages/std/emcc/runtime.js` + Asyncify 协程运行时挂起和恢复。`flow` / `parallel` 块内的 `return` 会被捕获为表达式结果，不会提前退出外层函数；嵌套控制流中的 `return` 也参与表达式返回类型推断。
+* **当前实现**：编译器会记录 flow/parallel/suspend point 元数据，并在 LLVM IR 中生成可链接的 `__ezrt_flow_*`、`__ezrt_parallel_*`、`__ezrt_sleep`、`__ezrt_race_i32`、`__ezrt_task_start_i32` / `__ezrt_task_join_i32` hook。`__ezrt_sleep` 会真实挂起当前执行点；`race(pl = [...], timeout = ...)` 对零捕获 `() => I32` 分支在 native 目标使用 C 任务运行时并发执行，在 emcc 目标使用 `packages/std/emcc/runtime.js` + Asyncify 协程运行时挂起和恢复。`flow` / `parallel` 块内的 `return` 会被捕获为表达式结果，不会提前退出外层函数；嵌套控制流中的 `return` 也参与表达式返回类型推断。
 * **阻塞操作**：flow 外部如 `fetch()` 保持用户体感上的同步调用。flow 内部的 `sleep`、`race(pl)`、零捕获 `I32` `parallel` 以及 emcc 下的 `fetch`、TCP/UDP、WebSocket、stdin、文件系统、进程和流式 I/O 会作为 suspend source 挂起后恢复；缺失能力的平台按接口约定返回失败值或继续使用阻塞 syscall，不做 CPU 忙等。
 * **parallel 块**：`const ret = parallel { code... return... }` 或 `const ret: I32 = parallel { code... return... }` 在 flow 内、初始化表达式本身就是 `parallel` 块、零捕获且返回 `I32` 时会启动后台任务；读取 `ret` 会等待任务完成，flow 退出前会 join 未读取任务，确保副作用提交。native、Android、iOS 使用 C 任务运行时，emcc 使用 JS 协程运行时；组合表达式、其它返回类型或捕获外层局部变量的场景保持同步协作 lowering。
 * **自动依赖等待**：读取 flow 内未完成的 `parallel` 结果会自动 join；当前依赖等待覆盖 native、Android、iOS 与 emcc 的零捕获 `I32` 任务，包括推断类型和显式 `I32` 声明。emcc 标准库 suspend source 通过 Asyncify 恢复 wasm 栈，保持顺序 ABI。
@@ -376,11 +381,11 @@ const err = catch {
 * **条件表达式**：`condition ? expr : expr`。既是表达式也是流程控制，不使用 `if/else`。`condition ? expression` 或 `condition ? { block }` 是条件语句，条件为真执行，否则跳过。
 * **loop**：`0...10` 表示左闭右开区间 `[0, 10)`。
 * 块表达式 `{ ... }` 返回值为 `Void`。
-* **match**：从上到下依次求值，匹配后继续下一条，除非显式 `break`。
-* **continue**：跳过当前 match 的后续分支，继续执行下一条。
+* **match**：从上到下依次求值，命中分支执行后默认继续检查下一分支，除非显式 `break`。
+* **continue**：在 `loop` 中跳到下一轮；在 `match` 中跳过当前分支剩余语句并继续检查下一分支。
 * **break**：退出当前 `loop` 或 `match`。
 * **throw**：写入 `Error` 异常槽并跳转到最近的 `catch {}` 出口；没有活动 `catch` 时会输出未捕获异常诊断并以退出码 1 终止。同步函数调用边界会检查异常槽并继续向外传播。
-* **catch**：返回块内或被调用函数传播出的 `throw expr` 异常值；没有 `throw` 时返回 `Void`。`Error` 会携带抛出点文件、行、列和轻量调用栈片段，可通过 `err.file`、`err.line`、`err.column`、`err.trace` 读取。
+* **catch**：返回块内或被调用函数传播出的 `throw expr` 异常值；没有捕获到异常时返回零值 `Error`（`code = 0`）。`Error` 会携带抛出点文件、行、列和轻量调用栈片段，可通过 `err.file`、`err.line`、`err.column`、`err.trace` 读取。
 
 ### LLVM 映射
 * 循环映射为 `br` 与 `phi` 节点结构。
@@ -470,7 +475,8 @@ declare static version: Str
   * `emcc` 目标导入 JS 模块时，编译时自动转换为 Emscripten 绑定。
 * **declare**：声明外部库符号，用于类型检查和链接时符号解析。
   * 可声明函数、全局变量、静态变量。
-  * 声明的符号必须在至少一个 `extern` 库中存在，否则链接失败。
+  * `declare` 应配合至少一个当前目标可用的 `extern` 使用；没有关联 `extern` 时编译器会给出链接诊断。
+  * 编译器不预扫描二进制库中的符号表，符号是否真实存在由后端链接器在链接阶段验证。
   * 所有外部符号必须显式声明，支持 C ABI 兼容的外部库调用。
 * EzLang 按入口文件的顶层语句顺序执行；不要求用户显式定义 `main` 函数。若源码中已定义 `main`，宿主入口沿用该函数，文件内其它函数仍需显式调用。
 
@@ -522,7 +528,7 @@ const add = (a: I32, b: I32): I32 => {
 }
 let val = 10 -> add(a = %, b = 5) // 管道语法，等同于 add(a = 10, b = 5)
 let name = "EzLang"
-let msg = "Hello {{name}}"        // 字符串插值
+let msg = "Hello {{name}}"        // 字符串插值，当前只支持简单 Str 变量名
 
 // 安全机制：类型断言与运行时检查
 declare const malloc: (size: I32) => Blob
@@ -534,20 +540,20 @@ let isError = typeof err & Error == Error
 ```
 
 ### 语义说明与规范
-* **元编程与装饰器**：`@Dec` 将顶层变量包装为 `Meta<T>` 并在模块初始化阶段调用装饰器函数。装饰器函数接收 `Meta<T>` 或 `this: #Meta<T>`，可读写 `value`, `getter`, `setter`, `type`, `name`。
+* **元编程与装饰器**：`@Dec` 将顶层变量包装为 `Meta<T>` 并在模块初始化阶段调用装饰器函数。装饰器函数接收 `Meta<T>` 或 `this: #Meta<T>`，可读写 `value`, `getter`, `setter`, `t`, `name`。
   * `value` 是被装饰变量的真实存储。
   * `getter` 是 `() => T` 闭包；未设置时读取直接返回 `value`。
   * `setter` 是 `(value: T) => Void` 闭包；未设置时写入直接更新 `value`。
-  * `type` 与 `name` 是编译器生成的类型名和变量名，供诊断、日志和元编程使用。
+  * `t` 与 `name` 是编译器生成的类型名和变量名，供诊断、日志和元编程使用。
   * 装饰器可以是泛型函数，编译器会按被装饰变量类型单态化。
 * **标记语法**：XML 风格标记语法只会 lowering 为普通函数调用。作用域内必须存在同名工厂函数，编译器会将属性按具名参数传入，并把子节点打包为 `children` 数组；若不存在同名工厂函数、属性类型不匹配或 `children` 类型不匹配，语义分析会直接报错。
-* **管道与插值**：管道 `->` 配合 `%` 占位符重写为命名参数调用（如 `a -> fn(x = %)` 重写为 `fn(x = a)`）；字符串插值编译为最小内存复制拼接逻辑。
+* **管道与插值**：管道 `->` 配合 `%` 占位符重写为命名参数调用（如 `a -> fn(x = %)` 重写为 `fn(x = a)`）；字符串插值使用 `{{name}}` 形式，当前只支持简单变量名，且变量类型必须是 `Str`，不支持 `{{a + b}}` 这类内联表达式。
 * **类型安全机制**：
   * `Type! expr`：无检查的类型断言，适用于强制拆包或位级重解释。
-  * `typeof`：基于结构体头部的 TypeID 进行快速类型判断，返回运行时结构体类型标识或结构体类型，而非类型别名。
+  * `typeof`：返回编译器为表达式或类型名生成的稳定 `I32` TypeID；对弱引用与 `Void` 的相等/不等比较会 lowering 为弱引用有效位检查。
 
 ### LLVM 映射
 * 装饰器生成 `Meta<T>` 结构体，`getter`/`setter` 使用闭包槽保存；读写被装饰变量时，如果闭包入口不为空则调用闭包，否则直接读写 `value`。
-* 标记语法必须找到同名工厂函数并生成普通 `call` 指令，属性按函数参数名重排，子节点通过当前数组/List ABI 传给 `children`；无工厂函数或参数类型不匹配时是编译错误。管道语法在编译前端翻译展开；字符串插值生成相应的内存复制拼接逻辑。
+* 标记语法必须找到同名工厂函数并生成普通 `call` 指令，属性按函数参数名重排，子节点通过当前数组/List ABI 传给 `children`；无工厂函数或参数类型不匹配时是编译错误。管道语法在编译前端翻译展开；字符串插值把静态文本片段和 `Str` 变量片段生成为内存复制拼接逻辑。
 * `Type! expr` 映射为位级重解释（`bitcast`）或 `load` 操作。
-* `typeof` 映射为通过结构体内部隐含的 TypeID 进行数值比较。
+* `typeof` 映射为稳定 TypeID 常量；`typeof weakRef == Void` / `typeof weakRef != Void` 映射为读取弱引用 `{ ok, ptr }` 的 `ok` 位。

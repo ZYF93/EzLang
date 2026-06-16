@@ -6,13 +6,16 @@ EzLang 提供了开箱即用的命令行工具链（CLI），并采用 `project.
 
 ## 1. 命令行工具 (CLI)
 
+### `ez init`
+初始化 EzLang 项目。默认在目标目录创建 `project.toml` 和 `src/main.ez`，项目名使用目录名；可通过 `--name` 指定项目名。传入 `--template <git-url>` 时会浅克隆模板仓库并复制除 `.git` 外的内容。
+
 ### `ez install`
 读取项目根目录下的 `project.toml` 文件（重点解析 `[deps]` 节点），自动下载并安装所有项目依赖。支持安装本地文件、特定版本号的远端包，以及工作区（Workspace）内的内部模块。远端版本依赖优先安装 registry 中的 `<name>-<version>.zip`，该文件也是 `ez release` 生成的包格式；旧的单文件 `<name>.ez` 仍作为兼容格式支持。
 
 `ez install -g` 会把版本依赖安装到全局缓存 `$EZLANG_HOME/deps/<name>/<version>`；未设置 `EZLANG_HOME` 时使用 `~/.ez/deps/<name>/<version>`。`-g` 不接受本地路径依赖或 Workspace 依赖。编译和运行解析版本依赖时会同时查找项目本地 `.ez/deps` 与全局缓存。
 
 ### `ez build`
-读取 `project.toml`，执行项目的编译与构建。该命令会根据配置中的 `[[output]]` 节点执行交叉编译，生成对应架构和操作系统的产物，并输出到指定的 `dir` 目录中。同时也会根据 `[[plugins]]` 配置项加载编译器前端或后端插件。
+读取 `project.toml`，执行项目的编译与构建。该命令会根据配置中的 `[[output]]` 节点执行交叉编译，生成对应架构和操作系统的产物，并输出到指定的 `dir` 目录中。同时也会根据 `[[plugins]]` 配置项加载 Python 构建 hook，在每个输出目标的构建前后调用 `before_build(context)` / `after_build(context)`。
 
 本机可执行目标会生成 LLVM IR、对象文件和同名可执行文件；链接阶段会编译 `extern "*.c"` 源码，链接对象文件、静态库、动态库、framework 与系统库。配置 `output.sdk` 后，`emcc` 目标会调用 Emscripten `emcc` 并把 `extern "*.js" for emcc` 作为 `--js-library` 传入；当 flow sleep、`race(pl)`、零捕获 `I32` `parallel` 或 emcc 标准库 suspend source 引入协程运行时时，CLI 会自动追加 `-sASYNCIFY`。Android/iOS 目标会调用 SDK 内的 `clang` 编译 C extern 并链接平台动态库。未配置 `output.sdk` 时仍保留 IR/对象文件输出，便于外部构建系统接手。
 
@@ -27,10 +30,11 @@ EzLang 提供了开箱即用的命令行工具链（CLI），并采用 `project.
 编译并执行 EzLang 测试。未指定路径时默认查找 `tests/` 下的 `.ez` 文件；没有测试目录时回退到项目入口文件。可指定一个或多个测试文件或目录。
 
 ### `ez fmt`
-代码格式化工具。自动对当前项目或工作区内的所有 `.ez` 源代码文件进行统一格式化，确保代码风格（缩进、换行、空格等）保持一致。
+代码格式化工具。传入文件或目录时只处理这些路径下的 `.ez` 文件；未传路径时递归格式化执行命令所在目录下的 `.ez` 文件。`--check` / `--dry-run` 只检查是否需要格式化，不写回文件。
 
 ### `ez release`
 包发布工具。结合 `project.toml` 中的配置，将当前项目作为模块发布到远端的包管理服务中，供他人或外部项目下载使用。发布产物为 `<name>-<version>.zip`，包含 `project.toml` 与项目源码。
+`[project].registry` 为本地路径时，产物写入 `<registry>/<name>/<version>/<name>-<version>.zip`；为 HTTP(S) URL 时，CLI 使用 `PUT <registry>/<name>/<version>/<name>-<version>.zip` 上传 zip，Content-Type 为 `application/zip`。`public = false` 的包不能发布，`--dry-run` 只校验元数据和发布目标，不写文件或上传。
 
 ---
 
@@ -85,6 +89,8 @@ search_paths = ["C:/Program Files/MyLib/lib"]
   | `"wasm32"`  | WebAssembly 32 位，配合 `os = "emcc"` 使用                    |
   | `"riscv64"` | RISC-V 64 位（实验性）                                        |
 
+  兼容别名：旧配置中的 `"wasm"` 会被 CLI 归一化为 `"wasm32"`，并输出废弃警告；新项目应直接使用 `"wasm32"`。
+
 * `os` (字符串)：目标操作系统环境。
 
   | 值               | 平台                     | 底层                          | 备注                                          |
@@ -110,9 +116,15 @@ search_paths = ["C:/Program Files/MyLib/lib"]
   ```
 
 ### `[[plugins]]`
-配置 EzLang 编译器在编译过程中使用的插件（数组对象）。
-* `name` (字符串)：插件名称，自动从依赖中加载对应的 plugin。
-* `args` (字符串数组 - 可选)：传递给插件的参数。例如 `["release=true"]` 用于通知后端开启最高级别的执行优化。
+配置 `ez build` 构建过程中使用的 Python hook（数组对象）。当前插件接口不替换编译器前端或后端，只在每个输出目标构建前后观察构建上下文并执行自定义脚本。
+* `name` (字符串)：插件模块名、Python 文件路径或包含 `plugin.py` 的目录。相对路径按项目根目录解析；非路径名称通过 Python import 加载。
+* `args` (字符串数组 - 可选)：传递给插件的参数。调用 hook 时会通过 `context["args"]` 提供。
+
+插件模块可导出以下可选函数：
+* `before_build(context)`：编译当前输出目标前调用。
+* `after_build(context)`：当前输出目标写出 IR/对象文件、可执行文件或 SDK 产物后调用。
+
+`context` 包含 `project`、`version`、`description`、`root`、`project_file`、`main`、`optimize`、`output`、`sources`；`after_build` 还包含 `ir`、`object`、`executable`、`sdk_artifact`、`extern_libs`，并在每次 hook 调用时附加当前 `plugin` 与该插件的 `args`。
 
 ### `[deps]`
 声明项目依赖包及其解析方式。EzLang 支持以下三种依赖类型：

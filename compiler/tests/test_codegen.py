@@ -215,6 +215,7 @@ class TestCodegen:
         const get_watched = (): I32 => { return 11; };
         const set_watched = (v: I32): Void => { return; };
         const log = (this: #Meta<I32>): Void => {
+            let typeName: Str = this.t;
             this.getter = get_watched;
             this.setter = set_watched;
         };
@@ -228,6 +229,7 @@ class TestCodegen:
         assert module is not None
         assert len(errors) == 0, f'编译错误: {errors}'
         ir_text = str(module)
+        assert '_meta_type' in ir_text
         assert 'store {i32 (i8*)*, i8*}' in ir_text
         assert 'store {void (i8*, i32)*, i8*}' in ir_text
         assert 'call void %"_closure_invoke"(i8* %"_closure_env", i32 2)' in ir_text
@@ -890,6 +892,26 @@ class TestCodegen:
             let box = Box(value = 7);
             let ref: #Box = #box;
             return (typeof ref == Void) ? 0 : ref.value;
+        };
+        '''
+        module, errors, _ = compile_source(source)
+        assert module is not None
+        assert len(errors) == 0, f'编译错误: {errors}'
+        ir_text = str(module)
+        binding.parse_assembly(ir_text).verify()
+        assert '{i1, %"Box"*}' in ir_text
+
+    def test_weak_reference_method_call_and_not_void_check(self):
+        """#T 弱引用可像值引用一样调用方法，并支持 typeof ref != Void 判空。"""
+        source = '''
+        struct Box {
+            value: I32;
+            get = (this: #Box): I32 => { return this.value; };
+        };
+        const run = (): I32 => {
+            let box = Box(value = 9);
+            let ref: #Box = #box;
+            return (typeof ref != Void) ? ref.get() : 0;
         };
         '''
         module, errors, _ = compile_source(source)
@@ -2111,6 +2133,23 @@ class TestCodegen:
         ir_text = str(module)
         assert '%"Node" = type {i32, {i1, %"Node"*}}' in ir_text
         assert 'insertvalue {i1, %"Node"*} undef, i1 0, 0' in ir_text
+
+    def test_optional_struct_field_ok_is_not_treated_as_weak_ref(self):
+        """Optional<Struct>.ok 应读取 ok 位，不能因 {i1, T*} 形状被当作弱引用解包。"""
+        source = '''
+        struct Node { value: I32; next: Node?; };
+        const run = (): I32 => {
+            let node = Node(value = 1, next = ?);
+            return node.next.ok ? 1 : 0;
+        };
+        '''
+        module, errors, _ = compile_source(source)
+        assert module is not None
+        assert len(errors) == 0, f'编译错误: {errors}'
+        ir_text = str(module)
+        binding.parse_assembly(ir_text).verify()
+        assert 'getelementptr inbounds {i1, %"Node"*}, {i1, %"Node"*}*' in ir_text
+        assert 'i32 0, i32 0' in ir_text
 
     # ==================== 标准库测试 ====================
 

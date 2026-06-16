@@ -1,5 +1,5 @@
 // std/collections.ez - 数据结构扩展标准库
-// 泛型模板函数，由编译器单态化生成，无需外部链接
+// 泛型模板函数，由编译器单态化并 lowering，无需外部链接
 
 // === List<T> 扩展方法 ===
 export declare const listPush: <T>(this: #List<T>, item: T) => Void;

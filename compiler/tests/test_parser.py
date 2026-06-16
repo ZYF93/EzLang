@@ -233,6 +233,30 @@ class TestParser:
         ''')
         assert len(errors) == 0, f'解析错误: {errors}'
 
+    def test_meta_t_field_avoids_type_keyword_field_name(self):
+        """Meta<T>.t 是公开字段，关键字 type 不能作为字段或裸 key。"""
+        tree, errors = parse_source('''
+        const log = (this: #Meta<I32>): Void => {
+            let typeName: Str = this.t;
+            return;
+        };
+        @log let watched = 1;
+        ''')
+        assert len(errors) == 0, f'解析错误: {errors}'
+
+        _, member_errors = parse_source('''
+        const log = (this: #Meta<I32>): Void => {
+            let typeName: Str = this.type;
+            return;
+        };
+        ''')
+        assert member_errors, '关键字 type 不应作为成员名解析'
+
+        _, key_errors = parse_source('''
+        const data = { type = "I32" };
+        ''')
+        assert key_errors, '关键字 type 不应作为裸字典 key 解析'
+
     def test_weak_reference_type_and_value(self):
         """测试 #T 弱引用类型与 #var 弱引用值语法"""
         tree, errors = parse_source('''
@@ -290,12 +314,13 @@ class TestParser:
 
     def test_documentation_ez_blocks_parse(self):
         """文档中的 EzLang 代码块应保持可解析。"""
-        docs = sorted((Path(__file__).parent.parent.parent / 'docs').glob('*.md'))
+        root = Path(__file__).parent.parent.parent
+        docs = [root / 'README.md', *sorted((root / 'docs').glob('*.md'))]
         checked = 0
         for doc in docs:
             for index, line, source in markdown_ez_blocks(doc):
                 checked += 1
                 _, errors = parse_source(source)
-                rel = doc.relative_to(Path(__file__).parent.parent.parent)
+                rel = doc.relative_to(root)
                 assert len(errors) == 0, f'{rel} 代码块 {index}（起始行 {line}）解析错误: {errors}'
         assert checked > 0

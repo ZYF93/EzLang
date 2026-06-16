@@ -25,7 +25,6 @@ def markdown_ez_blocks(filepath: Path):
 
 DOC_SEMANTIC_SKIP = {
     ('docs/doc.md', 9): 'extern 路径和跨平台库声明展示，依赖示例外部库文件',
-    ('docs/stdlib.md', 1): 'extern 搜索路径展示，依赖示例外部库文件',
 }
 
 
@@ -517,7 +516,7 @@ class TestSemantic:
         assert not any('ok' in e for e in anal.symbols.errors), anal.symbols.errors
 
     def test_string_interpolation_checks_inner_expr(self):
-        """字符串插值应分析内部表达式"""
+        """字符串插值应分析内部变量"""
         anal = analyze('''
         const name = "EzLang";
         const greeting = "Hello {{name}}";
@@ -528,6 +527,17 @@ class TestSemantic:
         """字符串插值应报告未定义变量"""
         anal = analyze('const greeting = "Hello {{missingName}}";')
         assert any('missingName' in e for e in anal.symbols.errors), f'应有未定义变量错误: {anal.symbols.errors}'
+
+    def test_string_interpolation_requires_simple_str_variable(self):
+        """字符串插值当前只支持简单 Str 变量名。"""
+        anal = analyze('''
+        const name = "EzLang";
+        const count = 1;
+        const expr = "Hello {{name + count}}";
+        const number = "Count {{count}}";
+        ''')
+        assert any('只支持简单 Str 变量' in e for e in anal.symbols.errors), anal.symbols.errors
+        assert any("变量 'count' 必须是 Str" in e for e in anal.symbols.errors), anal.symbols.errors
 
     def test_markup_literal_requires_factory(self):
         """标记字面量必须存在同名工厂函数。"""
@@ -753,11 +763,29 @@ class TestSemantic:
         anal = analyze('type Named = { name: Str }; type UserShape = { ...Named; age: I32; }; let u: UserShape = { age = 1 };')
         assert any("缺少字段 'name'" in e for e in anal.symbols.errors), anal.symbols.errors
 
+    def test_struct_value_can_match_shape_alias_by_fields(self):
+        """结构体值可按字段子集匹配固定形状别名。"""
+        anal = analyze('type Named = { name: Str }; struct User { name: Str; age: I32; }; let u = User(name = "a", age = 1); let n: Named = u;')
+        assert not anal.symbols.has_errors(), f'语义错误: {anal.symbols.errors}'
+
+    def test_dict_value_does_not_auto_convert_to_fixed_shape_alias(self):
+        """普通 Dict 变量不会自动转换成固定形状结构体。"""
+        anal = analyze('type Named = { name: Str }; let d = { name = "a"; age = "1" }; let n: Named = d;')
+        assert any('变量初始化类型不匹配' in e for e in anal.symbols.errors), anal.symbols.errors
+
     def test_return_outside_function(self):
         """return 在函数外应报错"""
         anal = analyze('return 42;')
         assert anal.symbols.has_errors()
         assert any('return 语句只能出现在函数内部' in e for e in anal.symbols.errors)
+
+    def test_catch_without_throw_returns_error_type(self):
+        """catch 未捕获异常时仍返回零值 Error，而不是 Void。"""
+        anal = analyze('let err = catch { let x = 1; };')
+        assert not anal.symbols.has_errors(), f'语义错误: {anal.symbols.errors}'
+        sym = anal.symbols.resolve('err')
+        assert sym is not None and sym.type is not None
+        assert sym.type.name == 'Error'
 
     def test_default_param_type_check(self):
         """默认参数类型应与参数类型匹配"""
@@ -962,6 +990,22 @@ class TestSemantic:
         assert not anal.symbols.errors, f'不应产生语义错误: {anal.symbols.errors}'
         assert not anal.symbols.warnings, f'不应产生语义警告: {anal.symbols.warnings}'
 
+    def test_weak_reference_method_call_and_not_void_check(self):
+        """#T 弱引用和值引用一样访问方法，空值通过 typeof ref != Void 判断。"""
+        anal = analyze('''
+        struct Box {
+            value: I32;
+            get = (this: #Box): I32 => { return this.value; };
+        };
+        const main = (): I32 => {
+            let box = Box(value = 3);
+            let ref: #Box = #box;
+            return (typeof ref != Void) ? ref.get() : 0;
+        };
+        ''')
+        assert not anal.symbols.errors, f'不应产生语义错误: {anal.symbols.errors}'
+        assert not anal.symbols.warnings, f'不应产生语义警告: {anal.symbols.warnings}'
+
     def test_struct_init_wrong_field(self):
         """结构体构造使用不存在的字段应警告"""
         anal = analyze('''
@@ -1029,6 +1073,8 @@ class TestSemantic:
         const log = (this: #Meta<I32>): Void => {
             this.getter = get_watched;
             this.setter = set_watched;
+            let typeName: Str = this.t;
+            let valueName: Str = this.name;
         };
         @log let watched = 1;
         const main = (): I32 => { watched = 2; return watched; };
@@ -1318,7 +1364,8 @@ class TestSemantic:
     def test_documentation_ez_blocks_semantic_or_marked_demo(self):
         """文档 Ez 代码块应通过语义分析，或显式标为演示片段。"""
         seen: set[tuple[str, int]] = set()
-        for doc in sorted((ROOT / 'docs').glob('*.md')):
+        docs = [ROOT / 'README.md', *sorted((ROOT / 'docs').glob('*.md'))]
+        for doc in docs:
             rel = doc.relative_to(ROOT).as_posix()
             for index, line, source in markdown_ez_blocks(doc):
                 key = (rel, index)

@@ -1504,7 +1504,7 @@ class LLVMCodeGenerator(EzLangVisitor):
             field_ctx = member_ctx.structField()
             if field_ctx is None:
                 continue
-            fname = field_ctx.VAR_IDENTIFIER().getText()
+            fname = self._field_name_text(field_ctx)
             actual = provided.get(fname)
             if actual is None:
                 continue
@@ -1552,7 +1552,7 @@ class LLVMCodeGenerator(EzLangVisitor):
             for member_ctx in template_ctx.structMember():
                 field_ctx = member_ctx.structField()
                 if field_ctx is not None:
-                    fname = field_ctx.VAR_IDENTIFIER().getText()
+                    fname = self._field_name_text(field_ctx)
                     ftype = self._map_type_with_map(field_ctx.type_(), type_map, unsigned_map, type_name_map)
                     field_names.append(fname)
                     field_types.append(ftype)
@@ -1582,7 +1582,7 @@ class LLVMCodeGenerator(EzLangVisitor):
 
                 method_ctx = member_ctx.structMethod()
                 if method_ctx is not None:
-                    methods.append((method_ctx.VAR_IDENTIFIER().getText(), method_ctx.functionLiteral(), method_ctx.functionSignature()))
+                    methods.append((self._field_name_text(method_ctx), method_ctx.functionLiteral(), method_ctx.functionSignature()))
         finally:
             self._struct_type_build_stack.pop()
 
@@ -1935,7 +1935,7 @@ class LLVMCodeGenerator(EzLangVisitor):
             setter_ptr = self._closure_type(ir.VoidType(), [value_type])
             meta_type.set_body(value_type, func_ptr, setter_ptr, i8_ptr, i8_ptr)
         self.structs[meta_name] = meta_type
-        self.struct_fields[meta_name] = ['value', 'getter', 'setter', 'type', 'name']
+        self.struct_fields[meta_name] = ['value', 'getter', 'setter', 't', 'name']
         return meta_type
 
     def _emit_emcc_js_binding(self, symbol_name: str, lib_path: str):
@@ -2862,6 +2862,10 @@ class LLVMCodeGenerator(EzLangVisitor):
             return decode_string_literal_token(key_ctx.STRING_LITERAL().getText())
         return None
 
+    def _field_name_text(self, ctx) -> str:
+        token = ctx.VAR_IDENTIFIER() if hasattr(ctx, 'VAR_IDENTIFIER') else None
+        return token.getText() if token is not None else ""
+
     def _dict_key_value(self, field_ctx) -> ir.Value:
         key_ctx = field_ctx.dictKey() if hasattr(field_ctx, 'dictKey') else None
         if key_ctx is not None and key_ctx.expression() is not None:
@@ -2956,7 +2960,7 @@ class LLVMCodeGenerator(EzLangVisitor):
         if not isinstance(pointee, (ir.IdentifiedStructType, ir.LiteralStructType)):
             return None
 
-        field_name = member_ctx.VAR_IDENTIFIER().getText()
+        field_name = self._field_name_text(member_ctx)
         field_index = None
         if isinstance(pointee, ir.LiteralStructType) and len(pointee.elements) == 2 and pointee.elements[0] == ir.IntType(1):
             optional_fields = {'ok': 0, 'value': 1}
@@ -4208,7 +4212,7 @@ class LLVMCodeGenerator(EzLangVisitor):
                 # 字段
                 field_ctx = member_ctx.structField()
                 if field_ctx is not None:
-                    fname = field_ctx.VAR_IDENTIFIER().getText()
+                    fname = self._field_name_text(field_ctx)
                     ftype = self._map_type(field_ctx.type_())
                     field_names.append(fname)
                     field_types.append(ftype)
@@ -4237,7 +4241,7 @@ class LLVMCodeGenerator(EzLangVisitor):
                 # 方法: methodName = (this: Type, ...) => body
                 method_ctx = member_ctx.structMethod()
                 if method_ctx is not None:
-                    mname = method_ctx.VAR_IDENTIFIER().getText()
+                    mname = self._field_name_text(method_ctx)
                     if name not in self.struct_methods:
                         self.struct_methods[name] = {}
                     self.struct_methods[name][mname] = f"{name}_{mname}"
@@ -7879,7 +7883,7 @@ class LLVMCodeGenerator(EzLangVisitor):
             for init_ctx in init_list.structFieldInit():
                 if init_ctx.ELLIPSIS() is not None or init_ctx.expression() is None:
                     continue
-                fname = init_ctx.VAR_IDENTIFIER().getText()
+                fname = self._field_name_text(init_ctx)
                 val = self._eval(init_ctx.expression())
                 if val is not None:
                     precomputed_values[id(init_ctx)] = val
@@ -7943,7 +7947,7 @@ class LLVMCodeGenerator(EzLangVisitor):
                                 provided_fields.add(fname)
                     continue
 
-                fname = init_ctx.VAR_IDENTIFIER().getText()
+                fname = self._field_name_text(init_ctx)
                 if fname in field_names and init_ctx.expression() is not None:
                     val = precomputed_values.get(id(init_ctx))
                     if val is None:
@@ -8129,7 +8133,7 @@ class LLVMCodeGenerator(EzLangVisitor):
 
     def visitMemberAccess(self, ctx: EzLangParser.MemberAccessContext):
         """对象字段访问: obj.field 或方法访问: obj.method"""
-        field_name = ctx.VAR_IDENTIFIER().getText()
+        field_name = self._field_name_text(ctx)
         static_struct_name = self._static_struct_member_owner(ctx.postfixExpression())
         if static_struct_name is not None:
             methods = self.struct_methods.get(static_struct_name, {})
@@ -8148,7 +8152,8 @@ class LLVMCodeGenerator(EzLangVisitor):
         obj_ptr = self._eval(ctx.postfixExpression())
         if obj_ptr is None:
             return None
-        obj_ptr = self._weak_ref_pointee_ptr(obj_ptr) or obj_ptr
+        if self._member_target_is_weak_ref(ctx.postfixExpression()):
+            obj_ptr = self._weak_ref_pointee_ptr(obj_ptr) or obj_ptr
         if (
             not isinstance(obj_ptr.type, ir.PointerType)
             and isinstance(obj_ptr.type, (ir.IdentifiedStructType, ir.LiteralStructType, ir.ArrayType))
@@ -8232,6 +8237,18 @@ class LLVMCodeGenerator(EzLangVisitor):
                 return value
 
         return None
+
+    def _member_target_is_weak_ref(self, ctx) -> bool:
+        """判断成员访问接收者在语言层是否是弱引用，避免把 Optional<Struct> 误当 #Struct。"""
+        if isinstance(ctx, EzLangParser.WeakRefExpressionContext):
+            return True
+        ident = self._leftmost_identifier_ctx(ctx)
+        if ident is not None and ident.getText() == ctx.getText():
+            token = ident.VAR_IDENTIFIER() or ident.TYPE_IDENTIFIER()
+            name = token.getText() if token is not None else ""
+            type_name = self._locals_type_names.get(name) or self._globals_type_names.get(name)
+            return bool(type_name and type_name.startswith('#'))
+        return False
 
     def _static_struct_member_owner(self, ctx) -> str | None:
         """识别 StructName.method 这种类型级结构体成员访问。"""
@@ -11349,22 +11366,26 @@ class LLVMCodeGenerator(EzLangVisitor):
         def _typeof_operand(ctx):
             if ctx is None or not hasattr(ctx, 'getChildCount'):
                 return None
-            if ctx.getChildCount() == 1:
-                return _typeof_operand(ctx.getChild(0))
             if isinstance(ctx, EzLangParser.TypeofPrimaryExprContext):
                 return ctx.typeofExpr().unaryExpression()
             if hasattr(ctx, 'typeofExpr') and ctx.typeofExpr() is not None:
                 return ctx.typeofExpr().unaryExpression()
+            if ctx.getChildCount() == 1:
+                return _typeof_operand(ctx.getChild(0))
+            if isinstance(ctx, EzLangParser.ParenExprContext):
+                return _typeof_operand(ctx.expression())
             return None
 
         def _is_void_type(ctx) -> bool:
             if ctx is None:
                 return False
-            if hasattr(ctx, 'getChildCount') and ctx.getChildCount() == 1:
-                return _is_void_type(ctx.getChild(0))
             operand = _typeof_operand(ctx)
             if operand is not None:
                 return operand.getText() == 'Void'
+            if hasattr(ctx, 'getChildCount') and ctx.getChildCount() == 1:
+                return _is_void_type(ctx.getChild(0))
+            if isinstance(ctx, EzLangParser.ParenExprContext):
+                return _is_void_type(ctx.expression())
             return hasattr(ctx, 'getText') and ctx.getText() == 'Void'
 
         def _weak_ok(expr_ctx):
@@ -11398,13 +11419,18 @@ class LLVMCodeGenerator(EzLangVisitor):
         return None
 
     def visitEqualityExpression(self, ctx: EzLangParser.EqualityExpressionContext):
-        left = self._eval(ctx.relationalExpression(0))
+        if len(ctx.relationalExpression()) == 1:
+            return self._eval(ctx.relationalExpression(0))
+
+        left = None
         for i in range(1, len(ctx.relationalExpression())):
             op = ctx.getChild((i * 2) - 1).getText()
-            weak_typeof = self._typeof_void_weak_check(ctx.relationalExpression(i - 1), ctx.relationalExpression(i), op)
-            if weak_typeof is not None:
-                left = weak_typeof
-                continue
+            if left is None:
+                weak_typeof = self._typeof_void_weak_check(ctx.relationalExpression(0), ctx.relationalExpression(i), op)
+                if weak_typeof is not None:
+                    left = weak_typeof
+                    continue
+                left = self._eval(ctx.relationalExpression(0))
             right = self._eval(ctx.relationalExpression(i))
             if left is None or right is None: continue
             left = self._gen_equality_comparison(left, right, op)

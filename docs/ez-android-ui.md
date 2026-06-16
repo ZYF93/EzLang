@@ -25,11 +25,6 @@ struct TouchEvent {
     y: F32
 }
 
-struct KeyEvent {
-    keyCode: I32
-    action:  Str   // "down" | "up"
-}
-
 struct TextChangedEvent {
     text:   Str
     start:  I32
@@ -41,6 +36,12 @@ type ClickHandler       = () => Void
 type TouchHandler       = (e: TouchEvent) => Void
 type TextChangeHandler  = (e: TextChangedEvent) => Void
 type CheckChangeHandler = (checked: Bool) => Void
+type ScrollHandler      = (dx: I32, dy: I32) => Void
+type FocusHandler       = (focused: Bool) => Void
+type AdapterItemCount   = () => I32
+type AdapterCreateItem  = (viewType: I32) => Node
+type AdapterBindItem    = (item: Node, index: I32) => Void
+type AdapterGetItemType = (index: I32) => I32
 
 // 颜色（ARGB 32 位整数）
 struct Color {
@@ -54,11 +55,6 @@ struct Color {
 const dp: Str = "dp"
 const sp: Str = "sp"
 const px: Str = "px"
-
-struct Size {
-    value: F32
-    unit:  Str   // dp | sp | px
-}
 
 // LayoutParams 常量
 const matchParent: I32 = -1
@@ -118,10 +114,10 @@ declare const getParent:     (node: Node) => Node?
 // 设置 RecyclerView Adapter（框架回调）
 declare const setAdapter: (
     recycler: Node,
-    itemCount:    () => I32,
-    createItem:   (viewType: I32) => Node,
-    bindItem:     (item: Node, index: I32) => Void,
-    getItemType:  (index: I32) => I32
+    itemCount:   AdapterItemCount,
+    createItem:  AdapterCreateItem,
+    bindItem:    AdapterBindItem,
+    getItemType: AdapterGetItemType
 ) => Void
 ```
 
@@ -214,8 +210,8 @@ declare const setOnLongClick:    (node: Node, handler: ClickHandler) => Void
 declare const setOnTouch:        (node: Node, handler: TouchHandler) => Void
 declare const setOnTextChanged:  (node: Node, handler: TextChangeHandler) => Void   // EditText
 declare const setOnCheckedChange:(node: Node, handler: CheckChangeHandler) => Void  // CheckBox / Switch
-declare const setOnScroll:       (node: Node, handler: (dx: I32, dy: I32) => Void) => Void
-declare const setOnFocus:        (node: Node, handler: (focused: Bool) => Void) => Void
+declare const setOnScroll:       (node: Node, handler: ScrollHandler) => Void
+declare const setOnFocus:        (node: Node, handler: FocusHandler) => Void
 
 // 移除事件
 declare const clearOnClick:      (node: Node) => Void
@@ -283,7 +279,7 @@ const permission.useBiometric:   Str = "android.permission.USE_BIOMETRIC"
 // 授权返回 true，拒绝 throw Error(code = errPermission)
 declare const requestPermission:  (perm: Str) => Bool
 // 批量申请，返回各权限授权状态
-declare const requestPermissions: (perms: Str[]) => { [key: Str]: Bool }
+declare const requestPermissions: (perms: Str[]) => Dict<Str, Bool>
 // "granted" | "denied" | "shouldShowRationale"
 declare const queryPermission:    (perm: Str) => Str
 ```

@@ -403,6 +403,34 @@ def test_run_allows_top_level_return_without_user_main(tmp_path):
     assert ez.main(["run", "--project", str(project_toml)]) == 7
 
 
+def test_run_weak_reference_uses_value_syntax_and_typeof_void(tmp_path):
+    project_toml = write_project(
+        tmp_path,
+        os_name=ez._native_os(),
+        arch=ez._native_arch(),
+    )
+    (tmp_path / "src" / "index.ez").write_text(
+        '''
+        struct Box {
+            value: I32;
+            get = (this: #Box): I32 => { return this.value; };
+        };
+
+        const main = (): I32 => {
+            let empty: #Box;
+            let box = Box(value = 41);
+            let ref: #Box = #box;
+            return (typeof empty != Void)
+                ? 1
+                : ((typeof ref == Void) ? 2 : ((ref.value == 41 && ref.get() == 41) ? 0 : 3));
+        };
+        ''',
+        encoding="utf-8",
+    )
+
+    assert ez.main(["run", "--project", str(project_toml)]) == 0
+
+
 def test_run_aggregate_equality_compares_fields_recursively(tmp_path):
     project_toml = write_project(
         tmp_path,
@@ -482,11 +510,11 @@ def test_run_decorator_meta_getter_setter_intercepts_global_access(tmp_path):
         arch=ez._native_arch(),
     )
     (tmp_path / "src" / "index.ez").write_text(
-        'const get_watched = (meta: Meta<I32>): I32 => {\n'
-        '    return meta.value + 10;\n'
+        'const get_watched = (): I32 => {\n'
+        '    return 13;\n'
         '};\n'
-        'const set_watched = (meta: Meta<I32>, v: I32): Void => {\n'
-        '    meta.value = v + 1;\n'
+        'const set_watched = (v: I32): Void => {\n'
+        '    return;\n'
         '};\n'
         'const log = (this: #Meta<I32>): Void => {\n'
         '    this.getter = get_watched;\n'
@@ -612,6 +640,21 @@ def test_project_log_compile_min_level_is_parsed(tmp_path):
     config = ez.load_project(project_toml, require_main=True)
 
     assert config.log_compile_min_level == 3
+
+
+def test_project_description_is_parsed_for_metadata(tmp_path):
+    project_toml = write_project(tmp_path)
+    text = project_toml.read_text(encoding="utf-8")
+    project_toml.write_text(
+        text.replace('version = "0.1.0"\n', 'version = "0.1.0"\ndescription = "Demo package"\n'),
+        encoding="utf-8",
+    )
+
+    config = ez.load_project(project_toml, require_main=True)
+    context = ez._plugin_context(config, config.outputs[0], [config.main])
+
+    assert config.description == "Demo package"
+    assert context["description"] == "Demo package"
 
 
 def test_project_rejects_invalid_log_compile_min_level(tmp_path):
@@ -6776,6 +6819,28 @@ def test_fmt_formats_multiple_files_in_directory(tmp_path, capsys):
     assert second.read_text(encoding="utf-8") == "let b: I32 = 2;\n"
     out = capsys.readouterr().out
     assert "formatted 3 files" in out
+
+
+def test_fmt_without_paths_formats_current_directory_tree(tmp_path, monkeypatch, capsys):
+    project_toml = write_project(tmp_path)
+    project_entry = tmp_path / "src" / "index.ez"
+    project_entry.write_text("let   projectValue:I32=1;\n", encoding="utf-8")
+    work_dir = tmp_path / "work"
+    nested = work_dir / "nested"
+    nested.mkdir(parents=True)
+    first = work_dir / "a.ez"
+    second = nested / "b.ez"
+    first.write_text("let   a:I32=1;\n", encoding="utf-8")
+    second.write_text("let   b:I32=2;\n", encoding="utf-8")
+    monkeypatch.chdir(work_dir)
+
+    assert ez.main(["fmt", "--project", str(project_toml)]) == 0
+
+    assert first.read_text(encoding="utf-8") == "let a: I32 = 1;\n"
+    assert second.read_text(encoding="utf-8") == "let b: I32 = 2;\n"
+    assert project_entry.read_text(encoding="utf-8") == "let   projectValue:I32=1;\n"
+    out = capsys.readouterr().out
+    assert "formatted 2 files" in out
 
 
 
