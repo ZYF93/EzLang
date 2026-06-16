@@ -1,81 +1,27 @@
 # EzLang 编程语言
 
-EzLang 是一门以表达式为中心、采用值语义为主的系统编程语言。它结合现代类型系统、Arena 内存模型与 Flow 并发语义，面向高性能系统级开发，并支持跨平台编译到本地和 WebAssembly。
+EzLang 是一门以表达式为中心、采用值语义为主的系统编程语言。它结合现代类型系统、Arena 内存模型与 Flow 并发语义，面向高性能系统级开发，并支持跨平台编译到本地、移动端和 WebAssembly。
 
-## 🚀 核心特性
+## 核心特性
 
-- **表达式优先**：几乎所有语法结构都可作为表达式使用，支持更紧凑的组合逻辑。
-- **值语义与 Arena 内存模型**：默认按值拷贝，Arena 自动回收临时内存，实现无显式释放的高效内存管理。
+- **表达式优先**：变量、控制流、match、函数调用等语法可自然组合。
 - **现代类型系统**：支持泛型、可选类型 `?`、弱引用 `#`、联合类型 `|`、函数类型、List/Vec、Dict、结构体和类型别名。
-- **形状类型验证**：`type` 定义的固定形状可与包含所需字段的结构体值匹配；对象字面量在形状注解下按字段名校验并生成静态布局。
-- **结构体组合与方法**：支持 `...Base` 结构体展开、字段默认值、命名初始化与显式 `this` 绑定方法。
-- **Flow 并发运行时**：内置 `flow {}` / `parallel {}` / `race(pl)` 并发模型，native 与 emcc 目标均支持零捕获 `I32` 任务挂起；emcc 通过 Asyncify 协程运行时恢复执行栈，并覆盖 sleep、HTTP、TCP/UDP、WebSocket、stdin、fs、process 和 stream I/O。
-- **外部 ABI 链接**：`extern "lib" for target` 语法支持按编译目标平台按需链接外部库，配合 `declare` 声明实现零开销 C ABI 调用。
-- **统一标准库设计**：标准库接口在不同目标平台上保持一致，底层实现基于平台感知系统调用。
-- **跨平台编译**：支持 `x86_64` / `aarch64` / `arm` / `wasm32`，可构建 Windows、macOS、Linux、Android、iOS 和 Emscripten 目标。
+- **值语义与 Arena 内存模型**：默认按值拷贝，作用域结束自动回收临时内存。
+- **结构体组合与方法**：支持 `...Base` 组合、字段默认值、命名初始化和显式 `this` 绑定方法。
+- **Flow 并发运行时**：内置 `flow {}` / `parallel {}` / `race(pl)`，native 与 emcc 目标均支持挂起点语义。
+- **外部 ABI 链接**：`extern "lib" for target` 配合 `declare` 可调用 C/JS/平台库。
+- **统一标准库**：`std/io`、`std/fs`、`std/net/*`、`std/fmt`、`std/collections` 等接口在多目标上保持一致。
+- **完整工具链**：CLI、格式化、LSP、VS Code 插件和项目依赖管理都在仓库内提供。
 
-## 📘 语言与运行时亮点
+## 安装
 
-- **类型系统**：包含基本数值类型、字符串、布尔、Void、列表、字典、SIMD 向量、可选、弱引用与联合类型。
-- **函数与闭包**：支持命名参数、默认参数、匿名函数、捕获闭包和部分应用，`?` 可作为占位符生成闭包。
-- **结构体与组合**：结构体支持泛型、字段展开、方法定义与默认值；编译器预声明 `Date`、`Error`、`Blob`、`Meta<T>`、`List<T>`、`Dict<K, V>` 等内置类型，`std/collections` 在这些内置集合类型上暴露对象方法式扩展 API。
-- **Arena 语义**：每个作用域对应 Arena 游标，作用域结束时回退游标，跨作用域返回自动复制到父级 Arena。
-- **平台无关标准库**：统一 I/O、文件系统、网络、OS、时间等接口，移动端 UI 由独立包 `ez-android-ui` / `ez-ios-ui` / `ez-web-ui` 提供。
+基础依赖：Python 3.9+、`git`、本机 C 编译器 `cc`。安装脚本会准备虚拟环境、安装 EzLang CLI 与编译器，并执行一次最小编译校验。
 
-## 🧭 项目结构
-
-```text
-EzLang/
-├── compiler/       # 编译器核心：ANTLR4 语法、词法、语义和 LLVM IR 生成
-├── docs/           # 语言规格、工具链与标准库设计文档
-├── packages/       # 标准库、UI库等
-├── grammar/        # ANTLR4 文法定义文件
-├── examples/       # EzLang 语法与语言特性示例
-├── tests/          # 测试套件
-├── LICENSE         # MIT 许可证
-├── project.toml    # 项目配置与编译目标定义
-└── README.md       # 项目说明文档
-```
-
-## 🛠 工具链概览
-
-EzLang 使用 `project.toml` 作为项目清单，`ez` CLI 提供完整的构建和发布体验。
-
-- `ez init`：创建默认项目骨架，或从 git 模板初始化项目。
-- `ez install`：解析 `project.toml` 的 `[deps]` 节点，安装本地依赖、远程版本依赖或 Workspace 内部模块；`-g` 可把版本依赖安装到全局缓存。
-- `ez build`：根据 `[[output]]` 目标编译项目，生成多平台产物。
-- `ez run`：构建并执行本地可执行程序。
-- `ez run path/to/file.ez`：直接运行单个 EzLang 源文件。
-- `ez test`：编译并执行 EzLang 测试文件。
-- `ez fmt`：格式化指定 `.ez` 文件/目录；未传路径时递归格式化执行命令所在目录下的 `.ez` 文件。
-- `ez release`：将包打包为 `<name>-<version>.zip` 并发布到注册表。
-
-### `project.toml` 关键字段
-
-- `[project]`：`name`, `version`, `description`, `main`, `public`, `registry`, `optimize`
-- `[workspace]`：`members` 用于 Monorepo 子包管理
-- `[[output]]`：定义 `arch`, `os`, `dir`, `sdk` 等多平台编译目标
-- `[[plugins]]`：Python 构建 hook 配置
-- `[deps]`：本地、远端和 Workspace 依赖声明
-
-## 📦 标准库设计
-
-EzLang 标准库遵循“统一 API，平台感知实现”的设计理念：
-
-- 所有平台共享相同接口
-- 底层实现根据目标平台自动选择系统调用或运行时绑定
-- `List<T>` / `Dict<K, V>` 等核心数据结构由编译器预声明，集合扩展函数在 `std/collections` 中暴露，首参统一为弱引用 `this`，可写作 `nums.push(item = 1)` 或 `listPush<I32>(this = #nums, item = 1)`
-- 阻塞 I/O 以 `flow {}` suspend point 为语义目标；emcc 通过 Asyncify 挂起后恢复，native 未接入事件源的封装保持阻塞 syscall ABI
-- 移动端 UI 通过 `ez-android-ui`、`ez-ios-ui` 和 `ez-web-ui` 提供独立的原生/DOM 绑定
-
-## 🔧 快速开始
-
-### 依赖安装
 ```bash
-# 推荐：从 GitHub 官方仓库安装或更新
+# 推荐：从官方仓库安装或更新
 curl -fsSL https://raw.githubusercontent.com/ZYF93/EzLang/main/install.sh | sh
 
-# 已经 clone 仓库时，可从当前源码安装
+# 已经 clone 仓库时，从当前源码安装
 sh install.sh --local
 
 # 可选：自定义安装目录或跳过 PATH 写入
@@ -85,57 +31,177 @@ EZLANG_INSTALL_DIR="$HOME/.ezlang" EZLANG_REGISTER_PATH=0 sh install.sh
 EZLANG_INSTALL_DEPS=1 sh install.sh
 ```
 
-安装脚本固定从 `https://github.com/ZYF93/EzLang.git` 拉取或更新源码，准备虚拟环境，安装 CLI 与编译器，执行一次最小本机编译校验，并把 `EZLANG_HOME` 与 `~/.ezlang/bin` 写入 `~/.ezlang/env`，再注册到 `.zshrc`、`.zprofile`、`.bashrc`、`.bash_profile` 和 `.profile`。后续新 shell 可直接使用 `ez` 命令。
+安装完成后打开新的 shell，或手动加载环境：
 
-基础安装需要 Python 3.9+、`git` 和本机 C 编译器 `cc`。脚本会给出 macOS/Linux 的安装命令；设置 `EZLANG_INSTALL_DEPS=1` 时会尝试调用 `brew`、`apt-get`、`dnf`、`yum` 或 `pacman` 安装基础依赖。Python 包依赖（包括 `llvmlite` 提供的 LLVM binding）由脚本通过 `pip` 安装，不要求用户单独安装系统 LLVM。`emcc` 不是基础安装硬依赖，只在构建 `os = "emcc"` / `wasm32` 目标时需要 Emscripten SDK。
-
-开发源码时也可以只安装当前工作区：
 ```bash
-sh install.sh --local
+source ~/.ezlang/env
+ez --version
+```
+
+开发源码时也可以使用 editable 安装：
+
+```bash
 pip install -e .
 ```
 
-### 构建项目
+如果系统 Python 启用了 PEP 668，建议使用虚拟环境：
+
 ```bash
-ez build
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -e .
 ```
 
-### 运行示例
+## 初始化项目
+
+创建新项目：
+
 ```bash
-ez run
+ez init my-app
+cd my-app
 ```
 
-## 📝 示例代码
+初始化后会生成：
+
+```text
+my-app/
+├── project.toml
+└── src/
+    └── main.ez
+```
+
+常用命令：
+
+```bash
+ez build              # 构建 project.toml 声明的输出目标
+ez run                # 构建并运行当前项目
+ez run src/main.ez    # 直接运行单个 .ez 文件
+ez test               # 编译并执行测试
+ez fmt                # 格式化当前目录下的 .ez 文件
+ez install            # 安装 project.toml 中的依赖
+```
+
+最小示例：
 
 ```ez
-from "std/io" import { print }
+from "std/io" import { println };
 
-type Named = { name: Str }
-struct User { name: Str; age: I32 }
-let user = User(name = "Alice", age = 42)
-let person: Named = user
-
-struct Pair<T, U> {
-    first: T
-    second: U
-    swap = (this: #Pair<T, U>) => Pair<U, T>(first = this.second, second = this.first)
-}
-
-let p = Pair(first = 42, second = "hello")
-let swapped = p.swap()
-swapped.first -> print(msg = %)
+let name: Str = "EzLang";
+println(msg = "Hello {{name}}");
 ```
 
-## 📚 进一步阅读
+字符串插值支持表达式，表达式结果必须是 `Str`：
 
-详见 `docs/doc.md`、`docs/toolchain.md` 与 `docs/stdlib.md`，了解完整语言规格、工具链配置和标准库设计。
+```ez
+let first: Str = "Ez";
+let last: Str = "Lang";
+let greeting: Str = "Hello {{first + last}}";
+```
 
-## 📜 许可证
+## VS Code 插件
+
+VS Code 插件源码位于 `editors/vscode`，提供：
+
+- `.ez` 语法高亮
+- 语法诊断和语义诊断
+- 关键字、类型、符号和标准库导入补全
+- hover
+- 跳转定义
+- 文档大纲
+- 文档格式化
+
+本地开发或打包：
+
+```bash
+cd editors/vscode
+npm install
+npm run compile
+npm run package
+```
+
+打包后会生成 `ezlang-vscode-0.1.0.vsix`，可在 VS Code 中安装：
+
+```bash
+code --install-extension ezlang-vscode-0.1.0.vsix
+```
+
+插件在仓库开发态会优先用 `python3 -m lsp` 启动 LSP；打包安装后默认调用 PATH 中的 `ez-lsp`。如果你使用自定义虚拟环境，可在 VS Code 设置中指定：
+
+```json
+{
+  "ezlang.server.command": "/path/to/python3",
+  "ezlang.server.args": ["-m", "lsp"]
+}
+```
+
+开启保存时格式化：
+
+```json
+{
+  "[ezlang]": {
+    "editor.defaultFormatter": "ezlang.ezlang-vscode",
+    "editor.formatOnSave": true
+  }
+}
+```
+
+## 文档索引
+
+- [快速教程](docs/tutorial.md)：变量、函数、结构体、控制流、标准库和 Flow 示例。
+- [语言规格](docs/doc.md)：类型系统、函数、结构体、控制流、模块、外部链接和语法糖。
+- [CLI 使用手册](docs/cli-manual.md)：`ez init`、`build`、`run`、`test`、`fmt`、`release` 等命令。
+- [工具链与项目配置](docs/toolchain.md)：`project.toml`、依赖、工作区、多目标输出、LSP 和 VS Code 插件。
+- [标准库设计](docs/stdlib.md)：标准库能力矩阵、平台适配和模块设计。
+- [标准库 API](docs/stdlib-api.md)：`std/io`、`std/fs`、`std/str`、`std/fmt`、`std/net/*` 等 API 列表。
+- [运行时设计](docs/runtime-design.md)：Arena、Flow ABI、阻塞调用和错误处理。
+- [编译器架构](docs/compiler-architecture.md)：解析、语义分析、LLVM IR 生成和运行时协作。
+- [Web UI 包](docs/ez-web-ui.md)：DOM 绑定和 Web UI API。
+- [Android UI 包](docs/ez-android-ui.md)：Android 原生 View 绑定。
+- [iOS UI 包](docs/ez-ios-ui.md)：UIKit 绑定。
+
+## 项目结构
+
+```text
+EzLang/
+├── cli/             # ez 命令行入口
+├── compiler/        # 编译器核心：ANTLR4 解析、语义分析、LLVM IR 生成
+├── docs/            # 语言、工具链、运行时和标准库文档
+├── editors/vscode/  # VS Code 插件
+├── examples/        # EzLang 示例
+├── grammar/         # ANTLR4 文法
+├── lsp/             # EzLang LSP 服务端
+├── packages/        # 标准库与 UI 包
+└── project.toml     # 本仓库示例项目配置
+```
+
+## 示例代码
+
+```ez
+from "std/io" import { print };
+
+type Named = { name: Str };
+struct User { name: Str; age: I32 }
+
+let user = User(name = "Alice", age = 42);
+let person: Named = user;
+
+struct Pair<T, U> {
+    first: T;
+    second: U;
+    swap = (this: #Pair<T, U>) => Pair<U, T>(first = this.second, second = this.first);
+}
+
+let p = Pair(first = 42, second = "hello");
+let swapped = p.swap();
+swapped.first -> print(msg = %);
+```
+
+## 许可证
 
 本项目采用 [MIT](LICENSE) 许可证。
 
-## 联系我
+## 联系方式
 
-可以加我微信
+可以加我微信交流 EzLang 使用、反馈和协作。
 
-![微信二维码](/wechat.png "微信二维码")
+![微信二维码](wechat.png "微信二维码")
