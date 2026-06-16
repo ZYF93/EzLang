@@ -219,11 +219,31 @@ class SemanticAnalyzer(EzLangVisitor):
             result.return_type = ret
             return result
 
+        # 泛型参数函数类型 <T, U>(params) => returnType，主要用于 declare 声明。
+        if isinstance(type_ctx, EzLangParser.GenericParamFunctionTypeContext):
+            ret = self._get_type_from_ctx(type_ctx.type_())
+            param_types = []
+            param_names = []
+            param_list = type_ctx.paramTypeList()
+            if param_list is not None:
+                for pt in param_list.paramType():
+                    param_names.append(pt.VAR_IDENTIFIER().getText())
+                    t = self._get_type_from_ctx(pt.type_())
+                    if t:
+                        param_types.append(t)
+            result = Type(kind=TypeKind.FUNCTION, name="generic_function")
+            result.param_types = param_types
+            result.param_names = param_names
+            result.return_type = ret
+            result.generic_params = self._generic_names_from_type_list(type_ctx.typeList())
+            return result
+
         # 泛型函数类型 <T, U> => ...
         if (hasattr(type_ctx, 'genericFunctionType') and type_ctx.genericFunctionType() is not None):
             ret = self._get_type_from_ctx(type_ctx.type_())
             result = Type(kind=TypeKind.FUNCTION, name="generic_function")
             result.return_type = ret
+            result.generic_params = self._generic_names_from_type_list(type_ctx.genericFunctionType().typeList())
             return result
 
         # 基本类型
@@ -288,6 +308,15 @@ class SemanticAnalyzer(EzLangVisitor):
             return Type(name="unknown", kind=TypeKind.BASIC)
 
         return None
+
+    def _generic_names_from_type_list(self, type_list) -> list[str]:
+        if type_list is None:
+            return []
+        return [type_ctx.getText() for type_ctx in type_list.type_()]
+
+    def _generic_names_from_type(self, type_: Optional[Type]) -> list[str]:
+        names = getattr(type_, "generic_params", None)
+        return list(names) if names else []
 
     def _qualified_name(self, ctx) -> str:
         """读取支持点号命名空间的声明名。"""
@@ -2845,6 +2874,9 @@ class SemanticAnalyzer(EzLangVisitor):
         kind = SymbolKind.EXTERN_DECLARE
         symbol = Symbol(name, kind, type_, exported=self._exporting, line=ctx.start.line)
         self.symbols.define(symbol)
+        generic_names = self._generic_names_from_type(type_)
+        if generic_names:
+            self.generic_templates[name] = (generic_names, type_ctx)
         linked_lib = self.active_extern_libs[-1] if self.active_extern_libs else None
         self.declare_extern_map[name] = linked_lib
         if linked_lib is None:

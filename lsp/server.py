@@ -23,7 +23,7 @@ from antlr4.error.ErrorListener import ErrorListener  # noqa: E402
 from parser.EzLangLexer import EzLangLexer  # noqa: E402
 from parser.EzLangParser import EzLangParser  # noqa: E402
 from semantic.analyzer import analyze  # noqa: E402
-from semantic.symbols import Symbol, SymbolKind  # noqa: E402
+from semantic.symbols import Symbol, SymbolKind, Type, TypeKind  # noqa: E402
 
 try:  # noqa: E402
     from cli.ez import _format_ez_source
@@ -71,7 +71,27 @@ KEYWORD_COMPLETIONS = [
     "loop", "break", "continue", "match", "catch", "throw", "flow", "parallel", "return",
     "extern", "true", "false",
 ]
-TYPE_COMPLETIONS = ["I8", "I32", "I64", "U8", "U32", "U64", "F32", "F64", "Str", "Bool", "Void", "Vec", "List", "Dict"]
+TYPE_COMPLETIONS = ["I8", "I32", "I64", "U8", "U32", "U64", "F32", "F64", "Str", "Bool", "Void", "Vec", "List", "Dict", "Date", "Error", "Blob", "Meta"]
+BUILTIN_TYPE_HOVERS = {
+    "I8": "8 位有符号整数。",
+    "I32": "32 位有符号整数。",
+    "I64": "64 位有符号整数。",
+    "U8": "8 位无符号整数。",
+    "U32": "32 位无符号整数。",
+    "U64": "64 位无符号整数。",
+    "F32": "32 位浮点数。",
+    "F64": "64 位浮点数。",
+    "Str": "UTF-8 字符串。",
+    "Bool": "布尔值，取值为 true 或 false。",
+    "Void": "无返回值类型。",
+    "Vec": "固定长度向量类型：Vec<T>[N]。",
+    "List": "动态列表类型：List<T>。",
+    "Dict": "字典类型：Dict<K, V>。",
+    "Date": "内置时间类型，存储 timestamp，并提供 getYear/getMonth/getDay/getHour/getMinute/getSecond/add/sub/format 方法。",
+    "Error": "内置错误类型，字段包含 code、message、file、line、column、trace，并提供 toString() 方法。",
+    "Blob": "内置二进制数据类型，字段包含 data 和 size。",
+    "Meta": "元信息类型：Meta<T>。",
+}
 STD_MODULES = [
     "std/io", "std/fmt", "std/str", "std/math", "std/time", "std/fs", "std/path", "std/log",
     "std/os", "std/random", "std/collections", "std/hash", "std/regex", "std/crypto",
@@ -301,7 +321,7 @@ class EzLanguageServer:
         text = self._document_text(uri)
         if text is None:
             return
-        diagnostics, _ = analyze_document(text, base_dir=self._base_dir_for_uri(uri, text))
+        diagnostics, _ = analyze_document_with_workspace(text, self._base_dir_for_uri(uri, text), self.workspace_root)
         self._send_notification("textDocument/publishDiagnostics", {"uri": uri, "diagnostics": diagnostics})
 
     def _completion(self, params: dict[str, Any]) -> dict[str, Any]:
@@ -320,7 +340,7 @@ class EzLanguageServer:
         else:
             items.extend({"label": word, "kind": COMPLETION_KIND_KEYWORD} for word in KEYWORD_COMPLETIONS)
             items.extend({"label": word, "kind": COMPLETION_KIND_TYPE} for word in TYPE_COMPLETIONS)
-            _, analyzer = analyze_document(text, base_dir=self._base_dir_for_uri(uri, text))
+            _, analyzer = analyze_document_with_workspace(text, self._base_dir_for_uri(uri, text), self.workspace_root)
             if analyzer is not None:
                 items.extend(_symbol_completion(symbol) for symbol in analyzer.symbols.global_scope.symbols.values())
         return {"isIncomplete": False, "items": _dedupe_items(items)}
@@ -332,13 +352,22 @@ class EzLanguageServer:
         word = _word_at(text, int(position.get("line", 0)), int(position.get("character", 0)))
         if not word:
             return None
+        builtin_hover = BUILTIN_TYPE_HOVERS.get(word)
+        if builtin_hover is not None:
+            return {"contents": {"kind": "markdown", "value": f"```ez\n{word}\n```\n\n{builtin_hover}"}}
         token_label = TOKEN_TYPES.get(word.upper())
         if token_label:
             return {"contents": {"kind": "markdown", "value": f"`{word}`\n\nEzLang {token_label}"}}
+        line = int(position.get("line", 0))
+        character = int(position.get("character", 0))
+        _, analyzer = analyze_document_with_workspace(text, self._base_dir_for_uri(uri, text), self.workspace_root)
+        if analyzer is not None:
+            symbol = analyzer.symbols.global_scope.symbols.get(word)
+            if symbol is not None:
+                return {"contents": {"kind": "markdown", "value": _symbol_markdown(symbol)}}
         declaration = declaration_at(text, word, self._base_dir_for_uri(uri, text), self.workspace_root)
         if declaration is not None:
             return {"contents": {"kind": "markdown", "value": _declaration_markdown(declaration)}}
-        _, analyzer = analyze_document(text, base_dir=self._base_dir_for_uri(uri, text))
         if analyzer is not None:
             symbol = analyzer.symbols.global_scope.symbols.get(word)
             if symbol is not None:
@@ -410,14 +439,29 @@ class EzLanguageServer:
 
 def analyze_document(source: str, base_dir: Path) -> tuple[list[dict[str, Any]], Any | None]:
     """返回 LSP 诊断和可选语义分析器。"""
+    return analyze_document_with_workspace(source, base_dir, ROOT)
+
+
+def analyze_document_with_workspace(source: str, base_dir: Path, workspace_root: Path) -> tuple[list[dict[str, Any]], Any | None]:
+    """返回 LSP 诊断，并按编辑器工作区解析 import 和标准库。"""
     syntax_errors = _parse_syntax_errors(source)
     diagnostics = [_syntax_diagnostic(error, source) for error in syntax_errors]
     if syntax_errors:
         return diagnostics, None
 
-    analyzer = analyze(source, base_dir=base_dir, allow_top_level_return=True)
-    diagnostics.extend(_line_diagnostic(message, source, DIAGNOSTIC_ERROR) for message in analyzer.symbols.errors)
-    diagnostics.extend(_line_diagnostic(message, source, DIAGNOSTIC_WARNING) for message in analyzer.symbols.warnings)
+    analysis_source = _source_with_import_resolution_hints(source, base_dir, workspace_root)
+    analyzer = analyze(analysis_source, base_dir=base_dir, allow_top_level_return=True)
+    imported_names = {binding.name for binding in _import_bindings(source)}
+    diagnostics.extend(
+        _line_diagnostic(message, source, DIAGNOSTIC_ERROR)
+        for message in analyzer.symbols.errors
+        if not _is_editor_only_diagnostic(message, imported_names)
+    )
+    diagnostics.extend(
+        _line_diagnostic(message, source, DIAGNOSTIC_WARNING)
+        for message in analyzer.symbols.warnings
+        if not _is_editor_only_diagnostic(message, imported_names)
+    )
     return diagnostics, analyzer
 
 
@@ -473,24 +517,32 @@ def format_document(source: str) -> str:
 
 
 def inlay_hints(source: str, base_dir: Path, workspace_root: Path) -> list[dict[str, Any]]:
-    """生成参数名和 suspend source 提示。"""
+    """生成 suspend source 提示。"""
     hints: list[dict[str, Any]] = []
     suspend_names = _suspend_names_for_document(source, base_dir, workspace_root)
     for line_number, line in enumerate(source.splitlines()):
+        for match in _function_declaration_matches(line):
+            name = match.group(1)
+            if name in suspend_names:
+                hints.append(_suspend_hint(line_number, match.start(1), "此函数会传播 suspend 语义"))
         for match in CALL_RE.finditer(line):
             name = match.group(1)
             args_text, _ = _call_args_on_line(line, match.end() - 1)
             if args_text is None:
                 continue
             if name in suspend_names:
-                hints.append({
-                    "position": {"line": line_number, "character": match.end(1)},
-                    "label": " suspend",
-                    "kind": 1,
-                    "tooltip": "suspend source：在 flow 中会传播挂起语义",
-                    "paddingLeft": True,
-                })
+                hints.append(_suspend_hint(line_number, match.start(1), "suspend source：在 flow 中会传播挂起语义"))
     return hints
+
+
+def _suspend_hint(line: int, character: int, tooltip: str) -> dict[str, Any]:
+    return {
+        "position": {"line": line, "character": character},
+        "label": "suspend ",
+        "kind": 1,
+        "tooltip": tooltip,
+        "paddingRight": True,
+    }
 
 
 def _suspend_names_for_document(source: str, base_dir: Path, workspace_root: Path) -> set[str]:
@@ -524,6 +576,10 @@ def _function_bodies(source: str) -> dict[str, str]:
         if body_end is not None:
             bodies[match.group(1)] = source[body_start:body_end]
     return bodies
+
+
+def _function_declaration_matches(line: str):
+    return re.finditer(r'\b(?:export\s+)?(?:let|const)\s+([a-z_][A-Za-z0-9_]*|\$[A-Za-z0-9_]+)\s*(?:<[^>]+>\s*)?=\s*\(', line)
 
 
 def _matching_brace(source: str, open_index: int) -> int | None:
@@ -802,6 +858,28 @@ def _syntax_diagnostic(error: SyntaxDiagnostic, source: str) -> dict[str, Any]:
     }
 
 
+def _source_with_import_resolution_hints(source: str, base_dir: Path, workspace_root: Path) -> str:
+    """为语义分析器改写 import 字符串，让打包内置标准库也能被解析。"""
+    def replace(match: re.Match[str]) -> str:
+        module = match.group(1)
+        module_file = _resolve_module_path(module, base_dir, workspace_root)
+        if module_file is None:
+            return match.group(0)
+        return f'from "{module_file.as_posix()}" import'
+
+    return re.sub(r'from\s+"([^"]+)"\s+import', replace, source)
+
+
+def _is_editor_only_diagnostic(message: str, imported_names: set[str]) -> bool:
+    """过滤 LSP 环境造成的误报，不改变编译器真实诊断。"""
+    if "extern 路径不存在" in message and ("'@std/" in message or "：'@std/" in message):
+        return True
+    missing_name = re.search(r"未定义的变量 '([^']+)'", message)
+    if missing_name is not None and missing_name.group(1) in imported_names:
+        return True
+    return False
+
+
 def _line_diagnostic(message: str, source: str, severity: int) -> dict[str, Any]:
     line_match = re.search(r"行\s+(\d+)", message)
     line = max(int(line_match.group(1)) - 1, 0) if line_match else 0
@@ -839,8 +917,71 @@ def _declaration_completion(declaration: Declaration) -> dict[str, Any]:
 
 
 def _symbol_markdown(symbol: Symbol) -> str:
-    detail = str(symbol.type) if symbol.type is not None else symbol.kind.name.lower()
-    return f"```ez\n{symbol.name}: {detail}\n```\n\n{symbol.kind.name.lower()}"
+    detail = _type_display(symbol.type) if symbol.type is not None else symbol.kind.name.lower()
+    label = "type" if symbol.kind in (SymbolKind.STRUCT, SymbolKind.TYPE_ALIAS) else symbol.kind.name.lower()
+    return f"```ez\n{symbol.name}: {detail}\n```\n\n{label}"
+
+
+def _type_display(type_: Type | None) -> str:
+    if type_ is None:
+        return "unknown"
+    if type_.kind == TypeKind.FUNCTION:
+        params: list[str] = []
+        for index, param_type in enumerate(type_.param_types):
+            name = type_.param_names[index] if index < len(type_.param_names) else f"arg{index + 1}"
+            params.append(f"{name}: {_type_display(param_type)}")
+        return f"({', '.join(params)}) => {_type_display(type_.return_type)}"
+    if type_.kind == TypeKind.DICT:
+        if type_.fields:
+            return _shape_display(type_.fields, prefix="", suffix="")
+        if type_.key_type is not None or type_.value_type is not None:
+            key = _type_display(type_.key_type) if type_.key_type is not None else "unknown"
+            value = _type_display(type_.value_type) if type_.value_type is not None else "unknown"
+            return f"{{ {key}: {value} }}"
+        return "Dict"
+    if type_.kind == TypeKind.STRUCT:
+        if type_.fields:
+            return _shape_display(type_.fields, prefix="struct ", suffix="")
+        return type_.name or "struct"
+    if type_.kind in (TypeKind.ARRAY, TypeKind.LIST):
+        return f"{_type_display(type_.element_type)}[]" if type_.kind == TypeKind.ARRAY else f"List<{_type_display(type_.element_type)}>"
+    if type_.kind == TypeKind.VEC:
+        return f"Vec<{_type_display(type_.element_type)}>[{type_.vec_size}]"
+    if type_.kind == TypeKind.OPTIONAL:
+        return f"{_type_display(type_.element_type)}?"
+    if type_.kind == TypeKind.UNION:
+        return " | ".join(_type_display(member) for member in type_.union_types)
+    if type_.kind == TypeKind.POINTER:
+        return f"*{_type_display(type_.pointee_type)}"
+    if type_.kind == TypeKind.WEAK_REF:
+        return f"#{_type_display(type_.referent_type or type_.element_type)}"
+    return type_.name or "unknown"
+
+
+def _shape_display(fields: dict[str, Type], prefix: str, suffix: str) -> str:
+    parts = [f"{name}: {_type_display(field_type)}" for name, field_type in fields.items()]
+    return f"{prefix}{{ {', '.join(parts)} }}{suffix}"
+
+
+def _is_declaration_position(source: str, word: str, line: int, character: int) -> bool:
+    lines = source.splitlines()
+    if line < 0 or line >= len(lines):
+        return False
+    current = lines[line]
+    character = min(max(character, 0), len(current))
+    left = character
+    while left > 0 and re.match(r"[A-Za-z0-9_$]", current[left - 1]):
+        left -= 1
+    right = left + len(word)
+    prefix = current[:left]
+    suffix = current[right:]
+    return bool(
+        re.search(r"\b(?:let|const|static)\s+$", prefix)
+        or re.search(r"\bstruct\s+$", prefix)
+        or re.search(r"\btype\s+$", prefix)
+        or re.search(r"\bdeclare\s+(?:let|const|static)\s+$", prefix)
+        or re.match(r"\s*[:=]", suffix)
+    )
 
 
 def _dedupe_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:

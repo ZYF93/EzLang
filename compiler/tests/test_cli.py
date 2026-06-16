@@ -6856,6 +6856,41 @@ def test_fmt_rewrites_single_file(tmp_path, capsys):
     assert "formatted 1 file" in out
 
 
+def test_fmt_inserts_space_before_block_braces(tmp_path, capsys):
+    project_toml = write_project(tmp_path)
+    source = tmp_path / "src" / "index.ez"
+    source.write_text(
+        "struct Data{\n"
+        "val:I32;\n"
+        "};\n"
+        "const main=():I32=>{\n"
+        "const value=flow{\n"
+        "const p=parallel{ return 1; };\n"
+        "return p;\n"
+        "};\n"
+        "return value;\n"
+        "};\n",
+        encoding="utf-8",
+    )
+
+    assert ez.main(["fmt", "--project", str(project_toml), str(source)]) == 0
+
+    assert source.read_text(encoding="utf-8") == (
+        "struct Data {\n"
+        "    val: I32;\n"
+        "};\n"
+        "const main = (): I32 => {\n"
+        "    const value = flow {\n"
+        "        const p = parallel { return 1; };\n"
+        "        return p;\n"
+        "    };\n"
+        "    return value;\n"
+        "};\n"
+    )
+
+    assert "formatted 1 file" in capsys.readouterr().out
+
+
 def test_fmt_preserves_comments_and_keeps_imports_single_line(tmp_path, capsys):
     project_toml = write_project(tmp_path)
     source = tmp_path / "src" / "index.ez"

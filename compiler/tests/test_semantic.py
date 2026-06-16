@@ -854,6 +854,21 @@ class TestSemantic:
         errors = [e for e in anal.symbols.errors if '期望' in e]
         assert len(errors) > 0, f'应检测到泛型参数数量不匹配: {anal.symbols.errors}'
 
+    def test_generic_declare_tracking_and_explicit_call(self):
+        """泛型 declare 应登记模板并支持显式类型参数调用。"""
+        anal = analyze('''
+        extern "fmt";
+        declare const toString: <T>(value: T) => Str;
+        const text = toString<I32>(value = 42);
+        ''')
+        assert not anal.symbols.errors, f'不应产生语义错误: {anal.symbols.errors}'
+        assert not anal.symbols.warnings, f'不应产生语义警告: {anal.symbols.warnings}'
+        assert 'toString' in anal.generic_templates
+        names, _ = anal.generic_templates['toString']
+        assert names == ['T']
+        text = anal.symbols.resolve('text')
+        assert text is not None and text.type is not None and text.type.name == 'Str'
+
     def test_generic_expression_function_infers_return_type_from_arguments(self):
         """表达式体泛型函数应从实参推导返回类型。"""
         anal = analyze('''

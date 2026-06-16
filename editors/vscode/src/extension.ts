@@ -40,11 +40,20 @@ function workspaceRoot(): string {
 }
 
 function repositoryRoot(context: vscode.ExtensionContext): string {
+  const bundled = path.join(context.extensionPath, 'server');
+  if (fs.existsSync(path.join(bundled, 'lsp', 'server.py'))) {
+    return bundled;
+  }
+
   const fromExtension = path.resolve(context.extensionPath, '..', '..');
   if (fs.existsSync(path.join(fromExtension, 'lsp', 'server.py'))) {
     return fromExtension;
   }
   return workspaceRoot();
+}
+
+function hasPythonServer(root: string): boolean {
+  return fs.existsSync(path.join(root, 'lsp', 'server.py'));
 }
 
 function pythonCommand(): string {
@@ -53,7 +62,7 @@ function pythonCommand(): string {
 
 function defaultServerOptions(context: vscode.ExtensionContext): ServerOptions {
   const root = repositoryRoot(context);
-  if (fs.existsSync(path.join(root, 'lsp', 'server.py'))) {
+  if (hasPythonServer(root)) {
     return { command: pythonCommand(), args: ['-m', 'lsp'], options: { cwd: root } };
   }
   return { command: 'ez-lsp', args: [], options: { cwd: workspaceRoot() } };

@@ -58,7 +58,7 @@ npm run compile
 npm run package
 ```
 
-插件在仓库内开发时默认以 `python3 -m lsp` 启动服务；打包安装后默认调用 PATH 中的 `ez-lsp`。如果希望使用其他解释器、虚拟环境或服务入口，可以在 VS Code 设置里配置 `ezlang.server.command` 与 `ezlang.server.args`。
+插件在仓库内开发时默认以 `python3 -m lsp` 启动服务；打包安装后默认使用 VSIX 内置的 LSP 运行文件，找不到内置服务时再调用 PATH 中的 `ez-lsp`。如果希望使用其他解释器、虚拟环境或服务入口，可以在 VS Code 设置里配置 `ezlang.server.command` 与 `ezlang.server.args`。
 
 格式化由 LSP 复用 `ez fmt` 的内部格式化器。VS Code 可手动执行 “Format Document”，也可以配置保存时格式化：
 

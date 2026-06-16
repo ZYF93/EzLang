@@ -8,6 +8,7 @@ if str(ROOT) not in sys.path:
 from lsp.server import (
     EzLanguageServer,
     analyze_document,
+    analyze_document_with_workspace,
     declaration_at,
     definition_at,
     document_symbols,
@@ -99,9 +100,9 @@ def test_lsp_document_symbols_include_top_level_declarations(tmp_path):
 
 
 def test_lsp_format_document_reuses_cli_formatter():
-    formatted = format_document('let value:I32=1;\nloop {value=value+1;}\n')
+    formatted = format_document('let value:I32=1;\nstruct Data{ val:I32; };\nconst main=():I32=>{ const nested=flow{ const p=parallel{ return 1; }; return p; }; return nested; };\n')
 
-    assert formatted == 'let value: I32 = 1;\nloop {value = value + 1;}\n'
+    assert formatted == 'let value: I32 = 1;\nstruct Data { val: I32; };\nconst main = (): I32 => { const nested = flow { const p = parallel { return 1; }; return p; }; return nested; };\n'
 
 
 def test_lsp_initialize_advertises_editor_features():
@@ -136,6 +137,21 @@ def test_lsp_hover_metadata_includes_struct_definition():
     assert "用户数据" in declaration.documentation
 
 
+def test_lsp_hover_describes_builtin_types():
+    server = EzLanguageServer()
+    uri = "file:///tmp/main.ez"
+    server.documents[uri] = "let err: Error;\nlet value: I32;\n"
+
+    error_hover = server._hover({"textDocument": {"uri": uri}, "position": {"line": 0, "character": 10}})
+    int_hover = server._hover({"textDocument": {"uri": uri}, "position": {"line": 1, "character": 12}})
+
+    assert error_hover is not None
+    assert "内置错误类型" in error_hover["contents"]["value"]
+    assert "toString" in error_hover["contents"]["value"]
+    assert int_hover is not None
+    assert "32 位有符号整数" in int_hover["contents"]["value"]
+
+
 def test_lsp_semantic_tokens_marks_named_argument_and_suspend(tmp_path):
     source = '''
 from "std/io" import { println, readLine };
@@ -168,3 +184,38 @@ const main = (): Void => {
     labels = [hint["label"].strip() for hint in hints]
 
     assert labels.count("suspend") >= 2
+
+
+def test_lsp_does_not_report_imported_symbols_as_undefined(tmp_path):
+    source = 'from "std/io" import { println };\nprintln(msg = "ok");\n'
+
+    diagnostics, _ = analyze_document_with_workspace(source, tmp_path, ROOT)
+
+    assert diagnostics == []
+
+
+def test_lsp_ignores_packaged_std_extern_missing_files(tmp_path):
+    std_root = tmp_path / "packages" / "std"
+    std_root.mkdir(parents=True)
+    source = 'extern "@std/native/time.c" for linux;\nexport declare const sleep: (ms: I64) => Void;\n'
+    module = std_root / "time.ez"
+    module.write_text(source, encoding="utf-8")
+
+    diagnostics, _ = analyze_document_with_workspace(source, module.parent, tmp_path)
+
+    assert diagnostics == []
+
+
+def test_lsp_suspend_hint_is_before_call_and_definition(tmp_path):
+    source = '''
+from "std/time" import { sleep };
+const main = (): Void => {
+    sleep(ms = 10);
+};
+'''
+
+    hints = inlay_hints(source, tmp_path, ROOT)
+    positions = [(hint["position"]["line"], hint["position"]["character"], hint["label"]) for hint in hints]
+
+    assert (2, 6, "suspend ") in positions
+    assert (3, 4, "suspend ") in positions

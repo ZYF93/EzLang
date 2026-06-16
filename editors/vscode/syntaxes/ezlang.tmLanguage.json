@@ -10,6 +10,7 @@
     { "include": "#declarations" },
     { "include": "#calls" },
     { "include": "#named-arguments" },
+    { "include": "#function-signatures" },
     { "include": "#operators" },
     { "include": "#keywords" },
     { "include": "#types" },
@@ -116,16 +117,33 @@
         }
       ]
     },
+    "function-signatures": {
+      "patterns": [
+        {
+          "name": "meta.function.return-arrow.ezlang",
+          "match": "(:)\\s*([A-Z][A-Za-z0-9_]*|Void|Bool|Str|I8|I32|I64|U8|U32|U64|F32|F64|[a-z_][A-Za-z0-9_]*|\\$[A-Za-z0-9_]+)(\\?)?(?=\\s*=>)",
+          "captures": {
+            "1": { "name": "punctuation.separator.type.ezlang" },
+            "2": { "name": "storage.type.return.ezlang" },
+            "3": { "name": "punctuation.definition.optional.ezlang" }
+          }
+        },
+        {
+          "name": "keyword.operator.arrow.fat.ezlang",
+          "match": "=>"
+        }
+      ]
+    },
     "operators": {
       "patterns": [
         { "name": "keyword.operator.arrow.fat.ezlang", "match": "=>" },
         { "name": "keyword.operator.arrow.thin.ezlang", "match": "->" },
         { "name": "keyword.operator.assignment.compound.ezlang", "match": "\\+=|-=|\\*=|/=|%=|&=|\\|=|\\^=|<<=|>>=" },
-        { "name": "keyword.operator.comparison.ezlang", "match": "==|!=|<=|>=" },
+        { "name": "keyword.operator.equality.ezlang", "match": "==|!=" },
         { "name": "keyword.operator.logical.ezlang", "match": "&&|\\|\\|" },
         { "name": "keyword.operator.bitwise.ezlang", "match": "<<|>>|[&|^~]" },
-        { "name": "keyword.operator.arithmetic.ezlang", "match": "[+\\-*/%]" },
-        { "name": "keyword.operator.assignment.ezlang", "match": "=" }
+        { "name": "keyword.operator.arithmetic.ezlang", "match": "[+*/%]|-(?!>)" },
+        { "name": "keyword.operator.assignment.ezlang", "match": "(?<![<>!])=(?![=>])" }
       ]
     },
     "keywords": {

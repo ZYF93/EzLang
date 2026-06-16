@@ -10,6 +10,7 @@ extern "@std/emcc/io.js" for emcc;
 
 // === 输出函数 ===
 export declare const print: (msg: Str) => Void;
+// 输出文本并追加换行。
 export declare const println: (msg: Str) => Void;
 export declare const error: (msg: Str) => Void;
 

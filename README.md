@@ -125,7 +125,7 @@ npm run package
 code --install-extension ezlang-vscode-0.1.0.vsix
 ```
 
-插件在仓库开发态会优先用 `python3 -m lsp` 启动 LSP；打包安装后默认调用 PATH 中的 `ez-lsp`。如果你使用自定义虚拟环境，可在 VS Code 设置中指定：
+插件在仓库开发态会优先用 `python3 -m lsp` 启动 LSP；打包安装后会使用 VSIX 内置的 LSP 运行文件，找不到内置服务时再调用 PATH 中的 `ez-lsp`。如果你使用自定义虚拟环境，可在 VS Code 设置中指定：
 
 ```json
 {

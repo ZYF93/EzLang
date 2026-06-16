@@ -1943,6 +1943,7 @@ def _normalize_ez_code_spacing(code: str) -> str:
     code = re.sub(r"\s+\)", ")", code)
     code = re.sub(r"\[\s+", "[", code)
     code = re.sub(r"\s+\]", "]", code)
+    code = re.sub(r"(?<=[A-Za-z0-9_>\])])\s*\{", " {", code)
     code = re.sub(r"\{\s+", "{ ", code)
     code = re.sub(r"\s+\}", " }", code)
     code = re.sub(r"\s*(==|!=|<=|>=|&&|\|\||=>|->|=)\s*", r" \1 ", code)
