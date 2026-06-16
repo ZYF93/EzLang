@@ -25,3 +25,6 @@ ezlang.egg-info/dependency_links.txt
 ezlang.egg-info/entry_points.txt
 ezlang.egg-info/requires.txt
 ezlang.egg-info/top_level.txt
+lsp/__init__.py
+lsp/__main__.py
+lsp/server.py

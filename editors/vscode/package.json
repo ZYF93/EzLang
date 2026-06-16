@@ -1,0 +1,78 @@
+{
+  "name": "ezlang-vscode",
+  "displayName": "EzLang",
+  "description": "EzLang 语法高亮、诊断、补全、跳转定义、hover、文档大纲和格式化",
+  "version": "0.1.0",
+  "publisher": "ezlang",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ZYF93/EzLang.git",
+    "directory": "editors/vscode"
+  },
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "activationEvents": [
+    "onLanguage:ezlang"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "languages": [
+      {
+        "id": "ezlang",
+        "aliases": [
+          "EzLang",
+          "ezlang"
+        ],
+        "extensions": [
+          ".ez"
+        ],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "ezlang",
+        "scopeName": "source.ezlang",
+        "path": "./syntaxes/ezlang.tmLanguage.json"
+      }
+    ],
+    "configuration": {
+      "title": "EzLang",
+      "properties": {
+        "ezlang.server.command": {
+          "type": "string",
+          "default": "",
+          "description": "自定义 EzLang LSP 启动命令；为空时仓库开发态使用 python3 -m lsp，打包安装态使用 ez-lsp。"
+        },
+        "ezlang.server.args": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "description": "自定义 EzLang LSP 启动参数。仅在 ezlang.server.command 非空时生效。"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "package": "vsce package"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/vscode": "^1.85.0",
+    "@vscode/vsce": "^3.6.0",
+    "typescript": "^5.3.0",
+    "vsce": "npm:@vscode/vsce@^3.6.0"
+  },
+  "dependencies": {
+    "vscode-languageclient": "^9.0.1"
+  }
+}

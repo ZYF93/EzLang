@@ -5,15 +5,15 @@ import re
 from pathlib import Path
 from typing import Optional
 
+from antlr4 import CommonTokenStream, InputStream, Token
+
+from parser.EzLangLexer import EzLangLexer
 from parser.EzLangParser import EzLangParser
 from parser.EzLangVisitor import EzLangVisitor
 from parser.string_literals import decode_string_literal_token
 from .symbols import (
     SymbolTable, Symbol, SymbolKind, Type, TypeKind, Scope, builtin_type
 )
-
-
-_EZ_VAR_IDENTIFIER_RE = re.compile(r'(?:[A-Za-z_][A-Za-z0-9_]*|\$[A-Za-z0-9_]+)')
 
 
 class SemanticAnalyzer(EzLangVisitor):
@@ -446,19 +446,29 @@ class SemanticAnalyzer(EzLangVisitor):
             text = decode_string_literal_token(ctx.STRING_LITERAL().getText())
             for match in re.finditer(r"\{\{(.+?)\}\}", text):
                 expr_text = match.group(1).strip()
-                if not _EZ_VAR_IDENTIFIER_RE.fullmatch(expr_text):
-                    self.symbols.add_error(f"行 {ctx.start.line}: 字符串插值只支持简单 Str 变量 '{{{{name}}}}'，不支持表达式 '{expr_text}'")
+                expr_type = self._analyze_interpolation_expr(expr_text, ctx.start.line)
+                if expr_type is None:
                     continue
-                symbol = self.symbols.resolve(expr_text)
-                if symbol is None:
-                    self.symbols.add_error(f"行 {ctx.start.line}: 未定义的变量 '{expr_text}'")
-                    continue
-                if symbol.type is not None and symbol.type.name != "Str":
-                    self.symbols.add_error(f"行 {ctx.start.line}: 字符串插值变量 '{expr_text}' 必须是 Str，实际为 '{symbol.type}'")
+                if expr_type.name != "Str":
+                    self.symbols.add_error(f"行 {ctx.start.line}: 字符串插值表达式 '{expr_text}' 必须是 Str，实际为 '{expr_type}'")
             return Type(name="Str", kind=TypeKind.BASIC)
         if ctx.BOOL_LITERAL() is not None:
             return Type(name="Bool", kind=TypeKind.BASIC)
         return None
+
+    def _analyze_interpolation_expr(self, expr_text: str, line: int) -> Optional[Type]:
+        """按 EzLang 表达式语法分析字符串插值内部表达式。"""
+        if not expr_text:
+            self.symbols.add_error(f"行 {line}: 字符串插值表达式不能为空")
+            return None
+        stream = CommonTokenStream(EzLangLexer(InputStream(expr_text)))
+        parser = EzLangParser(stream)
+        parser.removeErrorListeners()
+        expr = parser.expression()
+        if parser.getNumberOfSyntaxErrors() > 0 or stream.LA(1) != Token.EOF:
+            self.symbols.add_error(f"行 {line}: 字符串插值表达式语法错误: '{expr_text}'")
+            return None
+        return expr.accept(self)
 
     def _union_payload_type(self, type_: Type) -> Optional[Type]:
         """返回当前联合运行时 value 槽采用的语义类型。"""

@@ -21,9 +21,10 @@ dev = [
 
 [project.scripts]
 ez = "cli.ez:main"
+ez-lsp = "lsp.server:main"
 
 [tool.setuptools]
-packages = ["cli", "codegen", "parser", "semantic", "runtime"]
+packages = ["cli", "codegen", "parser", "semantic", "runtime", "lsp"]
 
 [tool.setuptools.package-dir]
 cli = "cli"

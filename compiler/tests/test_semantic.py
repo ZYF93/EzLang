@@ -528,16 +528,17 @@ class TestSemantic:
         anal = analyze('const greeting = "Hello {{missingName}}";')
         assert any('missingName' in e for e in anal.symbols.errors), f'应有未定义变量错误: {anal.symbols.errors}'
 
-    def test_string_interpolation_requires_simple_str_variable(self):
-        """字符串插值当前只支持简单 Str 变量名。"""
+    def test_string_interpolation_accepts_str_expression_and_rejects_non_str(self):
+        """字符串插值支持完整表达式，表达式结果必须是 Str。"""
         anal = analyze('''
-        const name = "EzLang";
+        const first = "Ez";
+        const last = "Lang";
         const count = 1;
-        const expr = "Hello {{name + count}}";
+        const expr = "Hello {{first + last}}";
         const number = "Count {{count}}";
         ''')
-        assert any('只支持简单 Str 变量' in e for e in anal.symbols.errors), anal.symbols.errors
-        assert any("变量 'count' 必须是 Str" in e for e in anal.symbols.errors), anal.symbols.errors
+        assert not any('first + last' in e for e in anal.symbols.errors), anal.symbols.errors
+        assert any("表达式 'count' 必须是 Str" in e for e in anal.symbols.errors), anal.symbols.errors
 
     def test_markup_literal_requires_factory(self):
         """标记字面量必须存在同名工厂函数。"""

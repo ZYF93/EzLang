@@ -1288,6 +1288,26 @@ def test_run_string_interpolation_uses_dynamic_length(tmp_path):
     assert ez.main(["run", "--project", str(project_toml)]) == 0
 
 
+def test_run_string_interpolation_accepts_str_expression(tmp_path):
+    project_toml = write_project(
+        tmp_path,
+        os_name=ez._native_os(),
+        arch=ez._native_arch(),
+    )
+    (tmp_path / "src" / "index.ez").write_text(
+        'from "std/str" import { strEqual };\n'
+        'const main = (): I32 => {\n'
+        '    let first: Str = "Ez";\n'
+        '    let last: Str = "Lang";\n'
+        '    let greeting: Str = "Hello {{first + last}}";\n'
+        '    return strEqual(a = greeting, b = "Hello EzLang") ? 0 : 1;\n'
+        '};\n',
+        encoding="utf-8",
+    )
+
+    assert ez.main(["run", "--project", str(project_toml)]) == 0
+
+
 def test_run_std_fmt_json_and_msgpack_basic_roundtrip(tmp_path):
     project_toml = write_project(
         tmp_path,

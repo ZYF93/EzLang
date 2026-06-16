@@ -36,6 +36,41 @@ EzLang 提供了开箱即用的命令行工具链（CLI），并采用 `project.
 包发布工具。结合 `project.toml` 中的配置，将当前项目作为模块发布到远端的包管理服务中，供他人或外部项目下载使用。发布产物为 `<name>-<version>.zip`，包含 `project.toml` 与项目源码。
 `[project].registry` 为本地路径时，产物写入 `<registry>/<name>/<version>/<name>-<version>.zip`；为 HTTP(S) URL 时，CLI 使用 `PUT <registry>/<name>/<version>/<name>-<version>.zip` 上传 zip，Content-Type 为 `application/zip`。`public = false` 的包不能发布，`--dry-run` 只校验元数据和发布目标，不写文件或上传。
 
+### `ez-lsp`
+启动 EzLang Language Server。LSP 通过标准输入输出与编辑器通信，当前提供 `.ez` 文件的语法高亮配套、语法诊断、语义诊断、基础补全、hover、跳转定义、文档大纲和全文格式化。源码安装后可直接运行：
+
+```bash
+ez-lsp
+```
+
+也可以在仓库根目录用 Python 模块方式启动：
+
+```bash
+python3 -m lsp
+```
+
+VS Code 插件源码位于 `editors/vscode`，本地开发或打包流程如下：
+
+```bash
+cd editors/vscode
+npm install
+npm run compile
+npm run package
+```
+
+插件在仓库内开发时默认以 `python3 -m lsp` 启动服务；打包安装后默认调用 PATH 中的 `ez-lsp`。如果希望使用其他解释器、虚拟环境或服务入口，可以在 VS Code 设置里配置 `ezlang.server.command` 与 `ezlang.server.args`。
+
+格式化由 LSP 复用 `ez fmt` 的内部格式化器。VS Code 可手动执行 “Format Document”，也可以配置保存时格式化：
+
+```json
+{
+  "[ezlang]": {
+    "editor.defaultFormatter": "ezlang.ezlang-vscode",
+    "editor.formatOnSave": true
+  }
+}
+```
+
 ---
 
 ## 2. `project.toml` 字段与枚举说明

@@ -3,13 +3,12 @@
 from typing import Optional
 from pathlib import Path
 import re
+from antlr4 import CommonTokenStream, InputStream, Token
 from llvmlite import ir
+from parser.EzLangLexer import EzLangLexer
 from parser.EzLangParser import EzLangParser
 from parser.EzLangVisitor import EzLangVisitor
 from parser.string_literals import decode_string_literal_token
-
-
-_EZ_VAR_IDENTIFIER_RE = re.compile(r'(?:[A-Za-z_][A-Za-z0-9_]*|\$[A-Za-z0-9_]+)')
 
 
 class LLVMCodeGenerator(EzLangVisitor):
@@ -4477,7 +4476,7 @@ class LLVMCodeGenerator(EzLangVisitor):
 
     @staticmethod
     def _parse_str_interp(text: str):
-        """解析字符串插值: "Hello {{name}}!" → [("text", "Hello "), ("expr", "name"), ("text", "!")]"""
+        """解析字符串插值: "Hello {{name + suffix}}!" → text / expr 片段。"""
         import re
         parts = []
         last = 0
@@ -4506,12 +4505,8 @@ class LLVMCodeGenerator(EzLangVisitor):
                 src = self._make_global_string(seg_content, prefix="_interp_seg")
                 seg_len = ir.Constant(i64, len(bytearray(seg_content, 'utf-8')))
             elif seg_type == "expr" and self.builder:
-                var_name = seg_content.strip()
-                storage = self.locals.get(var_name) or self.globals.get(var_name)
-                if storage is None:
-                    continue
-                src_val = self.builder.load(storage)
-                if isinstance(src_val.type, ir.PointerType) and src_val.type.pointee == i8:
+                src_val = self._eval_interpolation_expr(seg_content.strip())
+                if src_val is not None and isinstance(src_val.type, ir.PointerType) and src_val.type.pointee == i8:
                     src = src_val
                     seg_len = self.builder.call(strlen, [src], name="_interp_len")
                 else:
@@ -4539,6 +4534,18 @@ class LLVMCodeGenerator(EzLangVisitor):
         null_ptr = self.builder.gep(buf_base, [pos], inbounds=True)
         self.builder.store(ir.Constant(i8, 0), null_ptr)
         return buf_base
+
+    def _eval_interpolation_expr(self, expr_text: str) -> ir.Value | None:
+        """按 EzLang 表达式语法生成字符串插值内部表达式。"""
+        if not expr_text:
+            return None
+        stream = CommonTokenStream(EzLangLexer(InputStream(expr_text)))
+        parser = EzLangParser(stream)
+        parser.removeErrorListeners()
+        expr = parser.expression()
+        if parser.getNumberOfSyntaxErrors() > 0 or stream.LA(1) != Token.EOF:
+            return None
+        return self._eval(expr)
 
     def _get_or_define_strlen(self) -> ir.Function:
         """定义内部 strlen，避免依赖平台 size_t ABI。"""

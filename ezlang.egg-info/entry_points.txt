@@ -1,2 +1,3 @@
 [console_scripts]
 ez = cli.ez:main
+ez-lsp = lsp.server:main

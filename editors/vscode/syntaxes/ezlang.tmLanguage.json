@@ -1,0 +1,49 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "EzLang",
+  "scopeName": "source.ezlang",
+  "patterns": [
+    { "include": "#comments" },
+    { "include": "#strings" },
+    { "include": "#numbers" },
+    { "include": "#keywords" },
+    { "include": "#types" },
+    { "include": "#functions" }
+  ],
+  "repository": {
+    "comments": {
+      "patterns": [
+        { "name": "comment.line.double-slash.ezlang", "match": "//.*$" },
+        { "name": "comment.block.ezlang", "begin": "/\\*", "end": "\\*/" }
+      ]
+    },
+    "strings": {
+      "patterns": [
+        { "name": "string.quoted.double.ezlang", "begin": "\"", "end": "\"", "patterns": [{ "name": "constant.character.escape.ezlang", "match": "\\\\." }] }
+      ]
+    },
+    "numbers": {
+      "patterns": [
+        { "name": "constant.numeric.ezlang", "match": "\\b(0x[0-9a-fA-F_]+|0b[01_]+|0o[0-7_]+|[0-9][0-9_]*(\\.[0-9_]+)?([eE][+-]?[0-9_]+)?)\\b" }
+      ]
+    },
+    "keywords": {
+      "patterns": [
+        { "name": "keyword.control.ezlang", "match": "\\b(let|const|static|struct|type|declare|loop|break|continue|import|export|from|match|catch|throw|flow|parallel|return|extern|for|as|in)\\b" },
+        { "name": "constant.language.boolean.ezlang", "match": "\\b(true|false)\\b" }
+      ]
+    },
+    "types": {
+      "patterns": [
+        { "name": "storage.type.ezlang", "match": "\\b(I8|I32|I64|U8|U32|U64|F32|F64|Str|Bool|Void|Vec|List|Dict)\\b" },
+        { "name": "entity.name.type.ezlang", "match": "\\b[A-Z][A-Za-z0-9_]*\\b" }
+      ]
+    },
+    "functions": {
+      "patterns": [
+        { "name": "entity.name.function.ezlang", "match": "\\b[a-z_][A-Za-z0-9_]*(?=\\s*=\\s*(<[^>]+>\\s*)?\\()" }
+      ]
+    }
+  }
+}
+
