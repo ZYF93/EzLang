@@ -2,7 +2,7 @@
   "name": "ezlang-vscode",
   "displayName": "EzLang",
   "description": "EzLang 语法高亮、诊断、补全、跳转定义、hover、文档大纲和格式化",
-  "version": "0.1.7",
+  "version": "0.1.0",
   "publisher": "JoshuaDeVan",
   "license": "MIT",
   "repository": {
