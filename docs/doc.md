@@ -215,6 +215,7 @@ struct Meta<T> {
 
 ### 语法
 ```ez
+struct User { name: Str }
 let count: I32 = 10
 rp let cache: User[] = []  // 读优先锁
 wp let queue: I32[] = []   // 写优先锁

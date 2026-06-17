@@ -3564,26 +3564,56 @@ class LLVMCodeGenerator(EzLangVisitor):
             return i1
         if isinstance(node, EzLangParser.RelationalExpressionContext) and len(node.bitOrExpression()) > 1:
             return i1
-        if isinstance(node, EzLangParser.UnaryExpressionContext) and node.BANG() is not None:
+        if isinstance(node, EzLangParser.UnaryExpressionContext) and hasattr(node, 'BANG') and node.BANG() is not None:
             return i1
         return None
 
     def _infer_race_result_type(self, ctx) -> ir.Type:
         """从 race(pl = [() => T, ...]) 分支推断表达式结果类型。"""
         array_lit = self._find_array_literal_ctx(ctx)
-        first_branch = self._first_function_literal_in_array(array_lit)
-        if first_branch is None:
+        branches = self._function_literals_in_array(array_lit)
+        if not branches:
             return ir.IntType(32)
-        branch_type = self._infer_function_literal_return_type(first_branch)
-        return ir.IntType(32) if isinstance(branch_type, ir.VoidType) else branch_type
+        return self._merge_ir_union_types([
+            self._infer_function_literal_return_type(branch)
+            for branch in branches
+        ])
 
     def _infer_block_return_type(self, block_ctx) -> ir.Type:
         if block_ctx is None:
             return ir.VoidType()
         return_types = self._collect_block_return_types(block_ctx)
         if return_types:
-            return return_types[0]
+            return self._merge_ir_union_types(return_types)
         return ir.VoidType()
+
+    def _merge_ir_union_types(self, types: list[ir.Type]) -> ir.Type:
+        """把多个 LLVM 类型合并为单一结果类型；不同类型用 EzLang union ABI。"""
+        concrete = [t for t in types if not isinstance(t, ir.VoidType)]
+        if not concrete:
+            return ir.VoidType()
+        unique: list[ir.Type] = []
+        for type_ in concrete:
+            if not any(type_ == existing for existing in unique):
+                unique.append(type_)
+        if len(unique) == 1:
+            return unique[0]
+        max_type = max(unique, key=lambda t: self._type_width(t))
+        return ir.LiteralStructType([ir.IntType(32), max_type])
+
+    def _ir_union_variant_tag_for_types(self, union_type: ir.Type, variant_types: list[ir.Type], value_type: ir.Type) -> int:
+        if not self._is_union_type(union_type):
+            return 0
+        unique: list[ir.Type] = []
+        for type_ in variant_types:
+            if isinstance(type_, ir.VoidType):
+                continue
+            if not any(type_ == existing for existing in unique):
+                unique.append(type_)
+        for index, type_ in enumerate(unique):
+            if type_ == value_type:
+                return index
+        return 0
 
     def _collect_block_return_types(self, block_ctx) -> list[ir.Type]:
         """收集当前 flow/parallel/race 函数体内的 return 类型，不跨越嵌套函数或并发块。"""
@@ -8780,15 +8810,19 @@ class LLVMCodeGenerator(EzLangVisitor):
         if async_result is not None:
             return async_result
 
-        first_branch = self._first_function_literal_in_array(pl_array)
-        if first_branch is None:
+        branches = self._function_literals_in_array(pl_array)
+        if not branches:
             return legacy_race_hook()
+        first_branch = branches[0]
         params = first_branch.paramList()
         if params is not None and params.param():
             return legacy_race_hook()
 
-        branch_type = self._infer_function_literal_return_type(first_branch)
-        result_type = i32 if isinstance(branch_type, ir.VoidType) else branch_type
+        branch_types = [self._infer_function_literal_return_type(branch) for branch in branches]
+        first_branch_type = branch_types[0]
+        result_type = self._merge_ir_union_types(branch_types)
+        if isinstance(result_type, ir.VoidType):
+            return legacy_race_hook()
         result_alloca = self.builder.alloca(result_type, name="_race_result")
         self.builder.store(self._zero_constant(result_type), result_alloca)
         exit_block = self.builder.append_basic_block(name="race_exit")
@@ -8802,10 +8836,14 @@ class LLVMCodeGenerator(EzLangVisitor):
             self._eval(expr_block)
         elif first_branch.expression() is not None:
             branch_value = self._eval(first_branch.expression())
-            if branch_value is not None and not isinstance(branch_type, ir.VoidType):
+            if branch_value is not None and not isinstance(first_branch_type, ir.VoidType):
                 if self._is_aggregate_ptr(branch_value):
                     branch_value = self.builder.load(branch_value)
-                branch_value = self._coerce_value(branch_value, branch_type)
+                if self._is_union_type(result_type):
+                    tag = self._ir_union_variant_tag_for_types(result_type, branch_types, branch_value.type)
+                    branch_value = self._coerce_union_value(branch_value, result_type, tag)
+                else:
+                    branch_value = self._coerce_value(branch_value, result_type)
                 self.builder.store(branch_value, result_alloca)
         if self._parallel_result_stack and self._parallel_result_stack[-1] is result_alloca:
             self._parallel_result_stack.pop()
@@ -8816,8 +8854,6 @@ class LLVMCodeGenerator(EzLangVisitor):
         if self.builder is not None and not self.builder.block.is_terminated:
             self.builder.branch(exit_block)
         self.builder.position_at_start(exit_block)
-        if isinstance(branch_type, ir.VoidType):
-            return legacy_race_hook()
         return self.builder.load(result_alloca, name="race_value")
 
     def _function_literals_in_array(self, array_ctx) -> list:
@@ -9266,6 +9302,40 @@ class LLVMCodeGenerator(EzLangVisitor):
             return self.builder.load(ptr_slot, name='_weak_pointee_ptr')
         return self.builder.extract_value(value, 1, name='_weak_pointee_ptr')
 
+    def _weak_ref_calculation_value(self, value: ir.Value) -> ir.Value:
+        """弱引用在计算上下文中自动解包为内部值。"""
+        value_type = value.type.pointee if isinstance(value.type, ir.PointerType) else value.type
+        if not self._is_weak_ref_type(value_type):
+            return value
+        ref_ptr = self._weak_ref_pointee_ptr(value)
+        if ref_ptr is None:
+            return value
+        pointee = value_type.elements[1].pointee
+        if isinstance(pointee, (ir.IdentifiedStructType, ir.LiteralStructType, ir.ArrayType)):
+            return ref_ptr
+        is_null = self.builder.icmp_unsigned('==', ref_ptr, ir.Constant(ref_ptr.type, None), name='_weak_calc_is_null')
+        result_ptr = self.builder.alloca(pointee, name='_weak_calc_unwrapped_slot')
+        null_block = self.builder.append_basic_block('_weak_calc_null')
+        value_block = self.builder.append_basic_block('_weak_calc_value_block')
+        done_block = self.builder.append_basic_block('_weak_calc_done')
+        self.builder.cbranch(is_null, null_block, value_block)
+
+        self.builder.position_at_start(null_block)
+        self.builder.store(self._zero_constant(pointee), result_ptr)
+        self.builder.branch(done_block)
+
+        self.builder.position_at_start(value_block)
+        self.builder.store(self.builder.load(ref_ptr, name='_weak_calc_value'), result_ptr)
+        self.builder.branch(done_block)
+
+        self.builder.position_at_start(done_block)
+        result = self.builder.load(result_ptr, name='_weak_calc_unwrapped')
+        self._mark_unsigned(result, self._is_unsigned_value(value))
+        return result
+
+    def _weak_ref_calculation_operands(self, left: ir.Value, right: ir.Value) -> tuple[ir.Value, ir.Value]:
+        return self._weak_ref_calculation_value(left), self._weak_ref_calculation_value(right)
+
     def visitTypeAssertion(self, ctx: EzLangParser.TypeAssertionContext):
         return self._optional_unwrapped_value(ctx.postfixExpression())
 
@@ -9273,6 +9343,11 @@ class LLVMCodeGenerator(EzLangVisitor):
         return self._optional_unwrapped_value(ctx.postfixExpression())
 
     def visitWeakRefExpression(self, ctx: EzLangParser.WeakRefExpressionContext):
+        if not self._is_weak_ref_target(ctx.unaryExpression()):
+            self._extern_diagnostics.append(
+                f"行 {ctx.start.line}: 弱引用 '#' 只能用于变量、字段或索引等可寻址表达式"
+            )
+            return self._weak_ref_value(None, ir.IntType(32))
         inner = self._eval(ctx.unaryExpression())
         if inner is None or not hasattr(inner, 'type'):
             return self._weak_ref_value(None, ir.IntType(32))
@@ -9281,6 +9356,26 @@ class LLVMCodeGenerator(EzLangVisitor):
         ptr = self._arena_allocate(inner.type, name='_weak_tmp')
         self.builder.store(inner, ptr)
         return self._weak_ref_value(ptr, inner.type)
+
+    def _is_weak_ref_target(self, ctx) -> bool:
+        """#expr 只能捕获有稳定地址的表达式；字面量和临时计算结果没有弱引用意义。"""
+        if ctx is None:
+            return False
+        if isinstance(ctx, EzLangParser.PostfixUnaryExpressionContext):
+            return self._is_weak_ref_target(ctx.postfixExpression())
+        if isinstance(ctx, EzLangParser.PrimaryExprContext):
+            return self._is_weak_ref_target(ctx.primaryExpression())
+        if isinstance(ctx, EzLangParser.IdentifierExprContext):
+            return ctx.VAR_IDENTIFIER() is not None or ctx.VOID() is not None
+        if isinstance(ctx, (EzLangParser.MemberAccessContext, EzLangParser.IndexContext)):
+            return True
+        if isinstance(ctx, (EzLangParser.TypeAssertionContext, EzLangParser.OptionalUnwrapContext)):
+            return self._is_weak_ref_target(ctx.postfixExpression())
+        if isinstance(ctx, EzLangParser.ParenExprContext):
+            return self._is_weak_ref_target(ctx.expression())
+        if hasattr(ctx, 'getChildCount') and ctx.getChildCount() == 1:
+            return self._is_weak_ref_target(ctx.getChild(0))
+        return False
 
     def _call_arg_items(self, arg_list_ctx) -> list[tuple[Optional[str], object]]:
         """返回调用实参；name 为 None 表示位置参数。"""
@@ -11184,6 +11279,7 @@ class LLVMCodeGenerator(EzLangVisitor):
             right = self._eval(ctx.multiplicativeExpression(i))
             if left is None or right is None: continue
             op = ctx.getChild((i * 2) - 1).getText()
+            left, right = self._weak_ref_calculation_operands(left, right)
             left, right = self._prepare_vector_binary_operands(left, right)
             unsigned = self._binary_result_unsigned(left, right)
             if op == '+' and self._is_str_type(left.type) and self._is_str_type(right.type):
@@ -11203,6 +11299,7 @@ class LLVMCodeGenerator(EzLangVisitor):
             right = self._eval(ctx.unaryExpression(i))
             if left is None or right is None: continue
             op = ctx.getChild((i * 2) - 1).getText()
+            left, right = self._weak_ref_calculation_operands(left, right)
             left, right = self._prepare_vector_binary_operands(left, right)
             unsigned = self._binary_result_unsigned(left, right)
             left, right = self._coerce_float_binary_operands(left, right)
@@ -11359,6 +11456,7 @@ class LLVMCodeGenerator(EzLangVisitor):
         return left, right
 
     def _gen_equality_comparison(self, left: ir.Value, right: ir.Value, op: str) -> ir.Value:
+        left, right = self._weak_ref_calculation_operands(left, right)
         left, right = self._prepare_vector_binary_operands(left, right)
         if self._is_equality_aggregate_value(left) or self._is_equality_aggregate_value(right):
             equal = self._gen_aggregate_equality(left, right)
@@ -11452,6 +11550,7 @@ class LLVMCodeGenerator(EzLangVisitor):
             right = self._eval(ctx.bitOrExpression(i))
             if left is None or right is None: continue
             op = ctx.getChild((i * 2) - 1).getText()
+            left, right = self._weak_ref_calculation_operands(left, right)
             left, right = self._prepare_vector_binary_operands(left, right)
             left, right = self._coerce_float_binary_operands(left, right)
             if self._is_float_or_float_vector(left.type):
@@ -11470,6 +11569,7 @@ class LLVMCodeGenerator(EzLangVisitor):
             right = self._eval(ctx.additiveExpression(i))
             if left is None or right is None: continue
             op = ctx.getChild((i * 2) - 1).getText()
+            left, right = self._weak_ref_calculation_operands(left, right)
             left, right = self._prepare_vector_binary_operands(left, right)
             unsigned = self._is_unsigned_value(left)
             if op == '<<':
@@ -11484,6 +11584,7 @@ class LLVMCodeGenerator(EzLangVisitor):
         for i in range(1, len(ctx.shiftExpression())):
             right = self._eval(ctx.shiftExpression(i))
             if left is None or right is None: continue
+            left, right = self._weak_ref_calculation_operands(left, right)
             left, right = self._prepare_vector_binary_operands(left, right)
             unsigned = self._binary_result_unsigned(left, right)
             left = self.builder.and_(left, right)
@@ -11495,6 +11596,7 @@ class LLVMCodeGenerator(EzLangVisitor):
         for i in range(1, len(ctx.bitAndExpression())):
             right = self._eval(ctx.bitAndExpression(i))
             if left is None or right is None: continue
+            left, right = self._weak_ref_calculation_operands(left, right)
             left, right = self._prepare_vector_binary_operands(left, right)
             unsigned = self._binary_result_unsigned(left, right)
             left = self.builder.xor(left, right)
@@ -11506,6 +11608,7 @@ class LLVMCodeGenerator(EzLangVisitor):
         for i in range(1, len(ctx.bitXorExpression())):
             right = self._eval(ctx.bitXorExpression(i))
             if left is None or right is None: continue
+            left, right = self._weak_ref_calculation_operands(left, right)
             left, right = self._prepare_vector_binary_operands(left, right)
             unsigned = self._binary_result_unsigned(left, right)
             left = self.builder.or_(left, right)
@@ -11594,6 +11697,7 @@ class LLVMCodeGenerator(EzLangVisitor):
         inner = self._eval(ctx.unaryExpression())
         if inner is None:
             return None
+        inner = self._weak_ref_calculation_value(inner)
 
         if ctx.BANG() is not None:
             return self.builder.not_(inner)
@@ -11617,6 +11721,7 @@ class LLVMCodeGenerator(EzLangVisitor):
         inner = self._eval(ctx.unaryExpression())
         if inner is None:
             return None
+        inner = self._weak_ref_calculation_value(inner)
 
         if ctx.BANG() is not None:
             return self.builder.not_(inner)

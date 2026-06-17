@@ -547,6 +547,10 @@ struct ProcessResult {
     ok:       Bool
 }
 
+struct Stream {
+    handle: I64
+}
+
 declare const processExec:        (command: Command) => ProcessResult?
 declare const processSpawn:       (command: Command) => Process?
 declare const processWait:        (process: Process) => ProcessResult?
@@ -789,6 +793,10 @@ declare const cryptoHmacSha512: (key: Blob, data: Blob) => Blob?
 `std/compress` 提供 gzip、zlib 和 raw deflate 的二进制 `Blob` 编解码，也可通过 `std/stream.Stream` 从源流当前游标读入并写入目标流。
 
 ```ez
+struct Stream {
+    handle: I64
+}
+
 declare const compressGzip:      (data: Blob) => Blob?
 declare const decompressGzip:    (data: Blob) => Blob?
 declare const compressZlib:      (data: Blob) => Blob?
@@ -931,6 +939,15 @@ const winner = flow {
 原生平台的 HTTP 服务端为基础实现：`createServer` 创建服务端句柄，`on` 注册精确路径路由，`start` 在当前线程监听并为每个已接受连接启动 worker，`stop` 关闭监听句柄并等待已派发连接收尾。emcc Node 风格运行时通过 `http.createServer` + Asyncify 启动基础服务端，支持精确路径路由、请求头/请求体读取、响应状态码/响应头/响应体写回；浏览器/Worker 没有监听端口能力时 `createServer` 返回空句柄。
 
 ```ez
+struct HttpRequest {
+    path: Str
+}
+
+struct HttpResponse {
+    status: I32
+    body: Str
+}
+
 type RouteHandler = (req: HttpRequest) => HttpResponse;
 
 struct HttpServer {

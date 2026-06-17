@@ -431,6 +431,26 @@ def test_run_weak_reference_uses_value_syntax_and_typeof_void(tmp_path):
     assert ez.main(["run", "--project", str(project_toml)]) == 0
 
 
+def test_run_weak_reference_participates_in_calculation(tmp_path):
+    project_toml = write_project(
+        tmp_path,
+        os_name=ez._native_os(),
+        arch=ez._native_arch(),
+    )
+    (tmp_path / "src" / "index.ez").write_text(
+        '''
+        const main = (): I32 => {
+            let value: I32 = 40;
+            let ref: #I32 = #value;
+            return (ref + 2 == 42 && ref * 2 == 80) ? 0 : 1;
+        };
+        ''',
+        encoding="utf-8",
+    )
+
+    assert ez.main(["run", "--project", str(project_toml)]) == 0
+
+
 def test_run_aggregate_equality_compares_fields_recursively(tmp_path):
     project_toml = write_project(
         tmp_path,

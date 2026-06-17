@@ -100,6 +100,7 @@ STD_MODULES = [
 
 COMPLETION_KIND_KEYWORD = 14
 COMPLETION_KIND_FUNCTION = 3
+COMPLETION_KIND_FIELD = 5
 COMPLETION_KIND_VARIABLE = 6
 COMPLETION_KIND_MODULE = 9
 COMPLETION_KIND_STRUCT = 22
@@ -338,11 +339,23 @@ class EzLanguageServer:
             if module_file is not None:
                 items.extend(_declaration_completion(decl) for decl in _index_file(module_file).values())
         else:
-            items.extend({"label": word, "kind": COMPLETION_KIND_KEYWORD} for word in KEYWORD_COMPLETIONS)
-            items.extend({"label": word, "kind": COMPLETION_KIND_TYPE} for word in TYPE_COMPLETIONS)
+            line = int(position.get("line", 0))
+            character = int(position.get("character", 0))
             _, analyzer = analyze_document_with_workspace(text, self._base_dir_for_uri(uri, text), self.workspace_root)
-            if analyzer is not None:
-                items.extend(_symbol_completion(symbol) for symbol in analyzer.symbols.global_scope.symbols.values())
+            if analyzer is None and _member_completion_target(prefix) is not None:
+                _, analyzer = analyze_document_with_workspace(
+                    _source_with_member_completion_placeholder(text, line, character),
+                    self._base_dir_for_uri(uri, text),
+                    self.workspace_root,
+                )
+            member_items = _member_completion_items(analyzer, prefix, line) if analyzer is not None else []
+            if member_items:
+                items.extend(member_items)
+            else:
+                items.extend({"label": word, "kind": COMPLETION_KIND_KEYWORD} for word in KEYWORD_COMPLETIONS)
+                items.extend({"label": word, "kind": COMPLETION_KIND_TYPE} for word in TYPE_COMPLETIONS)
+                if analyzer is not None:
+                    items.extend(_symbol_completion(symbol) for symbol in analyzer.symbols.global_scope.symbols.values())
         return {"isIncomplete": False, "items": _dedupe_items(items)}
 
     def _hover(self, params: dict[str, Any]) -> dict[str, Any] | None:
@@ -360,7 +373,10 @@ class EzLanguageServer:
             return {"contents": {"kind": "markdown", "value": f"`{word}`\n\nEzLang {token_label}"}}
         _, analyzer = analyze_document_with_workspace(text, self._base_dir_for_uri(uri, text), self.workspace_root)
         if analyzer is not None:
-            symbol = analyzer.symbols.global_scope.symbols.get(word)
+            call_type = _call_signature_at(analyzer, text, word, int(position.get("line", 0)), int(position.get("character", 0)))
+            if call_type is not None:
+                return {"contents": {"kind": "markdown", "value": _call_markdown(word, call_type)}}
+            symbol = _symbol_at(analyzer, word, int(position.get("line", 0)))
             if symbol is not None:
                 type_declarations = _visible_type_declarations(text, uri, self._base_dir_for_uri(uri, text), self.workspace_root)
                 return {"contents": {"kind": "markdown", "value": _symbol_markdown(symbol, type_declarations, uri)}}
@@ -904,6 +920,55 @@ def _symbol_completion(symbol: Symbol) -> dict[str, Any]:
     return {"label": symbol.name, "kind": kind, "detail": detail}
 
 
+def _member_completion_items(analyzer: Any, prefix: str, line: int) -> list[dict[str, Any]]:
+    target = _member_completion_target(prefix)
+    if target is None:
+        return []
+    symbol = _symbol_at(analyzer, target, line)
+    if symbol is None or symbol.type is None:
+        return []
+    return _type_member_completion_items(symbol.type)
+
+
+def _member_completion_target(prefix: str) -> str | None:
+    match = re.search(r'([A-Za-z_$][A-Za-z0-9_$]*)\s*\.\s*[A-Za-z0-9_$]*$', prefix)
+    return match.group(1) if match is not None else None
+
+
+def _source_with_member_completion_placeholder(source: str, line: int, character: int) -> str:
+    lines = source.splitlines(keepends=True)
+    if line < 0 or line >= len(lines):
+        return source
+    current = lines[line]
+    newline = "\n" if current.endswith("\n") else ""
+    content = current[:-1] if newline else current
+    character = min(max(character, 0), len(content))
+    lines[line] = content[:character] + "__ez_completion" + content[character:] + newline
+    repaired = "".join(lines)
+    return re.sub(r'(\.\s*)(?=\n|$)', r'.__ez_completion', repaired)
+
+
+def _type_member_completion_items(type_: Type) -> list[dict[str, Any]]:
+    fields = getattr(type_, "fields", None) or {}
+    items = [
+        {"label": name, "kind": COMPLETION_KIND_FIELD, "detail": _type_display(field_type)}
+        for name, field_type in fields.items()
+    ]
+    if type_.kind == TypeKind.OPTIONAL:
+        items.extend([
+            {"label": "ok", "kind": COMPLETION_KIND_FIELD, "detail": "Bool"},
+            {"label": "value", "kind": COMPLETION_KIND_FIELD, "detail": _type_display(type_.element_type or type_.referent_type)},
+        ])
+    if type_.kind == TypeKind.UNION:
+        items.extend([
+            {"label": "tag", "kind": COMPLETION_KIND_FIELD, "detail": "I32"},
+            {"label": "value", "kind": COMPLETION_KIND_FIELD, "detail": _type_display(type_.union_types[0] if type_.union_types else None)},
+        ])
+    methods = getattr(type_, "methods", None) or {}
+    items.extend({"label": name, "kind": COMPLETION_KIND_FUNCTION, "detail": _type_display(method_type)} for name, method_type in methods.items())
+    return items
+
+
 def _declaration_completion(declaration: Declaration) -> dict[str, Any]:
     kind = COMPLETION_KIND_VARIABLE
     if declaration.kind == SymbolKind.FUNCTION:
@@ -918,6 +983,8 @@ def _declaration_completion(declaration: Declaration) -> dict[str, Any]:
 def _symbol_markdown(symbol: Symbol, type_declarations: dict[str, Declaration] | None = None, fallback_uri: str = "") -> str:
     type_declarations = type_declarations or {}
     alias_names = {name for name, declaration in type_declarations.items() if declaration.kind == SymbolKind.TYPE_ALIAS}
+    if symbol.kind == SymbolKind.TYPE_ALIAS:
+        alias_names.discard(symbol.name)
     detail = _type_display(symbol.type, alias_names=alias_names) if symbol.type is not None else symbol.kind.name.lower()
     label = "type" if symbol.kind in (SymbolKind.STRUCT, SymbolKind.TYPE_ALIAS) else symbol.kind.name.lower()
     lines = [f"```ez\n{symbol.name}: {detail}\n```", label]
@@ -927,10 +994,48 @@ def _symbol_markdown(symbol: Symbol, type_declarations: dict[str, Declaration] |
     return "\n\n".join(lines)
 
 
+def _call_markdown(name: str, type_: Type) -> str:
+    return f"```ez\n{name}: {_type_display(type_)}\n```\n\ncall"
+
+
+def _call_signature_at(analyzer: Any, source: str, word: str, line: int, character: int) -> Type | None:
+    token_start = _word_start_at(source, line, character)
+    key = (line + 1, token_start, word)
+    return getattr(analyzer, "call_signatures", {}).get(key)
+
+
+def _word_start_at(source: str, line: int, character: int) -> int:
+    lines = source.splitlines()
+    if line < 0 or line >= len(lines):
+        return character
+    current = lines[line]
+    character = min(max(character, 0), len(current))
+    left = character
+    while left > 0 and re.match(r"[A-Za-z0-9_$]", current[left - 1]):
+        left -= 1
+    return left
+
+
+def _symbol_at(analyzer: Any, word: str, line: int) -> Symbol | None:
+    symbol = analyzer.symbols.global_scope.symbols.get(word)
+    if symbol is not None:
+        return symbol
+    candidates = [
+        declared
+        for declared in getattr(analyzer, "declared_symbols", [])
+        if declared.name == word and declared.line <= line + 1
+    ]
+    if not candidates:
+        return None
+    return candidates[-1]
+
+
 def _type_display(type_: Type | None, alias_names: set[str] | None = None) -> str:
     alias_names = alias_names or set()
     if type_ is None:
-        return "unknown"
+        return "无法推导"
+    if type_.name == "unknown":
+        return "无法推导"
     if type_.name in alias_names:
         return type_.name
     if type_.kind == TypeKind.FUNCTION:
@@ -938,21 +1043,27 @@ def _type_display(type_: Type | None, alias_names: set[str] | None = None) -> st
         for index, param_type in enumerate(type_.param_types):
             name = type_.param_names[index] if index < len(type_.param_names) else f"arg{index + 1}"
             params.append(f"{name}: {_type_display(param_type, alias_names=alias_names)}")
-        return f"({', '.join(params)}) => {_type_display(type_.return_type, alias_names=alias_names)}"
+        generic_names = getattr(type_, "generic_params", None) or []
+        generic_prefix = f"<{', '.join(generic_names)}>" if generic_names else ""
+        return f"{generic_prefix}({', '.join(params)}) => {_type_display(type_.return_type, alias_names=alias_names)}"
     if type_.kind == TypeKind.DICT:
-        if type_.fields:
-            return _shape_display(type_.fields, prefix="", suffix="", alias_names=alias_names)
+        if type_.dynamic_entries or type_.fields:
+            return _dict_shape_display(type_, alias_names=alias_names)
         if type_.key_type is not None or type_.value_type is not None:
-            key = _type_display(type_.key_type, alias_names=alias_names) if type_.key_type is not None else "unknown"
-            value = _type_display(type_.value_type, alias_names=alias_names) if type_.value_type is not None else "unknown"
+            key = _type_display(type_.key_type, alias_names=alias_names) if type_.key_type is not None else "无法推导"
+            value = _type_display(type_.value_type, alias_names=alias_names) if type_.value_type is not None else "无法推导"
             return f"{{ {key}: {value} }}"
         return "Dict"
     if type_.kind == TypeKind.STRUCT:
+        if type_.name and type_.name not in {"struct", "shape", "unknown"}:
+            return type_.name
         if type_.fields:
             return _shape_display(type_.fields, prefix="struct ", suffix="", alias_names=alias_names)
         return type_.name or "struct"
     if type_.kind in (TypeKind.ARRAY, TypeKind.LIST):
         element = _type_display(type_.element_type, alias_names=alias_names)
+        if type_.element_type is not None and type_.element_type.kind == TypeKind.FUNCTION:
+            element = f"({element})"
         return f"{element}[]" if type_.kind == TypeKind.ARRAY else f"List<{element}>"
     if type_.kind == TypeKind.VEC:
         return f"Vec<{_type_display(type_.element_type, alias_names=alias_names)}>[{type_.vec_size}]"
@@ -964,12 +1075,24 @@ def _type_display(type_: Type | None, alias_names: set[str] | None = None) -> st
         return f"*{_type_display(type_.pointee_type, alias_names=alias_names)}"
     if type_.kind == TypeKind.WEAK_REF:
         return f"#{_type_display(type_.referent_type or type_.element_type, alias_names=alias_names)}"
-    return type_.name or "unknown"
+    return type_.name or "无法推导"
 
 
 def _shape_display(fields: dict[str, Type], prefix: str, suffix: str, alias_names: set[str] | None = None) -> str:
     parts = [f"{name}: {_type_display(field_type, alias_names=alias_names)}" for name, field_type in fields.items()]
     return f"{prefix}{{ {', '.join(parts)} }}{suffix}"
+
+
+def _dict_shape_display(type_: Type, alias_names: set[str] | None = None) -> str:
+    parts = [
+        f"[key: {_type_display(key_type, alias_names=alias_names)}]: {_type_display(value_type, alias_names=alias_names)}"
+        for key_type, value_type in type_.dynamic_entries
+    ]
+    parts.extend(
+        f"{name}: {_type_display(field_type, alias_names=alias_names)}"
+        for name, field_type in type_.fields.items()
+    )
+    return "{ " + "; ".join(parts) + " }"
 
 
 def _visible_type_declarations(source: str, uri: str, base_dir: Path, workspace_root: Path) -> dict[str, Declaration]:
@@ -992,7 +1115,7 @@ def _visible_type_declarations(source: str, uri: str, base_dir: Path, workspace_
 def _type_reference_links(detail: str, declarations: dict[str, Declaration], fallback_uri: str) -> list[str]:
     links: list[str] = []
     for name, declaration in declarations.items():
-        if declaration.kind != SymbolKind.TYPE_ALIAS:
+        if declaration.kind not in (SymbolKind.STRUCT, SymbolKind.TYPE_ALIAS):
             continue
         if re.search(rf"\b{re.escape(name)}\b", detail):
             links.append(_declaration_link(name, declaration, fallback_uri))

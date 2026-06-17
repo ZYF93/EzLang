@@ -8,7 +8,7 @@ from pathlib import Path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 
 from semantic.analyzer import SemanticAnalyzer, analyze
-from semantic.symbols import SymbolKind
+from semantic.symbols import SymbolKind, TypeKind
 from cli import ez
 
 
@@ -25,6 +25,34 @@ def markdown_ez_blocks(filepath: Path):
 
 DOC_SEMANTIC_SKIP = {
     ('docs/doc.md', 9): 'extern 路径和跨平台库声明展示，依赖示例外部库文件',
+    ('docs/ez-android-ui.md', 2): 'Android API 摘要片段依赖同页前置 Node 等类型定义',
+    ('docs/ez-android-ui.md', 3): 'Android API 摘要片段依赖同页前置 Node 等类型定义',
+    ('docs/ez-android-ui.md', 4): 'Android API 摘要片段依赖同页前置 Node 等类型定义',
+    ('docs/ez-android-ui.md', 5): 'Android API 摘要片段依赖同页前置 Node/Color 等类型定义',
+    ('docs/ez-android-ui.md', 6): 'Android API 摘要片段依赖同页前置 Node/Color 等类型定义',
+    ('docs/ez-android-ui.md', 7): 'Android API 摘要片段依赖同页前置 Node/Blob 等类型定义',
+    ('docs/ez-android-ui.md', 8): 'Android API 摘要片段依赖同页前置事件处理类型定义',
+    ('docs/ez-android-ui.md', 9): 'Android API 摘要片段依赖同页前置 Node 等类型定义',
+    ('docs/ez-android-ui.md', 10): 'Android API 摘要片段依赖同页前置 Node/Color 等类型定义',
+    ('docs/ez-ios-ui.md', 2): 'iOS API 摘要片段依赖同页前置 Node 等类型定义',
+    ('docs/ez-ios-ui.md', 3): 'iOS API 摘要片段依赖同页前置 Node 等类型定义',
+    ('docs/ez-ios-ui.md', 4): 'iOS API 摘要片段依赖同页前置 Node 等类型定义',
+    ('docs/ez-ios-ui.md', 5): 'iOS API 摘要片段依赖同页前置 Node/Color 等类型定义',
+    ('docs/ez-ios-ui.md', 6): 'iOS API 摘要片段依赖同页前置 Node/Color 等类型定义',
+    ('docs/ez-ios-ui.md', 7): 'iOS API 摘要片段依赖同页前置 Node/Blob 等类型定义',
+    ('docs/ez-ios-ui.md', 8): 'iOS API 摘要片段依赖同页前置 Node/Color 等类型定义',
+    ('docs/ez-ios-ui.md', 9): 'iOS API 摘要片段依赖同页前置事件处理类型定义',
+    ('docs/ez-ios-ui.md', 10): 'iOS API 摘要片段依赖同页前置 Node 等类型定义',
+    ('docs/ez-ios-ui.md', 11): 'iOS API 摘要片段依赖同页前置 Insets 等类型定义',
+    ('docs/ez-web-ui.md', 2): 'Web API 摘要片段依赖同页前置 Node 等类型定义',
+    ('docs/ez-web-ui.md', 3): 'Web API 摘要片段依赖同页前置 Node 等类型定义',
+    ('docs/ez-web-ui.md', 4): 'Web API 摘要片段依赖同页前置 Node 等类型定义',
+    ('docs/ez-web-ui.md', 5): 'Web API 摘要片段依赖同页前置 Node 等类型定义',
+    ('docs/ez-web-ui.md', 6): 'Web API 摘要片段依赖同页前置 Node 等类型定义',
+    ('docs/ez-web-ui.md', 7): 'Web API 摘要片段依赖同页前置 Node/Handler 等类型定义',
+    ('docs/ez-web-ui.md', 8): 'Web API 摘要片段依赖同页前置 Node 等类型定义',
+    ('docs/ez-web-ui.md', 9): 'Web API 摘要片段依赖同页前置 Node 等类型定义',
+    ('docs/ez-web-ui.md', 11): 'Web API 摘要片段依赖同页前置 Node 等类型定义',
 }
 
 
@@ -546,7 +574,7 @@ class TestSemantic:
         assert any("同名工厂函数 'text'" in e for e in anal.symbols.errors), anal.symbols.errors
         ui = anal.symbols.resolve('ui')
         assert ui is not None
-        assert ui.type.name == 'unknown'
+        assert ui.type is None
 
     def test_markup_literal_lowers_to_factory_type(self):
         """存在同名工厂函数时，标记字面量返回工厂函数的返回类型。"""
@@ -744,6 +772,97 @@ class TestSemantic:
         assert s.type.value_type.name == 'Str'
         assert 'name' in s.type.fields
 
+    def test_mixed_dynamic_shape_merges_fixed_field_value_types(self):
+        """动态字典形状的值类型应包含固定字段类型，点访问固定字段应返回精确类型。"""
+        anal = analyze('''
+        type Ax = { [key: Str]: Str; v: I32 };
+        const b: Ax = { x = "1"; v = 1 };
+        const c = b.v;
+        const d = b.x;
+        const x = b["x"];
+        const fixed = b["v"];
+        ''')
+        assert not anal.symbols.has_errors(), f'不应有语义错误: {anal.symbols.errors}'
+        assert not any('字典值类型不一致' in w for w in anal.symbols.warnings), anal.symbols.warnings
+        b = anal.symbols.resolve('b')
+        c = anal.symbols.resolve('c')
+        d = anal.symbols.resolve('d')
+        x = anal.symbols.resolve('x')
+        fixed = anal.symbols.resolve('fixed')
+        assert b is not None and b.type is not None
+        assert b.type.value_type.kind == TypeKind.UNION
+        assert [member.name for member in b.type.value_type.union_types] == ['Str', 'I32']
+        assert c is not None and c.type is not None and c.type.name == 'I32'
+        assert d is not None and d.type is not None and d.type.name == 'Str'
+        assert x is not None and x.type is not None and x.type.name == 'Str'
+        assert fixed is not None and fixed.type is not None and fixed.type.name == 'I32'
+
+    def test_multiple_dynamic_shape_keys_infer_by_key_type(self):
+        """多条动态 key 规则应按 key 类型选择对应 value 类型。"""
+        anal = analyze('''
+        type Multi = {
+            [name: Str]: Str;
+            [index: I32]: I32;
+            [enabled: Bool]: (value: I32) => Str;
+            items: List<I32>;
+        };
+        const m: Multi = {
+            name = "ez";
+            [1] = 42;
+            [true] = (value: I32): Str => { return "ok"; };
+            items = [1, 2];
+        };
+        const s = m.name;
+        const i = m[1];
+        const f = m[true];
+        const items = m.items;
+        ''')
+        assert not anal.symbols.has_errors(), f'不应有语义错误: {anal.symbols.errors}'
+        s = anal.symbols.resolve('s')
+        i = anal.symbols.resolve('i')
+        f = anal.symbols.resolve('f')
+        items = anal.symbols.resolve('items')
+        assert s is not None and s.type is not None and s.type.name == 'Str'
+        assert i is not None and i.type is not None and i.type.name == 'I32'
+        assert f is not None and f.type is not None and f.type.kind == TypeKind.FUNCTION
+        assert f.type.return_type.name == 'Str'
+        assert items is not None and items.type is not None and items.type.kind == TypeKind.LIST
+
+    def test_dynamic_shape_keeps_complex_value_types(self):
+        """动态 key 的 value 类型可以是结构体、Dict、List 和函数等复合类型。"""
+        anal = analyze('''
+        struct Box { value: I32; };
+        type Complex = {
+            [id: I32]: Box;
+            [name: Str]: { [key: Str]: I32 };
+            [enabled: Bool]: (value: I32) => Str;
+            list: List<Box>;
+        };
+        const c: Complex = {
+            [1] = Box(value = 1);
+            name = { count = 2 };
+            [true] = (value: I32): Str => { return "ok"; };
+            list = [Box(value = 3)];
+        };
+        const byId = c[1];
+        const byName = c.name;
+        const byBool = c[true];
+        const list = c.list;
+        ''')
+        assert not anal.symbols.has_errors(), f'不应有语义错误: {anal.symbols.errors}'
+        by_id = anal.symbols.resolve('byId')
+        by_name = anal.symbols.resolve('byName')
+        by_bool = anal.symbols.resolve('byBool')
+        list_value = anal.symbols.resolve('list')
+        assert by_id is not None and by_id.type is not None and by_id.type.name == 'Box'
+        assert by_name is not None and by_name.type is not None and by_name.type.kind == TypeKind.DICT
+        assert by_name.type.key_type.name == 'Str'
+        assert by_name.type.value_type.name == 'I32'
+        assert by_bool is not None and by_bool.type is not None and by_bool.type.kind == TypeKind.FUNCTION
+        assert by_bool.type.return_type.name == 'Str'
+        assert list_value is not None and list_value.type is not None and list_value.type.kind == TypeKind.LIST
+        assert list_value.type.element_type.name == 'Box'
+
     def test_shape_dict_literal_reports_missing_required_field(self):
         """固定 Shape 对象字面量缺字段应报错。"""
         anal = analyze('type Shape = { name: Str; side: Str; }; let s: Shape = { name = "Square"; };')
@@ -881,6 +1000,38 @@ class TestSemantic:
         explicit = anal.symbols.resolve('explicit')
         assert inferred is not None and inferred.type is not None and inferred.type.name == 'I32'
         assert explicit is not None and explicit.type is not None and explicit.type.name == 'I32'
+
+    def test_function_decl_infers_missing_return_type(self):
+        """函数没有显式返回类型时，应从 return/表达式体推导；无返回则为 Void。"""
+        anal = analyze('''
+        const fromBlock = () => { return 1; };
+        const fromExpr = () => "ok";
+        const noReturn = () => { let x: I32 = 1; };
+        const a = fromBlock();
+        const b = fromExpr();
+        const c = noReturn();
+        ''')
+        assert not anal.symbols.has_errors(), f'不应有语义错误: {anal.symbols.errors}'
+        from_block = anal.symbols.resolve('fromBlock')
+        from_expr = anal.symbols.resolve('fromExpr')
+        no_return = anal.symbols.resolve('noReturn')
+        a = anal.symbols.resolve('a')
+        b = anal.symbols.resolve('b')
+        c = anal.symbols.resolve('c')
+        assert from_block.type.return_type.name == 'I32'
+        assert from_expr.type.return_type.name == 'Str'
+        assert no_return.type.return_type.name == 'Void'
+        assert a.type.name == 'I32'
+        assert b.type.name == 'Str'
+        assert c.type.name == 'Void'
+
+    def test_member_access_on_non_member_type_reports_error(self):
+        """基本类型等非成员类型不能静默接受点访问。"""
+        anal = analyze('''
+        const copied: I32 = 1;
+        const bad = copied.v;
+        ''')
+        assert any("类型 'I32' 没有字段 'v'" in e for e in anal.symbols.errors), anal.symbols.errors
 
     def test_generic_struct_explicit_args_instantiate_fields(self):
         """显式泛型结构体实参应替换字段类型。"""
@@ -1021,6 +1172,31 @@ class TestSemantic:
         ''')
         assert not anal.symbols.errors, f'不应产生语义错误: {anal.symbols.errors}'
         assert not anal.symbols.warnings, f'不应产生语义警告: {anal.symbols.warnings}'
+
+    def test_weak_reference_unwraps_for_calculation_type(self):
+        """#T 在计算上下文中按 T 推导，表达式结果不保留弱引用包装。"""
+        anal = analyze('''
+        let value: I32 = 40;
+        let ref: #I32 = #value;
+        const sum = ref + 2;
+        ''')
+        assert not anal.symbols.errors, f'不应产生语义错误: {anal.symbols.errors}'
+        sym = anal.symbols.resolve('sum')
+        assert sym is not None and sym.type is not None
+        assert sym.type.kind == TypeKind.BASIC
+        assert sym.type.name == 'I32'
+
+    def test_weak_reference_rejects_literals_and_temporary_values(self):
+        """#expr 只能用于有稳定地址的表达式，不能弱引用字面量或临时计算结果。"""
+        anal = analyze('''
+        let a = #1;
+        let b = #"text";
+        let value: I32 = 1;
+        let c = #(value + 1);
+        ''')
+        errors = anal.symbols.errors
+        assert len(errors) == 3
+        assert all("弱引用 '#' 只能用于变量、字段或索引等可寻址表达式" in err for err in errors)
 
     def test_struct_init_wrong_field(self):
         """结构体构造使用不存在的字段应警告"""
@@ -1217,14 +1393,28 @@ class TestSemantic:
         assert sym is not None
         assert sym.type.name == 'Str'
 
-    def test_race_pl_rejects_mismatched_branch_return_types(self):
-        """race(pl) 分支返回类型不一致时应给出语义错误。"""
+    def test_race_pl_merges_mixed_branch_returns_as_union(self):
+        """race(pl) 多种分支返回类型应合并为 union。"""
         anal = analyze('''
         const r = flow {
             return race(pl = [() => { return "a"; }, () => { return 1; }], timeout = 10);
         };
         ''')
-        assert any('race(pl) 分支返回类型不一致' in e for e in anal.symbols.errors)
+        assert not anal.symbols.has_errors(), f'语义错误: {anal.symbols.errors}'
+        sym = anal.symbols.resolve('r')
+        assert sym is not None and sym.type is not None
+        assert sym.type.kind == TypeKind.UNION
+        assert [member.name for member in sym.type.union_types] == ['Str', 'I32']
+
+    def test_array_literal_infers_function_element_type(self):
+        """数组字面量中的函数元素应自动推导函数类型。"""
+        anal = analyze('const pl = [() => { return 1; }, () => { return 2; }];')
+        assert not anal.symbols.has_errors(), f'语义错误: {anal.symbols.errors}'
+        sym = anal.symbols.resolve('pl')
+        assert sym is not None and sym.type is not None
+        assert sym.type.kind == TypeKind.ARRAY
+        assert sym.type.element_type.kind == TypeKind.FUNCTION
+        assert sym.type.element_type.return_type.name == 'I32'
 
     def test_flow_dependency_records_reads(self):
         """读取 suspend 结果应记录数据流依赖"""

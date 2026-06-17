@@ -921,6 +921,34 @@ class TestCodegen:
         binding.parse_assembly(ir_text).verify()
         assert '{i1, %"Box"*}' in ir_text
 
+    def test_weak_reference_unwraps_for_calculation(self):
+        """#I32 在计算时解包为 I32 值。"""
+        source = '''
+        const run = (): I32 => {
+            let value: I32 = 40;
+            let ref: #I32 = #value;
+            return ref + 2;
+        };
+        '''
+        module, errors, _ = compile_source(source)
+        assert module is not None
+        assert len(errors) == 0, f'编译错误: {errors}'
+        ir_text = str(module)
+        binding.parse_assembly(ir_text).verify()
+        assert '_weak_calc_unwrapped' in ir_text
+
+    def test_weak_reference_rejects_literals_and_temporary_values(self):
+        """codegen 入口也应拒绝字面量和临时值弱引用。"""
+        source = '''
+        let a = #1;
+        let b = #"text";
+        let value: I32 = 1;
+        let c = #(value + 1);
+        '''
+        _, errors, _ = compile_source(source)
+        assert len(errors) == 3
+        assert all("弱引用 '#' 只能用于变量、字段或索引等可寻址表达式" in err for err in errors)
+
     def test_union_type(self):
         """联合类型 T1 | T2 映射为 {i32, T_max}"""
         source = 'let y: I32 | Str = 42;'

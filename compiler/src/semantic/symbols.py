@@ -42,6 +42,8 @@ class Type:
         self.element_type: Optional[Type] = None   # 数组/List/Vec/Optional 的元素类型
         self.key_type: Optional[Type] = None       # Dict 的键类型
         self.value_type: Optional[Type] = None     # Dict 的值类型
+        self.dynamic_entries: list[tuple[Type, Type]] = []  # 动态 key 规则 [(key_type, value_type)]
+        self.dynamic_value_type: Optional[Type] = None       # 动态 key 的合并 value 类型
         self.vec_size: int = 0                     # Vec 的元素数量
         self.param_types: list[Type] = []          # 函数参数类型
         self.param_names: list[str] = []           # 函数参数名（按顺序）
@@ -58,6 +60,11 @@ class Type:
         if self.kind == TypeKind.LIST:
             return f"List<{self.element_type}>"
         if self.kind == TypeKind.DICT:
+            if self.dynamic_entries:
+                entries = "; ".join(f"[{k}]: {v}" for k, v in self.dynamic_entries)
+                fields = "; ".join(f"{name}: {type_}" for name, type_ in self.fields.items())
+                body = "; ".join(part for part in (entries, fields) if part)
+                return f"{{ {body} }}"
             if self.key_type is not None and self.value_type is not None:
                 return f"Dict<{self.key_type}, {self.value_type}>"
             return "Dict"
@@ -87,7 +94,12 @@ class Type:
         if self.kind == TypeKind.ARRAY or self.kind == TypeKind.LIST or self.kind == TypeKind.OPTIONAL:
             return self.element_type == other.element_type
         if self.kind == TypeKind.DICT:
-            return self.key_type == other.key_type and self.value_type == other.value_type
+            return (
+                self.key_type == other.key_type
+                and self.value_type == other.value_type
+                and self.fields == other.fields
+                and self.dynamic_entries == other.dynamic_entries
+            )
         if self.kind == TypeKind.VEC:
             return self.element_type == other.element_type and self.vec_size == other.vec_size
         if self.kind == TypeKind.UNION:
@@ -138,6 +150,23 @@ class Type:
                 return True
             return self.element_type.compatible_with(other.element_type)
         if self.kind == TypeKind.DICT and other.kind == TypeKind.DICT:
+            if self.fields:
+                for field_name, field_type in self.fields.items():
+                    other_field_type = other.fields.get(field_name)
+                    if other_field_type is None or not field_type.compatible_with(other_field_type):
+                        return False
+            if self.dynamic_entries:
+                other_entries = other.dynamic_entries or [(other.key_type, other.dynamic_value_type or other.value_type)]
+                for key_type, value_type in self.dynamic_entries:
+                    if not any(
+                        other_key is not None
+                        and other_value is not None
+                        and key_type.compatible_with(other_key)
+                        and value_type.compatible_with(other_value)
+                        for other_key, other_value in other_entries
+                    ):
+                        return False
+                return True
             if self.key_type is None or self.value_type is None:
                 return True
             if other.key_type is None or other.value_type is None:

@@ -170,7 +170,7 @@ const dict: Dict<Str, I32>;
     alias_hover = server._hover({"textDocument": {"uri": uri}, "position": {"line": 3, "character": 28}})
 
     assert data_hover is not None
-    assert "data: struct { val: I32 }" in data_hover["contents"]["value"]
+    assert "data: Data" in data_hover["contents"]["value"]
     assert fn_hover is not None
     assert "fn: (name: Str) => Named" in fn_hover["contents"]["value"]
     assert dict_hover is not None
@@ -178,6 +178,205 @@ const dict: Dict<Str, I32>;
     assert alias_hover is not None
     assert "Named" in alias_hover["contents"]["value"]
     assert "[Named](file:///tmp/main.ez#L2," in fn_hover["contents"]["value"]
+    assert "[Data](file:///tmp/main.ez#L3," in data_hover["contents"]["value"]
+
+
+def test_lsp_hover_infers_weak_reference_calculation_value_type():
+    server = EzLanguageServer()
+    uri = "file:///tmp/main.ez"
+    server.documents[uri] = '''
+const main = (): I32 => {
+    let value: I32 = 40;
+    let ref: #I32 = #value;
+    const sum = ref + 2;
+    return sum;
+};
+'''
+
+    sum_hover = server._hover({"textDocument": {"uri": uri}, "position": {"line": 4, "character": 12}})
+
+    assert sum_hover is not None
+    assert "sum: I32" in sum_hover["contents"]["value"]
+
+
+def test_lsp_hover_infers_control_flow_local_values():
+    server = EzLanguageServer()
+    uri = "file:///tmp/main.ez"
+    server.documents[uri] = '''
+const main = (): I32 => {
+    const value = flow {
+        const p = parallel {
+            return 7;
+        };
+        const fastest = race(pl = [
+            () => { return 1; },
+            () => { return 2; },
+        ]);
+        return p + fastest;
+    };
+    return value;
+};
+'''
+
+    value_hover = server._hover({"textDocument": {"uri": uri}, "position": {"line": 2, "character": 12}})
+    parallel_hover = server._hover({"textDocument": {"uri": uri}, "position": {"line": 3, "character": 15}})
+    race_hover = server._hover({"textDocument": {"uri": uri}, "position": {"line": 6, "character": 17}})
+
+    assert value_hover is not None
+    assert "value: I32" in value_hover["contents"]["value"]
+    assert parallel_hover is not None
+    assert "p: I32" in parallel_hover["contents"]["value"]
+    assert race_hover is not None
+    assert "fastest: I32" in race_hover["contents"]["value"]
+
+    call_hover = server._hover({"textDocument": {"uri": uri}, "position": {"line": 6, "character": 25}})
+    assert call_hover is not None
+    assert "race: (pl: (() => I32)[], timeout: I32) => I32" in call_hover["contents"]["value"]
+
+
+def test_lsp_hover_race_displays_union_return_and_function_pl():
+    server = EzLanguageServer()
+    uri = "file:///tmp/main.ez"
+    server.documents[uri] = '''
+const main = (): I32 => {
+    const value = flow {
+        const fastest = race(pl = [
+            () => { return "a"; },
+            () => { return 2; },
+        ]);
+        return fastest.value;
+    };
+    return value;
+};
+'''
+
+    call_hover = server._hover({"textDocument": {"uri": uri}, "position": {"line": 3, "character": 25}})
+    fastest_hover = server._hover({"textDocument": {"uri": uri}, "position": {"line": 3, "character": 15}})
+
+    assert call_hover is not None
+    assert "race: (pl: (() => Str | I32)[], timeout: I32) => Str | I32" in call_hover["contents"]["value"]
+    assert fastest_hover is not None
+    assert "fastest: Str | I32" in fastest_hover["contents"]["value"]
+
+
+def test_lsp_hover_displays_generic_function_params(tmp_path):
+    server = EzLanguageServer()
+    server.workspace_root = ROOT
+    uri = tmp_path.joinpath("main.ez").as_uri()
+    server.documents[uri] = '''
+from "std/fmt" import { toString };
+const id<T> = (value: T): T => { return value; };
+const expr = <T>(value: T): Str => { return toString<T>(value = value); };
+'''
+
+    imported_hover = server._hover({"textDocument": {"uri": uri}, "position": {"line": 1, "character": 26}})
+    declared_hover = server._hover({"textDocument": {"uri": uri}, "position": {"line": 2, "character": 8}})
+    expr_hover = server._hover({"textDocument": {"uri": uri}, "position": {"line": 3, "character": 8}})
+
+    assert imported_hover is not None
+    assert "toString: <T>(value: T) => Str" in imported_hover["contents"]["value"]
+    assert declared_hover is not None
+    assert "id: <T>(value: T) => T" in declared_hover["contents"]["value"]
+    assert expr_hover is not None
+    assert "expr: <T>(value: T) => Str" in expr_hover["contents"]["value"]
+
+
+def test_lsp_hover_displays_inferred_generic_call_signature(tmp_path):
+    server = EzLanguageServer()
+    server.workspace_root = ROOT
+    uri = tmp_path.joinpath("main.ez").as_uri()
+    server.documents[uri] = '''
+from "std/fmt" import { toString };
+const copied: I32 = 1;
+const text = toString(value = copied);
+'''
+
+    call_hover = server._hover({"textDocument": {"uri": uri}, "position": {"line": 3, "character": 14}})
+
+    assert call_hover is not None
+    assert "toString: (value: I32) => Str" in call_hover["contents"]["value"]
+    assert "<T>" not in call_hover["contents"]["value"]
+
+
+def test_lsp_hover_uses_precise_dict_field_and_inferred_function_return():
+    server = EzLanguageServer()
+    uri = "file:///tmp/main.ez"
+    server.documents[uri] = '''
+type Ax = { [key: Str]: Str; v: I32 };
+const b: Ax = { x = "1"; v = 1 };
+const c = b.x;
+const f = () => { return c; };
+const noop = () => { let x: I32 = 1; };
+'''
+
+    b_hover = server._hover({"textDocument": {"uri": uri}, "position": {"line": 2, "character": 6}})
+    c_hover = server._hover({"textDocument": {"uri": uri}, "position": {"line": 3, "character": 6}})
+    f_hover = server._hover({"textDocument": {"uri": uri}, "position": {"line": 4, "character": 6}})
+    noop_hover = server._hover({"textDocument": {"uri": uri}, "position": {"line": 5, "character": 8}})
+
+    assert b_hover is not None
+    assert "b: Ax" in b_hover["contents"]["value"]
+    assert c_hover is not None
+    assert "c: Str" in c_hover["contents"]["value"]
+    assert f_hover is not None
+    assert "f: () => Str" in f_hover["contents"]["value"]
+    assert noop_hover is not None
+    assert "noop: () => Void" in noop_hover["contents"]["value"]
+
+
+def test_lsp_hover_displays_multiple_dynamic_key_rules():
+    server = EzLanguageServer()
+    uri = "file:///tmp/main.ez"
+    server.documents[uri] = '''
+type Multi = {
+    [name: Str]: Str;
+    [index: I32]: I32;
+    [enabled: Bool]: (value: I32) => Str;
+    items: List<I32>;
+};
+const m: Multi = { name = "ez"; [1] = 42; [true] = (value: I32): Str => { return "ok"; }; items = [1, 2]; };
+const i = m[1];
+const f = m[true];
+'''
+
+    type_hover = server._hover({"textDocument": {"uri": uri}, "position": {"line": 1, "character": 6}})
+    i_hover = server._hover({"textDocument": {"uri": uri}, "position": {"line": 8, "character": 6}})
+    f_hover = server._hover({"textDocument": {"uri": uri}, "position": {"line": 9, "character": 6}})
+
+    assert type_hover is not None
+    assert "[key: Str]: Str" in type_hover["contents"]["value"]
+    assert "[key: I32]: I32" in type_hover["contents"]["value"]
+    assert "[key: Bool]: (value: I32) => Str" in type_hover["contents"]["value"]
+    assert "items: List<I32>" in type_hover["contents"]["value"]
+    assert i_hover is not None
+    assert "i: I32" in i_hover["contents"]["value"]
+    assert f_hover is not None
+    assert "f: (value: I32) => Str" in f_hover["contents"]["value"]
+
+
+def test_lsp_completion_suggests_member_fields_after_dot():
+    server = EzLanguageServer()
+    uri = "file:///tmp/main.ez"
+    server.documents[uri] = '''
+type Ax = { [key: Str]: Str; v: I32 };
+struct Data { name: Str; count: I32; };
+const b: Ax = { x = "1"; v = 1 };
+const data = Data(name = "ez", count = 1);
+const fromDict = b.
+const fromStruct = data.
+'''
+
+    dict_completion = server._completion({"textDocument": {"uri": uri}, "position": {"line": 5, "character": 19}})
+    struct_completion = server._completion({"textDocument": {"uri": uri}, "position": {"line": 6, "character": 24}})
+
+    dict_items = {item["label"]: item for item in dict_completion["items"]}
+    struct_items = {item["label"]: item for item in struct_completion["items"]}
+    assert "v" in dict_items
+    assert dict_items["v"]["detail"] == "I32"
+    assert "name" in struct_items
+    assert struct_items["name"]["detail"] == "Str"
+    assert "count" in struct_items
+    assert struct_items["count"]["detail"] == "I32"
 
 
 def test_lsp_semantic_tokens_marks_named_argument_and_suspend(tmp_path):
