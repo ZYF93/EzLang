@@ -358,13 +358,12 @@ class EzLanguageServer:
         token_label = TOKEN_TYPES.get(word.upper())
         if token_label:
             return {"contents": {"kind": "markdown", "value": f"`{word}`\n\nEzLang {token_label}"}}
-        line = int(position.get("line", 0))
-        character = int(position.get("character", 0))
         _, analyzer = analyze_document_with_workspace(text, self._base_dir_for_uri(uri, text), self.workspace_root)
         if analyzer is not None:
             symbol = analyzer.symbols.global_scope.symbols.get(word)
             if symbol is not None:
-                return {"contents": {"kind": "markdown", "value": _symbol_markdown(symbol)}}
+                type_declarations = _visible_type_declarations(text, uri, self._base_dir_for_uri(uri, text), self.workspace_root)
+                return {"contents": {"kind": "markdown", "value": _symbol_markdown(symbol, type_declarations, uri)}}
         declaration = declaration_at(text, word, self._base_dir_for_uri(uri, text), self.workspace_root)
         if declaration is not None:
             return {"contents": {"kind": "markdown", "value": _declaration_markdown(declaration)}}
@@ -916,72 +915,95 @@ def _declaration_completion(declaration: Declaration) -> dict[str, Any]:
     return {"label": declaration.name, "kind": kind, "detail": declaration.kind.name.lower()}
 
 
-def _symbol_markdown(symbol: Symbol) -> str:
-    detail = _type_display(symbol.type) if symbol.type is not None else symbol.kind.name.lower()
+def _symbol_markdown(symbol: Symbol, type_declarations: dict[str, Declaration] | None = None, fallback_uri: str = "") -> str:
+    type_declarations = type_declarations or {}
+    alias_names = {name for name, declaration in type_declarations.items() if declaration.kind == SymbolKind.TYPE_ALIAS}
+    detail = _type_display(symbol.type, alias_names=alias_names) if symbol.type is not None else symbol.kind.name.lower()
     label = "type" if symbol.kind in (SymbolKind.STRUCT, SymbolKind.TYPE_ALIAS) else symbol.kind.name.lower()
-    return f"```ez\n{symbol.name}: {detail}\n```\n\n{label}"
+    lines = [f"```ez\n{symbol.name}: {detail}\n```", label]
+    links = _type_reference_links(detail, type_declarations, fallback_uri)
+    if links:
+        lines.append("定义: " + ", ".join(links))
+    return "\n\n".join(lines)
 
 
-def _type_display(type_: Type | None) -> str:
+def _type_display(type_: Type | None, alias_names: set[str] | None = None) -> str:
+    alias_names = alias_names or set()
     if type_ is None:
         return "unknown"
+    if type_.name in alias_names:
+        return type_.name
     if type_.kind == TypeKind.FUNCTION:
         params: list[str] = []
         for index, param_type in enumerate(type_.param_types):
             name = type_.param_names[index] if index < len(type_.param_names) else f"arg{index + 1}"
-            params.append(f"{name}: {_type_display(param_type)}")
-        return f"({', '.join(params)}) => {_type_display(type_.return_type)}"
+            params.append(f"{name}: {_type_display(param_type, alias_names=alias_names)}")
+        return f"({', '.join(params)}) => {_type_display(type_.return_type, alias_names=alias_names)}"
     if type_.kind == TypeKind.DICT:
         if type_.fields:
-            return _shape_display(type_.fields, prefix="", suffix="")
+            return _shape_display(type_.fields, prefix="", suffix="", alias_names=alias_names)
         if type_.key_type is not None or type_.value_type is not None:
-            key = _type_display(type_.key_type) if type_.key_type is not None else "unknown"
-            value = _type_display(type_.value_type) if type_.value_type is not None else "unknown"
+            key = _type_display(type_.key_type, alias_names=alias_names) if type_.key_type is not None else "unknown"
+            value = _type_display(type_.value_type, alias_names=alias_names) if type_.value_type is not None else "unknown"
             return f"{{ {key}: {value} }}"
         return "Dict"
     if type_.kind == TypeKind.STRUCT:
         if type_.fields:
-            return _shape_display(type_.fields, prefix="struct ", suffix="")
+            return _shape_display(type_.fields, prefix="struct ", suffix="", alias_names=alias_names)
         return type_.name or "struct"
     if type_.kind in (TypeKind.ARRAY, TypeKind.LIST):
-        return f"{_type_display(type_.element_type)}[]" if type_.kind == TypeKind.ARRAY else f"List<{_type_display(type_.element_type)}>"
+        element = _type_display(type_.element_type, alias_names=alias_names)
+        return f"{element}[]" if type_.kind == TypeKind.ARRAY else f"List<{element}>"
     if type_.kind == TypeKind.VEC:
-        return f"Vec<{_type_display(type_.element_type)}>[{type_.vec_size}]"
+        return f"Vec<{_type_display(type_.element_type, alias_names=alias_names)}>[{type_.vec_size}]"
     if type_.kind == TypeKind.OPTIONAL:
-        return f"{_type_display(type_.element_type)}?"
+        return f"{_type_display(type_.element_type, alias_names=alias_names)}?"
     if type_.kind == TypeKind.UNION:
-        return " | ".join(_type_display(member) for member in type_.union_types)
+        return " | ".join(_type_display(member, alias_names=alias_names) for member in type_.union_types)
     if type_.kind == TypeKind.POINTER:
-        return f"*{_type_display(type_.pointee_type)}"
+        return f"*{_type_display(type_.pointee_type, alias_names=alias_names)}"
     if type_.kind == TypeKind.WEAK_REF:
-        return f"#{_type_display(type_.referent_type or type_.element_type)}"
+        return f"#{_type_display(type_.referent_type or type_.element_type, alias_names=alias_names)}"
     return type_.name or "unknown"
 
 
-def _shape_display(fields: dict[str, Type], prefix: str, suffix: str) -> str:
-    parts = [f"{name}: {_type_display(field_type)}" for name, field_type in fields.items()]
+def _shape_display(fields: dict[str, Type], prefix: str, suffix: str, alias_names: set[str] | None = None) -> str:
+    parts = [f"{name}: {_type_display(field_type, alias_names=alias_names)}" for name, field_type in fields.items()]
     return f"{prefix}{{ {', '.join(parts)} }}{suffix}"
 
 
-def _is_declaration_position(source: str, word: str, line: int, character: int) -> bool:
-    lines = source.splitlines()
-    if line < 0 or line >= len(lines):
-        return False
-    current = lines[line]
-    character = min(max(character, 0), len(current))
-    left = character
-    while left > 0 and re.match(r"[A-Za-z0-9_$]", current[left - 1]):
-        left -= 1
-    right = left + len(word)
-    prefix = current[:left]
-    suffix = current[right:]
-    return bool(
-        re.search(r"\b(?:let|const|static)\s+$", prefix)
-        or re.search(r"\bstruct\s+$", prefix)
-        or re.search(r"\btype\s+$", prefix)
-        or re.search(r"\bdeclare\s+(?:let|const|static)\s+$", prefix)
-        or re.match(r"\s*[:=]", suffix)
-    )
+def _visible_type_declarations(source: str, uri: str, base_dir: Path, workspace_root: Path) -> dict[str, Declaration]:
+    """收集 hover 中可引用的本地与导入类型声明。"""
+    declarations = {
+        name: declaration
+        for name, declaration in index_document(source, uri).items()
+        if declaration.kind in (SymbolKind.STRUCT, SymbolKind.TYPE_ALIAS)
+    }
+    for binding in _import_bindings(source):
+        module_file = _resolve_module_path(binding.module, base_dir, workspace_root)
+        if module_file is None:
+            continue
+        imported = _index_file(module_file).get(binding.source_name)
+        if imported is not None and imported.kind in (SymbolKind.STRUCT, SymbolKind.TYPE_ALIAS):
+            declarations[binding.name] = imported
+    return declarations
+
+
+def _type_reference_links(detail: str, declarations: dict[str, Declaration], fallback_uri: str) -> list[str]:
+    links: list[str] = []
+    for name, declaration in declarations.items():
+        if declaration.kind != SymbolKind.TYPE_ALIAS:
+            continue
+        if re.search(rf"\b{re.escape(name)}\b", detail):
+            links.append(_declaration_link(name, declaration, fallback_uri))
+    return links
+
+
+def _declaration_link(label: str, declaration: Declaration, fallback_uri: str) -> str:
+    target_uri = declaration.uri or fallback_uri
+    fragment = f"#L{declaration.line + 1},{declaration.character + 1}"
+    return f"[{label}]({target_uri}{fragment})"
+
 
 
 def _dedupe_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:

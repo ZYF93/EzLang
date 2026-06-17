@@ -152,6 +152,34 @@ def test_lsp_hover_describes_builtin_types():
     assert "32 位有符号整数" in int_hover["contents"]["value"]
 
 
+def test_lsp_hover_prefers_inferred_type_summary():
+    server = EzLanguageServer()
+    uri = "file:///tmp/main.ez"
+    server.documents[uri] = '''
+type Named = { name: Str };
+struct Data { val: I32; };
+const create = (name: Str): Named => { return { name = name }; };
+const data = Data(val = 1);
+const fn = create;
+const dict: Dict<Str, I32>;
+'''
+
+    data_hover = server._hover({"textDocument": {"uri": uri}, "position": {"line": 4, "character": 7}})
+    fn_hover = server._hover({"textDocument": {"uri": uri}, "position": {"line": 5, "character": 7}})
+    dict_hover = server._hover({"textDocument": {"uri": uri}, "position": {"line": 6, "character": 7}})
+    alias_hover = server._hover({"textDocument": {"uri": uri}, "position": {"line": 3, "character": 28}})
+
+    assert data_hover is not None
+    assert "data: struct { val: I32 }" in data_hover["contents"]["value"]
+    assert fn_hover is not None
+    assert "fn: (name: Str) => Named" in fn_hover["contents"]["value"]
+    assert dict_hover is not None
+    assert "dict: { Str: I32 }" in dict_hover["contents"]["value"]
+    assert alias_hover is not None
+    assert "Named" in alias_hover["contents"]["value"]
+    assert "[Named](file:///tmp/main.ez#L2," in fn_hover["contents"]["value"]
+
+
 def test_lsp_semantic_tokens_marks_named_argument_and_suspend(tmp_path):
     source = '''
 from "std/io" import { println, readLine };
