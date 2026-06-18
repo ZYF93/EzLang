@@ -1,6 +1,10 @@
 # EzLang CLI 使用手册
 
+[English](en/cli-manual.md)
+
 EzLang CLI 入口位于 [cli/ez.py](../cli/ez.py)。在仓库根目录执行 `pip install -e .` 后会注册本地命令 `ez`。常用命令如下。
+
+本篇聚焦命令行为和参数速查；`project.toml` 字段、目标平台和 VS Code/LSP 配置的完整说明见 [工具链与项目配置指南](toolchain.md)。
 
 ## 查看帮助
 

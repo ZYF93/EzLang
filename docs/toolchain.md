@@ -1,6 +1,10 @@
 # EzLang 工具链与项目配置指南
 
+[English](en/toolchain.md)
+
 EzLang 提供了开箱即用的命令行工具链（CLI），并采用 `project.toml` 作为标准的项目配置文件，用于管理项目元数据、编译产物、插件扩展和依赖关系。
+
+本篇聚焦 `project.toml`、目标平台和编辑器集成；命令参数速查见 [CLI 使用手册](cli-manual.md)。
 
 ---
 

@@ -1,5 +1,7 @@
 # EzLang 编译器架构
 
+[English](en/compiler-architecture.md)
+
 EzLang 编译器采用小型分层结构，目标是把 `.ez` 源码转换为 LLVM IR，并由 CLI 进一步生成目标平台对象文件。
 
 ## 编译阶段

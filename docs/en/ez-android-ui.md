@@ -1,26 +1,26 @@
-# ez-android-ui 包文档
+# ez-android-ui Package Documentation
 
-[English](en/ez-android-ui.md)
+[中文](../ez-android-ui.md)
 
-`ez-android-ui` 提供面向 `android` 目标的**原生 View 底层绑定**（基于 Android NDK + JNI）。包本身不做框架和调度——这些由使用者自行实现。所有 UI 原语均为同步 JNI 调用，**View 树修改必须在主线程执行**，包提供主线程调度桥接。
+`ez-android-ui` provides low-level native View bindings for the `android` target, based on Android NDK + JNI. The package does not provide a framework or scheduling; users implement those layers themselves. All UI primitives are synchronous JNI calls. **View tree mutations must run on the main thread**, and this package provides a main-thread scheduling bridge.
 
-> **当前实现状态**：仓库内已提供可编译链接的原生句柄状态层，可维护根视图、节点表、父子关系、文本、frame、可见性、屏幕尺寸与密度等基础状态；配置 `output.sdk` 构建 Android 目标且项目导入 `ez-android-ui` 时，CLI 会随 `lib<name>.so` 生成 `ez-android-ui-bridge/` 宿主模板（Activity、Manifest、CMake 入口），用于把动态库接入 Android 工程，并在 Activity 启动时把真实 `DisplayMetrics` 注入原生状态层。`runOnMainThread` / `scheduleFrame` 在最小句柄层内同步执行回调；真实 Android 主线程消息队列、事件分发与权限申请由宿主模板扩展实现，公开签名保持稳定。
+> **Current implementation status**: the repository provides a compilable/linkable native handle state layer. It can maintain root view, node table, parent/child relationships, text, frame, visibility, screen size, density, and related base state. When building an Android target with `output.sdk` and importing `ez-android-ui`, the CLI emits an `ez-android-ui-bridge/` host template next to `lib<name>.so` with Activity, Manifest, and CMake entrypoints. The template connects the dynamic library to an Android project and injects real `DisplayMetrics` into the native state layer when Activity starts. `runOnMainThread` / `scheduleFrame` execute callbacks synchronously in the minimal handle layer. Real Android main-thread message queue, event dispatch, and permission requests are extension points in the host template; public signatures stay stable.
 
-> **Fiber 调度可行性**：完全可行。EzLang 的 `flow` 已是协作式调度器，reconcile（差量计算）阶段在 `flow` 内并发运行；commit（View 修改）阶段通过 `runOnMainThread` 桥接回 UI 线程，架构与 React Native Fabric 一致。
+> **Fiber scheduling feasibility**: fully feasible. EzLang `flow` is already a cooperative scheduler. The reconcile phase can run concurrently inside `flow`, while the commit phase bridges back to the UI thread through `runOnMainThread`, matching the architecture of React Native Fabric.
 
-> **使用前提**：`project.toml` 中 `os = "android"`，`sdk` 指向 NDK 路径；构建产物中的 `ez-android-ui-bridge/` 可合并到 Gradle/Android Studio 工程。
+> **Requirement**: `project.toml` must use `os = "android"`, and `sdk` must point to the NDK path. The generated `ez-android-ui-bridge/` can be merged into a Gradle/Android Studio project.
 
 ---
 
-## 1. 核心类型
+## 1. Core Types
 
 ```ez
-// 不透明 View 句柄（JNI GlobalRef 的整数 ID）
+// Opaque View handle, integer ID for JNI GlobalRef
 struct Node {
     id: I32
 }
 
-// 事件类型
+// Event types
 struct TouchEvent {
     action: Str    // "down" | "up" | "move" | "cancel"
     x: F32
@@ -33,7 +33,7 @@ struct TextChangedEvent {
     count:  I32
 }
 
-// 通用事件处理函数类型
+// General event handler types
 type ClickHandler       = () => Void
 type TouchHandler       = (e: TouchEvent) => Void
 type TextChangeHandler  = (e: TextChangedEvent) => Void
@@ -45,64 +45,64 @@ type AdapterCreateItem  = (viewType: I32) => Node
 type AdapterBindItem    = (item: Node, index: I32) => Void
 type AdapterGetItemType = (index: I32) => I32
 
-// 颜色（ARGB 32 位整数）
+// Color, ARGB 32-bit integer
 struct Color {
     value: I32   // 0xAARRGGBB
 
     fromARGB = (a: I32, r: I32, g: I32, b: I32) => Color
-    fromHex  = (hex: Str) => Color   // "#RRGGBB" 或 "#AARRGGBB"
+    fromHex  = (hex: Str) => Color   // "#RRGGBB" or "#AARRGGBB"
 }
 
-// 尺寸单位
+// Units
 const dp: Str = "dp"
 const sp: Str = "sp"
 const px: Str = "px"
 
-// LayoutParams 常量
+// LayoutParams constants
 const matchParent: I32 = -1
 const wrapContent: I32 = -2
 ```
 
 ---
 
-## 2. View 创建
+## 2. View Creation
 
 ```ez
-// 通用 View（空白容器，对应 android.view.View）
+// Generic View, blank container corresponding to android.view.View
 declare const createView:         () => Node
 
-// 布局容器
+// Layout containers
 declare const createLinearLayout: (orientation: Str) => Node   // "vertical" | "horizontal"
 declare const createFrameLayout:  () => Node
-declare const createScrollView:   () => Node                   // 垂直滚动
-declare const createHScrollView:  () => Node                   // 水平滚动
-declare const createRecyclerView: () => Node                   // 列表容器
+declare const createScrollView:   () => Node                   // Vertical scroll
+declare const createHScrollView:  () => Node                   // Horizontal scroll
+declare const createRecyclerView: () => Node                   // List container
 
-// 文本
+// Text
 declare const createTextView:     () => Node
 declare const createEditText:     () => Node
 
-// 按钮
+// Buttons
 declare const createButton:       () => Node
 declare const createImageButton:  () => Node
 declare const createCheckBox:     () => Node
 declare const createRadioButton:  () => Node
 declare const createSwitch:       () => Node
 
-// 图像
+// Images
 declare const createImageView:    () => Node
 
-// 进度 / 输入
+// Progress / input
 declare const createProgressBar:  () => Node
 declare const createSeekBar:      () => Node
 
-// 销毁（释放 JNI GlobalRef）
+// Destroy, releasing JNI GlobalRef
 declare const destroyNode:        (node: Node) => Void
 ```
 
 ---
 
-## 3. View 树操作
+## 3. View Tree Operations
 
 ```ez
 declare const addView:       (parent: Node, child: Node) => Void
@@ -113,7 +113,7 @@ declare const getChildAt:    (parent: Node, index: I32) => Node?
 declare const getChildCount: (parent: Node) => I32
 declare const getParent:     (node: Node) => Node?
 
-// 设置 RecyclerView Adapter（框架回调）
+// Set RecyclerView Adapter, framework callback
 declare const setAdapter: (
     recycler: Node,
     itemCount:   AdapterItemCount,
@@ -125,17 +125,17 @@ declare const setAdapter: (
 
 ---
 
-## 4. 布局参数（LayoutParams）
+## 4. LayoutParams
 
 ```ez
-declare const setLayoutWidth:    (node: Node, value: I32) => Void   // matchParent / wrapContent / px 值
+declare const setLayoutWidth:    (node: Node, value: I32) => Void   // matchParent / wrapContent / px value
 declare const setLayoutHeight:   (node: Node, value: I32) => Void
 declare const setMargin:         (node: Node, left: I32, top: I32, right: I32, bottom: I32) => Void
 declare const setPadding:        (node: Node, left: I32, top: I32, right: I32, bottom: I32) => Void
 declare const setWeight:         (node: Node, weight: F32) => Void   // LinearLayout weight
-declare const setGravity:        (node: Node, gravity: I32) => Void  // gravity 常量
+declare const setGravity:        (node: Node, gravity: I32) => Void  // gravity constants
 
-// gravity 常量（可组合 | 运算）
+// gravity constants, composable with | operations
 const gravity.left:   I32 = 0x03
 const gravity.right:  I32 = 0x05
 const gravity.top:    I32 = 0x30
@@ -147,21 +147,21 @@ const gravity.center:   I32 = 0x11
 
 ---
 
-## 5. 通用 View 属性
+## 5. Common View Properties
 
 ```ez
 declare const setBackgroundColor:   (node: Node, color: Color) => Void
 declare const setBackgroundDrawable:(node: Node, resId: I32) => Void
-declare const setAlpha:             (node: Node, alpha: F32) => Void    // 0.0–1.0
+declare const setAlpha:             (node: Node, alpha: F32) => Void    // 0.0-1.0
 declare const setVisibility:        (node: Node, v: I32) => Void        // 0=VISIBLE 4=INVISIBLE 8=GONE
 declare const setEnabled:           (node: Node, enabled: Bool) => Void
 declare const setElevation:         (node: Node, dp: F32) => Void
-declare const setCornerRadius:      (node: Node, dp: F32) => Void       // 需要 API 21+
+declare const setCornerRadius:      (node: Node, dp: F32) => Void       // Requires API 21+
 declare const setTag:               (node: Node, key: Str, value: Str) => Void
 declare const getTag:               (node: Node, key: Str) => Str?
 declare const setContentDesc:       (node: Node, desc: Str) => Void
 
-// 尺寸查询（px）
+// Size queries, px
 declare const getWidth:             (node: Node) => I32
 declare const getHeight:            (node: Node) => I32
 declare const getMeasuredWidth:     (node: Node) => I32
@@ -170,7 +170,7 @@ declare const getMeasuredHeight:    (node: Node) => I32
 
 ---
 
-## 6. 文本相关属性（TextView / Button / EditText）
+## 6. Text Properties for TextView / Button / EditText
 
 ```ez
 declare const setText:         (node: Node, text: Str) => Void
@@ -183,7 +183,7 @@ declare const setTextStyle:    (node: Node, style: I32) => Void   // 0=NORMAL 1=
 declare const setMaxLines:     (node: Node, max: I32) => Void
 declare const setInputType:    (node: Node, type_: I32) => Void
 
-// inputType 常量（可按位组合）
+// inputType constants, composable by bit operations
 const inputType.text:     I32 = 0x00000001
 const inputType.number:   I32 = 0x00000002
 const inputType.phone:    I32 = 0x00000003
@@ -193,18 +193,18 @@ const inputType.password: I32 = 0x00000081
 
 ---
 
-## 7. 图像属性（ImageView / ImageButton）
+## 7. Image Properties for ImageView / ImageButton
 
 ```ez
-declare const setImageUrl:      (node: Node, url: Str) => Void     // 异步加载（flow 内）
-declare const setImageRes:      (node: Node, resId: I32) => Void   // 本地资源 ID
-declare const setImageBlob:     (node: Node, data: Blob) => Void   // 原始像素数据
+declare const setImageUrl:      (node: Node, url: Str) => Void     // Async load inside Flow
+declare const setImageRes:      (node: Node, resId: I32) => Void   // Local resource ID
+declare const setImageBlob:     (node: Node, data: Blob) => Void   // Raw pixel data
 declare const setScaleType:     (node: Node, type_: Str) => Void   // "fitCenter" | "centerCrop" | "fitXY"
 ```
 
 ---
 
-## 8. 事件监听
+## 8. Event Listeners
 
 ```ez
 declare const setOnClick:        (node: Node, handler: ClickHandler) => Void
@@ -215,7 +215,7 @@ declare const setOnCheckedChange:(node: Node, handler: CheckChangeHandler) => Vo
 declare const setOnScroll:       (node: Node, handler: ScrollHandler) => Void
 declare const setOnFocus:        (node: Node, handler: FocusHandler) => Void
 
-// 移除事件
+// Remove events
 declare const clearOnClick:      (node: Node) => Void
 declare const clearOnTouch:      (node: Node) => Void
 declare const clearOnTextChanged:(node: Node) => Void
@@ -223,42 +223,42 @@ declare const clearOnTextChanged:(node: Node) => Void
 
 ---
 
-## 9. 主线程调度桥接（Fiber Commit 阶段必须使用）
+## 9. Main Thread Scheduling Bridge for Fiber Commit
 
 ```ez
-// 在 UI 主线程同步执行（任何 View 属性修改必须通过此函数）
+// Run synchronously on the UI main thread; all View mutations must go through this function
 declare const runOnMainThread:    (work: () => Void) => Void
 
-// 在 UI 主线程的下一帧执行（对应 View.post / Choreographer）
-declare const postFrame:          (work: () => Void) => I64   // 返回 token
+// Run on the next UI frame, corresponding to View.post / Choreographer
+declare const postFrame:          (work: () => Void) => I64   // Returns token
 declare const cancelFrame:        (token: I64) => Void
 
-// 在 UI 线程以 delay(ms) 延迟执行
+// Run on the UI thread after delay(ms)
 declare const postDelayed:        (work: () => Void, ms: I64) => I64
 declare const cancelDelayed:      (token: I64) => Void
 
-// 查询当前是否在主线程（用于断言）
+// Query whether the current thread is the main thread, useful for assertions
 declare const isMainThread:       () => Bool
 ```
 
-> **Fiber 调度模式**：reconcile 阶段在 `flow {}` 内并发运行，计算出 effect list 后，通过 `runOnMainThread` 将 commit 工作批量提交到 UI 线程。
+> **Fiber scheduling model**: reconcile runs concurrently inside `flow {}` and computes an effect list. Commit work is batched onto the UI thread through `runOnMainThread`.
 
 ---
 
-## 10. Activity / Window 访问
+## 10. Activity / Window Access
 
 ```ez
-// 获取 Activity 根 DecorView（挂载 UI 树的起点）
+// Get the Activity root DecorView, the mount point for the UI tree
 declare const getRootView:        () => Node
 
-// 设置状态栏颜色（API 21+）
+// Set status bar color, API 21+
 declare const setStatusBarColor:  (color: Color) => Void
 
-// 软键盘
+// Soft keyboard
 declare const showKeyboard:       (node: Node) => Void
 declare const hideKeyboard:       () => Void
 
-// 屏幕密度（px per dp）
+// Screen density, px per dp
 declare const getScreenDensity:   () => F32
 declare const getScreenWidth:     () => I32    // px
 declare const getScreenHeight:    () => I32    // px
@@ -266,7 +266,7 @@ declare const getScreenHeight:    () => I32    // px
 
 ---
 
-## 11. 权限
+## 11. Permissions
 
 ```ez
 const permission.camera:         Str = "android.permission.CAMERA"
@@ -278,9 +278,9 @@ const permission.notifications:  Str = "android.permission.POST_NOTIFICATIONS"
 const permission.readContacts:   Str = "android.permission.READ_CONTACTS"
 const permission.useBiometric:   Str = "android.permission.USE_BIOMETRIC"
 
-// 授权返回 true，拒绝 throw Error(code = errPermission)
+// Returns true when granted; denial throws Error(code = errPermission)
 declare const requestPermission:  (perm: Str) => Bool
-// 批量申请，返回各权限授权状态
+// Batch request, returns permission status map
 declare const requestPermissions: (perms: Str[]) => Dict<Str, Bool>
 // "granted" | "denied" | "shouldShowRationale"
 declare const queryPermission:    (perm: Str) => Str
@@ -288,7 +288,7 @@ declare const queryPermission:    (perm: Str) => Str
 
 ---
 
-## 附：Fiber 骨架示例
+## Appendix: Fiber Skeleton
 
 ```ez
 from "ez-android-ui" import {
@@ -296,27 +296,27 @@ from "ez-android-ui" import {
     setText, addView, runOnMainThread, getRootView
 }
 
-// 用户定义的 Fiber 工作单元
+// User-defined Fiber work unit
 struct Fiber {
     kind:      Str;
     props:     { [key: Str]: Str };
     children:  Fiber[];
-    stateNode: Node?;      // 对应真实 View
+    stateNode: Node?;      // Corresponding real View
     effectTag: I32;        // 0=NONE 1=PLACEMENT 2=UPDATE 3=DELETION
-    next:      Fiber?;     // 下一个待处理 fiber
+    next:      Fiber?;     // Next fiber to process
 }
 
-// reconcile 在 flow 内并发运行
+// reconcile runs concurrently inside Flow
 const reconcile = (fiber: Fiber): Void => {
-    // 计算子树差量 ...
+    // Compute subtree diff ...
 };
 
-// commit 必须在主线程
+// commit must run on the main thread
 const commitEffects = (effectList: Fiber[]): Void => {
     runOnMainThread(work = () => {
         loop effect in effectList {
             (effect.effectTag == 1) ? {
-                // PLACEMENT：创建并挂载
+                // PLACEMENT: create and mount
             }
         }
     });
@@ -326,7 +326,7 @@ const workLoop = (): Void => {
     const root = Fiber(kind = "root", props = {}, children = [], stateNode = getRootView(), effectTag = 0, next = ?);
     flow {
         reconcile(fiber = root);
-        // 收集 effectList 后提交
+        // Commit after collecting effectList
         commitEffects(effectList = []);
     }
 };

@@ -1,24 +1,24 @@
-# ez-ios-ui 包文档
+# ez-ios-ui Package Documentation
 
-[English](en/ez-ios-ui.md)
+[中文](../ez-ios-ui.md)
 
-`ez-ios-ui` 提供面向 `ios` 目标的**原生 UIKit View 底层绑定**（基于 Objective-C runtime 桥接）。包本身不做框架和调度——这些由使用者自行实现。**View 树修改必须在主线程执行**，包提供主线程调度桥接。
+`ez-ios-ui` provides low-level native UIKit View bindings for the `ios` target, based on Objective-C runtime bridging. The package does not provide a framework or scheduling; users implement those layers themselves. **View tree mutations must run on the main thread**, and the package provides a main-thread scheduling bridge.
 
-> **当前实现状态**：仓库内已提供可编译链接的原生句柄状态层，可维护根视图、节点表、父子关系、文本、富文本可见文本、frame、可见性、屏幕尺寸、缩放比例和安全区等基础状态；配置 `output.sdk` 构建 iOS 目标且项目导入 `ez-ios-ui` 时，CLI 会随 `lib<name>.dylib` 生成 `ez-ios-ui-bridge/` 宿主模板（Swift ViewController、Package.swift、Info.plist），用于把动态库接入 Xcode/UIKit 工程，并在 ViewController 启动时把 `UIScreen` 与 `safeAreaInsets` 注入原生状态层。`runOnMainThread` / `scheduleFrame` 在最小句柄层内同步执行回调；真实 iOS 主线程队列、事件分发与权限查询由宿主模板扩展实现，公开签名保持稳定。
+> **Current implementation status**: the repository provides a compilable/linkable native handle state layer. It can maintain root view, node table, parent/child relationships, text, visible text for attributed content, frame, visibility, screen size, scale, safe area, and related base state. When building an iOS target with `output.sdk` and importing `ez-ios-ui`, the CLI emits an `ez-ios-ui-bridge/` host template next to `lib<name>.dylib` with Swift ViewController, Package.swift, and Info.plist. The template connects the dynamic library to an Xcode/UIKit project and injects `UIScreen` and `safeAreaInsets` into the native state layer when the ViewController starts. `runOnMainThread` / `scheduleFrame` execute callbacks synchronously in the minimal handle layer. Real iOS main-thread queue, event dispatch, and permission queries are extension points in the host template; public signatures stay stable.
 
-> **使用前提**：`project.toml` 中 `os = "ios"`，`sdk` 指向 Xcode SDK；构建产物中的 `ez-ios-ui-bridge/` 可加入 Xcode 工程。
+> **Requirement**: `project.toml` must use `os = "ios"`, and `sdk` must point to the Xcode SDK. The generated `ez-ios-ui-bridge/` can be added to an Xcode project.
 
 ---
 
-## 1. 核心类型
+## 1. Core Types
 
 ```ez
-// 不透明 UIView 句柄（Objective-C 对象引用的整数 ID）
+// Opaque UIView handle, integer ID for Objective-C object reference
 struct Node {
     id: I32
 }
 
-// 事件类型
+// Event types
 struct TouchEvent {
     phase: Str   // "began" | "moved" | "ended" | "cancelled"
     x: F32
@@ -27,10 +27,10 @@ struct TouchEvent {
 
 struct TextChangedEvent {
     text:  Str
-    range: I32   // 修改起始位置
+    range: I32   // Start position of the edit
 }
 
-// 通用事件处理函数类型
+// General event handler types
 type ActionHandler     = () => Void
 type TouchHandler      = (e: TouchEvent) => Void
 type TextChangeHandler = (e: TextChangedEvent) => Void
@@ -40,7 +40,7 @@ type TableCreateCell   = (reuseId: Str) => Node
 type TableBindCell     = (cell: Node, row: I32, section: I32) => Void
 type TableCellHeight   = (row: I32, section: I32) => F32
 
-// 颜色（RGBA，各分量 0.0–1.0）
+// Color, RGBA components in 0.0-1.0
 struct Color {
     r: F32    g: F32    b: F32    a: F32
 
@@ -59,7 +59,7 @@ struct Insets {
     top: F32    left: F32    bottom: F32    right: F32
 }
 
-// contentMode 常量
+// contentMode constants
 const contentMode.scaleToFill:        I32 = 0
 const contentMode.scaleAspectFit:     I32 = 1
 const contentMode.scaleAspectFill:    I32 = 2
@@ -68,22 +68,22 @@ const contentMode.center:             I32 = 4
 
 ---
 
-## 2. View 创建
+## 2. View Creation
 
 ```ez
-// 基础 View（对应 UIView）
+// Base View, corresponding to UIView
 declare const createView:           () => Node
 
-// 布局容器
+// Layout containers
 declare const createStackView:      (axis: Str) => Node   // "vertical" | "horizontal"
 declare const createScrollView:     () => Node
 
-// 文本
+// Text
 declare const createLabel:          () => Node
 declare const createTextField:      () => Node
-declare const createTextView:       () => Node            // 多行文本输入
+declare const createTextView:       () => Node            // Multiline text input
 
-// 交互
+// Interactive controls
 declare const createButton:         () => Node
 declare const createSwitch:         () => Node
 declare const createSlider:         () => Node
@@ -91,20 +91,20 @@ declare const createSegmentControl: (segments: Str[]) => Node
 declare const createStepper:        () => Node
 declare const createActivityIndicator: () => Node
 
-// 图像
+// Images
 declare const createImageView:      () => Node
 
-// 列表
+// Lists
 declare const createTableView:      () => Node
 declare const createCollectionView: () => Node
 
-// 销毁（释放 ObjC 强引用）
+// Destroy, releasing Objective-C strong reference
 declare const destroyNode:          (node: Node) => Void
 ```
 
 ---
 
-## 3. View 树操作
+## 3. View Tree Operations
 
 ```ez
 declare const addSubview:        (parent: Node, child: Node) => Void
@@ -118,10 +118,10 @@ declare const getSubviewAt:      (parent: Node, index: I32) => Node?
 declare const getSubviewCount:   (parent: Node) => I32
 declare const getSuperview:      (node: Node) => Node?
 
-// 获取根 UIWindow 的 rootView（挂载 UI 树的起点）
+// Get the root UIWindow rootView, the mount point for the UI tree
 declare const getRootView:       () => Node
 
-// 设置 TableView / CollectionView 数据源（框架回调）
+// Set TableView / CollectionView data source, framework callback
 declare const setTableAdapter: (
     table:      Node,
     rowCount:   TableRowCount,
@@ -133,23 +133,23 @@ declare const setTableAdapter: (
 
 ---
 
-## 4. 布局（Frame / Auto Layout）
+## 4. Layout: Frame / Auto Layout
 
 ```ez
-// Frame 直接定位
+// Direct frame positioning
 declare const setFrame:           (node: Node, rect: Rect) => Void
 declare const getFrame:           (node: Node) => Rect
 declare const setBounds:          (node: Node, rect: Rect) => Void
 declare const getBounds:          (node: Node) => Rect
 
-// Auto Layout 约束（简化接口）
-declare const pinToEdges:         (node: Node, insets: Insets) => Void  // 相对于 superview
+// Simplified Auto Layout constraints
+declare const pinToEdges:         (node: Node, insets: Insets) => Void  // Relative to superview
 declare const centerInParent:     (node: Node) => Void
 declare const setWidth:           (node: Node, width: F32) => Void
 declare const setHeight:          (node: Node, height: F32) => Void
 declare const sizeToFit:          (node: Node) => Void
 
-// StackView 布局参数
+// StackView layout parameters
 declare const setSpacing:         (node: Node, spacing: F32) => Void
 declare const setAlignment:       (node: Node, align: I32) => Void   // UIStackViewAlignment
 declare const setDistribution:    (node: Node, dist: I32) => Void    // UIStackViewDistribution
@@ -157,11 +157,11 @@ declare const setDistribution:    (node: Node, dist: I32) => Void    // UIStackV
 
 ---
 
-## 5. 通用 View 属性
+## 5. Common View Properties
 
 ```ez
 declare const setBackgroundColor: (node: Node, color: Color) => Void
-declare const setAlpha:           (node: Node, alpha: F32) => Void    // 0.0–1.0
+declare const setAlpha:           (node: Node, alpha: F32) => Void    // 0.0-1.0
 declare const setHidden:          (node: Node, hidden: Bool) => Void
 declare const setUserInteraction: (node: Node, enabled: Bool) => Void
 declare const setClipsToBounds:   (node: Node, clips: Bool) => Void
@@ -173,19 +173,19 @@ declare const setTag_:            (node: Node, tag: I32) => Void
 declare const getTag_:            (node: Node) => I32
 declare const setAccessLabel:     (node: Node, label: Str) => Void
 
-// 强制布局
+// Force layout
 declare const layoutIfNeeded:     (node: Node) => Void
 declare const setNeedsLayout:     (node: Node) => Void
 ```
 
 ---
 
-## 6. 文本属性（UILabel / UITextField / UITextView）
+## 6. Text Properties for UILabel / UITextField / UITextView
 
 ```ez
 declare const setText:            (node: Node, text: Str) => Void
 declare const getText:            (node: Node) => Str
-declare const setAttributedText:  (node: Node, html: Str) => Void   // HTML 富文本；状态层会同步保存去标签可见文本
+declare const setAttributedText:  (node: Node, html: Str) => Void   // HTML attributed text; state layer stores visible text without tags
 declare const setFont:            (node: Node, name: Str, size: F32) => Void
 declare const setSystemFont:      (node: Node, size: F32, weight: F32) => Void  // UIFontWeight
 declare const setTextColor:       (node: Node, color: Color) => Void
@@ -200,20 +200,20 @@ declare const setReturnKeyType:   (node: Node, type_: I32) => Void
 
 ---
 
-## 7. 图像属性（UIImageView）
+## 7. Image Properties for UIImageView
 
 ```ez
-declare const setImageUrl:        (node: Node, url: Str) => Void       // 异步加载（flow 内）
-declare const setImageName:       (node: Node, name: Str) => Void      // Assets.xcassets 图片名
-declare const setSystemImage:     (node: Node, sfName: Str) => Void    // SF Symbol 名
-declare const setImageBlob:       (node: Node, data: Blob) => Void     // 原始像素数据
-declare const setContentMode:     (node: Node, mode: I32) => Void      // ContentMode 常量
+declare const setImageUrl:        (node: Node, url: Str) => Void       // Async load inside Flow
+declare const setImageName:       (node: Node, name: Str) => Void      // Assets.xcassets image name
+declare const setSystemImage:     (node: Node, sfName: Str) => Void    // SF Symbol name
+declare const setImageBlob:       (node: Node, data: Blob) => Void     // Raw pixel data
+declare const setContentMode:     (node: Node, mode: I32) => Void      // ContentMode constant
 declare const setTintColor:       (node: Node, color: Color) => Void
 ```
 
 ---
 
-## 8. 交互组件属性
+## 8. Interactive Component Properties
 
 ```ez
 // UIButton
@@ -238,74 +238,74 @@ declare const stopAnimating:      (node: Node) => Void
 
 ---
 
-## 9. 事件监听（Target-Action + Gesture）
+## 9. Event Listeners: Target-Action + Gesture
 
 ```ez
-// UIControl 事件（Button、Switch、Slider 等）
+// UIControl events, such as Button, Switch, Slider
 declare const addTarget:          (node: Node, event: I32, handler: ActionHandler) => Void
 declare const removeTarget:       (node: Node, event: I32) => Void
 
-// UIControlEvent 常量
+// UIControlEvent constants
 const controlEvent.touchUpInside: I32 = 0x40
 const controlEvent.valueChanged:  I32 = 0x1000
 const controlEvent.editingChanged: I32 = 0x100
 
-// 文本变化（UITextField / UITextView）
+// Text changes, UITextField / UITextView
 declare const setOnTextChanged:   (node: Node, handler: TextChangeHandler) => Void
 declare const setOnReturn:        (node: Node, handler: ActionHandler) => Void
 
-// 手势识别器
+// Gesture recognizers
 declare const addTapGesture:      (node: Node, taps: I32, handler: ActionHandler) => Void
 declare const addLongPressGesture:(node: Node, minDuration: F32, handler: ActionHandler) => Void
 declare const addPanGesture:      (node: Node, handler: TouchHandler) => Void
 declare const addSwipeGesture:    (node: Node, direction: I32, handler: ActionHandler) => Void  // 1=right 2=left 4=up 8=down
 declare const removeTapGesture:   (node: Node) => Void
 
-// 键盘
+// Keyboard
 declare const becomeFirstResponder: (node: Node) => Void
 declare const resignFirstResponder: (node: Node) => Void
 ```
 
 ---
 
-## 10. 主线程调度桥接（Fiber Commit 阶段必须使用）
+## 10. Main Thread Scheduling Bridge for Fiber Commit
 
 ```ez
-// 在主线程同步执行（任何 UIView 修改必须通过此函数）
+// Run synchronously on the main thread; all UIView mutations must go through this function
 declare const runOnMainThread:    (work: () => Void) => Void
 
-// 在主线程下一个 RunLoop 周期执行（对应 DispatchQueue.main.async）
+// Run on the next main RunLoop cycle, equivalent to DispatchQueue.main.async
 declare const postToMain:         (work: () => Void) => Void
 
-// 延迟执行
+// Delayed execution
 declare const postDelayed:        (work: () => Void, ms: F64) => I64
 declare const cancelDelayed:      (token: I64) => Void
 
-// 下一帧（对应 CADisplayLink）
+// Next frame, equivalent to CADisplayLink
 declare const scheduleFrame:      (work: () => Void) => I64
 declare const cancelFrame:        (token: I64) => Void
 
-// 查询是否在主线程
+// Query whether the current thread is the main thread
 declare const isMainThread:       () => Bool
 ```
 
-> **Fiber 调度模式**：reconcile 阶段在 `flow {}` 内并发运行，计算出 effect list 后，通过 `runOnMainThread` 将所有 UIView 修改批量提交到主线程。
+> **Fiber scheduling model**: reconcile runs concurrently inside `flow {}` and computes an effect list. All UIView mutations are then batched onto the main thread through `runOnMainThread`.
 
 ---
 
-## 11. 屏幕信息
+## 11. Screen Information
 
 ```ez
-declare const getScreenWidth:     () => F32   // pt（逻辑像素）
+declare const getScreenWidth:     () => F32   // pt, logical pixels
 declare const getScreenHeight:    () => F32
-declare const getScreenScale:     () => F32   // 2.0 / 3.0（物理像素倍数）
+declare const getScreenScale:     () => F32   // 2.0 / 3.0, physical pixel scale
 declare const getSafeAreaInsets:  () => Insets
 declare const getStatusBarHeight: () => F32
 ```
 
 ---
 
-## 12. 权限
+## 12. Permissions
 
 ```ez
 const permission.camera:          Str = "camera"
@@ -318,7 +318,7 @@ const permission.contacts:        Str = "contacts"
 const permission.faceID:          Str = "faceID"
 const permission.calendar:        Str = "calendar"
 
-// 授权返回 true，拒绝 throw Error(code = errPermission)
+// Returns true when granted; denial throws Error(code = errPermission)
 declare const requestPermission:  (perm: Str) => Bool
 // "authorized" | "denied" | "notDetermined" | "restricted"
 declare const queryPermission:    (perm: Str) => Str
@@ -326,7 +326,7 @@ declare const queryPermission:    (perm: Str) => Str
 
 ---
 
-## 附：Fiber 骨架示例
+## Appendix: Fiber Skeleton
 
 ```ez
 from "ez-ios-ui" import {
@@ -338,17 +338,17 @@ struct Fiber {
     kind:      Str;
     props:     { [key: Str]: Str };
     children:  Fiber[];
-    stateNode: Node?;      // 对应真实 UIView
+    stateNode: Node?;      // Corresponding real UIView
     effectTag: I32;        // 0=NONE 1=PLACEMENT 2=UPDATE 3=DELETION
     next:      Fiber?;
 }
 
-// reconcile 在 flow 内并发运行（不触碰 UIView）
+// reconcile runs concurrently inside Flow and does not touch UIView
 const reconcile = (fiber: Fiber): Void => {
-    // 计算子树差量，收集 effect list ...
+    // Compute subtree diff and collect effect list ...
 };
 
-// commit 必须在主线程
+// commit must run on the main thread
 const commitEffects = (effectList: Fiber[]): Void => {
     runOnMainThread(work = () => {
         loop effect in effectList {

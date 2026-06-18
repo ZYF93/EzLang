@@ -1,5 +1,7 @@
 # EzLang 运行时设计
 
+[English](en/runtime-design.md)
+
 EzLang 运行时围绕三个核心目标设计：Arena 内存管理、Flow 并发调度、标准库平台适配。
 
 ## Arena 内存管理

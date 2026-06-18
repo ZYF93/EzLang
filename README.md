@@ -1,5 +1,7 @@
 # EzLang 编程语言
 
+[English](README.en.md)
+
 EzLang 是一门以表达式为中心、采用值语义为主的系统编程语言。它结合现代类型系统、Arena 内存模型与 Flow 并发语义，面向高性能系统级开发，并支持跨平台编译到本地、移动端和 WebAssembly。
 
 ## 核心特性
@@ -146,6 +148,8 @@ code --install-extension ezlang-vscode-0.1.0.vsix
 ```
 
 ## 文档索引
+
+英文文档入口见 [README.en.md](README.en.md)。
 
 - [快速教程](docs/tutorial.md)：变量、函数、结构体、控制流、标准库和 Flow 示例。
 - [语言规格](docs/doc.md)：类型系统、函数、结构体、控制流、模块、外部链接和语法糖。

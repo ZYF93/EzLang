@@ -1,28 +1,28 @@
-# ez-web-ui 包文档
+# ez-web-ui Package Documentation
 
-[English](en/ez-web-ui.md)
+[中文](../ez-web-ui.md)
 
-`ez-web-ui` 提供面向 `emcc` 目标的 **底层 DOM 绑定**。包本身不做框架、不做 diff、不做渲染调度——这些由使用者自行实现。所有 API 均为对 Browser/Emscripten JS 侧的 FFI 绑定。
+`ez-web-ui` provides low-level DOM bindings for the `emcc` target. The package does not provide a framework, diffing, or render scheduling; users implement those layers themselves. All APIs are FFI bindings to the Browser/Emscripten JavaScript side.
 
-> **当前实现状态**：仓库内已提供可编译链接的 ABI。`emcc` wrapper 已接入核心 DOM 操作；非 Web 原生目标返回零句柄、空字符串、空可选值、`false` 或执行 no-op，用于明确表示不可用，不伪装为成功。
+> **Current implementation status**: the repository provides a compilable/linkable ABI. The `emcc` wrapper is connected to core DOM operations. Non-Web native targets return zero handles, empty strings, empty optionals, `false`, or no-op behavior to explicitly indicate unavailability rather than pretending to succeed.
 
-> **使用前提**：`project.toml` 中 `os = "emcc"`。
+> **Requirement**: `project.toml` must use `os = "emcc"`.
 
 ---
 
-## 1. 核心类型
+## 1. Core Types
 
 ```ez
-// 不透明 DOM 节点句柄（对应 JS 侧 Element 引用的整数 ID）
+// Opaque DOM node handle, an integer ID for the JS-side Element reference
 struct Node {
     id: I32
 }
 
-// 事件对象
+// Event object
 struct Event {
     eventType: Str
     targetId: I32
-    data:    Blob?   // 序列化的原始事件数据，按需通过 getEventData 解析
+    data:    Blob?   // Serialized raw event data, parsed through getEventData-style helpers as needed
 }
 
 type EventHandler = (e: Event) => Void
@@ -32,20 +32,20 @@ type Styles = { [key: Str]: Str }
 
 ---
 
-## 2. 节点创建与销毁
+## 2. Node Creation and Destruction
 
 ```ez
-// 创建指定 tag 的元素（如 "div" "span" "button" "input" 等）
+// Create an element with a tag, such as "div", "span", "button", or "input"
 declare const createElement:     (tag: Str) => Node
-// 创建文本节点
+// Create a text node
 declare const createTextNode:    (content: Str) => Node
-// 销毁节点（从内部引用表中释放，不自动从 DOM 中移除）
+// Destroy a node from the internal reference table; it is not automatically removed from the DOM
 declare const destroyNode:       (node: Node) => Void
 ```
 
 ---
 
-## 3. 树操作
+## 3. Tree Operations
 
 ```ez
 declare const appendChild:       (parent: Node, child: Node) => Void
@@ -53,39 +53,39 @@ declare const insertBefore:      (parent: Node, child: Node, ref: Node) => Void
 declare const removeChild:       (parent: Node, child: Node) => Void
 declare const replaceChild:      (parent: Node, newChild: Node, oldChild: Node) => Void
 
-// 获取父节点 / 子节点列表
+// Parent and child list queries
 declare const getParent:         (node: Node) => Node?
 declare const getChildren:       (node: Node) => Node[]
 
-// 挂载到宿主 DOM 元素（CSS 选择器），返回宿主 Node
+// Mount to a host DOM element by CSS selector; returns the host Node
 declare const getHostNode:       (selector: Str) => Node?
 ```
 
 ---
 
-## 4. 属性操作
+## 4. Attributes
 
 ```ez
 declare const getAttribute:      (node: Node, key: Str) => Str?
 declare const setAttribute:      (node: Node, key: Str, value: Str) => Void
 declare const removeAttribute:   (node: Node, key: Str) => Void
 
-// 批量设置属性（减少跨 FFI 调用次数）
+// Batch set attributes to reduce FFI calls
 declare const setAttributes:     (node: Node, attrs: Attrs) => Void
 
-// 直接读写 DOM property（区别于 attribute）
+// Direct DOM property access, distinct from attributes
 declare const getProperty:       (node: Node, key: Str) => Str
 declare const setProperty:       (node: Node, key: Str, value: Str) => Void
 ```
 
 ---
 
-## 5. 样式与类名
+## 5. Style and Class Names
 
 ```ez
 declare const getStyle:          (node: Node, prop: Str) => Str
 declare const setStyle:          (node: Node, prop: Str, value: Str) => Void
-// 批量设置 style（驼峰 key，如 "backgroundColor"）
+// Batch set style; keys use camelCase, such as "backgroundColor"
 declare const setStyles:         (node: Node, styles: Styles) => Void
 
 declare const addClass:          (node: Node, name: Str) => Void
@@ -93,13 +93,13 @@ declare const removeClass:       (node: Node, name: Str) => Void
 declare const hasClass:          (node: Node, name: Str) => Bool
 declare const setClassName:      (node: Node, name: Str) => Void
 
-// 获取当前计算样式
+// Get the current computed style
 declare const getComputedStyle:  (node: Node, prop: Str) => Str
 ```
 
 ---
 
-## 6. 文本内容
+## 6. Text Content
 
 ```ez
 declare const getTextContent:    (node: Node) => Str
@@ -110,28 +110,28 @@ declare const setInnerHTML:      (node: Node, html: Str) => Void
 
 ---
 
-## 7. 事件系统
+## 7. Event System
 
 ```ez
-// 注册 / 注销事件监听（capture 表示是否使用捕获阶段）
+// Register / unregister event listeners; capture indicates capture phase
 declare const addEventListener:      (node: Node, event: Str, handler: EventHandler, capture: Bool) => Void
 declare const removeEventListener:   (node: Node, event: Str, handler: EventHandler) => Void
 
-// 事件委托（在 parent 上监听冒泡，通过 selector 过滤）
+// Event delegation: listen on parent and filter bubbling events by selector
 declare const delegateEvent:         (parent: Node, event: Str, selector: Str, handler: EventHandler) => Void
 
-// 从 Event.data 中解析具体字段
-declare const getEventValue:         (e: Event) => Str        // input / change 事件的 value
-declare const getEventKey:           (e: Event) => Str        // keydown/keyup 的 key
-declare const getEventClientX:       (e: Event) => F32        // 鼠标 / touch X
-declare const getEventClientY:       (e: Event) => F32        // 鼠标 / touch Y
+// Parse specific fields from Event.data
+declare const getEventValue:         (e: Event) => Str        // input/change value
+declare const getEventKey:           (e: Event) => Str        // keydown/keyup key
+declare const getEventClientX:       (e: Event) => F32        // mouse/touch X
+declare const getEventClientY:       (e: Event) => F32        // mouse/touch Y
 declare const preventDefault:        (e: Event) => Void
 declare const stopPropagation:       (e: Event) => Void
 ```
 
 ---
 
-## 8. 布局查询
+## 8. Layout Queries
 
 ```ez
 struct Rect {
@@ -148,24 +148,24 @@ declare const blur_:             (node: Node) => Void
 
 ---
 
-## 9. 调度钩子（供框架调度器使用）
+## 9. Scheduling Hooks for Framework Schedulers
 
 ```ez
-// 在下一帧执行（对应 requestAnimationFrame）
+// Run on the next frame, equivalent to requestAnimationFrame
 declare const scheduleFrame:     (cb: () => Void) => I32
 declare const cancelFrame:       (id: I32) => Void
 
-// 微任务队列（对应 queueMicrotask）
+// Microtask queue, equivalent to queueMicrotask
 declare const scheduleMicrotask: (cb: () => Void) => Void
 
-// 空闲时执行（对应 requestIdleCallback）
+// Run during idle time, equivalent to requestIdleCallback
 declare const scheduleIdle:      (cb: (deadline: F64) => Void) => I32
 declare const cancelIdle:        (id: I32) => Void
 ```
 
 ---
 
-## 10. 权限
+## 10. Permissions
 
 ```ez
 const permission.geolocation:   Str = "geolocation"
@@ -174,7 +174,7 @@ const permission.microphone:    Str = "microphone"
 const permission.notifications: Str = "notifications"
 const permission.clipboard:     Str = "clipboard-read"
 
-// 授权返回 true，拒绝 throw Error(code = errPermission)
+// Returns true when granted; denial throws Error(code = errPermission)
 declare const requestPermission: (perm: Str) => Bool
 // "granted" | "denied" | "prompt"
 declare const queryPermission:   (perm: Str) => Str
@@ -182,7 +182,7 @@ declare const queryPermission:   (perm: Str) => Str
 
 ---
 
-## 11. 全局
+## 11. Globals
 
 ```ez
 declare const getWindowWidth:  () => F32
@@ -197,7 +197,7 @@ declare const historyReplace:  (url: Str) => Void
 
 ---
 
-## 附：自定义框架骨架示例
+## Appendix: Custom Framework Skeleton
 
 ```ez
 from "ez-web-ui" import {
@@ -206,15 +206,15 @@ from "ez-web-ui" import {
     addEventListener, scheduleFrame
 }
 
-// 用户自定义 VNode
+// User-defined VNode
 struct VNode {
     tag:      Str;
     props:    { [key: Str]: Str };
     children: VNode[];
-    dom:      Node?;      // 对应真实 DOM 节点
+    dom:      Node?;      // Corresponding real DOM node
 }
 
-// 创建真实 DOM（mount 阶段）
+// Create real DOM during mount
 const createDom = (vnode: VNode): Node => {
     const dom = createElement(tag = vnode.tag);
     setStyles(node = dom, styles = vnode.props);
@@ -224,5 +224,5 @@ const createDom = (vnode: VNode): Node => {
     return dom;
 };
 
-// diff 与 patch 由用户自行实现...
+// diff and patch are implemented by the user...
 ```

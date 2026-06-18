@@ -1,6 +1,10 @@
 # EzLang 标准库 API 文档
 
+[English](en/stdlib-api.md)
+
 标准库源码位于 [packages/std/](../packages/std/)。标准库 `.ez` 文件提供稳定 API，平台实现放在 native C wrapper 或 emcc JS wrapper 中。
+
+本篇是逐项 API 清单；模块边界、平台能力矩阵和设计原则见 [标准库设计文档](stdlib.md)。
 
 ## std/mem
 

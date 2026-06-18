@@ -1,19 +1,19 @@
-# EzLang 示例教程
+# EzLang Tutorial
 
-[English](en/tutorial.md)
+[中文](../tutorial.md)
 
-本教程展示 EzLang 的基本写法。
+This tutorial shows the basic EzLang syntax.
 
-## 变量
+## Variables
 
 ```ez
 let x: I32 = 42;
 const name: Str = "EzLang";
 ```
 
-`let` 可变，`const` 不可变。
+`let` declares a mutable binding. `const` declares an immutable binding.
 
-## 函数
+## Functions
 
 ```ez
 const add = (a: I32, b: I32): I32 => {
@@ -23,9 +23,9 @@ const add = (a: I32, b: I32): I32 => {
 let result = add(a = 1, b = 2);
 ```
 
-函数调用使用具名参数。
+Function calls use named arguments.
 
-## 结构体
+## Structs
 
 ```ez
 struct Point {
@@ -36,9 +36,9 @@ struct Point {
 let p = Point(x = 10);
 ```
 
-字段可设置默认值。
+Fields can define default values.
 
-## 条件与 match
+## Conditions and Match
 
 ```ez
 let x = 1;
@@ -48,7 +48,7 @@ match {
 };
 ```
 
-## 循环
+## Loops
 
 ```ez
 let sum: I32 = 0;
@@ -57,7 +57,7 @@ loop i in 0...10 {
 };
 ```
 
-## 标准库
+## Standard Library
 
 ```ez
 from "std/io" import { println };
@@ -75,11 +75,11 @@ flow {
 };
 ```
 
-`flow` 内阻塞调用会被标记为 suspend point。
+Blocking calls inside `flow` are marked as suspend points.
 
-## 构建项目
+## Build a Project
 
-创建 `project.toml`：
+Create `project.toml`:
 
 ```toml
 [project]
@@ -93,7 +93,7 @@ os = "linux"
 dir = "dist/linux"
 ```
 
-运行：
+Run:
 
 ```bash
 ez build --project project.toml

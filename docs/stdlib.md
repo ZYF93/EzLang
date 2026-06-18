@@ -1,6 +1,10 @@
-# EzLang 标准库设计文档 (Standard Library Design)
+# EzLang 标准库设计文档
+
+[English](en/stdlib.md)
 
 EzLang 标准库采用"统一上层 API，平台感知底层实现"的设计策略。编译器根据 `project.toml` 中定义的目标平台（target）动态切换底层链接库与系统调用。阻塞 I/O 遵循 Flow 并发语义目标：在 `flow {}` 内可作为 suspend point 调度，在 `flow` 外等价于同步阻塞；emcc 目标通过 Asyncify 挂起后恢复，native 目标未接入事件源的封装仍使用阻塞 syscall，并在平台说明中标注限制。
+
+本篇说明模块职责、平台能力和设计约束；逐项函数签名以 [标准库 API 文档](stdlib-api.md) 为准。
 
 ---
 
@@ -547,10 +551,6 @@ struct ProcessResult {
     ok:       Bool
 }
 
-struct Stream {
-    handle: I64
-}
-
 declare const processExec:        (command: Command) => ProcessResult?
 declare const processSpawn:       (command: Command) => Process?
 declare const processWait:        (process: Process) => ProcessResult?
@@ -790,13 +790,9 @@ declare const cryptoHmacSha512: (key: Blob, data: Blob) => Blob?
 
 ## 4.13 压缩与解压缩 (`std/compress`)
 
-`std/compress` 提供 gzip、zlib 和 raw deflate 的二进制 `Blob` 编解码，也可通过 `std/stream.Stream` 从源流当前游标读入并写入目标流。
+`std/compress` 提供 gzip、zlib 和 raw deflate 的二进制 `Blob` 编解码，也可通过 `std/stream.Stream { handle, kind }` 从源流当前游标读入并写入目标流。
 
 ```ez
-struct Stream {
-    handle: I64
-}
-
 declare const compressGzip:      (data: Blob) => Blob?
 declare const decompressGzip:    (data: Blob) => Blob?
 declare const compressZlib:      (data: Blob) => Blob?
@@ -938,26 +934,7 @@ const winner = flow {
 
 原生平台的 HTTP 服务端为基础实现：`createServer` 创建服务端句柄，`on` 注册精确路径路由，`start` 在当前线程监听并为每个已接受连接启动 worker，`stop` 关闭监听句柄并等待已派发连接收尾。emcc Node 风格运行时通过 `http.createServer` + Asyncify 启动基础服务端，支持精确路径路由、请求头/请求体读取、响应状态码/响应头/响应体写回；浏览器/Worker 没有监听端口能力时 `createServer` 返回空句柄。
 
-```ez
-struct HttpRequest {
-    path: Str
-}
-
-struct HttpResponse {
-    status: I32
-    body: Str
-}
-
-type RouteHandler = (req: HttpRequest) => HttpResponse;
-
-struct HttpServer {
-    on(this: #HttpServer, path: Str, handler: RouteHandler) => Void;
-    start(this: #HttpServer) => Void;    // 阻塞，推荐在 flow {} 内调用
-    stop(this: #HttpServer) => Void;
-}
-
-declare const createServer: (host: Str, port: I32) => HttpServer;
-```
+`HttpServer` 复用 `std/net/http` 中的 `HttpRequest`、`HttpResponse` 和 `RouteHandler`。服务端 handler 收到的请求仍是完整 `HttpRequest { method, url, headers, body }`，响应也使用完整 `HttpResponse { status, headers, body }`。
 
 **使用示例**：
 
