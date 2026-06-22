@@ -1843,8 +1843,8 @@ class TestCodegen:
         assert any(str(lib).endswith('packages/std/native/runtime.c') for lib in libs)
         assert 'pthread' in {str(lib) for lib in libs}
 
-    def test_flow_parallel_local_capture_uses_synchronous_fallback(self):
-        """捕获外层局部变量的 parallel 不能跨线程引用栈地址，应同步 fallback。"""
+    def test_flow_parallel_local_capture_starts_shared_env_future(self):
+        """捕获外层局部变量的 parallel 应共享外层存储槽并启动后台任务。"""
         source = '''
         const run = (): I32 => {
             const result = flow {
@@ -1860,10 +1860,91 @@ class TestCodegen:
         assert len(errors) == 0, f'编译错误: {errors}'
         ir_text = str(module)
         binding.parse_assembly(ir_text).verify()
-        assert 'call i8* @"__ezrt_task_start_i32"' not in ir_text
-        assert 'call i32 @"__ezrt_task_join_i32"' not in ir_text
-        assert 'call void @"__ezrt_parallel_enter"()' in ir_text
-        assert not any(str(lib).endswith('packages/std/native/runtime.c') for lib in libs)
+        assert 'call i8* @"__ezrt_task_start_env_i32"' in ir_text
+        assert 'call i32 @"__ezrt_task_join_i32"' in ir_text
+        assert 'define i32 @"__ez_parallel_branch_' in ir_text
+        assert '_offset_shared' in ir_text
+        assert 'call void @"__ezrt_parallel_enter"()' not in ir_text
+        assert any(str(lib).endswith('packages/std/native/runtime.c') for lib in libs)
+        assert 'pthread' in {str(lib) for lib in libs}
+
+    def test_closure_capture_shares_outer_mutation_slot(self):
+        """闭包捕获应共享外层变量槽，支持内外双向修改。"""
+        source = '''
+        const run = (): I32 => {
+            let counter: I32 = 1;
+            let bump: () => I32 = (): I32 => {
+                counter += 1;
+                return counter;
+            };
+            counter = 10;
+            const afterInner = bump();
+            return afterInner + counter;
+        };
+        '''
+        module, errors, _ = compile_source(source, compile_target='linux')
+        assert module is not None
+        assert len(errors) == 0, f'编译错误: {errors}'
+        ir_text = str(module)
+        binding.parse_assembly(ir_text).verify()
+        assert '_counter_shared' in ir_text
+        lambda_ir = function_ir(ir_text, '__lambda_0')
+        assert 'load i32*' in lambda_ir
+        assert 'store i32' in lambda_ir
+
+    def test_flow_parallel_capture_writes_back_to_outer_slot(self):
+        """parallel 捕获普通局部变量后，内部赋值应写回外层共享槽。"""
+        source = '''
+        const run = (): I32 => {
+            let total: I32 = 1;
+            const result = flow {
+                const p: I32 = parallel {
+                    total += 4;
+                    return total;
+                };
+                return p + total;
+            };
+            return result;
+        };
+        '''
+        module, errors, _ = compile_source(source, compile_target='linux')
+        assert module is not None
+        assert len(errors) == 0, f'编译错误: {errors}'
+        ir_text = str(module)
+        binding.parse_assembly(ir_text).verify()
+        assert '_total_shared' in ir_text
+        branch_ir = function_ir(ir_text, '__ez_parallel_branch_0')
+        assert 'load i32*' in branch_ir
+        assert 'store i32' in branch_ir
+        assert 'call i8* @"__ezrt_task_start_env_i32"' in ir_text
+
+    def test_flow_parallel_locked_local_capture_uses_lock_hooks_in_future(self):
+        """parallel 后台任务读写捕获的锁局部变量时应沿用现有锁 hook。"""
+        source = '''
+        const run = (): I32 => {
+            wp let total: I32 = 0;
+            const result = flow {
+                const delta = 2;
+                const p: I32 = parallel {
+                    total += delta;
+                    return total;
+                };
+                return p;
+            };
+            return result;
+        };
+        '''
+        module, errors, _ = compile_source(source, compile_target='linux')
+        assert module is not None
+        assert len(errors) == 0, f'编译错误: {errors}'
+        ir_text = str(module)
+        binding.parse_assembly(ir_text).verify()
+        branch_ir = function_ir(ir_text, '__ez_parallel_branch_0')
+        assert 'call void @"__ezrt_lock_write_acquire"' in branch_ir
+        assert 'call void @"__ezrt_lock_write_release"' in branch_ir
+        assert 'call void @"__ezrt_lock_read_acquire"' in branch_ir
+        assert 'call void @"__ezrt_lock_read_release"' in branch_ir
+        assert 'call i8* @"__ezrt_task_start_env_i32"' in ir_text
 
     def test_flow_parallel_non_i32_explicit_type_uses_synchronous_fallback(self):
         """当前 native 后台任务 ABI 仅覆盖显式 I32，I64 等类型保持同步 fallback。"""

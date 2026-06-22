@@ -53,8 +53,8 @@ The EzLang compiler uses a small layered architecture. Its goal is to turn `.ez`
 ## Flow Model
 
 - `flow {}` records blocking calls and dependencies in semantic analysis.
-- LLVM generation inserts runtime hooks such as `__ezrt_flow_enter`, `__ezrt_flow_exit`, `__ezrt_sleep`, `__ezrt_race_i32`, `__ezrt_task_start_i32`, and `__ezrt_task_join_i32`.
-- Linux/macOS/Windows/Android/iOS use `packages/std/native/runtime.c` for the minimal task runtime behind `sleep`, `race(pl)`, and zero-capture `I32` `parallel` inside Flow. emcc uses `packages/std/emcc/runtime.js` plus Asyncify for suspendable and resumable coroutine behavior. `parallel` with outer captures, compound expressions, or non-`I32` return types keeps synchronous cooperative lowering.
+- LLVM generation inserts runtime hooks such as `__ezrt_flow_enter`, `__ezrt_flow_exit`, `__ezrt_sleep`, `__ezrt_race_i32`, `__ezrt_task_start_i32`, `__ezrt_task_start_env_i32`, and `__ezrt_task_join_i32`.
+- Linux/macOS/Windows/Android/iOS use `packages/std/native/runtime.c` for the minimal task runtime behind `sleep`, `race(pl)`, and `I32` `parallel` inside Flow. emcc uses `packages/std/emcc/runtime.js` plus Asyncify for suspendable and resumable coroutine behavior. `parallel` with outer captures uses a shared-storage task environment; compound expressions or non-`I32` return types keep synchronous cooperative lowering.
 - These hooks are stable ABI boundaries, so a more complete platform scheduler can replace them without changing EzLang syntax.
 
 ## External Linking

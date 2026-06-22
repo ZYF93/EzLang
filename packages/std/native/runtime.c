@@ -14,6 +14,7 @@
 #endif
 
 typedef int32_t (*EzRaceI32Branch)(void);
+typedef int32_t (*EzTaskEnvI32Branch)(void *env);
 
 typedef struct EzRuntimeLock {
     char *name;
@@ -289,6 +290,8 @@ typedef struct EzRaceI32State {
 
 typedef struct EzTaskI32 {
     EzRaceI32Branch branch;
+    EzTaskEnvI32Branch env_branch;
+    void *env;
     int32_t result;
 #if defined(_WIN32)
     HANDLE thread;
@@ -362,7 +365,9 @@ static DWORD WINAPI ez_race_i32_worker(LPVOID data) {
 
 static DWORD WINAPI ez_task_i32_worker(LPVOID data) {
     EzTaskI32 *task = (EzTaskI32 *)data;
-    task->result = task->branch ? task->branch() : 0;
+    task->result = task->env_branch ? task->env_branch(task->env) : (task->branch ? task->branch() : 0);
+    free(task->env);
+    task->env = NULL;
     return 0;
 }
 
@@ -376,7 +381,9 @@ static void *ez_race_i32_worker(void *data) {
 
 static void *ez_task_i32_worker(void *data) {
     EzTaskI32 *task = (EzTaskI32 *)data;
-    task->result = task->branch ? task->branch() : 0;
+    task->result = task->env_branch ? task->env_branch(task->env) : (task->branch ? task->branch() : 0);
+    free(task->env);
+    task->env = NULL;
     return NULL;
 }
 
@@ -392,6 +399,32 @@ void *__ezrt_task_start_i32(EzRaceI32Branch branch) {
 #else
     if (pthread_create(&task->thread, NULL, ez_task_i32_worker, task) != 0) {
         task->result = branch ? branch() : 0;
+        task->thread = 0;
+    }
+#endif
+    return task;
+}
+
+void *__ezrt_task_start_env_i32(EzTaskEnvI32Branch branch, void *env) {
+    EzTaskI32 *task = (EzTaskI32 *)calloc(1, sizeof(EzTaskI32));
+    if (!task) {
+        free(env);
+        return NULL;
+    }
+    task->env_branch = branch;
+    task->env = env;
+#if defined(_WIN32)
+    task->thread = CreateThread(NULL, 0, ez_task_i32_worker, task, 0, NULL);
+    if (!task->thread) {
+        task->result = branch ? branch(env) : 0;
+        free(env);
+        task->env = NULL;
+    }
+#else
+    if (pthread_create(&task->thread, NULL, ez_task_i32_worker, task) != 0) {
+        task->result = branch ? branch(env) : 0;
+        free(env);
+        task->env = NULL;
         task->thread = 0;
     }
 #endif

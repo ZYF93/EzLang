@@ -94,10 +94,12 @@ class LLVMCodeGenerator(EzLangVisitor):
         self._type_ids: dict[str, int] = {}
         self._runtime_required = False
         self._race_branch_counter = 0
+        self._parallel_branch_counter = 0
         self._flow_future_stack: list[dict[str, dict[str, ir.Value]]] = []
         self._flow_depth = 0
         self._import_depth = 0
         self._source_dir_stack: list[Path] = [self.base_dir]
+        self._shared_capture_locals: set[str] = set()
         self._parallel_result_stack: list[ir.AllocaInstr] = []
         self._parallel_exit_stack: list[ir.Block] = []
         self._parallel_arena_depth_stack: list[int] = []
@@ -1631,6 +1633,7 @@ class LLVMCodeGenerator(EzLangVisitor):
             'method_this': self._method_this,
             'locals': self.locals,
             'locals_type_names': self._locals_type_names,
+            'shared_capture_locals': self._shared_capture_locals,
             'loop_exit_blocks': self.loop_exit_blocks,
             'loop_continue_blocks': self.loop_continue_blocks,
             'catch_exit_blocks': self.catch_exit_blocks,
@@ -1650,6 +1653,7 @@ class LLVMCodeGenerator(EzLangVisitor):
         self._method_this = None
         self.locals = {}
         self._locals_type_names = {}
+        self._shared_capture_locals = set()
         self.loop_exit_blocks = []
         self.loop_continue_blocks = []
         self.catch_exit_blocks = []
@@ -1671,6 +1675,7 @@ class LLVMCodeGenerator(EzLangVisitor):
         self._method_this = state['method_this']
         self.locals = state['locals']
         self._locals_type_names = state['locals_type_names']
+        self._shared_capture_locals = state['shared_capture_locals']
         self.loop_exit_blocks = state['loop_exit_blocks']
         self.loop_continue_blocks = state['loop_continue_blocks']
         self.catch_exit_blocks = state['catch_exit_blocks']
@@ -1701,6 +1706,36 @@ class LLVMCodeGenerator(EzLangVisitor):
         raw_ptr = self.builder.call(self._arena_alloc, [size_val, align_val])
         typed_ptr = self.builder.bitcast(raw_ptr, ir.PointerType(llvm_type), name=name)
         return typed_ptr
+
+    def _heap_allocate(self, llvm_type: ir.Type, name: str = "") -> ir.Value:
+        """在进程堆上分配内存，用于可能跨线程访问的捕获环境。"""
+        i64 = ir.IntType(64)
+        i8_ptr = ir.PointerType(ir.IntType(8))
+        malloc = self._get_or_declare_function('malloc', ir.FunctionType(i8_ptr, [i64]))
+        size_val = ir.Constant(i64, max(self._type_width(llvm_type), 1))
+        raw_ptr = self.builder.call(malloc, [size_val], name=f'{name}_raw' if name else '')
+        return self.builder.bitcast(raw_ptr, ir.PointerType(llvm_type), name=name)
+
+    def _capture_shared_storage(self, name: str) -> ir.Value | None:
+        """把捕获局部提升为共享存储槽，闭包/parallel 与外层共同读写。"""
+        storage = self.locals.get(name)
+        if storage is None or not isinstance(storage.type, ir.PointerType):
+            return storage
+        if name in self._shared_capture_locals:
+            return storage
+        pointee = storage.type.pointee
+        shared = self._heap_allocate(pointee, name=f'_{name}_shared')
+        current = self.builder.load(storage, name=f'_{name}_shared_init')
+        self.builder.store(current, shared)
+        self.locals[name] = shared
+        self._shared_capture_locals.add(name)
+        self._mark_unsigned(shared, self._ptr_unsigned.get(id(storage), False))
+        if self._is_list_type(pointee):
+            self._mark_list_elem_unsigned(shared, self._list_type_is_unsigned(storage.type))
+        if pointee == self.structs.get('Dict'):
+            key_type, value_type = self._dict_item_types_for_value(storage)
+            self._mark_dict_item_types(shared, key_type, value_type)
+        return shared
 
     # ==================== 类型映射 ====================
 
@@ -8964,6 +8999,32 @@ class LLVMCodeGenerator(EzLangVisitor):
         self._restore_unsigned_state(prev_unsigned)
         return func
 
+    def _gen_parallel_i32_branch_function(self, block_ctx, env_type: ir.Type, metadata: list[dict]) -> ir.Function:
+        """生成带捕获环境的 parallel I32 分支函数。"""
+        i8_ptr = ir.PointerType(ir.IntType(8))
+        i32 = ir.IntType(32)
+        name = f"__ez_parallel_branch_{self._parallel_branch_counter}"
+        self._parallel_branch_counter += 1
+        func = ir.Function(self.module, ir.FunctionType(i32, [i8_ptr]), name)
+        func.args[0].name = '__env'
+
+        entry = func.append_basic_block('entry')
+        prev_unsigned = self._save_unsigned_state()
+        prev_state = self._enter_function_codegen_state(ir.IRBuilder(entry), func)
+        self._flow_depth = max(prev_state.get('flow_depth', 0), 1)
+        self._bind_capture_env_locals(func.args[0], env_type, metadata)
+        throw_exit = func.append_basic_block('throw_exit')
+        self._function_throw_exit_stack.append(throw_exit)
+        self._function_return_type_ctx_stack.append(None)
+
+        value = self._eval(block_ctx) if block_ctx is not None else ir.Constant(i32, 0)
+        self._finish_function_with_throw_exit(i32, value)
+        self._function_return_type_ctx_stack.pop()
+
+        self._restore_function_codegen_state(prev_state)
+        self._restore_unsigned_state(prev_unsigned)
+        return func
+
     def _parallel_block_from_initializer(self, initializer):
         """识别 flow 内 const x = parallel { ... } 初始化。"""
         if initializer is None:
@@ -9003,11 +9064,24 @@ class LLVMCodeGenerator(EzLangVisitor):
         """flow 内 parallel I32 块启动为后台任务，读取变量时 join。"""
         if self._flow_depth <= 0 or not self._flow_future_stack or parallel_block is None:
             return None
-        if self._ctx_references_local_capture(parallel_block):
-            return None
         result_type = self._infer_block_return_type(parallel_block.block())
         if result_type != ir.IntType(32):
             return None
+        capture_names = self._ctx_capture_names(parallel_block.block())
+        for cap_name in capture_names:
+            storage = self.locals.get(cap_name)
+            if storage is not None and self._is_aggregate_ptr(storage):
+                return None
+        if capture_names:
+            env_type, env_ptr, metadata = self._build_parallel_capture_env(capture_names)
+            branch = self._gen_parallel_i32_branch_function(parallel_block.block(), env_type, metadata)
+            self._require_runtime()
+            i8_ptr = ir.PointerType(ir.IntType(8))
+            start_type = ir.FunctionType(i8_ptr, [ir.PointerType(ir.FunctionType(ir.IntType(32), [i8_ptr])), i8_ptr])
+            start = self._get_or_declare_function('__ezrt_task_start_env_i32', start_type)
+            handle = self.builder.call(start, [branch, env_ptr], name=f'_{name}_future')
+            self._flow_future_stack[-1][name] = {'handle': handle, 'joined': False}
+            return handle
         fake_fn = type('ParallelFutureLiteral', (), {})()
         fake_fn.block = lambda: parallel_block.block()
         fake_fn.expression = lambda: None
@@ -9116,6 +9190,119 @@ class LLVMCodeGenerator(EzLangVisitor):
         walk(fn_lit.block() or fn_lit.expression())
         return names
 
+    def _ctx_capture_names(self, ctx, param_names: set[str] | None = None) -> list[str]:
+        """收集后台任务体需要从外层捕获的局部变量。"""
+        names: list[str] = []
+        seen: set[str] = set()
+        scopes: list[set[str]] = [set(param_names or set())]
+
+        def is_local_declared(name: str) -> bool:
+            return any(name in scope for scope in reversed(scopes))
+
+        def declare_from_var_decl(node) -> None:
+            qname = node.qualifiedVarName() if hasattr(node, 'qualifiedVarName') else None
+            if qname is None:
+                return
+            parts = qname.VAR_IDENTIFIER()
+            if len(parts) == 1:
+                scopes[-1].add(parts[0].getText())
+
+        def add(name: str) -> None:
+            if name in seen or is_local_declared(name):
+                return
+            if name in self.locals:
+                seen.add(name)
+                names.append(name)
+
+        def walk(node) -> None:
+            if node is None:
+                return
+            if isinstance(node, EzLangParser.BlockContext):
+                scopes.append(set())
+                for stmt in node.statement():
+                    walk(stmt)
+                scopes.pop()
+                return
+            if isinstance(node, EzLangParser.FunctionLiteralContext):
+                scopes.append(set())
+                if node.paramList() is not None:
+                    for param in node.paramList().param():
+                        scopes[-1].add(param.VAR_IDENTIFIER().getText())
+                        if param.expression() is not None:
+                            walk(param.expression())
+                walk(node.block() or node.expression())
+                scopes.pop()
+                return
+            if isinstance(node, EzLangParser.VariableDeclContext):
+                if node.expression() is not None:
+                    walk(node.expression())
+                declare_from_var_decl(node)
+                return
+            if isinstance(node, EzLangParser.FunctionDeclContext):
+                return
+            if isinstance(node, EzLangParser.ParamContext):
+                if node.expression() is not None:
+                    walk(node.expression())
+                return
+            if isinstance(node, EzLangParser.IdentifierExprContext):
+                token = node.VAR_IDENTIFIER() or node.TYPE_IDENTIFIER()
+                if token is not None:
+                    add(token.getText())
+                return
+            if hasattr(node, 'getChildCount'):
+                for i in range(node.getChildCount()):
+                    walk(node.getChild(i))
+
+        walk(ctx)
+        return names
+
+    def _build_parallel_capture_env(self, capture_names: list[str]) -> tuple[ir.Type, ir.Value, list[dict]]:
+        capture_types: list[ir.Type] = []
+        capture_values: list[ir.Value] = []
+        metadata: list[dict] = []
+        for name in capture_names:
+            self._join_flow_future(name)
+            storage = self._capture_shared_storage(name)
+            if storage is None:
+                continue
+            value = storage
+            capture_types.append(value.type)
+            capture_values.append(value)
+            storage_type = storage.type.pointee if isinstance(storage.type, ir.PointerType) else storage.type
+            metadata.append({
+                'name': name,
+                'unsigned': self._ptr_unsigned.get(id(storage), self._is_unsigned_value(storage)),
+                'type_name': self._locals_type_names.get(name),
+                'dict_types': self._dict_item_types_for_value(storage) if storage_type == self.structs.get('Dict') else None,
+                'list_unsigned': self._list_type_is_unsigned(storage.type),
+            })
+        env_type = ir.LiteralStructType(capture_types) if capture_types else ir.LiteralStructType([])
+        if not capture_values:
+            return env_type, ir.Constant(ir.PointerType(ir.IntType(8)), None), metadata
+        env_ptr = self._heap_allocate(env_type, name='_parallel_env')
+        for index, value in enumerate(capture_values):
+            slot = self.builder.gep(env_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), index)], inbounds=True)
+            self.builder.store(value, slot)
+        return env_type, self.builder.bitcast(env_ptr, ir.PointerType(ir.IntType(8))), metadata
+
+    def _bind_capture_env_locals(self, env_arg: ir.Value, env_type: ir.Type, metadata: list[dict]) -> None:
+        if not metadata:
+            return
+        typed_env = self.builder.bitcast(env_arg, ir.PointerType(env_type), name='_parallel_env_typed')
+        for index, item in enumerate(metadata):
+            name = item['name']
+            slot = self.builder.gep(typed_env, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), index)], inbounds=True)
+            local_storage = self.builder.load(slot, name=name)
+            self.locals[name] = local_storage
+            self._mark_unsigned(local_storage, bool(item.get('unsigned')))
+            type_name = item.get('type_name')
+            if type_name is not None:
+                self._locals_type_names[name] = type_name
+            dict_types = item.get('dict_types')
+            if dict_types is not None:
+                self._mark_dict_item_types(slot, dict_types[0], dict_types[1])
+            self._mark_list_elem_unsigned(slot, bool(item.get('list_unsigned')))
+
     def visitFnLiteralExpr(self, ctx: EzLangParser.FnLiteralExprContext):
         return self._gen_function_literal_closure(ctx.functionLiteral())
 
@@ -9125,12 +9312,23 @@ class LLVMCodeGenerator(EzLangVisitor):
         capture_names = self._function_literal_capture_names(fn_lit, set(param_names))
         capture_types: list[ir.Type] = []
         capture_values: list[ir.Value] = []
+        capture_unsigned: list[bool] = []
+        capture_type_names: list[str | None] = []
+        capture_dict_types: list[tuple[ir.Type, ir.Type] | None] = []
+        capture_list_unsigned: list[bool] = []
         for name in capture_names:
-            storage = self.locals.get(name)
+            self._join_flow_future(name)
+            storage = self._capture_shared_storage(name)
             if storage is None:
                 continue
-            capture_types.append(storage.type)
-            capture_values.append(storage)
+            value = storage
+            capture_types.append(value.type)
+            capture_values.append(value)
+            capture_unsigned.append(self._ptr_unsigned.get(id(storage), self._is_unsigned_value(storage)))
+            capture_type_names.append(self._locals_type_names.get(name))
+            storage_type = storage.type.pointee if isinstance(storage.type, ir.PointerType) else storage.type
+            capture_dict_types.append(self._dict_item_types_for_value(storage) if storage_type == self.structs.get('Dict') else None)
+            capture_list_unsigned.append(self._list_type_is_unsigned(storage.type))
 
         env_type = ir.LiteralStructType(capture_types) if capture_types else ir.LiteralStructType([])
         env_ptr = self._arena_allocate(env_type, name='_closure_env')
@@ -9167,7 +9365,17 @@ class LLVMCodeGenerator(EzLangVisitor):
         typed_env = self.builder.bitcast(invoke.args[0], ir.PointerType(env_type), name='_closure_env_typed')
         for index, cap_name in enumerate(capture_names):
             slot = self.builder.gep(typed_env, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), index)], inbounds=True)
-            self.locals[cap_name] = self.builder.load(slot, name=cap_name)
+            captured_storage = self.builder.load(slot, name=cap_name)
+            self.locals[cap_name] = captured_storage
+            self._shared_capture_locals.add(cap_name)
+            self._mark_unsigned(captured_storage, capture_unsigned[index] if index < len(capture_unsigned) else False)
+            if index < len(capture_type_names) and capture_type_names[index] is not None:
+                self._locals_type_names[cap_name] = capture_type_names[index]
+            if index < len(capture_dict_types) and capture_dict_types[index] is not None:
+                key_type, value_type = capture_dict_types[index]
+                self._mark_dict_item_types(captured_storage, key_type, value_type)
+            if index < len(capture_list_unsigned):
+                self._mark_list_elem_unsigned(captured_storage, capture_list_unsigned[index])
         for index, pname in enumerate(param_names):
             self._bind_function_param(pname, param_types[index], invoke.args[index + 1])
 

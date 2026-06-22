@@ -21,7 +21,7 @@ EzLang 提供了开箱即用的命令行工具链（CLI），并采用 `project.
 ### `ez build`
 读取 `project.toml`，执行项目的编译与构建。该命令会根据配置中的 `[[output]]` 节点执行交叉编译，生成对应架构和操作系统的产物，并输出到指定的 `dir` 目录中。同时也会根据 `[[plugins]]` 配置项加载 Python 构建 hook，在每个输出目标的构建前后调用 `before_build(context)` / `after_build(context)`。
 
-本机可执行目标会生成 LLVM IR、对象文件和同名可执行文件；链接阶段会编译 `extern "*.c"` 源码，链接对象文件、静态库、动态库、framework 与系统库。配置 `output.sdk` 后，`emcc` 目标会调用 Emscripten `emcc` 并把 `extern "*.js" for emcc` 作为 `--js-library` 传入；当 flow sleep、`race(pl)`、零捕获 `I32` `parallel` 或 emcc 标准库 suspend source 引入协程运行时时，CLI 会自动追加 `-sASYNCIFY`。Android/iOS 目标会调用 SDK 内的 `clang` 编译 C extern 并链接平台动态库。未配置 `output.sdk` 时仍保留 IR/对象文件输出，便于外部构建系统接手。
+本机可执行目标会生成 LLVM IR、对象文件和同名可执行文件；链接阶段会编译 `extern "*.c"` 源码，链接对象文件、静态库、动态库、framework 与系统库。配置 `output.sdk` 后，`emcc` 目标会调用 Emscripten `emcc` 并把 `extern "*.js" for emcc` 作为 `--js-library` 传入；当 flow sleep、`race(pl)`、`I32` `parallel` 或 emcc 标准库 suspend source 引入协程运行时时，CLI 会自动追加 `-sASYNCIFY`。Android/iOS 目标会调用 SDK 内的 `clang` 编译 C extern 并链接平台动态库。未配置 `output.sdk` 时仍保留 IR/对象文件输出，便于外部构建系统接手。
 
 ### `ez run`
 构建并立即执行当前项目（仅适用于本地可执行产物）。不适用于 `emcc` / `android` / `ios` 目标。入口文件会优先使用 `[project].main`；未配置时自动查找 `src/main.ez`、`src/index.ez`、`main.ez` 或 `index.ez`。入口文件顶层语句会按源码顺序执行，不要求显式定义 `main` 函数。

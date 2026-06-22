@@ -53,8 +53,8 @@ EzLang 编译器采用小型分层结构，目标是把 `.ez` 源码转换为 LL
 ## Flow 模型
 
 - `flow {}` 在语义层记录阻塞调用和依赖关系。
-- LLVM 层插入 `__ezrt_flow_enter`、`__ezrt_flow_exit`、`__ezrt_sleep`、`__ezrt_race_i32`、`__ezrt_task_start_i32` / `__ezrt_task_join_i32` 等运行时 hook。
-- Linux/macOS/Windows/Android/iOS 通过 `packages/std/native/runtime.c` 提供 `sleep`、`race(pl)` 和 flow 内零捕获 `I32` `parallel` 的基础任务运行时；emcc 通过 `packages/std/emcc/runtime.js` 与 Asyncify 提供可挂起和恢复的协程运行时。捕获外层局部变量、组合表达式或非 `I32` 返回类型的 `parallel` 保持同步协作 lowering。
+- LLVM 层插入 `__ezrt_flow_enter`、`__ezrt_flow_exit`、`__ezrt_sleep`、`__ezrt_race_i32`、`__ezrt_task_start_i32` / `__ezrt_task_start_env_i32` / `__ezrt_task_join_i32` 等运行时 hook。
+- Linux/macOS/Windows/Android/iOS 通过 `packages/std/native/runtime.c` 提供 `sleep`、`race(pl)` 和 flow 内 `I32` `parallel` 的基础任务运行时；emcc 通过 `packages/std/emcc/runtime.js` 与 Asyncify 提供可挂起和恢复的协程运行时。捕获外层局部变量的 `parallel` 会使用共享存储槽任务环境；组合表达式或非 `I32` 返回类型保持同步协作 lowering。
 - 这些 hook 是稳定 ABI 边界，后续可在不改变 EzLang 语法的前提下替换为更完整的平台调度器。
 
 ## 外部链接

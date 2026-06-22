@@ -30,10 +30,20 @@
     return fn ? toI32(fn()) : 0;
   }
 
+  function callI32EnvBranch(ptr, env) {
+    if (!ptr) return 0;
+    if (typeof dynCall_ii === 'function') return toI32(dynCall_ii(ptr, env));
+    if (typeof Module !== 'undefined' && Module && typeof Module.dynCall_ii === 'function') {
+      return toI32(Module.dynCall_ii(ptr, env));
+    }
+    var fn = tableFunction(ptr);
+    return fn ? toI32(fn(env)) : 0;
+  }
+
   function runTask(task) {
     if (!task || task.done || task.cancelled) return;
     try {
-      task.result = callI32Branch(task.branch);
+      task.result = task.hasEnv ? callI32EnvBranch(task.branch, task.env) : callI32Branch(task.branch);
     } catch (err) {
       task.error = err;
       task.result = 0;
@@ -43,14 +53,22 @@
     for (var i = 0; i < waiters.length; i++) waiters[i](task.result | 0);
   }
 
-  function createTask(branch) {
+  function createTask(branch, env, hasEnv) {
     var id = nextTaskId++;
-    tasks[id] = { branch: branch, result: 0, done: false, cancelled: false, waiters: [] };
+    tasks[id] = { branch: branch, env: env || 0, hasEnv: !!hasEnv, result: 0, done: false, cancelled: false, waiters: [] };
     return id;
   }
 
   function startTask(branch) {
-    var id = createTask(branch);
+    var id = createTask(branch, 0, false);
+    var task = tasks[id];
+    if (hasAsyncify()) setTimeout(function () { runTask(task); }, 0);
+    else runTask(task);
+    return id;
+  }
+
+  function startEnvTask(branch, env) {
+    var id = createTask(branch, env, true);
     var task = tasks[id];
     if (hasAsyncify()) setTimeout(function () { runTask(task); }, 0);
     else runTask(task);
@@ -131,6 +149,9 @@
     __ezrt_task_join_i32__async: 'auto',
     __ezrt_task_start_i32: function (branch) {
       return startTask(branch) | 0;
+    },
+    __ezrt_task_start_env_i32: function (branch, env) {
+      return startEnvTask(branch, env) | 0;
     },
     __ezrt_task_join_i32: function (handle) {
       return joinTask(handle) | 0;
