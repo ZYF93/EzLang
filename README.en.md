@@ -2,9 +2,17 @@
 
 [中文](README.md)
 
-EzLang is an expression-oriented systems programming language that defaults to value semantics. It combines a modern type system, an Arena memory model, and Flow concurrency semantics for high-performance system-level development, with cross-platform output for native targets, mobile platforms, and WebAssembly.
+## Why EzLang
+
+- **Fewer memory pitfalls without giving up speed**: common memory risks are handled by the language and toolchain as much as possible, so developers can focus on behavior and performance.
+- **One codebase for more platforms**: from native programs to mobile targets and WebAssembly, EzLang aims to cover more environments with the same way of writing code.
+- **Code that reads like intent**: control flow, data structures, and function calls compose naturally, making programs easier to understand and change.
+- **AI can write it, humans can own it**: code stays clear, explicit, and easy to reason about, so people can review, take over, and maintain it over time.
+- **Systems programming, made lighter**: EzLang brings reliability, performance, concurrency, and cross-platform output into a development experience that feels simple and practical.
 
 ## Core Features
+
+EzLang is an expression-oriented systems programming language that defaults to value semantics. It combines a modern type system, an Arena memory model, and Flow concurrency semantics for high-performance system-level development, with cross-platform output for native targets, mobile platforms, and WebAssembly.
 
 - **Expression-first syntax**: variables, control flow, `match`, function calls, and other constructs compose naturally.
 - **Modern type system**: generics, optional types `?`, weak references `#`, union types `|`, function types, `List`/`Vec`, `Dict`, structs, and type aliases.
