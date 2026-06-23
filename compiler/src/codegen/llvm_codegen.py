@@ -97,9 +97,14 @@ class LLVMCodeGenerator(EzLangVisitor):
         self._parallel_branch_counter = 0
         self._flow_future_stack: list[dict[str, dict[str, ir.Value]]] = []
         self._flow_depth = 0
+        self._flow_arena_protect_depth_stack: list[int] = []
         self._import_depth = 0
         self._source_dir_stack: list[Path] = [self.base_dir]
         self._shared_capture_locals: set[str] = set()
+        self._heap_capture_locals: set[str] = set()
+        self._owned_heap_capture_locals: set[str] = set()
+        self._owned_closure_local_names: set[str] = set()
+        self._owned_closure_values: set[int] = set()
         self._parallel_result_stack: list[ir.AllocaInstr] = []
         self._parallel_exit_stack: list[ir.Block] = []
         self._parallel_arena_depth_stack: list[int] = []
@@ -120,6 +125,11 @@ class LLVMCodeGenerator(EzLangVisitor):
         self._decorator_init_functions: list[ir.Function] = []
         self._closure_types: dict[str, ir.LiteralStructType] = {}
         self._closure_invokers: dict[str, ir.Function] = {}
+        self._heap_alloc_fn: ir.Function | None = None
+        self._heap_retain_fn: ir.Function | None = None
+        self._heap_release_fn: ir.Function | None = None
+        self._heap_destructors: dict[str, ir.Function] = {}
+        self._closure_env_destructors: dict[str, ir.Function] = {}
         self._function_literal_counter = 0
         self._declare_builtins()
 
@@ -227,6 +237,7 @@ class LLVMCodeGenerator(EzLangVisitor):
 
         # Arena 内存管理
         self._declare_arena()
+        self._declare_heap_runtime()
 
         flow_hook_type = ir.FunctionType(void, [])
         self._flow_enter = self._define_runtime_void_hook('__ezrt_flow_enter', flow_hook_type)
@@ -752,12 +763,15 @@ class LLVMCodeGenerator(EzLangVisitor):
 
         if normal_block is not None and not normal_block.is_terminated:
             if isinstance(ret_type, ir.VoidType):
+                self._release_owned_locals()
                 self.builder.ret_void()
             elif isinstance(result, ir.Value) and not isinstance(result.type, ir.VoidType):
                 if self._is_aggregate_ptr(result):
                     result = self.builder.load(result)
                 if result.type != ret_type:
                     result = self._coerce_return_value(result, ret_type)
+                if self._is_closure_type(result.type):
+                    result = self._prepare_value_for_return(result)
                 self._restore_active_arena_scopes_for_return(result, ret_type)
                 self.builder.ret(result)
             else:
@@ -771,8 +785,10 @@ class LLVMCodeGenerator(EzLangVisitor):
                 self.builder.unreachable()
                 return
             if isinstance(ret_type, ir.VoidType):
+                self._release_owned_locals()
                 self.builder.ret_void()
             else:
+                self._release_owned_locals()
                 self.builder.ret(self._zero_constant(ret_type))
 
     def _declare_arena(self):
@@ -897,6 +913,95 @@ class LLVMCodeGenerator(EzLangVisitor):
         self._arena_alloc = arena_alloc
         self._arena_save = save_fn
         self._arena_restore = restore_fn
+
+    def _declare_heap_runtime(self):
+        """声明闭包逃逸对象使用的引用计数堆。"""
+        i8 = ir.IntType(8)
+        i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
+        i8_ptr = ir.PointerType(i8)
+        void = ir.VoidType()
+        destructor_type = ir.PointerType(ir.FunctionType(void, [i8_ptr]))
+
+        malloc = self._get_or_declare_function('malloc', ir.FunctionType(i8_ptr, [i64]))
+        free = self._get_or_declare_function('free', ir.FunctionType(void, [i8_ptr]))
+        trap_fn = self._get_or_declare_function('llvm.trap', ir.FunctionType(void, []))
+
+        header_size = ir.Constant(i64, 16)
+        ref_offset = ir.Constant(i64, 0)
+        destructor_offset = ir.Constant(i64, 8)
+
+        alloc_fn = ir.Function(self.module, ir.FunctionType(i8_ptr, [i64, destructor_type]), '__ez_heap_alloc')
+        entry = alloc_fn.append_basic_block('entry')
+        ok = alloc_fn.append_basic_block('ok')
+        oom = alloc_fn.append_basic_block('oom')
+        b = ir.IRBuilder(entry)
+        total = b.add(alloc_fn.args[0], header_size, name='_heap_total')
+        raw = b.call(malloc, [total], name='_heap_raw')
+        has_raw = b.icmp_unsigned('!=', raw, ir.Constant(i8_ptr, None), name='_heap_alloc_ok')
+        b.cbranch(has_raw, ok, oom)
+        b.position_at_start(oom)
+        b.call(trap_fn, [])
+        b.unreachable()
+        b.position_at_start(ok)
+        ref_ptr = b.bitcast(b.gep(raw, [ref_offset], name='_heap_ref_addr'), ir.PointerType(i64), name='_heap_ref_ptr')
+        b.store(ir.Constant(i64, 1), ref_ptr)
+        dtor_ptr = b.bitcast(b.gep(raw, [destructor_offset], name='_heap_dtor_addr'), ir.PointerType(destructor_type), name='_heap_dtor_ptr')
+        b.store(alloc_fn.args[1], dtor_ptr)
+        user = b.gep(raw, [header_size], name='_heap_user')
+        b.ret(user)
+
+        retain_fn = ir.Function(self.module, ir.FunctionType(void, [i8_ptr]), '__ez_heap_retain')
+        entry = retain_fn.append_basic_block('entry')
+        has_ptr_bb = retain_fn.append_basic_block('has_ptr')
+        done = retain_fn.append_basic_block('done')
+        b = ir.IRBuilder(entry)
+        ptr = retain_fn.args[0]
+        b.cbranch(b.icmp_unsigned('!=', ptr, ir.Constant(i8_ptr, None), name='_heap_retain_has_ptr'), has_ptr_bb, done)
+        b.position_at_start(has_ptr_bb)
+        raw = b.gep(ptr, [ir.Constant(i64, -16)], name='_heap_retain_raw')
+        ref_ptr = b.bitcast(b.gep(raw, [ref_offset]), ir.PointerType(i64), name='_heap_retain_ref_ptr')
+        ref = b.load(ref_ptr, name='_heap_retain_ref')
+        b.store(b.add(ref, ir.Constant(i64, 1), name='_heap_retain_next'), ref_ptr)
+        b.branch(done)
+        b.position_at_start(done)
+        b.ret_void()
+
+        release_fn = ir.Function(self.module, ir.FunctionType(void, [i8_ptr]), '__ez_heap_release')
+        entry = release_fn.append_basic_block('entry')
+        has_ptr_bb = release_fn.append_basic_block('has_ptr')
+        call_dtor_bb = release_fn.append_basic_block('call_dtor')
+        free_bb = release_fn.append_basic_block('free')
+        done = release_fn.append_basic_block('done')
+        b = ir.IRBuilder(entry)
+        ptr = release_fn.args[0]
+        b.cbranch(b.icmp_unsigned('!=', ptr, ir.Constant(i8_ptr, None), name='_heap_release_has_ptr'), has_ptr_bb, done)
+        b.position_at_start(has_ptr_bb)
+        raw = b.gep(ptr, [ir.Constant(i64, -16)], name='_heap_release_raw')
+        ref_ptr = b.bitcast(b.gep(raw, [ref_offset]), ir.PointerType(i64), name='_heap_release_ref_ptr')
+        ref = b.load(ref_ptr, name='_heap_release_ref')
+        next_ref = b.sub(ref, ir.Constant(i64, 1), name='_heap_release_next')
+        b.store(next_ref, ref_ptr)
+        is_last = b.icmp_unsigned('==', next_ref, ir.Constant(i64, 0), name='_heap_release_last')
+        b.cbranch(is_last, call_dtor_bb, done)
+        b.position_at_start(call_dtor_bb)
+        dtor_ptr = b.bitcast(b.gep(raw, [destructor_offset]), ir.PointerType(destructor_type), name='_heap_release_dtor_ptr')
+        dtor = b.load(dtor_ptr, name='_heap_release_dtor')
+        has_dtor = b.icmp_unsigned('!=', dtor, ir.Constant(destructor_type, None), name='_heap_release_has_dtor')
+        dtor_bb = release_fn.append_basic_block('dtor')
+        b.cbranch(has_dtor, dtor_bb, free_bb)
+        b.position_at_start(dtor_bb)
+        b.call(dtor, [ptr])
+        b.branch(free_bb)
+        b.position_at_start(free_bb)
+        b.call(free, [raw])
+        b.branch(done)
+        b.position_at_start(done)
+        b.ret_void()
+
+        self._heap_alloc_fn = alloc_fn
+        self._heap_retain_fn = retain_fn
+        self._heap_release_fn = release_fn
 
     @staticmethod
     def _is_aggregate_ptr(val: ir.Value) -> bool:
@@ -1037,6 +1142,9 @@ class LLVMCodeGenerator(EzLangVisitor):
             self.locals[name] = arg
             return arg
         alloca = self.builder.alloca(param_type, name=name)
+        if self._is_closure_type(param_type):
+            self._retain_closure_value(arg)
+            self._owned_closure_local_names.add(name)
         self.builder.store(arg, alloca)
         if isinstance(param_type, (ir.LiteralStructType, ir.IdentifiedStructType)):
             copied = self._copy_aggregate_value(alloca, name=name)
@@ -1053,6 +1161,32 @@ class LLVMCodeGenerator(EzLangVisitor):
             saved_pos = self._arena_scope_stack.pop()
             self.builder.call(self._arena_restore, [saved_pos])
 
+    def _release_owned_locals(self, names: set[str] | None = None, *, exclude_names: set[str] | None = None) -> None:
+        if self.builder is None:
+            return
+        exclude_names = exclude_names or set()
+        closure_names = set(self._owned_closure_local_names if names is None else self._owned_closure_local_names & names)
+        for name in list(closure_names):
+            if name in exclude_names:
+                continue
+            storage = self.locals.get(name)
+            if storage is None or not isinstance(storage.type, ir.PointerType) or not self._is_closure_type(storage.type.pointee):
+                continue
+            value = self.builder.load(storage, name=f'_{name}_drop')
+            self._release_value(value)
+            self._owned_closure_local_names.discard(name)
+        heap_names = set(self._owned_heap_capture_locals if names is None else self._owned_heap_capture_locals & names)
+        for name in list(heap_names):
+            if name in exclude_names:
+                continue
+            storage = self.locals.get(name)
+            if storage is None or not isinstance(storage.type, ir.PointerType):
+                continue
+            self._heap_release_ptr(storage)
+            self._owned_heap_capture_locals.discard(name)
+            self._heap_capture_locals.discard(name)
+            self._shared_capture_locals.discard(name)
+
     @staticmethod
     def _type_may_reference_arena(t: ir.Type) -> bool:
         """判断值类型内部是否可能保存 Arena 指针，返回时需要提升到外层生命周期。"""
@@ -1068,17 +1202,20 @@ class LLVMCodeGenerator(EzLangVisitor):
 
     def _restore_active_arena_scopes_for_return(self, ret_value: ir.Value | None = None,
                                                 ret_type: ir.Type | None = None,
-                                                target_depth: int = 0) -> None:
+                                                target_depth: int = 0,
+                                                exclude_names: set[str] | None = None) -> None:
         """return 前恢复作用域；若返回值含 Arena 指针，则保留当前块分配避免悬垂引用。"""
         value_type = ret_type
         if value_type is None and isinstance(ret_value, ir.Value):
             value_type = ret_value.type.pointee if self._is_aggregate_ptr(ret_value) else ret_value.type
         if value_type is not None and self._type_may_reference_arena(value_type):
+            self._release_owned_locals(exclude_names=exclude_names)
             if target_depth > 0:
                 del self._arena_scope_stack[target_depth:]
             else:
                 self._arena_scope_stack.clear()
             return
+        self._release_owned_locals(exclude_names=exclude_names)
         self._restore_active_arena_scopes(target_depth)
 
     def _type_ctx_is_unsigned(self, ctx) -> bool:
@@ -1634,6 +1771,9 @@ class LLVMCodeGenerator(EzLangVisitor):
             'locals': self.locals,
             'locals_type_names': self._locals_type_names,
             'shared_capture_locals': self._shared_capture_locals,
+            'owned_heap_capture_locals': self._owned_heap_capture_locals,
+            'owned_closure_local_names': self._owned_closure_local_names,
+            'owned_closure_values': self._owned_closure_values,
             'loop_exit_blocks': self.loop_exit_blocks,
             'loop_continue_blocks': self.loop_continue_blocks,
             'catch_exit_blocks': self.catch_exit_blocks,
@@ -1643,10 +1783,12 @@ class LLVMCodeGenerator(EzLangVisitor):
             'function_return_type_ctx_stack': self._function_return_type_ctx_stack,
             'flow_future_stack': self._flow_future_stack,
             'flow_depth': self._flow_depth,
+            'flow_arena_protect_depth_stack': self._flow_arena_protect_depth_stack,
             'parallel_result_stack': self._parallel_result_stack,
             'parallel_exit_stack': self._parallel_exit_stack,
             'parallel_arena_depth_stack': self._parallel_arena_depth_stack,
             'arena_scope_stack': self._arena_scope_stack,
+            'heap_capture_locals': self._heap_capture_locals,
         }
         self.builder = builder
         self.current_function = func
@@ -1654,6 +1796,10 @@ class LLVMCodeGenerator(EzLangVisitor):
         self.locals = {}
         self._locals_type_names = {}
         self._shared_capture_locals = set()
+        self._heap_capture_locals = set()
+        self._owned_heap_capture_locals = set()
+        self._owned_closure_local_names = set()
+        self._owned_closure_values = set()
         self.loop_exit_blocks = []
         self.loop_continue_blocks = []
         self.catch_exit_blocks = []
@@ -1663,6 +1809,7 @@ class LLVMCodeGenerator(EzLangVisitor):
         self._function_return_type_ctx_stack = []
         self._flow_future_stack = []
         self._flow_depth = 0
+        self._flow_arena_protect_depth_stack = []
         self._parallel_result_stack = []
         self._parallel_exit_stack = []
         self._parallel_arena_depth_stack = []
@@ -1676,6 +1823,9 @@ class LLVMCodeGenerator(EzLangVisitor):
         self.locals = state['locals']
         self._locals_type_names = state['locals_type_names']
         self._shared_capture_locals = state['shared_capture_locals']
+        self._owned_heap_capture_locals = state['owned_heap_capture_locals']
+        self._owned_closure_local_names = state['owned_closure_local_names']
+        self._owned_closure_values = state['owned_closure_values']
         self.loop_exit_blocks = state['loop_exit_blocks']
         self.loop_continue_blocks = state['loop_continue_blocks']
         self.catch_exit_blocks = state['catch_exit_blocks']
@@ -1685,10 +1835,12 @@ class LLVMCodeGenerator(EzLangVisitor):
         self._function_return_type_ctx_stack = state['function_return_type_ctx_stack']
         self._flow_future_stack = state['flow_future_stack']
         self._flow_depth = state['flow_depth']
+        self._flow_arena_protect_depth_stack = state['flow_arena_protect_depth_stack']
         self._parallel_result_stack = state['parallel_result_stack']
         self._parallel_exit_stack = state['parallel_exit_stack']
         self._parallel_arena_depth_stack = state['parallel_arena_depth_stack']
         self._arena_scope_stack = state['arena_scope_stack']
+        self._heap_capture_locals = state['heap_capture_locals']
 
     def _arena_allocate(self, llvm_type: ir.Type, name: str = "") -> ir.Value:
         """在 Arena 中分配内存，返回指向分配区域的指针"""
@@ -1707,24 +1859,201 @@ class LLVMCodeGenerator(EzLangVisitor):
         typed_ptr = self.builder.bitcast(raw_ptr, ir.PointerType(llvm_type), name=name)
         return typed_ptr
 
-    def _heap_allocate(self, llvm_type: ir.Type, name: str = "") -> ir.Value:
-        """在进程堆上分配内存，用于可能跨线程访问的捕获环境。"""
+    def _arena_allocate_parent_lifetime(self, llvm_type: ir.Type, name: str = "") -> ir.Value:
+        """在当前父 Arena 生命周期内分配逃逸捕获存储。"""
+        ptr = self._arena_allocate(llvm_type, name=name)
+        if self.builder is not None and hasattr(self, '_arena_save') and self._arena_scope_stack:
+            saved_pos = self.builder.call(self._arena_save, [], name=f'{name}_arena_saved' if name else '_arena_saved')
+            self._arena_scope_stack[-1] = saved_pos
+        return ptr
+
+    def _arena_allocate_lifetime_at_depth(self, llvm_type: ir.Type, depth: int, name: str = "") -> ir.Value:
+        """分配并把指定作用域的恢复点推进到分配之后。"""
+        ptr = self._arena_allocate(llvm_type, name=name)
+        if self.builder is not None and hasattr(self, '_arena_save') and self._arena_scope_stack:
+            index = min(max(depth, 0), len(self._arena_scope_stack) - 1)
+            saved_pos = self.builder.call(self._arena_save, [], name=f'{name}_arena_saved' if name else '_arena_saved')
+            for i in range(index, len(self._arena_scope_stack)):
+                self._arena_scope_stack[i] = saved_pos
+        return ptr
+
+    def _heap_allocate(self, llvm_type: ir.Type, name: str = "", destructor: ir.Function | None = None) -> ir.Value:
+        """在进程堆上分配逃逸闭包捕获，避免被调用者 Arena 回收。"""
+        if self.builder is None:
+            return None
         i64 = ir.IntType(64)
         i8_ptr = ir.PointerType(ir.IntType(8))
-        malloc = self._get_or_declare_function('malloc', ir.FunctionType(i8_ptr, [i64]))
-        size_val = ir.Constant(i64, max(self._type_width(llvm_type), 1))
-        raw_ptr = self.builder.call(malloc, [size_val], name=f'{name}_raw' if name else '')
+        dtor_type = ir.PointerType(ir.FunctionType(ir.VoidType(), [i8_ptr]))
+        dtor = destructor if destructor is not None else ir.Constant(dtor_type, None)
+        raw_ptr = self.builder.call(self._heap_alloc_fn, [ir.Constant(i64, max(self._type_width(llvm_type), 1)), dtor], name=f'{name}_raw' if name else '')
         return self.builder.bitcast(raw_ptr, ir.PointerType(llvm_type), name=name)
 
-    def _capture_shared_storage(self, name: str) -> ir.Value | None:
+    def _heap_retain_ptr(self, ptr: ir.Value | None) -> None:
+        if ptr is None or self.builder is None:
+            return
+        i8_ptr = ir.PointerType(ir.IntType(8))
+        if ptr.type != i8_ptr:
+            ptr = self.builder.bitcast(ptr, i8_ptr)
+        self.builder.call(self._heap_retain_fn, [ptr])
+
+    def _heap_release_ptr(self, ptr: ir.Value | None) -> None:
+        if ptr is None or self.builder is None:
+            return
+        i8_ptr = ir.PointerType(ir.IntType(8))
+        if ptr.type != i8_ptr:
+            ptr = self.builder.bitcast(ptr, i8_ptr)
+        self.builder.call(self._heap_release_fn, [ptr])
+
+    def _closure_env_ptr(self, closure: ir.Value) -> ir.Value | None:
+        if not isinstance(closure, ir.Value):
+            return None
+        if isinstance(closure.type, ir.PointerType) and self._is_closure_type(closure.type.pointee):
+            closure = self.builder.load(closure, name='_closure_owner_value')
+        if not self._is_closure_type(closure.type):
+            return None
+        return self.builder.extract_value(closure, 1, name='_closure_owner_env')
+
+    def _retain_closure_value(self, closure: ir.Value) -> ir.Value:
+        env = self._closure_env_ptr(closure)
+        if env is not None:
+            self._heap_retain_ptr(env)
+        return closure
+
+    def _release_closure_value(self, closure: ir.Value | None) -> None:
+        if closure is None:
+            return
+        env = self._closure_env_ptr(closure)
+        if env is not None:
+            self._heap_release_ptr(env)
+
+    def _value_needs_release(self, typ: ir.Type) -> bool:
+        return self._is_closure_type(typ)
+
+    def _release_value(self, value: ir.Value | None) -> None:
+        if value is None or self.builder is None:
+            return
+        value_type = value.type.pointee if isinstance(value.type, ir.PointerType) else value.type
+        if self._is_closure_type(value_type):
+            self._release_closure_value(value)
+
+    def _retain_value(self, value: ir.Value | None) -> ir.Value | None:
+        if value is None or self.builder is None:
+            return value
+        if self._is_closure_type(value.type):
+            return self._retain_closure_value(value)
+        return value
+
+    def _consume_owned_closure_value(self, value: ir.Value | None) -> bool:
+        if value is None or not isinstance(value, ir.Value):
+            return False
+        if id(value) in self._owned_closure_values:
+            self._owned_closure_values.discard(id(value))
+            return True
+        return False
+
+    def _prepare_value_for_store(self, value: ir.Value) -> ir.Value:
+        """把值写入拥有所有权的槽位；闭包临时值转移，借用值 retain。"""
+        if isinstance(value, ir.Value) and self._is_closure_type(value.type):
+            if not self._consume_owned_closure_value(value):
+                self._retain_closure_value(value)
+        return value
+
+    def _prepare_value_for_return(self, value: ir.Value) -> ir.Value:
+        """返回值由调用方拥有；闭包临时值转移，借用值 retain。"""
+        if isinstance(value, ir.Value) and self._is_closure_type(value.type):
+            if not self._consume_owned_closure_value(value):
+                self._retain_closure_value(value)
+        return value
+
+    def _heap_destructor_for_type(self, llvm_type: ir.Type) -> ir.Function | None:
+        if not self._value_needs_release(llvm_type):
+            return None
+        key = str(llvm_type)
+        cached = self._heap_destructors.get(key)
+        if cached is not None:
+            return cached
+        i8_ptr = ir.PointerType(ir.IntType(8))
+        name = f'__ez_heap_destructor_{len(self._heap_destructors)}'
+        func = ir.Function(self.module, ir.FunctionType(ir.VoidType(), [i8_ptr]), name)
+        self._heap_destructors[key] = func
+        old_builder = self.builder
+        old_func = self.current_function
+        entry = func.append_basic_block('entry')
+        self.builder = ir.IRBuilder(entry)
+        self.current_function = func
+        typed = self.builder.bitcast(func.args[0], ir.PointerType(llvm_type), name='_heap_value_typed')
+        value = self.builder.load(typed, name='_heap_value')
+        self._release_value(value)
+        self.builder.ret_void()
+        self.builder = old_builder
+        self.current_function = old_func
+        return func
+
+    def _closure_env_destructor(self, env_type: ir.Type) -> ir.Function | None:
+        if not isinstance(env_type, ir.LiteralStructType) or len(env_type.elements) == 0:
+            return None
+        key = str(env_type)
+        cached = self._closure_env_destructors.get(key)
+        if cached is not None:
+            return cached
+        i8_ptr = ir.PointerType(ir.IntType(8))
+        i32 = ir.IntType(32)
+        name = f'__ez_closure_env_destructor_{len(self._closure_env_destructors)}'
+        func = ir.Function(self.module, ir.FunctionType(ir.VoidType(), [i8_ptr]), name)
+        self._closure_env_destructors[key] = func
+        old_builder = self.builder
+        old_func = self.current_function
+        entry = func.append_basic_block('entry')
+        self.builder = ir.IRBuilder(entry)
+        self.current_function = func
+        typed = self.builder.bitcast(func.args[0], ir.PointerType(env_type), name='_closure_env_drop_typed')
+        for index, elem_type in enumerate(env_type.elements):
+            if isinstance(elem_type, ir.PointerType):
+                slot = self.builder.gep(typed, [ir.Constant(i32, 0), ir.Constant(i32, index)], inbounds=True)
+                captured_ptr = self.builder.load(slot, name=f'_closure_capture_{index}')
+                self._heap_release_ptr(captured_ptr)
+        self.builder.ret_void()
+        self.builder = old_builder
+        self.current_function = old_func
+        return func
+
+    def _capture_shared_storage(self, name: str, *, heap: bool = False, arena_depth: int | None = None) -> ir.Value | None:
         """把捕获局部提升为共享存储槽，闭包/parallel 与外层共同读写。"""
         storage = self.locals.get(name)
         if storage is None or not isinstance(storage.type, ir.PointerType):
             return storage
+        if name in self._heap_capture_locals:
+            return storage
+        if heap and name in self._shared_capture_locals:
+            self._join_pending_flow_futures()
+            storage = self.locals.get(name)
+            if storage is None or not isinstance(storage.type, ir.PointerType):
+                return storage
+            pointee = storage.type.pointee
+            shared = self._heap_allocate(pointee, name=f'_{name}_shared', destructor=self._heap_destructor_for_type(pointee))
+            current = self.builder.load(storage, name=f'_{name}_shared_heap_init')
+            self.builder.store(current, shared)
+            self.locals[name] = shared
+            self._heap_capture_locals.add(name)
+            self._owned_heap_capture_locals.add(name)
+            self._mark_unsigned(shared, self._ptr_unsigned.get(id(storage), False))
+            if self._is_list_type(pointee):
+                self._mark_list_elem_unsigned(shared, self._list_type_is_unsigned(storage.type))
+            if pointee == self.structs.get('Dict'):
+                key_type, value_type = self._dict_item_types_for_value(storage)
+                self._mark_dict_item_types(shared, key_type, value_type)
+            return shared
         if name in self._shared_capture_locals:
             return storage
         pointee = storage.type.pointee
-        shared = self._heap_allocate(pointee, name=f'_{name}_shared')
+        if heap:
+            shared = self._heap_allocate(pointee, name=f'_{name}_shared', destructor=self._heap_destructor_for_type(pointee))
+            self._heap_capture_locals.add(name)
+            self._owned_heap_capture_locals.add(name)
+        elif arena_depth is not None:
+            shared = self._arena_allocate_lifetime_at_depth(pointee, arena_depth, name=f'_{name}_shared')
+        else:
+            shared = self._arena_allocate_parent_lifetime(pointee, name=f'_{name}_shared')
         current = self.builder.load(storage, name=f'_{name}_shared_init')
         self.builder.store(current, shared)
         self.locals[name] = shared
@@ -2957,10 +3286,20 @@ class LLVMCodeGenerator(EzLangVisitor):
                 store_val = self._apply_assignment_operator(current, store_val, op_ctx)
             if store_val.type != target.type.pointee:
                 store_val = self._coerce_preserve_unsigned(store_val, target.type.pointee)
+            if self._value_needs_release(target.type.pointee):
+                store_val = self._prepare_value_for_store(store_val)
+                old_value = self.builder.load(target, name=f'_{name}_old')
+                self._release_value(old_value)
             self.builder.store(store_val, target)
             return store_val
 
         return self._emit_lock_access(name, "write", do_store)
+
+    def _initialize_storage(self, target: ir.Value, value: ir.Value) -> None:
+        """初始化新存储槽；value 的当前所有权转移给该槽。"""
+        if self._value_needs_release(target.type.pointee):
+            value = self._prepare_value_for_store(value)
+        self.builder.store(value, target)
 
     def _simple_lvalue_name(self, ctx) -> str | None:
         """识别裸标识符左值名；成员和索引左值由专门路径处理。"""
@@ -3396,7 +3735,7 @@ class LLVMCodeGenerator(EzLangVisitor):
         val = self._coerce_value(val, gv.type.pointee)
         if val.type != gv.type.pointee:
             return None
-        self._emit_lock_access(name, "write", lambda: self.builder.store(val, gv))
+        self._emit_lock_access(name, "write", lambda: self._initialize_storage(gv, val))
         if gv.type.pointee == self.structs.get('Dict'):
             item_types = self._dict_item_types_from_decl(ctx.type_(), initializer) or source_dict_types
             if item_types is not None:
@@ -4131,16 +4470,6 @@ class LLVMCodeGenerator(EzLangVisitor):
             if type_ctx is not None:
                 llvm_type = self._map_type(type_ctx)
                 parallel_block = self._parallel_block_from_initializer(initializer) if self._is_exact_parallel_block_expr(initializer) else None
-                if parallel_block is not None and self._flow_depth > 0 and self._type_ctx_name(type_ctx) == 'I32':
-                    future_handle = self._start_flow_parallel_i32_future(name, parallel_block)
-                    if future_handle is not None:
-                        alloca = self.builder.alloca(llvm_type, name=name)
-                        self.builder.store(self._zero_constant(llvm_type), alloca)
-                        self.locals[name] = alloca
-                        self._remember_type_name(name, llvm_type, type_ctx)
-                        self._mark_unsigned(alloca, self._type_ctx_is_unsigned(type_ctx))
-                        self._mark_list_elem_unsigned(alloca, self._type_ctx_is_unsigned(type_ctx))
-                        return None
                 alloca = self.builder.alloca(llvm_type, name=name)
                 self.locals[name] = alloca
                 self._remember_type_name(name, llvm_type, type_ctx)
@@ -4149,12 +4478,18 @@ class LLVMCodeGenerator(EzLangVisitor):
                     self._mark_dict_item_types(alloca, dict_item_types[0], dict_item_types[1])
                 self._mark_unsigned(alloca, self._type_ctx_is_unsigned(type_ctx))
                 self._mark_list_elem_unsigned(alloca, self._type_ctx_is_unsigned(type_ctx))
+                if parallel_block is not None and self._flow_depth > 0:
+                    future_handle = self._start_flow_parallel_future(name, parallel_block, alloca)
+                    if future_handle is not None:
+                        return None
                 if initializer is not None:
                     val = self._eval_expr_with_expected(initializer, llvm_type, dict_item_types)
                     if val is not None:
                         if self._is_aggregate_ptr(val) and val.type.pointee == llvm_type:
                             loaded_val = self.builder.load(val)
-                            self._emit_lock_access(name, "write", lambda: self.builder.store(loaded_val, alloca))
+                            self._emit_lock_access(name, "write", lambda: self._initialize_storage(alloca, loaded_val))
+                            if self._is_closure_type(llvm_type):
+                                self._owned_closure_local_names.add(name)
                             if llvm_type == self.structs.get('Dict'):
                                 source_dict_types = self._dict_item_types_for_value(val)
                                 self._mark_dict_item_types(alloca, source_dict_types[0], source_dict_types[1])
@@ -4166,21 +4501,28 @@ class LLVMCodeGenerator(EzLangVisitor):
                                 val = self._coerce_union_value(val, llvm_type, self._union_variant_tag(type_ctx, val.type))
                             else:
                                 val = self._coerce_value(val, llvm_type)
-                            self._emit_lock_access(name, "write", lambda: self.builder.store(val, alloca))
+                            self._emit_lock_access(name, "write", lambda: self._initialize_storage(alloca, val))
+                            if self._is_closure_type(llvm_type):
+                                self._owned_closure_local_names.add(name)
                 else:
-                    self._emit_lock_access(name, "write", lambda: self.builder.store(self._zero_constant(llvm_type), alloca))
+                    self._emit_lock_access(name, "write", lambda: self._initialize_storage(alloca, self._zero_constant(llvm_type)))
+                    if self._is_closure_type(llvm_type):
+                        self._owned_closure_local_names.add(name)
             elif initializer is not None:
                 # 类型推断：先求值，根据结果确定类型
                 parallel_block = self._parallel_block_from_initializer(initializer) if self._is_exact_parallel_block_expr(initializer) else None
                 if parallel_block is not None and self._flow_depth > 0:
-                    future_handle = self._start_flow_parallel_i32_future(name, parallel_block)
+                    result_type = self._infer_block_return_type(parallel_block.block())
+                    result_type = ir.IntType(32) if isinstance(result_type, ir.VoidType) else result_type
+                    alloca = self.builder.alloca(result_type, name=name)
+                    self.builder.store(self._zero_constant(result_type), alloca)
+                    self.locals[name] = alloca
+                    self._remember_type_name(name, result_type)
+                    self._mark_unsigned(alloca, False)
+                    future_handle = self._start_flow_parallel_future(name, parallel_block, alloca)
                     if future_handle is not None:
-                        alloca = self.builder.alloca(ir.IntType(32), name=name)
-                        self.builder.store(ir.Constant(ir.IntType(32), 0), alloca)
-                        self.locals[name] = alloca
-                        self._remember_type_name(name, ir.IntType(32))
-                        self._mark_unsigned(alloca, False)
                         return None
+                    self.locals.pop(name, None)
                 val = self._eval_expr(initializer)
                 if val is not None:
                     if isinstance(val, ir.AllocaInstr) or self._is_aggregate_ptr(val):
@@ -4196,9 +4538,11 @@ class LLVMCodeGenerator(EzLangVisitor):
                         self._mark_list_elem_unsigned(copied, self._list_type_is_unsigned(copied.type))
                     else:
                         alloca = self.builder.alloca(val.type, name=name)
-                        self._emit_lock_access(name, "write", lambda: self.builder.store(val, alloca))
+                        self._emit_lock_access(name, "write", lambda: self._initialize_storage(alloca, val))
                         self.locals[name] = alloca
                         self._remember_type_name(name, val.type, value=val)
+                        if self._is_closure_type(val.type):
+                            self._owned_closure_local_names.add(name)
                         if val.type == self.structs.get('Dict'):
                             key_type, value_type = self._dict_item_types_for_value(val)
                             self._mark_dict_item_types(alloca, key_type, value_type)
@@ -4206,7 +4550,7 @@ class LLVMCodeGenerator(EzLangVisitor):
             else:
                 # 无类型无初值，默认 i32
                 alloca = self.builder.alloca(ir.IntType(32), name=name)
-                self._emit_lock_access(name, "write", lambda: self.builder.store(ir.Constant(ir.IntType(32), 0), alloca))
+                self._emit_lock_access(name, "write", lambda: self._initialize_storage(alloca, ir.Constant(ir.IntType(32), 0)))
                 self.locals[name] = alloca
                 self._remember_type_name(name, ir.IntType(32))
                 self._mark_unsigned(alloca, False)
@@ -8731,6 +9075,12 @@ class LLVMCodeGenerator(EzLangVisitor):
 
     def visitFlowBlock(self, ctx: EzLangParser.FlowBlockContext):
         """flow 块：保留运行时边界，并把块内 return 捕获为表达式结果。"""
+        flow_arena_saved = None
+        flow_arena_index = len(self._arena_scope_stack)
+        if self.builder is not None and hasattr(self, '_arena_save'):
+            flow_arena_saved = self.builder.call(self._arena_save, [], name='_flow_arena_saved')
+            self._arena_scope_stack.append(flow_arena_saved)
+            flow_arena_index = len(self._arena_scope_stack) - 1
         if self.builder is not None:
             self.builder.call(self._flow_enter, [])
         result_type = self._infer_block_return_type(ctx.block())
@@ -8744,6 +9094,7 @@ class LLVMCodeGenerator(EzLangVisitor):
             self._parallel_exit_stack.append(exit_block)
             self._parallel_arena_depth_stack.append(len(self._arena_scope_stack))
         self._flow_future_stack.append({})
+        self._flow_arena_protect_depth_stack.append(flow_arena_index)
         self._flow_depth += 1
         self._eval(ctx.block())
         self._flow_depth -= 1
@@ -8761,6 +9112,16 @@ class LLVMCodeGenerator(EzLangVisitor):
             self._join_pending_flow_futures()
         if self._flow_future_stack:
             self._flow_future_stack.pop()
+        if self._flow_arena_protect_depth_stack:
+            self._flow_arena_protect_depth_stack.pop()
+        if flow_arena_saved is not None and self.builder is not None and not self.builder.block.is_terminated:
+            while len(self._arena_scope_stack) > flow_arena_index + 1:
+                saved_pos = self._arena_scope_stack.pop()
+                self.builder.call(self._arena_restore, [saved_pos])
+            if len(self._arena_scope_stack) > flow_arena_index:
+                self._arena_scope_stack.pop()
+            if result_alloca is None or not self._type_may_reference_arena(result_type):
+                self.builder.call(self._arena_restore, [flow_arena_saved])
         if self.builder is not None and not self.builder.block.is_terminated:
             self.builder.call(self._flow_exit, [])
         if result_alloca is not None:
@@ -8844,6 +9205,9 @@ class LLVMCodeGenerator(EzLangVisitor):
         async_result = self._gen_race_i32_runtime_call(pl_array, timeout_arg)
         if async_result is not None:
             return async_result
+        async_result = self._gen_race_runtime_call(pl_array, timeout_arg)
+        if async_result is not None:
+            return async_result
 
         branches = self._function_literals_in_array(pl_array)
         if not branches:
@@ -8890,6 +9254,141 @@ class LLVMCodeGenerator(EzLangVisitor):
             self.builder.branch(exit_block)
         self.builder.position_at_start(exit_block)
         return self.builder.load(result_alloca, name="race_value")
+
+    def _gen_race_runtime_call(self, array_ctx, timeout_arg: ir.Value) -> ir.Value | None:
+        """把 race(pl=[() => T, ...]) lower 为通用 out 指针运行时。"""
+        branches = self._function_literals_in_array(array_ctx)
+        if not branches:
+            return None
+        i32 = ir.IntType(32)
+        i64 = ir.IntType(64)
+        i8_ptr = ir.PointerType(ir.IntType(8))
+        branch_types = [self._infer_function_literal_return_type(branch) for branch in branches]
+        result_type = self._merge_ir_union_types(branch_types)
+        if isinstance(result_type, ir.VoidType):
+            return None
+
+        branch_funcs = []
+        env_values = []
+        for index, fn_lit in enumerate(branches):
+            params = fn_lit.paramList()
+            if params is not None and params.param():
+                return None
+            capture_names = self._function_literal_capture_names(fn_lit, set())
+            env_type, env_ptr, metadata = self._build_parallel_capture_env(capture_names)
+            branch_funcs.append(self._gen_race_branch_function(fn_lit, result_type, branch_types, index, env_type, metadata))
+            env_values.append(env_ptr)
+
+        self._require_runtime()
+        fn_ptr_type = ir.PointerType(ir.FunctionType(ir.VoidType(), [i8_ptr, i8_ptr]))
+        branches_type = ir.ArrayType(fn_ptr_type, len(branch_funcs))
+        branches_ptr = self.builder.alloca(branches_type, name='_race_branches')
+        envs_type = ir.ArrayType(i8_ptr, len(env_values))
+        envs_ptr = self.builder.alloca(envs_type, name='_race_envs')
+        for index, func in enumerate(branch_funcs):
+            branch_slot = self.builder.gep(branches_ptr, [ir.Constant(i32, 0), ir.Constant(i32, index)], inbounds=True)
+            self.builder.store(func, branch_slot)
+            env_slot = self.builder.gep(envs_ptr, [ir.Constant(i32, 0), ir.Constant(i32, index)], inbounds=True)
+            self.builder.store(env_values[index], env_slot)
+
+        result_ptr = self._arena_allocate_parent_lifetime(result_type, name='_race_result')
+        self.builder.store(self._zero_constant(result_type), result_ptr)
+        scratch_type = ir.ArrayType(result_type, len(branch_funcs))
+        scratch_ptr = self._arena_allocate_parent_lifetime(scratch_type, name='_race_branch_results')
+        timed_out = self.builder.alloca(i32, name='_race_timed_out')
+        self.builder.store(ir.Constant(i32, 0), timed_out)
+        first_branch = self.builder.gep(branches_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        first_env = self.builder.gep(envs_ptr, [ir.Constant(i32, 0), ir.Constant(i32, 0)], inbounds=True)
+        runtime_type = ir.FunctionType(ir.VoidType(), [
+            ir.PointerType(fn_ptr_type),
+            ir.PointerType(i8_ptr),
+            i32,
+            i32,
+            i8_ptr,
+            i8_ptr,
+            i64,
+            ir.PointerType(i32),
+        ])
+        runtime = self._get_or_declare_function('__ezrt_race_value', runtime_type)
+        result_i8 = self.builder.bitcast(result_ptr, i8_ptr, name='_race_result_out')
+        scratch_i8 = self.builder.bitcast(scratch_ptr, i8_ptr, name='_race_result_scratch')
+        self.builder.call(runtime, [
+            first_branch,
+            first_env,
+            ir.Constant(i32, len(branch_funcs)),
+            timeout_arg,
+            result_i8,
+            scratch_i8,
+            ir.Constant(i64, max(self._type_width(result_type), 1)),
+            timed_out,
+        ])
+        self._emit_throw_check_after_call()
+        if self._is_aggregate_type(result_type):
+            return result_ptr
+        return self.builder.load(result_ptr, name='_race_value')
+
+    def _gen_race_branch_function(self, fn_lit, result_type: ir.Type, branch_types: list[ir.Type], branch_index: int,
+                                  env_type: ir.Type, metadata: list[dict]) -> ir.Function:
+        """生成带捕获环境和 out 参数的通用 race 分支函数。"""
+        i8_ptr = ir.PointerType(ir.IntType(8))
+        name = f"__ez_race_branch_{self._race_branch_counter}"
+        self._race_branch_counter += 1
+        func = ir.Function(self.module, ir.FunctionType(ir.VoidType(), [i8_ptr, i8_ptr]), name)
+        func.args[0].name = '__env'
+        func.args[1].name = '__out'
+
+        entry = func.append_basic_block('entry')
+        prev_unsigned = self._save_unsigned_state()
+        prev_state = self._enter_function_codegen_state(ir.IRBuilder(entry), func)
+        self._flow_depth = max(prev_state.get('flow_depth', 0), 1)
+        self._bind_capture_env_locals(func.args[0], env_type, metadata)
+        throw_exit = func.append_basic_block('throw_exit')
+        self._function_throw_exit_stack.append(throw_exit)
+        self._function_return_type_ctx_stack.append(fn_lit.type_())
+
+        branch_result_type = branch_types[branch_index]
+        if isinstance(branch_result_type, ir.VoidType):
+            branch_result_type = result_type
+        result_alloca = self.builder.alloca(branch_result_type, name='_race_task_result')
+        self.builder.store(self._zero_constant(branch_result_type), result_alloca)
+        exit_block = self.builder.append_basic_block(name='race_task_exit')
+        self._parallel_result_stack.append(result_alloca)
+        self._parallel_exit_stack.append(exit_block)
+        self._parallel_arena_depth_stack.append(len(self._arena_scope_stack))
+
+        body = fn_lit.block() or fn_lit.expression()
+        value = self._eval(body) if body is not None else None
+        if value is not None and not self.builder.block.is_terminated:
+            if self._is_aggregate_ptr(value):
+                value = self.builder.load(value)
+            if value.type != branch_result_type:
+                value = self._coerce_value(value, branch_result_type)
+            self.builder.store(value, result_alloca)
+
+        if self._parallel_result_stack and self._parallel_result_stack[-1] is result_alloca:
+            self._parallel_result_stack.pop()
+        if self._parallel_exit_stack and self._parallel_exit_stack[-1] is exit_block:
+            self._parallel_exit_stack.pop()
+        if self._parallel_arena_depth_stack:
+            self._parallel_arena_depth_stack.pop()
+        if self.builder is not None and not self.builder.block.is_terminated:
+            self.builder.branch(exit_block)
+        self.builder.position_at_start(exit_block)
+
+        out_ptr = self.builder.bitcast(func.args[1], ir.PointerType(result_type), name='_race_task_out')
+        value = self.builder.load(result_alloca, name='_race_task_value')
+        if self._is_union_type(result_type):
+            tag = self._ir_union_variant_tag_for_types(result_type, branch_types, branch_result_type)
+            value = self._coerce_union_value(value, result_type, tag)
+        elif value.type != result_type:
+            value = self._coerce_value(value, result_type)
+        self.builder.store(value, out_ptr)
+        self._finish_function_with_throw_exit(ir.VoidType(), None)
+        self._function_return_type_ctx_stack.pop()
+
+        self._restore_function_codegen_state(prev_state)
+        self._restore_unsigned_state(prev_unsigned)
+        return func
 
     def _function_literals_in_array(self, array_ctx) -> list:
         expr_list = array_ctx.expressionList() if array_ctx is not None else None
@@ -8999,14 +9498,14 @@ class LLVMCodeGenerator(EzLangVisitor):
         self._restore_unsigned_state(prev_unsigned)
         return func
 
-    def _gen_parallel_i32_branch_function(self, block_ctx, env_type: ir.Type, metadata: list[dict]) -> ir.Function:
-        """生成带捕获环境的 parallel I32 分支函数。"""
+    def _gen_parallel_branch_function(self, block_ctx, result_type: ir.Type, env_type: ir.Type, metadata: list[dict]) -> ir.Function:
+        """生成带捕获环境和 out 参数的 parallel 分支函数。"""
         i8_ptr = ir.PointerType(ir.IntType(8))
-        i32 = ir.IntType(32)
         name = f"__ez_parallel_branch_{self._parallel_branch_counter}"
         self._parallel_branch_counter += 1
-        func = ir.Function(self.module, ir.FunctionType(i32, [i8_ptr]), name)
+        func = ir.Function(self.module, ir.FunctionType(ir.VoidType(), [i8_ptr, i8_ptr]), name)
         func.args[0].name = '__env'
+        func.args[1].name = '__out'
 
         entry = func.append_basic_block('entry')
         prev_unsigned = self._save_unsigned_state()
@@ -9017,8 +9516,29 @@ class LLVMCodeGenerator(EzLangVisitor):
         self._function_throw_exit_stack.append(throw_exit)
         self._function_return_type_ctx_stack.append(None)
 
-        value = self._eval(block_ctx) if block_ctx is not None else ir.Constant(i32, 0)
-        self._finish_function_with_throw_exit(i32, value)
+        result_alloca = self.builder.alloca(result_type, name='_parallel_task_result')
+        self.builder.store(self._zero_constant(result_type), result_alloca)
+        exit_block = self.builder.append_basic_block(name='parallel_task_exit')
+        self._parallel_result_stack.append(result_alloca)
+        self._parallel_exit_stack.append(exit_block)
+        self._parallel_arena_depth_stack.append(len(self._arena_scope_stack))
+
+        self._eval(block_ctx)
+
+        if self._parallel_result_stack and self._parallel_result_stack[-1] is result_alloca:
+            self._parallel_result_stack.pop()
+        if self._parallel_exit_stack and self._parallel_exit_stack[-1] is exit_block:
+            self._parallel_exit_stack.pop()
+        if self._parallel_arena_depth_stack:
+            self._parallel_arena_depth_stack.pop()
+        if self.builder is not None and not self.builder.block.is_terminated:
+            self.builder.branch(exit_block)
+        self.builder.position_at_start(exit_block)
+
+        out_ptr = self.builder.bitcast(func.args[1], ir.PointerType(result_type), name='_parallel_task_out')
+        value = self.builder.load(result_alloca, name='_parallel_task_value')
+        self.builder.store(value, out_ptr)
+        self._finish_function_with_throw_exit(ir.VoidType(), None)
         self._function_return_type_ctx_stack.pop()
 
         self._restore_function_codegen_state(prev_state)
@@ -9060,39 +9580,26 @@ class LLVMCodeGenerator(EzLangVisitor):
 
         return walk(ctx)
 
-    def _start_flow_parallel_i32_future(self, name: str, parallel_block) -> ir.Value | None:
-        """flow 内 parallel I32 块启动为后台任务，读取变量时 join。"""
+    def _start_flow_parallel_future(self, name: str, parallel_block, result_storage: ir.Value | None = None) -> ir.Value | None:
+        """flow 内 parallel 块启动为后台任务，读取变量时 join。"""
         if self._flow_depth <= 0 or not self._flow_future_stack or parallel_block is None:
             return None
         result_type = self._infer_block_return_type(parallel_block.block())
-        if result_type != ir.IntType(32):
+        if isinstance(result_type, ir.VoidType):
             return None
         capture_names = self._ctx_capture_names(parallel_block.block())
-        for cap_name in capture_names:
-            storage = self.locals.get(cap_name)
-            if storage is not None and self._is_aggregate_ptr(storage):
-                return None
-        if capture_names:
-            env_type, env_ptr, metadata = self._build_parallel_capture_env(capture_names)
-            branch = self._gen_parallel_i32_branch_function(parallel_block.block(), env_type, metadata)
-            self._require_runtime()
-            i8_ptr = ir.PointerType(ir.IntType(8))
-            start_type = ir.FunctionType(i8_ptr, [ir.PointerType(ir.FunctionType(ir.IntType(32), [i8_ptr])), i8_ptr])
-            start = self._get_or_declare_function('__ezrt_task_start_env_i32', start_type)
-            handle = self.builder.call(start, [branch, env_ptr], name=f'_{name}_future')
-            self._flow_future_stack[-1][name] = {'handle': handle, 'joined': False}
-            return handle
-        fake_fn = type('ParallelFutureLiteral', (), {})()
-        fake_fn.block = lambda: parallel_block.block()
-        fake_fn.expression = lambda: None
-        fake_fn.type_ = lambda: None
-        branch = self._gen_race_i32_branch_function(fake_fn)
+        env_type, env_ptr, metadata = self._build_parallel_capture_env(capture_names)
+        branch = self._gen_parallel_branch_function(parallel_block.block(), result_type, env_type, metadata)
         self._require_runtime()
         i8_ptr = ir.PointerType(ir.IntType(8))
-        start_type = ir.FunctionType(i8_ptr, [ir.PointerType(ir.FunctionType(ir.IntType(32), []))])
-        start = self._get_or_declare_function('__ezrt_task_start_i32', start_type)
-        handle = self.builder.call(start, [branch], name=f'_{name}_future')
-        self._flow_future_stack[-1][name] = {'handle': handle, 'joined': False}
+        if result_storage is None:
+            result_storage = self.builder.alloca(result_type, name=name)
+            self.builder.store(self._zero_constant(result_type), result_storage)
+        out_ptr = self.builder.bitcast(result_storage, i8_ptr, name=f'_{name}_future_out')
+        start_type = ir.FunctionType(i8_ptr, [ir.PointerType(ir.FunctionType(ir.VoidType(), [i8_ptr, i8_ptr])), i8_ptr, i8_ptr])
+        start = self._get_or_declare_function('__ezrt_task_start', start_type)
+        handle = self.builder.call(start, [branch, env_ptr, out_ptr], name=f'_{name}_future')
+        self._flow_future_stack[-1][name] = {'handle': handle, 'joined': False, 'storage': result_storage}
         return handle
 
     def _join_flow_future(self, name: str) -> None:
@@ -9101,15 +9608,11 @@ class LLVMCodeGenerator(EzLangVisitor):
         meta = self._flow_future_stack[-1][name]
         if meta.get('joined'):
             return
-        alloca = self.locals.get(name)
-        if alloca is None:
-            return
-        join_type = ir.FunctionType(ir.IntType(32), [ir.PointerType(ir.IntType(8))])
-        join = self._get_or_declare_function('__ezrt_task_join_i32', join_type)
-        value = self.builder.call(join, [meta['handle']], name=f'_{name}_joined')
+        join_type = ir.FunctionType(ir.VoidType(), [ir.PointerType(ir.IntType(8))])
+        join = self._get_or_declare_function('__ezrt_task_join', join_type)
+        self.builder.call(join, [meta['handle']])
         self._emit_throw_check_after_call()
         if self.builder is not None and not self.builder.block.is_terminated:
-            self.builder.store(value, alloca)
             meta['joined'] = True
 
     def _join_pending_flow_futures(self) -> None:
@@ -9262,7 +9765,8 @@ class LLVMCodeGenerator(EzLangVisitor):
         metadata: list[dict] = []
         for name in capture_names:
             self._join_flow_future(name)
-            storage = self._capture_shared_storage(name)
+            arena_depth = self._flow_arena_protect_depth_stack[-1] if self._flow_arena_protect_depth_stack else None
+            storage = self._capture_shared_storage(name, arena_depth=arena_depth)
             if storage is None:
                 continue
             value = storage
@@ -9279,7 +9783,8 @@ class LLVMCodeGenerator(EzLangVisitor):
         env_type = ir.LiteralStructType(capture_types) if capture_types else ir.LiteralStructType([])
         if not capture_values:
             return env_type, ir.Constant(ir.PointerType(ir.IntType(8)), None), metadata
-        env_ptr = self._heap_allocate(env_type, name='_parallel_env')
+        arena_depth = self._flow_arena_protect_depth_stack[-1] if self._flow_arena_protect_depth_stack else None
+        env_ptr = self._arena_allocate_lifetime_at_depth(env_type, arena_depth, name='_parallel_env') if arena_depth is not None else self._arena_allocate_parent_lifetime(env_type, name='_parallel_env')
         for index, value in enumerate(capture_values):
             slot = self.builder.gep(env_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), index)], inbounds=True)
             self.builder.store(value, slot)
@@ -9300,8 +9805,8 @@ class LLVMCodeGenerator(EzLangVisitor):
                 self._locals_type_names[name] = type_name
             dict_types = item.get('dict_types')
             if dict_types is not None:
-                self._mark_dict_item_types(slot, dict_types[0], dict_types[1])
-            self._mark_list_elem_unsigned(slot, bool(item.get('list_unsigned')))
+                self._mark_dict_item_types(local_storage, dict_types[0], dict_types[1])
+            self._mark_list_elem_unsigned(local_storage, bool(item.get('list_unsigned')))
 
     def visitFnLiteralExpr(self, ctx: EzLangParser.FnLiteralExprContext):
         return self._gen_function_literal_closure(ctx.functionLiteral())
@@ -9318,7 +9823,7 @@ class LLVMCodeGenerator(EzLangVisitor):
         capture_list_unsigned: list[bool] = []
         for name in capture_names:
             self._join_flow_future(name)
-            storage = self._capture_shared_storage(name)
+            storage = self._capture_shared_storage(name, heap=True)
             if storage is None:
                 continue
             value = storage
@@ -9331,11 +9836,16 @@ class LLVMCodeGenerator(EzLangVisitor):
             capture_list_unsigned.append(self._list_type_is_unsigned(storage.type))
 
         env_type = ir.LiteralStructType(capture_types) if capture_types else ir.LiteralStructType([])
-        env_ptr = self._arena_allocate(env_type, name='_closure_env')
+        if capture_values:
+            env_ptr = self._heap_allocate(env_type, name='_closure_env', destructor=self._closure_env_destructor(env_type))
+            env_i8 = self.builder.bitcast(env_ptr, ir.PointerType(ir.IntType(8)))
+        else:
+            env_ptr = None
+            env_i8 = ir.Constant(ir.PointerType(ir.IntType(8)), None)
         for index, value in enumerate(capture_values):
+            self._heap_retain_ptr(value)
             slot = self.builder.gep(env_ptr, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), index)], inbounds=True)
             self.builder.store(value, slot)
-        env_i8 = self.builder.bitcast(env_ptr, ir.PointerType(ir.IntType(8)))
 
         invoke_type = closure_type.elements[0].pointee
         name = f"__lambda_{self._function_literal_counter}"
@@ -9351,6 +9861,9 @@ class LLVMCodeGenerator(EzLangVisitor):
         old_type_names = self._locals_type_names
         old_method_this = self._method_this
         old_stack = self._function_return_type_ctx_stack
+        old_arena_stack = self._arena_scope_stack
+        old_shared_capture_locals = self._shared_capture_locals
+        old_heap_capture_locals = self._heap_capture_locals
 
         block = invoke.append_basic_block('entry')
         self.builder = ir.IRBuilder(block)
@@ -9359,6 +9872,9 @@ class LLVMCodeGenerator(EzLangVisitor):
         self._locals_type_names = {}
         self._method_this = None
         self._function_return_type_ctx_stack = [fn_lit.type_()]
+        self._arena_scope_stack = []
+        self._shared_capture_locals = set(capture_names)
+        self._heap_capture_locals = set(capture_names)
         throw_exit = invoke.append_basic_block('throw_exit')
         self._function_throw_exit_stack.append(throw_exit)
 
@@ -9389,10 +9905,15 @@ class LLVMCodeGenerator(EzLangVisitor):
         self._locals_type_names = old_type_names
         self._method_this = old_method_this
         self._function_return_type_ctx_stack = old_stack
+        self._arena_scope_stack = old_arena_stack
+        self._shared_capture_locals = old_shared_capture_locals
+        self._heap_capture_locals = old_heap_capture_locals
 
         closure = ir.Constant(closure_type, ir.Undefined)
         closure = self.builder.insert_value(closure, invoke, 0)
         closure = self.builder.insert_value(closure, env_i8, 1)
+        if capture_values:
+            self._owned_closure_values.add(id(closure))
         return closure
 
     # ==================== SIMD 向量 ====================
@@ -12192,9 +12713,13 @@ class LLVMCodeGenerator(EzLangVisitor):
                 store_val = self._copy_aggregate_value(store_val, name="_assign_copy")
                 store_val = self.builder.load(store_val)
             current = self._load_with_unsigned(lvalue_ptr, name="_assign_current")
-            store_val = self._apply_assignment_operator(current, store_val, op_ctx)
+            if op_ctx is not None and op_ctx.ASSIGN() is None:
+                store_val = self._apply_assignment_operator(current, store_val, op_ctx)
             if store_val.type != lvalue_ptr.type.pointee:
                 store_val = self._coerce_preserve_unsigned(store_val, lvalue_ptr.type.pointee)
+            if self._value_needs_release(lvalue_ptr.type.pointee):
+                store_val = self._prepare_value_for_store(store_val)
+                self._release_value(current)
             self.builder.store(store_val, lvalue_ptr)
             return store_val
 
@@ -12239,7 +12764,20 @@ class LLVMCodeGenerator(EzLangVisitor):
 
     def visitExpressionStatement(self, ctx: EzLangParser.ExpressionStatementContext):
         if ctx.expression():
-            return self._eval(ctx.expression())
+            value = self._eval(ctx.expression())
+            if isinstance(value, ir.Value) and id(value) in self._owned_closure_values:
+                self._owned_closure_values.discard(id(value))
+                self._release_value(value)
+            return value
+        return None
+
+    def _return_expr_local_name(self, ctx) -> str | None:
+        """识别 return 直接返回的局部闭包名，用于转移所有权。"""
+        if ctx is None:
+            return None
+        text = ctx.getText() if hasattr(ctx, 'getText') else ''
+        if text in self.locals and text in self._owned_closure_local_names:
+            return text
         return None
 
     def visitReturnStatement(self, ctx: EzLangParser.ReturnStatementContext):
@@ -12258,6 +12796,7 @@ class LLVMCodeGenerator(EzLangVisitor):
             self.builder.branch(self._parallel_exit_stack[-1])
             return None
         if ctx.expression():
+            return_local_name = self._return_expr_local_name(ctx.expression())
             val = self._eval(ctx.expression())
             if val is not None:
                 # 聚合类型指针需要 load 后才能 ret（alloca 和 arena 都是指针）
@@ -12267,7 +12806,12 @@ class LLVMCodeGenerator(EzLangVisitor):
                     expected = self.current_function.function_type.return_type
                     if not isinstance(expected, ir.VoidType) and val.type != expected:
                         val = self._coerce_return_value(val, expected)
-                self._restore_active_arena_scopes_for_return(val, val.type)
+                if self._is_closure_type(val.type):
+                    if return_local_name is not None:
+                        self._owned_closure_local_names.discard(return_local_name)
+                    else:
+                        val = self._prepare_value_for_return(val)
+                self._restore_active_arena_scopes_for_return(val, val.type, exclude_names={return_local_name} if return_local_name else None)
                 self.builder.ret(val)
             else:
                 self._restore_active_arena_scopes()
@@ -12287,19 +12831,24 @@ class LLVMCodeGenerator(EzLangVisitor):
     def visitBlock(self, ctx: EzLangParser.BlockContext):
         # Arena 作用域管理：进入时保存游标，退出时恢复
         saved_pos = None
+        arena_depth = len(self._arena_scope_stack)
+        owned_closure_before = set(self._owned_closure_local_names)
+        owned_heap_before = set(self._owned_heap_capture_locals)
         if self.builder and hasattr(self, '_arena_save'):
             saved_pos = self.builder.call(self._arena_save, [], name='_arena_saved')
             self._arena_scope_stack.append(saved_pos)
         for stmt in ctx.statement():
             self._eval(stmt)
             if self.builder.block.is_terminated:
-                if saved_pos is not None and self._arena_scope_stack and self._arena_scope_stack[-1] is saved_pos:
-                    self._arena_scope_stack.pop()
+                if saved_pos is not None and len(self._arena_scope_stack) > arena_depth:
+                    del self._arena_scope_stack[arena_depth:]
                 return None
         if saved_pos is not None:
-            self.builder.call(self._arena_restore, [saved_pos])
-            if self._arena_scope_stack and self._arena_scope_stack[-1] is saved_pos:
-                self._arena_scope_stack.pop()
+            block_owned = (self._owned_closure_local_names - owned_closure_before) | (self._owned_heap_capture_locals - owned_heap_before)
+            self._release_owned_locals(block_owned)
+            while len(self._arena_scope_stack) > arena_depth:
+                restore_pos = self._arena_scope_stack.pop()
+                self.builder.call(self._arena_restore, [restore_pos])
         return None
 
     # ==================== 循环与跳转 ====================

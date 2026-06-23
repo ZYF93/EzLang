@@ -15,6 +15,8 @@
 
 typedef int32_t (*EzRaceI32Branch)(void);
 typedef int32_t (*EzTaskEnvI32Branch)(void *env);
+typedef void (*EzTaskBranch)(void *env, void *out);
+typedef void (*EzRaceBranch)(void *env, void *out);
 
 typedef struct EzRuntimeLock {
     char *name;
@@ -288,6 +290,17 @@ typedef struct EzRaceI32State {
 #endif
 } EzRaceI32State;
 
+typedef struct EzRaceState {
+    bool done;
+    void *result;
+    size_t result_size;
+#if defined(_WIN32)
+    CRITICAL_SECTION mutex;
+#else
+    pthread_mutex_t mutex;
+#endif
+} EzRaceState;
+
 typedef struct EzTaskI32 {
     EzRaceI32Branch branch;
     EzTaskEnvI32Branch env_branch;
@@ -299,6 +312,31 @@ typedef struct EzTaskI32 {
     pthread_t thread;
 #endif
 } EzTaskI32;
+
+typedef struct EzTask {
+    EzTaskBranch branch;
+    void *env;
+    void *out;
+#if defined(_WIN32)
+    HANDLE thread;
+#else
+    pthread_t thread;
+#endif
+} EzTask;
+
+typedef struct EzRaceTask {
+    EzRaceBranch branch;
+    void *env;
+    void *out;
+    EzRaceState *state;
+    bool done;
+    bool started;
+#if defined(_WIN32)
+    HANDLE thread;
+#else
+    pthread_t thread;
+#endif
+} EzRaceTask;
 
 static void ez_race_i32_state_init(EzRaceI32State *state) {
 #if defined(_WIN32)
@@ -355,6 +393,69 @@ static int32_t ez_race_i32_task_result(EzRaceI32Task *task) {
     return result;
 }
 
+static void ez_race_state_init(EzRaceState *state, void *result, size_t result_size) {
+    state->done = false;
+    state->result = result;
+    state->result_size = result_size;
+#if defined(_WIN32)
+    InitializeCriticalSection(&state->mutex);
+#else
+    pthread_mutex_init(&state->mutex, NULL);
+#endif
+}
+
+static void ez_race_state_destroy(EzRaceState *state) {
+#if defined(_WIN32)
+    DeleteCriticalSection(&state->mutex);
+#else
+    pthread_mutex_destroy(&state->mutex);
+#endif
+}
+
+static void ez_race_state_lock(EzRaceState *state) {
+#if defined(_WIN32)
+    EnterCriticalSection(&state->mutex);
+#else
+    pthread_mutex_lock(&state->mutex);
+#endif
+}
+
+static void ez_race_state_unlock(EzRaceState *state) {
+#if defined(_WIN32)
+    LeaveCriticalSection(&state->mutex);
+#else
+    pthread_mutex_unlock(&state->mutex);
+#endif
+}
+
+static bool ez_race_done(EzRaceState *state) {
+    bool done;
+    ez_race_state_lock(state);
+    done = state->done;
+    ez_race_state_unlock(state);
+    return done;
+}
+
+static void ez_race_finish(EzRaceTask *task) {
+    ez_race_state_lock(task->state);
+    task->done = true;
+    if (!task->state->done) {
+        if (task->state->result && task->out && task->state->result_size > 0) {
+            memcpy(task->state->result, task->out, task->state->result_size);
+        }
+        task->state->done = true;
+    }
+    ez_race_state_unlock(task->state);
+}
+
+static bool ez_race_task_done(EzRaceTask *task) {
+    bool done;
+    ez_race_state_lock(task->state);
+    done = task->done;
+    ez_race_state_unlock(task->state);
+    return done;
+}
+
 #if defined(_WIN32)
 static DWORD WINAPI ez_race_i32_worker(LPVOID data) {
     EzRaceI32Task *task = (EzRaceI32Task *)data;
@@ -366,8 +467,19 @@ static DWORD WINAPI ez_race_i32_worker(LPVOID data) {
 static DWORD WINAPI ez_task_i32_worker(LPVOID data) {
     EzTaskI32 *task = (EzTaskI32 *)data;
     task->result = task->env_branch ? task->env_branch(task->env) : (task->branch ? task->branch() : 0);
-    free(task->env);
-    task->env = NULL;
+    return 0;
+}
+
+static DWORD WINAPI ez_task_worker(LPVOID data) {
+    EzTask *task = (EzTask *)data;
+    if (task->branch) task->branch(task->env, task->out);
+    return 0;
+}
+
+static DWORD WINAPI ez_race_worker(LPVOID data) {
+    EzRaceTask *task = (EzRaceTask *)data;
+    if (task->branch) task->branch(task->env, task->out);
+    ez_race_finish(task);
     return 0;
 }
 
@@ -382,8 +494,19 @@ static void *ez_race_i32_worker(void *data) {
 static void *ez_task_i32_worker(void *data) {
     EzTaskI32 *task = (EzTaskI32 *)data;
     task->result = task->env_branch ? task->env_branch(task->env) : (task->branch ? task->branch() : 0);
-    free(task->env);
-    task->env = NULL;
+    return NULL;
+}
+
+static void *ez_task_worker(void *data) {
+    EzTask *task = (EzTask *)data;
+    if (task->branch) task->branch(task->env, task->out);
+    return NULL;
+}
+
+static void *ez_race_worker(void *data) {
+    EzRaceTask *task = (EzRaceTask *)data;
+    if (task->branch) task->branch(task->env, task->out);
+    ez_race_finish(task);
     return NULL;
 }
 
@@ -407,28 +530,131 @@ void *__ezrt_task_start_i32(EzRaceI32Branch branch) {
 
 void *__ezrt_task_start_env_i32(EzTaskEnvI32Branch branch, void *env) {
     EzTaskI32 *task = (EzTaskI32 *)calloc(1, sizeof(EzTaskI32));
-    if (!task) {
-        free(env);
-        return NULL;
-    }
+    if (!task) return NULL;
     task->env_branch = branch;
     task->env = env;
 #if defined(_WIN32)
     task->thread = CreateThread(NULL, 0, ez_task_i32_worker, task, 0, NULL);
     if (!task->thread) {
         task->result = branch ? branch(env) : 0;
-        free(env);
-        task->env = NULL;
     }
 #else
     if (pthread_create(&task->thread, NULL, ez_task_i32_worker, task) != 0) {
         task->result = branch ? branch(env) : 0;
-        free(env);
-        task->env = NULL;
         task->thread = 0;
     }
 #endif
     return task;
+}
+
+void *__ezrt_task_start(EzTaskBranch branch, void *env, void *out) {
+    EzTask *task = (EzTask *)calloc(1, sizeof(EzTask));
+    if (!task) return NULL;
+    task->branch = branch;
+    task->env = env;
+    task->out = out;
+#if defined(_WIN32)
+    task->thread = CreateThread(NULL, 0, ez_task_worker, task, 0, NULL);
+    if (!task->thread && branch) branch(env, out);
+#else
+    if (pthread_create(&task->thread, NULL, ez_task_worker, task) != 0) {
+        if (branch) branch(env, out);
+        task->thread = 0;
+    }
+#endif
+    return task;
+}
+
+void __ezrt_task_join(void *handle) {
+    EzTask *task = (EzTask *)handle;
+    if (!task) return;
+#if defined(_WIN32)
+    if (task->thread) {
+        WaitForSingleObject(task->thread, INFINITE);
+        CloseHandle(task->thread);
+    }
+#else
+    if (task->thread) pthread_join(task->thread, NULL);
+#endif
+    free(task);
+}
+
+void __ezrt_race_value(EzRaceBranch *branches, void **envs, int32_t count, int32_t timeout_ms,
+                       void *result, void *scratch, uint64_t result_size, int32_t *timed_out) {
+    if (timed_out) *timed_out = 0;
+    if (!branches || count <= 0 || !result || !scratch || result_size == 0) return;
+
+    EzRaceTask *tasks = (EzRaceTask *)calloc((size_t)count, sizeof(EzRaceTask));
+    if (!tasks) {
+        if (branches[0]) branches[0](envs ? envs[0] : NULL, result);
+        return;
+    }
+    EzRaceState state;
+    ez_race_state_init(&state, result, (size_t)result_size);
+
+#if defined(_WIN32)
+    for (int32_t i = 0; i < count; ++i) {
+        tasks[i].branch = branches[i];
+        tasks[i].env = envs ? envs[i] : NULL;
+        tasks[i].out = (char *)scratch + ((size_t)i * (size_t)result_size);
+        tasks[i].state = &state;
+        tasks[i].thread = CreateThread(NULL, 0, ez_race_worker, &tasks[i], 0, NULL);
+        tasks[i].started = tasks[i].thread != NULL;
+        if (!tasks[i].thread) {
+            if (tasks[i].branch) tasks[i].branch(tasks[i].env, tasks[i].out);
+            ez_race_finish(&tasks[i]);
+        }
+    }
+    DWORD start = GetTickCount();
+    while (!ez_race_done(&state)) {
+        if (timeout_ms > 0 && (int32_t)(GetTickCount() - start) >= timeout_ms) {
+            if (timed_out) *timed_out = 1;
+            break;
+        }
+        Sleep(1);
+    }
+    for (int32_t i = 0; i < count; ++i) {
+        if (!tasks[i].started) continue;
+        if (!ez_race_task_done(&tasks[i])) TerminateThread(tasks[i].thread, 0);
+        WaitForSingleObject(tasks[i].thread, INFINITE);
+        CloseHandle(tasks[i].thread);
+    }
+#else
+    for (int32_t i = 0; i < count; ++i) {
+        tasks[i].branch = branches[i];
+        tasks[i].env = envs ? envs[i] : NULL;
+        tasks[i].out = (char *)scratch + ((size_t)i * (size_t)result_size);
+        tasks[i].state = &state;
+        if (pthread_create(&tasks[i].thread, NULL, ez_race_worker, &tasks[i]) != 0) {
+            if (tasks[i].branch) tasks[i].branch(tasks[i].env, tasks[i].out);
+            ez_race_finish(&tasks[i]);
+        } else {
+            tasks[i].started = true;
+        }
+    }
+    struct timespec start;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    while (!ez_race_done(&state)) {
+        if (timeout_ms > 0) {
+            struct timespec now;
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            int64_t elapsed_ms = (int64_t)(now.tv_sec - start.tv_sec) * 1000 + (now.tv_nsec - start.tv_nsec) / 1000000;
+            if (elapsed_ms >= timeout_ms) {
+                if (timed_out) *timed_out = 1;
+                break;
+            }
+        }
+        usleep(1000);
+    }
+    for (int32_t i = 0; i < count; ++i) {
+        if (!tasks[i].started) continue;
+        if (!ez_race_task_done(&tasks[i])) pthread_cancel(tasks[i].thread);
+        pthread_join(tasks[i].thread, NULL);
+    }
+#endif
+
+    ez_race_state_destroy(&state);
+    free(tasks);
 }
 
 int32_t __ezrt_task_join_i32(void *handle) {

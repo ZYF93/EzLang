@@ -1694,13 +1694,13 @@ class TestCodegen:
         assert 'define i32 @"__ez_race_branch_' in ir_text
         assert str(STD_ROOT / 'emcc' / 'runtime.js') in {str(lib) for lib in libs}
         runtime_js = (STD_ROOT / 'emcc' / 'runtime.js').read_text(encoding='utf-8')
-        assert "__ezrt_task_join_i32__async: 'auto'" in runtime_js
+        assert "__ezrt_task_join__async: 'auto'" in runtime_js
         assert "__ezrt_race_i32__async: 'auto'" in runtime_js
         assert not any(str(lib).endswith('packages/std/native/runtime.c') for lib in libs)
         assert 'pthread' not in {str(lib) for lib in libs}
 
-    def test_flow_race_pl_non_i32_uses_typed_synchronous_fallback(self):
-        """非 I32 race(pl) 应使用分支返回类型，而不是固定成 I32。"""
+    def test_flow_race_pl_non_i32_uses_generic_runtime(self):
+        """非 I32 race(pl) 应使用通用 out 指针运行时，而不是固定成 I32。"""
         source = '''
         const run = (): Str => {
             const result = flow {
@@ -1709,15 +1709,59 @@ class TestCodegen:
             return result;
         };
         '''
-        module, errors, libs = compile_source(source)
+        module, errors, libs = compile_source(source, compile_target='linux')
         assert module is not None
         assert len(errors) == 0, f'编译错误: {errors}'
         ir_text = str(module)
         binding.parse_assembly(ir_text).verify()
         assert 'define i8* @"run"' in ir_text
+        assert 'call void @"__ezrt_race_value"' in ir_text
         assert 'call i32 @"__ezrt_race_i32"' not in ir_text
         assert 'call i32 @"__ezrt_race"' not in ir_text
-        assert not any(str(lib).endswith('packages/std/native/runtime.c') for lib in libs)
+        assert any(str(lib).endswith('packages/std/native/runtime.c') for lib in libs)
+
+    def test_flow_race_pl_capture_uses_generic_runtime(self):
+        """race(pl) 分支捕获外层变量时也应进入通用运行时。"""
+        source = '''
+        const run = (): I64 => {
+            const base: I64 = 40;
+            const one: I64 = 1;
+            const two: I64 = 2;
+            const result = flow {
+                return race(pl = [() => { return base + one; }, () => { return base + two; }], timeout = 10);
+            };
+            return result;
+        };
+        '''
+        module, errors, libs = compile_source(source, compile_target='linux')
+        assert module is not None
+        assert len(errors) == 0, f'编译错误: {errors}'
+        ir_text = str(module)
+        binding.parse_assembly(ir_text).verify()
+        assert '_base_shared' in ir_text
+        assert 'call void @"__ezrt_race_value"' in ir_text
+        assert 'call i32 @"__ezrt_race_i32"' not in ir_text
+        assert any(str(lib).endswith('packages/std/native/runtime.c') for lib in libs)
+
+    def test_flow_race_pl_mixed_returns_use_generic_union_runtime(self):
+        """race(pl) 混合返回类型应通过通用运行时写入 union 结果。"""
+        source = '''
+        const run = (): I32 | Str => {
+            const result = flow {
+                return race(pl = [() => { return 1; }, () => { return "two"; }], timeout = 10);
+            };
+            return result;
+        };
+        '''
+        module, errors, libs = compile_source(source, compile_target='linux')
+        assert module is not None
+        assert len(errors) == 0, f'编译错误: {errors}'
+        ir_text = str(module)
+        binding.parse_assembly(ir_text).verify()
+        assert 'call void @"__ezrt_race_value"' in ir_text
+        assert 'call i32 @"__ezrt_race_i32"' not in ir_text
+        assert 'insertvalue {i32, i8*}' in ir_text
+        assert any(str(lib).endswith('packages/std/native/runtime.c') for lib in libs)
 
     def test_flow_parallel_nested_return_type_codegen(self):
         """flow/parallel 返回槽应支持嵌套块里的 return 类型。"""
@@ -1762,7 +1806,8 @@ class TestCodegen:
         binding.parse_assembly(ir_text).verify()
         assert 'define i8* @"run"' in ir_text
         assert '%"_flow_result" = alloca i8*' in ir_text
-        assert '%"_parallel_result" = alloca i8*' in ir_text
+        assert 'call i8* @"__ezrt_task_start"' in ir_text
+        assert 'call void @"__ezrt_task_join"' in ir_text
 
     def test_flow_parallel_combined_initializer_is_not_truncated(self):
         """只有完整 `parallel {}` 初始化才应启动后台 future，组合表达式必须同步求完整值。"""
@@ -1780,7 +1825,7 @@ class TestCodegen:
         assert len(errors) == 0, f'编译错误: {errors}'
         ir_text = str(module)
         binding.parse_assembly(ir_text).verify()
-        assert 'call i8* @"__ezrt_task_start_i32"' not in ir_text
+        assert 'call i8* @"__ezrt_task_start"' not in ir_text
         assert 'add i32' in function_ir(ir_text, 'run')
 
     def test_top_level_flow_comparison_initializer_infers_bool(self):
@@ -1811,9 +1856,9 @@ class TestCodegen:
         assert len(errors) == 0, f'编译错误: {errors}'
         ir_text = str(module)
         binding.parse_assembly(ir_text).verify()
-        assert 'call i8* @"__ezrt_task_start_i32"' in ir_text
-        assert 'call i32 @"__ezrt_task_join_i32"' in ir_text
-        assert 'define i32 @"__ez_race_branch_' in ir_text
+        assert 'call i8* @"__ezrt_task_start"' in ir_text
+        assert 'call void @"__ezrt_task_join"' in ir_text
+        assert 'define void @"__ez_parallel_branch_' in ir_text
         assert 'call void @"__ezrt_parallel_enter"()' not in ir_text
         assert str(STD_ROOT / 'emcc' / 'runtime.js') in {str(lib) for lib in libs}
         assert not any(str(lib).endswith('packages/std/native/runtime.c') for lib in libs)
@@ -1837,9 +1882,9 @@ class TestCodegen:
         assert len(errors) == 0, f'编译错误: {errors}'
         ir_text = str(module)
         binding.parse_assembly(ir_text).verify()
-        assert 'call i8* @"__ezrt_task_start_i32"' in ir_text
-        assert 'call i32 @"__ezrt_task_join_i32"' in ir_text
-        assert 'define i32 @"__ez_race_branch_' in ir_text
+        assert 'call i8* @"__ezrt_task_start"' in ir_text
+        assert 'call void @"__ezrt_task_join"' in ir_text
+        assert 'define void @"__ez_parallel_branch_' in ir_text
         assert any(str(lib).endswith('packages/std/native/runtime.c') for lib in libs)
         assert 'pthread' in {str(lib) for lib in libs}
 
@@ -1860,9 +1905,9 @@ class TestCodegen:
         assert len(errors) == 0, f'编译错误: {errors}'
         ir_text = str(module)
         binding.parse_assembly(ir_text).verify()
-        assert 'call i8* @"__ezrt_task_start_env_i32"' in ir_text
-        assert 'call i32 @"__ezrt_task_join_i32"' in ir_text
-        assert 'define i32 @"__ez_parallel_branch_' in ir_text
+        assert 'call i8* @"__ezrt_task_start"' in ir_text
+        assert 'call void @"__ezrt_task_join"' in ir_text
+        assert 'define void @"__ez_parallel_branch_' in ir_text
         assert '_offset_shared' in ir_text
         assert 'call void @"__ezrt_parallel_enter"()' not in ir_text
         assert any(str(lib).endswith('packages/std/native/runtime.c') for lib in libs)
@@ -1888,9 +1933,77 @@ class TestCodegen:
         ir_text = str(module)
         binding.parse_assembly(ir_text).verify()
         assert '_counter_shared' in ir_text
+        assert '%"_counter_shared" = alloca i32' not in ir_text
+        run_ir = function_ir(ir_text, 'run')
+        assert 'call i8* @"__ez_heap_alloc"' in run_ir
+        assert 'call void @"__ez_heap_release"' in run_ir
         lambda_ir = function_ir(ir_text, '__lambda_0')
         assert 'load i32*' in lambda_ir
         assert 'store i32' in lambda_ir
+
+    def test_closure_assigned_to_global_uses_heap_capture_storage(self):
+        """闭包逃逸到全局时，捕获槽和 env 不能被当前函数 Arena 回收。"""
+        source = '''
+        let saved: (x: I32) => I32;
+
+        const set = (): Void => {
+            let base: I32 = 1;
+            saved = (x: I32): I32 => { return base + x; };
+        };
+        '''
+        module, errors, _ = compile_source(source, compile_target='linux')
+        assert module is not None
+        assert len(errors) == 0, f'编译错误: {errors}'
+        ir_text = str(module)
+        binding.parse_assembly(ir_text).verify()
+        set_ir = function_ir(ir_text, 'set')
+        assert '%"_base_shared_raw" = call i8* @"__ez_heap_alloc"' in set_ir
+        assert '%"_closure_env_raw" = call i8* @"__ez_heap_alloc"' in set_ir
+        assert 'call void @"__ez_heap_release"' in set_ir
+        assert 'store {i32 (i8*, i32)*, i8*}' in set_ir
+
+    def test_returned_local_closure_transfers_ownership_without_retain(self):
+        """直接返回局部闭包时应转移所有权，不能 retain 后泄漏。"""
+        source = '''
+        const make = (base: I32): (x: I32) => I32 => {
+            let f: (x: I32) => I32 = (x: I32): I32 => { return base + x; };
+            return f;
+        };
+        '''
+        module, errors, _ = compile_source(source, compile_target='linux')
+        assert module is not None
+        assert len(errors) == 0, f'编译错误: {errors}'
+        ir_text = str(module)
+        binding.parse_assembly(ir_text).verify()
+        make_ir = function_ir(ir_text, 'make')
+        assert 'ret {i32 (i8*, i32)*, i8*}' in make_ir
+        assert 'call void @"__ez_heap_retain"(i8* %"_closure_owner_env")' not in make_ir
+
+    def test_flow_parallel_inner_block_capture_survives_until_join(self):
+        """flow 内层块启动的 future 捕获必须晚于 join 才能恢复。"""
+        source = '''
+        const run = (): I32 => {
+            let y: I32 = 1;
+            const result = flow {
+                if true {
+                    const p: I32 = parallel {
+                        return y;
+                    };
+                }
+                return 0;
+            };
+            return result;
+        };
+        '''
+        module, errors, _ = compile_source(source, compile_target='linux')
+        assert module is not None
+        assert len(errors) == 0, f'编译错误: {errors}'
+        ir_text = str(module)
+        binding.parse_assembly(ir_text).verify()
+        run_ir = function_ir(ir_text, 'run')
+        assert '_flow_arena_saved' in run_ir
+        assert '_parallel_env_arena_saved' in run_ir
+        assert run_ir.index('call void @"__ezrt_task_join"') < run_ir.index('call void @"__arena_restore"(i64 %"_flow_arena_saved")')
 
     def test_flow_parallel_capture_writes_back_to_outer_slot(self):
         """parallel 捕获普通局部变量后，内部赋值应写回外层共享槽。"""
@@ -1916,7 +2029,37 @@ class TestCodegen:
         branch_ir = function_ir(ir_text, '__ez_parallel_branch_0')
         assert 'load i32*' in branch_ir
         assert 'store i32' in branch_ir
-        assert 'call i8* @"__ezrt_task_start_env_i32"' in ir_text
+        assert 'call i8* @"__ezrt_task_start"' in ir_text
+
+    def test_flow_parallel_aggregate_capture_starts_future_with_parent_arena_env(self):
+        """parallel 捕获聚合值也应走后台任务，并把共享槽/env 放在父 Arena。"""
+        source = '''
+        struct Box { value: I64; };
+
+        const run = (): I64 => {
+            let box = Box(value = 5);
+            const result = flow {
+                const p: I64 = parallel {
+                    box.value += 7;
+                    return box.value;
+                };
+                return p;
+            };
+            return result;
+        };
+        '''
+        module, errors, _ = compile_source(source, compile_target='linux')
+        assert module is not None
+        assert len(errors) == 0, f'编译错误: {errors}'
+        ir_text = str(module)
+        binding.parse_assembly(ir_text).verify()
+        assert '_box_shared' in ir_text
+        assert 'call i8* @"__ezrt_task_start"' in ir_text
+        assert 'call void @"__ezrt_task_join"' in ir_text
+        assert 'call void @"__ezrt_parallel_enter"()' not in ir_text
+        branch_ir = function_ir(ir_text, '__ez_parallel_branch_0')
+        assert '%"Box"*' in branch_ir
+        assert '%"_parallel_env" = alloca' not in ir_text
 
     def test_flow_parallel_locked_local_capture_uses_lock_hooks_in_future(self):
         """parallel 后台任务读写捕获的锁局部变量时应沿用现有锁 hook。"""
@@ -1944,10 +2087,10 @@ class TestCodegen:
         assert 'call void @"__ezrt_lock_write_release"' in branch_ir
         assert 'call void @"__ezrt_lock_read_acquire"' in branch_ir
         assert 'call void @"__ezrt_lock_read_release"' in branch_ir
-        assert 'call i8* @"__ezrt_task_start_env_i32"' in ir_text
+        assert 'call i8* @"__ezrt_task_start"' in ir_text
 
-    def test_flow_parallel_non_i32_explicit_type_uses_synchronous_fallback(self):
-        """当前 native 后台任务 ABI 仅覆盖显式 I32，I64 等类型保持同步 fallback。"""
+    def test_flow_parallel_non_i32_explicit_type_starts_future(self):
+        """非 I32 parallel 返回值也应通过 out 指针后台任务执行。"""
         source = '''
         const run = (): I64 => {
             const result = flow {
@@ -1962,10 +2105,10 @@ class TestCodegen:
         assert len(errors) == 0, f'编译错误: {errors}'
         ir_text = str(module)
         binding.parse_assembly(ir_text).verify()
-        assert 'call i8* @"__ezrt_task_start_i32"' not in ir_text
-        assert 'call i32 @"__ezrt_task_join_i32"' not in ir_text
-        assert 'call void @"__ezrt_parallel_enter"()' in ir_text
-        assert not any(str(lib).endswith('packages/std/native/runtime.c') for lib in libs)
+        assert 'call i8* @"__ezrt_task_start"' in ir_text
+        assert 'call void @"__ezrt_task_join"' in ir_text
+        assert 'call void @"__ezrt_parallel_enter"()' not in ir_text
+        assert any(str(lib).endswith('packages/std/native/runtime.c') for lib in libs)
 
     def test_emcc_flow_parallel_typed_i32_uses_asyncify_runtime(self):
         """emcc 下显式 I32 parallel 同样接入 JS 协程任务 runtime。"""
@@ -1983,9 +2126,9 @@ class TestCodegen:
         assert len(errors) == 0, f'编译错误: {errors}'
         ir_text = str(module)
         binding.parse_assembly(ir_text).verify()
-        assert 'call i8* @"__ezrt_task_start_i32"' in ir_text
-        assert 'call i32 @"__ezrt_task_join_i32"' in ir_text
-        assert 'define i32 @"__ez_race_branch_' in ir_text
+        assert 'call i8* @"__ezrt_task_start"' in ir_text
+        assert 'call void @"__ezrt_task_join"' in ir_text
+        assert 'define void @"__ez_parallel_branch_' in ir_text
         assert 'call void @"__ezrt_parallel_enter"()' not in ir_text
         assert str(STD_ROOT / 'emcc' / 'runtime.js') in {str(lib) for lib in libs}
         assert not any(str(lib).endswith('packages/std/native/runtime.c') for lib in libs)
@@ -2011,13 +2154,13 @@ class TestCodegen:
             lib_names = {str(lib) for lib in libs}
             uses_native_runtime = any(str(lib).endswith('packages/std/native/runtime.c') for lib in libs)
             if target == 'emcc':
-                assert 'call i8* @"__ezrt_task_start_i32"' in ir_text
+                assert 'call i8* @"__ezrt_task_start"' in ir_text
                 assert 'call i32 @"__ezrt_race_i32"' in ir_text
                 assert not uses_native_runtime
                 assert 'pthread' not in lib_names
                 assert str(STD_ROOT / 'emcc' / 'runtime.js') in lib_names
             else:
-                assert 'call i8* @"__ezrt_task_start_i32"' in ir_text
+                assert 'call i8* @"__ezrt_task_start"' in ir_text
                 assert 'call i32 @"__ezrt_race_i32"' in ir_text
                 assert uses_native_runtime
                 if target != 'windows':

@@ -239,6 +239,7 @@ let copy = count
   * 跨作用域返回时，值被复制至父级 Arena 游标所管理的空间，不会出现悬垂引用。
   * 线程独占 Arena，配合值语义实现无锁并发。自动按 `alignof(T)` 对齐。
   * Arena 会智能的调度内存，例如重新赋值时如果新值需要的内存比旧值大，则会重新分配一块新的内存，并将旧内存标记为可重新分配。
+  * 捕获闭包属于例外：闭包捕获槽和环境使用编译器生成的引用计数 heap 对象，以支持返回、赋给全局/export、字段保存等逃逸场景。变量/字段/全局闭包槽覆盖、局部作用域退出和返回值所有权转移会自动插入 retain/release。
 
 ### LLVM 映射
 * 局部变量映射为 `alloca` 或 Arena 内存地址。拷贝使用 `llvm.memcpy`。
@@ -283,12 +284,12 @@ let value = add10(x = 5)
 * 函数调用支持位置参数和命名参数混用（如 `fn(1, c = 3)`），位置参数需位于具名参数之前。
 * 形参可声明默认值，调用时省略该参数即使用默认值。
 * 函数体使用 `{ ... }` block 时，必须通过 `return` 显式返回值，最后一个表达式不会隐式作为返回值。
-* 匿名函数可以捕获当前作用域内使用到的局部变量，生成闭包值。捕获环境存放在当前 Arena 中，因此闭包应遵循普通 Arena 生命周期规则，不应在捕获环境已结束后跨作用域长期保存。
+* 匿名函数可以捕获当前作用域内使用到的局部变量，生成闭包值。捕获槽按共享变量语义工作，闭包内外读写同一份捕获变量。逃逸闭包的捕获槽和环境由引用计数 heap 管理，因此可以通过返回值、全局/export 变量或字段保存；最后一个闭包引用释放时会回收对应捕获环境。
 * `?` 占位符支持部分应用与柯里化，生成等待剩余参数的闭包。
 
 ### LLVM 映射
 * 具名参数在编译期重排以生成标准 `call`。
-* 函数值生成闭包结构体 `{ invoke, env }`；匿名函数和柯里化结果在 Arena 中存储捕获的变量，调用时先取出 `invoke` 与 `env` 再执行。
+* 函数值生成闭包结构体 `{ invoke, env }`；普通函数闭包的 `env` 可为空。捕获匿名函数的 `env` 指向引用计数 heap 环境，环境析构时释放其持有的捕获槽；调用时先取出 `invoke` 与 `env` 再执行。
 
 ---
 
@@ -327,18 +328,18 @@ const ret = flow {
 
 ### 语义说明与规范
 * **flow**：`flow { ... }` 为并发调度作用域。flow 不改变程序的顺序语义。flow 内代码在语义上严格按源码顺序执行，但 runtime 可对无依赖阻塞操作进行调度优化，且调度不得改变可观察行为。
-* **当前实现**：编译器会记录 flow/parallel/suspend point 元数据，并在 LLVM IR 中生成可链接的 `__ezrt_flow_*`、`__ezrt_parallel_*`、`__ezrt_sleep`、`__ezrt_race_i32`、`__ezrt_task_start_i32` / `__ezrt_task_start_env_i32` / `__ezrt_task_join_i32` hook。`__ezrt_sleep` 会真实挂起当前执行点；`race(pl = [...], timeout = ...)` 对零捕获 `() => I32` 分支在 native 目标使用 C 任务运行时并发执行，在 emcc 目标使用 `packages/std/emcc/runtime.js` + Asyncify 协程运行时挂起和恢复。`flow` / `parallel` 块内的 `return` 会被捕获为表达式结果，不会提前退出外层函数；嵌套控制流中的 `return` 也参与表达式返回类型推断。
-* **阻塞操作**：flow 外部如 `fetch()` 保持用户体感上的同步调用。flow 内部的 `sleep`、`race(pl)`、返回 `I32` 的 `parallel` 以及 emcc 下的 `fetch`、TCP/UDP、WebSocket、stdin、文件系统、进程和流式 I/O 会作为 suspend source 挂起后恢复；缺失能力的平台按接口约定返回失败值或继续使用阻塞 syscall，不做 CPU 忙等。
-* **parallel 块**：`const ret = parallel { code... return... }` 或 `const ret: I32 = parallel { code... return... }` 在 flow 内、初始化表达式本身就是 `parallel` 块且返回 `I32` 时会启动后台任务；读取 `ret` 会等待任务完成，flow 退出前会 join 未读取任务，确保副作用提交。捕获外层局部变量时会提升为共享存储槽，内外读写同一份变量；读写锁变量仍使用现有 `rp` / `wp` / 默认顺序锁 hook。native、Android、iOS 使用 C 任务运行时，emcc 使用 JS 协程运行时；组合表达式或其它返回类型保持同步协作 lowering。
-* **自动依赖等待**：读取 flow 内未完成的 `parallel` 结果会自动 join；当前依赖等待覆盖 native、Android、iOS 与 emcc 的 `I32` 任务，包括推断类型、显式 `I32` 声明和共享捕获任务环境。emcc 标准库 suspend source 通过 Asyncify 恢复 wasm 栈，保持顺序 ABI。
+* **当前实现**：编译器会记录 flow/parallel/suspend point 元数据，并在 LLVM IR 中生成可链接的 `__ezrt_flow_*`、`__ezrt_parallel_*`、`__ezrt_sleep`、`__ezrt_race_i32`、`__ezrt_race_value`、`__ezrt_task_start` 和 `__ezrt_task_join` hook。`__ezrt_sleep` 会真实挂起当前执行点；`race(pl = [...], timeout = ...)` 在 native 目标使用 C 任务运行时并发执行，在 emcc 目标使用 `packages/std/emcc/runtime.js` + Asyncify 协程运行时挂起和恢复。零捕获 `() => I32` race 分支保留紧凑的 `__ezrt_race_i32` 快路径；带捕获或非 `I32` 分支使用 out 指针结果槽。`flow` / `parallel` 块内的 `return` 会被捕获为表达式结果，不会提前退出外层函数；嵌套控制流中的 `return` 也参与表达式返回类型推断。
+* **阻塞操作**：flow 外部如 `fetch()` 保持用户体感上的同步调用。flow 内部的 `sleep`、`race(pl)`、`parallel` 以及 emcc 下的 `fetch`、TCP/UDP、WebSocket、stdin、文件系统、进程和流式 I/O 会作为 suspend source 挂起后恢复；缺失能力的平台按接口约定返回失败值或继续使用阻塞 syscall，不做 CPU 忙等。
+* **parallel 块**：`const ret = parallel { code... return... }` 或 `const ret: T = parallel { code... return... }` 在 flow 内且初始化表达式本身就是 `parallel` 块时会启动后台任务；读取 `ret` 会等待任务完成，flow 退出前会 join 未读取任务，确保副作用提交。返回值使用调用方提供的 out 存储，覆盖 primitive、指针、闭包和聚合结果。捕获外层局部变量时会提升为 flow 保护的共享存储槽，内外读写同一份变量；这些共享槽和任务环境会活到 pending future join 后再随 flow 保护 Arena 恢复。读写锁变量仍使用现有 `rp` / `wp` / 默认顺序锁 hook。native、Android、iOS 使用 C 任务运行时，emcc 使用 JS 协程运行时；组合表达式保持同步协作 lowering。
+* **自动依赖等待**：读取 flow 内未完成的 `parallel` 结果会自动 join；当前依赖等待覆盖 native、Android、iOS 与 emcc 的任务，包括推断类型、显式声明、非 `I32` 返回值、聚合返回值和共享捕获任务环境。emcc 标准库 suspend source 通过 Asyncify 恢复 wasm 栈，保持顺序 ABI。
 * **flow 返回**：flow 返回前必须保证所有前序语义操作完成，且所有副作用已提交。
-* **race 函数**：native、Android、iOS 与 emcc 目标并发运行 `pl` 中的零捕获 `() => I32` 分支，返回首个完成值并取消或忽略其它分支；`timeout` 到期时返回零值并标记超时槽。异常通过运行时异常槽传回外层 `catch`。捕获闭包和非 `I32` 返回值使用同步协作 fallback。
+* **race 函数**：native、Android、iOS 与 emcc 目标并发运行 `pl` 分支，返回首个完成值并取消或忽略其它分支；`timeout` 到期时返回零值并标记超时槽。零捕获 `() => I32` 分支使用紧凑 I32 race ABI；带捕获分支和其它返回类型使用调用方 Arena 中的结果槽、分支 scratch 与 out 指针 race ABI，runtime 返回前会完成或取消并 join 分支。异常通过运行时异常槽传回外层 `catch`。
 * **cancel**：取消不会立即终止同步代码。取消仅中断 IO、sleep、timer、wait 等 suspend source。底层 suspend source 被取消时，`throw Error(code = errCancel, message = "操作已取消")` 并沿同步调用栈传播；可在 `catch {}` 中通过 `err.code == errCancel` 判断并特殊处理。
 * **非阻塞同步代码**：普通同步 CPU 代码不会被中断。
 * **副作用一致性**：runtime 不允许改变副作用顺序、锁语义、可观察行为。
 
 ### LLVM 映射
-* **当前**：lowering 为 runtime hook + flow/parallel 返回值槽；`sleep`、`race(pl)` 和 flow 内 `I32` `parallel` 已接入原生任务运行时，Android/iOS 复用同一 C runtime，emcc 通过 Asyncify JS 协程 runtime 提供可挂起行为。emcc 标准库中的 `sleep`、HTTP `fetch`、TCP/UDP、WebSocket `wsConnect` / `wsRecv`、stdin、fs、process 和 stream I/O 都带 Asyncify 元数据；CLI 会自动追加 `-sASYNCIFY`。后续可继续以 JSPI 或 wasm pthread 替换 emcc backend，而不改变 EzLang 语法。
+* **当前**：lowering 为 runtime hook + flow/parallel 返回值槽；`sleep`、`race(pl)` 和 flow 内 `parallel` 已接入原生任务运行时，Android/iOS 复用同一 C runtime，emcc 通过 Asyncify JS 协程 runtime 提供可挂起行为。emcc 标准库中的 `sleep`、HTTP `fetch`、TCP/UDP、WebSocket `wsConnect` / `wsRecv`、stdin、fs、process 和 stream I/O 都带 Asyncify 元数据；CLI 会自动追加 `-sASYNCIFY`。后续可继续以 JSPI 或 wasm pthread 替换 emcc backend，而不改变 EzLang 语法。
 * **目标**：后续可继续把 native 阻塞 I/O 替换为状态机、平台等待源（epoll、io_uring、kqueue、timerfd 等）、结果存储与等待唤醒。
 
 ---

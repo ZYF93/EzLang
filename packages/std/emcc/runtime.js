@@ -40,10 +40,29 @@
     return fn ? toI32(fn(env)) : 0;
   }
 
+  function callTaskBranch(ptr, env, out) {
+    if (!ptr) return;
+    if (typeof dynCall_vii === 'function') {
+      dynCall_vii(ptr, env, out);
+      return;
+    }
+    if (typeof Module !== 'undefined' && Module && typeof Module.dynCall_vii === 'function') {
+      Module.dynCall_vii(ptr, env, out);
+      return;
+    }
+    var fn = tableFunction(ptr);
+    if (fn) fn(env, out);
+  }
+
   function runTask(task) {
     if (!task || task.done || task.cancelled) return;
     try {
-      task.result = task.hasEnv ? callI32EnvBranch(task.branch, task.env) : callI32Branch(task.branch);
+      if (task.hasOut) {
+        callTaskBranch(task.branch, task.env, task.out);
+        task.result = 0;
+      } else {
+        task.result = task.hasEnv ? callI32EnvBranch(task.branch, task.env) : callI32Branch(task.branch);
+      }
     } catch (err) {
       task.error = err;
       task.result = 0;
@@ -53,14 +72,14 @@
     for (var i = 0; i < waiters.length; i++) waiters[i](task.result | 0);
   }
 
-  function createTask(branch, env, hasEnv) {
+  function createTask(branch, env, hasEnv, out) {
     var id = nextTaskId++;
-    tasks[id] = { branch: branch, env: env || 0, hasEnv: !!hasEnv, result: 0, done: false, cancelled: false, waiters: [] };
+    tasks[id] = { branch: branch, env: env || 0, hasEnv: !!hasEnv, out: out || 0, hasOut: !!out, result: 0, done: false, cancelled: false, waiters: [] };
     return id;
   }
 
   function startTask(branch) {
-    var id = createTask(branch, 0, false);
+    var id = createTask(branch, 0, false, 0);
     var task = tasks[id];
     if (hasAsyncify()) setTimeout(function () { runTask(task); }, 0);
     else runTask(task);
@@ -68,7 +87,15 @@
   }
 
   function startEnvTask(branch, env) {
-    var id = createTask(branch, env, true);
+    var id = createTask(branch, env, true, 0);
+    var task = tasks[id];
+    if (hasAsyncify()) setTimeout(function () { runTask(task); }, 0);
+    else runTask(task);
+    return id;
+  }
+
+  function startOutTask(branch, env, out) {
+    var id = createTask(branch, env, true, out);
     var task = tasks[id];
     if (hasAsyncify()) setTimeout(function () { runTask(task); }, 0);
     else runTask(task);
@@ -99,6 +126,12 @@
 
   function setI32(ptr, value) {
     if (ptr) HEAP32[Number(ptr) >> 2] = value | 0;
+  }
+
+  function copyBytes(dst, src, size) {
+    var len = Number(size || 0);
+    if (!dst || !src || len <= 0) return;
+    HEAPU8.set(HEAPU8.subarray(Number(src), Number(src) + len), Number(dst));
   }
 
   function finishRace(state, result, timedOut) {
@@ -145,22 +178,87 @@
     });
   }
 
+  function finishRaceValue(state, branchOut, timedOut) {
+    if (state.finished) return;
+    state.finished = true;
+    if (!timedOut) copyBytes(state.resultPtr, branchOut, state.resultSize);
+    if (state.timer) clearTimeout(state.timer);
+    setI32(state.timedOutPtr, timedOut ? 1 : 0);
+    var waiters = state.waiters.splice(0, state.waiters.length);
+    for (var i = 0; i < waiters.length; i++) waiters[i]();
+  }
+
+  function startRaceValue(branches, envs, count, timeoutMs, resultPtr, scratchPtr, resultSize, timedOutPtr) {
+    var state = {
+      finished: false,
+      timer: 0,
+      waiters: [],
+      resultPtr: resultPtr,
+      resultSize: Number(resultSize || 0),
+      timedOutPtr: timedOutPtr,
+    };
+    setI32(timedOutPtr, 0);
+    var total = Number(count || 0) | 0;
+    if (!branches || total <= 0 || !resultPtr || !scratchPtr || state.resultSize <= 0) {
+      finishRaceValue(state, 0, false);
+      return state;
+    }
+    for (var i = 0; i < total; i++) {
+      (function (index, branchPtr, envPtr) {
+        var outPtr = Number(scratchPtr) + index * state.resultSize;
+        var run = function () {
+          if (state.finished) return;
+          callTaskBranch(branchPtr, envPtr, outPtr);
+          finishRaceValue(state, outPtr, false);
+        };
+        if (hasAsyncify()) setTimeout(run, 0);
+        else run();
+      })(i, readBranchPtr(branches, i), readBranchPtr(envs, i));
+      if (state.finished && !hasAsyncify()) break;
+    }
+    var delay = Number(timeoutMs || 0);
+    if (hasAsyncify() && delay > 0) {
+      state.timer = setTimeout(function () { finishRaceValue(state, 0, true); }, delay);
+    }
+    return state;
+  }
+
+  function waitRaceValue(state) {
+    if (state.finished || !hasAsyncify()) return;
+    return Asyncify.handleSleep(function (wakeUp) {
+      state.waiters.push(function () { wakeUp(0); });
+    });
+  }
+
   mergeInto(LibraryManager.library, {
     __ezrt_task_join_i32__async: 'auto',
+    __ezrt_task_join__async: 'auto',
     __ezrt_task_start_i32: function (branch) {
       return startTask(branch) | 0;
     },
     __ezrt_task_start_env_i32: function (branch, env) {
       return startEnvTask(branch, env) | 0;
     },
+    __ezrt_task_start: function (branch, env, out) {
+      return startOutTask(branch, env, out) | 0;
+    },
     __ezrt_task_join_i32: function (handle) {
       return joinTask(handle) | 0;
+    },
+    __ezrt_task_join: function (handle) {
+      joinTask(handle);
     },
     __ezrt_race_i32__async: 'auto',
     __ezrt_race_i32: function (branches, count, timeoutMs, timedOutPtr) {
       var state = startRace(branches, count, timeoutMs, timedOutPtr);
       if (state.finished || !hasAsyncify()) return state.result | 0;
       return waitRace(state) | 0;
+    },
+    __ezrt_race_value__async: 'auto',
+    __ezrt_race_value: function (branches, envs, count, timeoutMs, resultPtr, scratchPtr, resultSize, timedOutPtr) {
+      var state = startRaceValue(branches, envs, count, timeoutMs, resultPtr, scratchPtr, resultSize, timedOutPtr);
+      if (state.finished || !hasAsyncify()) return;
+      return waitRaceValue(state);
     },
   });
 })();

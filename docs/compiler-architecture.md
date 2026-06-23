@@ -49,12 +49,13 @@ EzLang 编译器采用小型分层结构，目标是把 `.ez` 源码转换为 LL
 - 编译器内建 Arena 分配器，默认用于聚合值和临时结构。
 - 块作用域进入时保存 Arena 游标，退出时恢复。
 - 跨作用域返回聚合值时按值加载，避免返回已回收区域的指针。
+- 逃逸闭包的捕获槽和环境使用编译器生成的引用计数 heap 对象，而不是普通 Arena 分配；局部作用域退出、变量/字段/全局闭包槽覆盖和返回值所有权转移会插入 retain/release。
 
 ## Flow 模型
 
 - `flow {}` 在语义层记录阻塞调用和依赖关系。
-- LLVM 层插入 `__ezrt_flow_enter`、`__ezrt_flow_exit`、`__ezrt_sleep`、`__ezrt_race_i32`、`__ezrt_task_start_i32` / `__ezrt_task_start_env_i32` / `__ezrt_task_join_i32` 等运行时 hook。
-- Linux/macOS/Windows/Android/iOS 通过 `packages/std/native/runtime.c` 提供 `sleep`、`race(pl)` 和 flow 内 `I32` `parallel` 的基础任务运行时；emcc 通过 `packages/std/emcc/runtime.js` 与 Asyncify 提供可挂起和恢复的协程运行时。捕获外层局部变量的 `parallel` 会使用共享存储槽任务环境；组合表达式或非 `I32` 返回类型保持同步协作 lowering。
+- LLVM 层插入 `__ezrt_flow_enter`、`__ezrt_flow_exit`、`__ezrt_sleep`、`__ezrt_race_i32`、`__ezrt_race_value`、`__ezrt_task_start` 和 `__ezrt_task_join` 等运行时 hook。
+- Linux/macOS/Windows/Android/iOS 通过 `packages/std/native/runtime.c` 提供 `sleep`、`race(pl)` 和 flow 内 `parallel` 的基础任务运行时；emcc 通过 `packages/std/emcc/runtime.js` 与 Asyncify 提供可挂起和恢复的协程运行时。flow 内 `parallel` 的捕获共享槽和任务环境会提升到 flow 保护的 Arena 生命周期，确保所有 pending future join 后才恢复；带捕获/非 `I32` 的 `race(pl)` 使用调用方结果槽、scratch 和 out 指针运行时调用，生命周期覆盖到 runtime 返回；组合表达式保持同步协作 lowering。
 - 这些 hook 是稳定 ABI 边界，后续可在不改变 EzLang 语法的前提下替换为更完整的平台调度器。
 
 ## 外部链接

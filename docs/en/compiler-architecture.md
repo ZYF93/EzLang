@@ -49,12 +49,13 @@ The EzLang compiler uses a small layered architecture. Its goal is to turn `.ez`
 - The compiler has a built-in Arena allocator for aggregate values and temporaries.
 - Entering a block scope saves the Arena cursor; leaving the block restores it.
 - Aggregate values returned across scopes are loaded by value to avoid pointers into reclaimed Arena regions.
+- Escaping closure capture slots and environments use compiler-generated reference-counted heap objects instead of ordinary Arena allocation. Local-scope exit, closure-slot overwrites in variables/fields/globals, and return-value ownership transfer insert retain/release operations.
 
 ## Flow Model
 
 - `flow {}` records blocking calls and dependencies in semantic analysis.
-- LLVM generation inserts runtime hooks such as `__ezrt_flow_enter`, `__ezrt_flow_exit`, `__ezrt_sleep`, `__ezrt_race_i32`, `__ezrt_task_start_i32`, `__ezrt_task_start_env_i32`, and `__ezrt_task_join_i32`.
-- Linux/macOS/Windows/Android/iOS use `packages/std/native/runtime.c` for the minimal task runtime behind `sleep`, `race(pl)`, and `I32` `parallel` inside Flow. emcc uses `packages/std/emcc/runtime.js` plus Asyncify for suspendable and resumable coroutine behavior. `parallel` with outer captures uses a shared-storage task environment; compound expressions or non-`I32` return types keep synchronous cooperative lowering.
+- LLVM generation inserts runtime hooks such as `__ezrt_flow_enter`, `__ezrt_flow_exit`, `__ezrt_sleep`, `__ezrt_race_i32`, `__ezrt_race_value`, `__ezrt_task_start`, and `__ezrt_task_join`.
+- Linux/macOS/Windows/Android/iOS use `packages/std/native/runtime.c` for the minimal task runtime behind `sleep`, `race(pl)`, and `parallel` inside Flow. emcc uses `packages/std/emcc/runtime.js` plus Asyncify for suspendable and resumable coroutine behavior. Captures and task environments for Flow-local `parallel` are promoted to a Flow-protected Arena lifetime and are restored only after pending futures have joined. Captured/non-`I32` `race(pl)` branches use caller result slots, scratch storage, and out-pointer runtime calls whose lifetime covers the runtime call; compound expressions keep synchronous cooperative lowering.
 - These hooks are stable ABI boundaries, so a more complete platform scheduler can replace them without changing EzLang syntax.
 
 ## External Linking
